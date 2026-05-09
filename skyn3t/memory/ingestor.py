@@ -1,0 +1,347 @@
+"""Experience Ingestor — feeds task outcomes, lessons, and insights into RAG.
+
+Every experience the swarm has gets automatically converted into knowledge
+and stored in the vector database. This means agents can semantically recall
+"how did we solve this before?" just by querying RAG.
+"""
+
+import asyncio
+import hashlib
+import logging
+from typing import Any, Dict, Optional
+
+from skyn3t.core.events import Event, EventBus, EventType
+from skyn3t.rag.rag_engine import RAGEngine
+
+logger = logging.getLogger("skyn3t.memory.ingestor")
+
+
+def _log_task_exception(fut: "asyncio.Future") -> None:
+    exc = fut.exception()
+    if exc is not None:
+        logger.error("ingest task failed", exc_info=exc)
+
+
+class ExperienceIngestor:
+    """Automatically ingest experiences into the RAG vector store.
+
+    Listens to task completion/failure events and reflection knowledge updates,
+    formats them as documents, and adds them to the vector DB for semantic recall.
+    """
+
+    def __init__(
+        self,
+        event_bus: Optional[EventBus] = None,
+        rag_engine: Optional[RAGEngine] = None,
+        memory_store: Optional[Any] = None,
+    ):
+        self.event_bus = event_bus
+        self.rag = rag_engine or RAGEngine()
+        self._memory = memory_store
+        self._running = False
+        self._seen_hashes: set[str] = set()
+
+        if event_bus:
+            event_bus.subscribe(self._on_task_completed, EventType.TASK_COMPLETED)
+            event_bus.subscribe(self._on_task_failed, EventType.TASK_FAILED)
+            event_bus.subscribe(self._on_knowledge_updated, EventType.KNOWLEDGE_UPDATED)
+
+    async def initialize(self) -> None:
+        """Initialize the RAG engine."""
+        await self.rag.initialize()
+        self._running = True
+
+    # ------------------------------------------------------------------
+    # Event handlers
+    # ------------------------------------------------------------------
+
+    def _on_task_completed(self, event: Event) -> None:
+        """Ingest a successful task outcome."""
+        if not self._running:
+            return
+        payload = event.payload
+        t = asyncio.create_task(self.ingest_task_experience(
+            task_id=payload.get("task_id", ""),
+            agent_name=event.source,
+            success=True,
+            output=payload.get("output", {}),
+            execution_time_ms=payload.get("execution_time_ms", 0.0),
+        ))
+        t.add_done_callback(_log_task_exception)
+
+    def _on_task_failed(self, event: Event) -> None:
+        """Ingest a failed task outcome with error analysis."""
+        if not self._running:
+            return
+        payload = event.payload
+        t = asyncio.create_task(self.ingest_task_experience(
+            task_id=payload.get("task_id", ""),
+            agent_name=event.source,
+            success=False,
+            output={},
+            error=payload.get("error", "unknown"),
+            execution_time_ms=payload.get("execution_time_ms", 0.0),
+        ))
+        t.add_done_callback(_log_task_exception)
+
+    def _on_knowledge_updated(self, event: Event) -> None:
+        """Ingest reflection-generated knowledge."""
+        if not self._running:
+            return
+        payload = event.payload
+        t = asyncio.create_task(self.ingest_lesson(
+            agent=payload.get("agent", event.source),
+            success=payload.get("success", True),
+            patterns=payload.get("patterns", []),
+            suggestions=payload.get("suggestions", []),
+            task_id=payload.get("task_id", ""),
+        ))
+        t.add_done_callback(_log_task_exception)
+
+    # ------------------------------------------------------------------
+    # Ingestion methods
+    # ------------------------------------------------------------------
+
+    async def ingest_task_experience(
+        self,
+        task_id: str,
+        agent_name: str,
+        success: bool,
+        output: Dict[str, Any],
+        execution_time_ms: float = 0.0,
+        error: Optional[str] = None,
+    ) -> Optional[str]:
+        """Ingest a single task outcome as a knowledge document."""
+        status = "SUCCESS" if success else "FAILURE"
+        content = self._format_task_experience(
+            task_id, agent_name, status, output, execution_time_ms, error
+        )
+        content_hash = self._hash(content)
+
+        # Deduplication check
+        if await self._is_duplicate(content_hash):
+            return None
+
+        title = f"Task {task_id} — {status} ({agent_name})"
+        doc_type = "experience"
+
+        metadata = {
+            "task_id": task_id,
+            "agent_name": agent_name,
+            "success": success,
+            "execution_time_ms": execution_time_ms,
+            "content_hash": content_hash,
+            "error": error,
+        }
+        embedding_id = await self.rag.add_knowledge_one(
+            content=content,
+            title=title,
+            source=agent_name,
+            doc_type=doc_type,
+            metadata=metadata,
+        )
+        if embedding_id:
+            self._seen_hashes.add(content_hash)
+            await self._persist_doc(title, content, agent_name, doc_type, metadata, embedding_id)
+        return embedding_id
+
+    async def ingest_lesson(
+        self,
+        agent: str,
+        success: bool,
+        patterns: list,
+        suggestions: list,
+        task_id: str = "",
+    ) -> Optional[str]:
+        """Ingest a reflection lesson as a knowledge document."""
+        content = self._format_lesson(agent, success, patterns, suggestions, task_id)
+        content_hash = self._hash(content)
+
+        if await self._is_duplicate(content_hash):
+            return None
+
+        title = f"Lesson from {agent} — {'success' if success else 'failure'}"
+        metadata = {
+            "agent": agent,
+            "success": success,
+            "patterns": patterns,
+            "task_id": task_id,
+            "content_hash": content_hash,
+        }
+        embedding_id = await self.rag.add_knowledge_one(
+            content=content,
+            title=title,
+            source="reflection",
+            doc_type="lesson",
+            metadata=metadata,
+        )
+        if embedding_id:
+            self._seen_hashes.add(content_hash)
+            await self._persist_doc(title, content, "reflection", "lesson", metadata, embedding_id)
+        return embedding_id
+
+    async def ingest_insight(
+        self,
+        agent_name: str,
+        insight: str,
+        capability: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Ingest an agent insight as a knowledge document."""
+        content = f"Agent: {agent_name}\n"
+        if capability:
+            content += f"Capability: {capability}\n"
+        content += f"Insight: {insight}\n"
+        if context:
+            content += f"Context: {context}\n"
+
+        content_hash = self._hash(content)
+        if await self._is_duplicate(content_hash):
+            return None
+
+        title = f"Insight from {agent_name}"
+        metadata = {
+            "agent_name": agent_name,
+            "capability": capability,
+            "content_hash": content_hash,
+        }
+        embedding_id = await self.rag.add_knowledge_one(
+            content=content,
+            title=title,
+            source=agent_name,
+            doc_type="insight",
+            metadata=metadata,
+        )
+        if embedding_id:
+            self._seen_hashes.add(content_hash)
+            await self._persist_doc(title, content, agent_name, "insight", metadata, embedding_id)
+        return embedding_id
+
+    async def ingest_failure_pattern(
+        self,
+        pattern_name: str,
+        description: str,
+        suggested_fix: str,
+        affected_agents: list,
+    ) -> Optional[str]:
+        """Ingest a failure pattern and its fix as a knowledge document."""
+        content = (
+            f"Failure Pattern: {pattern_name}\n"
+            f"Description: {description}\n"
+            f"Suggested Fix: {suggested_fix}\n"
+            f"Affected Agents: {', '.join(affected_agents)}\n"
+        )
+        content_hash = self._hash(content)
+        if await self._is_duplicate(content_hash):
+            return None
+
+        title = f"Pattern: {pattern_name}"
+        metadata = {
+            "pattern_name": pattern_name,
+            "affected_agents": affected_agents,
+            "content_hash": content_hash,
+        }
+        embedding_id = await self.rag.add_knowledge_one(
+            content=content,
+            title=title,
+            source="reflection",
+            doc_type="pattern",
+            metadata=metadata,
+        )
+        if embedding_id:
+            self._seen_hashes.add(content_hash)
+            await self._persist_doc(title, content, "reflection", "pattern", metadata, embedding_id)
+        return embedding_id
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _format_task_experience(
+        self,
+        task_id: str,
+        agent_name: str,
+        status: str,
+        output: Dict[str, Any],
+        execution_time_ms: float,
+        error: Optional[str],
+    ) -> str:
+        lines = [
+            f"Task ID: {task_id}",
+            f"Agent: {agent_name}",
+            f"Status: {status}",
+            f"Execution Time: {execution_time_ms:.0f}ms",
+        ]
+        if error:
+            lines.append(f"Error: {error}")
+        if output:
+            output_str = str(output)
+            lines.append(f"Output: {output_str[:800]}")
+        return "\n".join(lines)
+
+    def _format_lesson(
+        self,
+        agent: str,
+        success: bool,
+        patterns: list,
+        suggestions: list,
+        task_id: str,
+    ) -> str:
+        lines = [
+            f"Agent: {agent}",
+            f"Outcome: {'success' if success else 'failure'}",
+            f"Task ID: {task_id}",
+        ]
+        if patterns:
+            lines.append(f"Patterns Detected: {', '.join(patterns)}")
+        if suggestions:
+            lines.append("Suggestions:")
+            for s in suggestions:
+                lines.append(f"  - {s}")
+        return "\n".join(lines)
+
+    def _hash(self, content: str) -> str:
+        """Create a content hash for deduplication."""
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+
+    async def _is_duplicate(self, content_hash: str) -> bool:
+        """Check if content with this hash was already ingested this session."""
+        # In-memory dedup; persistence across restarts is a TODO.
+        return content_hash in self._seen_hashes
+
+    async def _persist_doc(
+        self,
+        title: str,
+        content: str,
+        source: str,
+        doc_type: str,
+        metadata: Dict[str, Any],
+        embedding_id: str,
+    ) -> None:
+        """Persist a knowledge doc to MemoryStore alongside RAG, if available."""
+        if self._memory is None:
+            return
+        try:
+            saver = getattr(self._memory, "save_knowledge_doc", None)
+            if saver is not None:
+                await saver(
+                    title=title,
+                    content=content,
+                    source=source,
+                    doc_type=doc_type,
+                    embedding_id=embedding_id,
+                    meta=metadata,
+                )
+            else:
+                save_lesson = getattr(self._memory, "save_lesson", None)
+                if save_lesson is not None:
+                    await save_lesson(
+                        title=title,
+                        content=content,
+                        source=source,
+                        doc_type=doc_type,
+                        meta=metadata,
+                        embedding_id=embedding_id,
+                    )
+        except Exception as e:
+            logger.warning("failed to persist knowledge doc to MemoryStore: %s", e)

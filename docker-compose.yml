@@ -1,0 +1,49 @@
+version: "3.9"
+
+services:
+  skyn3t:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: skyn3t
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${PORT:-6660}:6660"
+    volumes:
+      - skyn3t_data:/app/data
+    depends_on:
+      - redis
+    networks:
+      - skyn3t_net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:6660/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: skyn3t_redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    networks:
+      - skyn3t_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  skyn3t_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  skyn3t_net:
+    driver: bridge
