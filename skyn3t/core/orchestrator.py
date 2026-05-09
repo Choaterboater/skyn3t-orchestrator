@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger("skyn3t.core.orchestrator")
 from typing import Any, Callable, Dict, List, Optional
@@ -358,7 +358,7 @@ class Orchestrator:
             "type": agent.agent_type,
             "provider": agent.provider,
             "capabilities": [c.name for c in agent.capabilities],
-            "registered_at": datetime.utcnow().isoformat(),
+            "registered_at": datetime.now(timezone.utc).isoformat(),
         }
         asyncio.create_task(
             self._agent_selector.registry.update_capability_index(
@@ -647,8 +647,8 @@ class Orchestrator:
 
     async def wait_for_task(self, task_id: str, timeout: float = 300.0) -> Optional[TaskResult]:
         """Wait for a task to complete."""
-        start = datetime.utcnow()
-        while (datetime.utcnow() - start).total_seconds() < timeout:
+        start = datetime.now(timezone.utc)
+        while (datetime.now(timezone.utc) - start).total_seconds() < timeout:
             if task_id in self.task_results:
                 return self.task_results[task_id]
             await asyncio.sleep(0.5)
@@ -1037,7 +1037,7 @@ class Orchestrator:
                     retry_count=task.retry_count if task else 0,
                     max_retries=task.max_retries if task else 3,
                     started_at=None,
-                    completed_at=datetime.utcnow(),
+                    completed_at=datetime.now(timezone.utc),
                     session_id=task.session_id if task else None,
                 )
             )
@@ -1088,7 +1088,7 @@ class Orchestrator:
                     retry_count=task.retry_count,
                     max_retries=task.max_retries,
                     started_at=None,
-                    completed_at=datetime.utcnow(),
+                    completed_at=datetime.now(timezone.utc),
                     session_id=task.session_id,
                 )
             )
