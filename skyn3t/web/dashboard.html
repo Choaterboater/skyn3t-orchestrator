@@ -14,13 +14,13 @@
             --bg-1: #0e1214;
             --bg-2: #151a1e;
             --bg-3: #1d2428;
-            --border: #2a3038;
-            --border-hover: #8b0000;
-            --text-primary: #d8dde1;
-            --text-secondary: #8f9aa3;
-            --text-dim: #525c66;
-            --cyan: #8b0000;
-            --cyan-glow: rgba(139,0,0,0.50);
+            --border: #323b46;
+            --border-hover: #d45b3f;
+            --text-primary: #e1e8ef;
+            --text-secondary: #a8b3bf;
+            --text-dim: #6f7a86;
+            --cyan: #d45b3f;
+            --cyan-glow: rgba(212,91,63,0.35);
             --magenta: #c45000;
             --magenta-glow: rgba(196,80,0,0.42);
             --green: #4e7a4f;
@@ -30,6 +30,11 @@
             --orange: #c45000;
             --purple: #6b1a0a;
             --grid-line: rgba(139,0,0,0.10);
+            --radius-xs: 0.375rem;
+            --radius-sm: 0.55rem;
+            --radius-md: 0.8rem;
+            --radius-lg: 1rem;
+            --focus-ring: rgba(212,91,63,0.24);
         }
         * { margin:0; padding:0; box-sizing:border-box; }
 
@@ -629,6 +634,282 @@
         .toast .toast-title { font-weight: 600; margin-bottom: .15rem; }
         .toast .toast-body { color: var(--text-secondary); font-size: .75rem; }
         .toast .toast-close { float: right; cursor: pointer; color: var(--text-dim); margin-left: .5rem; }
+        /* Live conversation panel */
+        .convo-row { background: var(--bg-2); border: 1px solid var(--border); border-radius: .4rem; overflow: hidden; }
+        .convo-head { display: flex; gap: .5rem; padding: .5rem .75rem; cursor: pointer; align-items: center; font-size: .8rem; border-bottom: 1px solid transparent; }
+        .convo-row.expanded .convo-head { border-bottom-color: var(--border); }
+        .convo-head .convo-agent { font-weight: 600; color: var(--cyan); }
+        .convo-head .convo-model { color: var(--text-secondary); font-family: 'JetBrains Mono', monospace; font-size: .7rem; }
+        .convo-head time { margin-left: auto; color: var(--text-dim); font-size: .7rem; font-family: 'JetBrains Mono', monospace; }
+        .convo-body { padding: .5rem .75rem; display: none; gap: .5rem; flex-direction: column; font-family: 'JetBrains Mono', monospace; font-size: .72rem; }
+        .convo-row.expanded .convo-body { display: flex; }
+        .convo-block { background: var(--bg-3); padding: .5rem .65rem; border-radius: .3rem; white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow-y: auto; }
+        .convo-block-label { font-size: .6rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .08em; margin-bottom: .2rem; }
+        .convo-prompt { border-left: 2px solid var(--magenta); }
+        .convo-response { border-left: 2px solid var(--green); }
+
+        /* ─── Design polish pass: unify spacing, contrast, and controls ─── */
+        .page-shell { gap: 1.25rem; }
+        .page-header { padding: 1rem 1.5rem; background: linear-gradient(180deg, var(--bg-1), rgba(14,18,20,0.9)); }
+        .page-body { padding: 1.25rem 1.5rem 1.5rem; gap: 1.25rem; }
+        .ui-card, .panel, #page-cortex .card, .studio-pane.card, .studio-viewer.card,
+        .tbl-wrap, .split-view .sv-right, .sv-list, .modal, .prop-modal .modal-card,
+        .convo-row, .system-status {
+            border-radius: var(--radius-md);
+        }
+        .ui-card, .panel, #page-cortex .card, .studio-pane.card, .studio-viewer.card {
+            background: linear-gradient(180deg, rgba(29,36,40,0.94), rgba(14,18,20,0.98));
+            border-color: var(--border);
+            box-shadow: 0 8px 24px rgba(0,0,0,0.24);
+        }
+        .card-h, .panel-header {
+            padding: 0.85rem 1rem;
+            background: linear-gradient(180deg, rgba(212,91,63,0.10), rgba(212,91,63,0.03));
+            border-bottom-color: var(--border);
+        }
+        .card-b, .panel-body { padding: 1rem; }
+
+        .btn {
+            min-height: 2.2rem;
+            padding: 0.5rem 0.9rem;
+            border-radius: var(--radius-sm);
+            border-color: var(--border);
+        }
+        .btn:hover { border-color: var(--border-hover); box-shadow: 0 0 0 2px var(--focus-ring); }
+        .btn-primary { color: #fff; border-color: rgba(212,91,63,0.55); }
+        .btn-xs {
+            min-height: 1.7rem;
+            padding: 0.2rem 0.55rem;
+            border-radius: var(--radius-xs);
+            font-size: 0.72rem;
+        }
+
+        .empty-state {
+            border-radius: var(--radius-sm);
+            border-color: var(--border);
+            background: rgba(9,11,13,0.35);
+            color: var(--text-secondary);
+        }
+        .playground-input, .playground-output, .pipeline-stage, .timeline-item,
+        .focus-card, .agent-pulse, .studio-template, .cortex-list li {
+            border-radius: var(--radius-sm);
+            border-color: var(--border);
+        }
+        .timeline-item { padding: 0.9rem 1rem; }
+
+        .form-group { margin-bottom: 1rem; }
+        .form-group label, .form-label {
+            margin-bottom: 0.45rem;
+            color: var(--text-secondary);
+            letter-spacing: 0.06em;
+        }
+        .form-group :is(input:not([type="checkbox"]), select, textarea),
+        .form-input, .form-select,
+        .drawer-body :is(input:not([type="checkbox"]), select, textarea),
+        .tbl-toolbar input.search, .sv-toolbar input.sv-search,
+        .pipeline-stage :is(input, select) {
+            width: 100%;
+            background: var(--bg-0);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            padding: 0.6rem 0.75rem;
+            font-size: 0.84rem;
+            transition: border-color 0.18s, box-shadow 0.18s;
+        }
+        .form-group textarea,
+        #studioBrief, #playgroundPrompt, #ragContent,
+        .drawer-body textarea {
+            line-height: 1.5;
+        }
+        :is(
+            .form-group input:not([type="checkbox"]), .form-group select, .form-group textarea,
+            .form-input, .form-select,
+            .drawer-body input:not([type="checkbox"]), .drawer-body select, .drawer-body textarea,
+            .tbl-toolbar input.search, .sv-toolbar input.sv-search,
+            .pipeline-stage input, .pipeline-stage select
+        ):focus {
+            outline: none;
+            border-color: var(--cyan);
+            box-shadow: 0 0 0 3px var(--focus-ring);
+        }
+
+        #convoFilter {
+            background: var(--bg-0) !important;
+            border: 1px solid var(--border) !important;
+            color: var(--text-primary) !important;
+            border-radius: var(--radius-xs) !important;
+            padding: 0.38rem 0.55rem !important;
+            font-size: 0.74rem !important;
+        }
+        #suggestText,
+        #cuOlderDays,
+        #cuKeepLast {
+            border-radius: var(--radius-sm) !important;
+            border-color: var(--border) !important;
+            padding: 0.58rem 0.72rem !important;
+        }
+        #suggestBtn {
+            border-radius: var(--radius-md) !important;
+            box-shadow: 0 10px 28px rgba(0,0,0,0.35) !important;
+        }
+
+        .tbl {
+            font-size: 0.84rem;
+            line-height: 1.42;
+        }
+        .tbl-wrap {
+            max-height: 72vh;
+            border-color: var(--border);
+        }
+        .tbl-toolbar {
+            gap: 0.65rem;
+            padding: 0.7rem 0.85rem;
+            background: rgba(21,26,30,0.92);
+        }
+        .tbl-toolbar input.search { padding: 0.52rem 0.68rem; }
+        .tbl thead th {
+            background: var(--bg-2);
+            padding: 0.75rem 0.85rem;
+            color: var(--text-secondary);
+            font-weight: 600;
+            letter-spacing: 0.06em;
+        }
+        .tbl tbody td {
+            padding: 0.74rem 0.85rem;
+            border-bottom-color: rgba(50,59,70,0.7);
+        }
+        .tbl tbody tr:hover { background: rgba(212,91,63,0.08); }
+        .tbl.compact tbody td { padding: 0.52rem 0.68rem; }
+        .row-expand td { padding: 0.9rem 1.1rem !important; }
+
+        /* ─── Visual polish pass ─── */
+        :root {
+            --bg-0: #0a0f14;
+            --bg-1: #111923;
+            --bg-2: #18222d;
+            --bg-3: #1f2b38;
+            --border: #445364;
+            --text-primary: #ecf3fa;
+            --text-secondary: #c3cfdb;
+            --text-dim: #8f9dae;
+            --radius-xs: 0.45rem;
+            --radius-sm: 0.7rem;
+            --radius-md: 0.95rem;
+            --radius-lg: 1.15rem;
+            --focus-ring: rgba(212, 91, 63, 0.3);
+        }
+
+        body { line-height: 1.45; }
+        .app { grid-template-columns: 272px 1fr; }
+        .sidebar { padding: 1.25rem; gap: 1.25rem; }
+        .main { background: linear-gradient(180deg, rgba(17,25,35,0.72), rgba(10,15,20,0.2)); }
+        .page-header {
+            padding: 1.1rem 1.5rem;
+            background: rgba(17,25,35,0.92);
+            border-bottom: 1px solid rgba(68,83,100,0.95);
+            backdrop-filter: blur(8px);
+        }
+        .page-body { padding: 1.2rem 1.5rem 1.5rem; gap: 1.25rem; }
+
+        .ui-card,
+        .panel,
+        .studio-pane.card,
+        .studio-viewer.card,
+        #page-cortex .card,
+        .system-status,
+        .modal,
+        .playground-input,
+        .playground-output,
+        .pipeline-stage,
+        .timeline-item,
+        .focus-card,
+        .agent-row,
+        .agent-pulse,
+        .empty-state,
+        .cy-container {
+            border-radius: var(--radius-md);
+            border-color: rgba(88,103,120,0.9);
+            background-clip: padding-box;
+        }
+
+        .card-h,
+        .panel-header,
+        .studio-viewer .card-header,
+        .studio-pane .card-header,
+        #page-cortex .card-header {
+            padding: 0.9rem 1rem;
+            gap: 0.65rem;
+        }
+        .card-b,
+        .panel-body,
+        .studio-pane,
+        .studio-viewer.card,
+        .playground-input,
+        .playground-output {
+            padding: 1rem;
+        }
+
+        .nav-item { border-radius: var(--radius-sm); padding: 0.68rem 0.92rem; }
+        .btn { border-radius: var(--radius-sm); padding: 0.56rem 0.96rem; }
+        .btn-primary { color: #140f0d; }
+        .stat-card,
+        .studio-template,
+        .studio-list li,
+        .studio-artifact-list li { border-radius: var(--radius-sm); }
+
+        .form-group { margin-bottom: 0.9rem; }
+        .form-group label,
+        .form-label {
+            color: var(--text-secondary);
+            font-size: 0.74rem;
+            letter-spacing: 0.055em;
+            font-weight: 600;
+        }
+
+        :where(
+            .form-group input:not([type="checkbox"]):not([type="radio"]),
+            .form-group select,
+            .form-group textarea,
+            .form-input,
+            .form-select,
+            .drawer-body input:not([type="checkbox"]):not([type="radio"]),
+            .drawer-body select,
+            .drawer-body textarea,
+            .tbl-toolbar input.search,
+            .sv-toolbar input.sv-search,
+            .pipeline-stage input,
+            .pipeline-stage select
+        ) {
+            background: rgba(10,15,20,0.92);
+            border: 1px solid rgba(95,111,129,0.95);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+        }
+        :where(
+            .form-group input:not([type="checkbox"]):not([type="radio"]),
+            .form-group select,
+            .form-group textarea,
+            .form-input,
+            .form-select,
+            .drawer-body input:not([type="checkbox"]):not([type="radio"]),
+            .drawer-body select,
+            .drawer-body textarea,
+            .tbl-toolbar input.search,
+            .sv-toolbar input.sv-search,
+            .pipeline-stage input,
+            .pipeline-stage select
+        ):hover {
+            border-color: rgba(137,154,174,0.95);
+        }
+
+        .agent-meta,
+        .timeline-meta,
+        .event-payload,
+        .swarm-empty,
+        .muted {
+            color: var(--text-secondary);
+        }
     </style>
 </head>
 <body>
@@ -773,6 +1054,22 @@
                             </div>
                         </div>
 
+                        <div class="ui-card col-12">
+                            <div class="card-h">
+                                <h3><i class="fa-solid fa-comments"></i> Live conversation</h3>
+                                <span class="right">
+                                    <select id="convoFilter" style="background:var(--bg-2);border:1px solid var(--border);color:var(--text-primary);border-radius:.3rem;padding:.2rem .4rem;font-size:.7rem;">
+                                        <option value="">All agents</option>
+                                    </select>
+                                    <button class="btn btn-ghost btn-xs" onclick="convoClear()" title="Clear"><i class="fa-solid fa-broom"></i></button>
+                                </span>
+                            </div>
+                            <div class="card-b">
+                                <div id="convoLog" style="max-height: 480px; overflow-y: auto; display: flex; flex-direction: column; gap: .65rem;"></div>
+                                <div id="convoEmpty" class="muted" style="text-align:center; padding:2rem;">No exchanges yet — run a Studio project to see live agent conversation.</div>
+                            </div>
+                        </div>
+
                         <div class="ui-card col-8 fill">
                             <div class="card-h"><h3><i class="fa-solid fa-wave-square"></i> Activity Stream</h3><span class="right" id="swarmActivityCount" style="color:var(--text-dim);font-size:.7rem">0 events</span></div>
                             <div class="card-b" style="padding:0">
@@ -804,6 +1101,7 @@
                             <span class="subtitle">Spin up a swarm from a template + brief and watch artifacts land.</span>
                         </div>
                         <div class="page-actions">
+                            <button class="btn btn-ghost btn-xs" onclick="openCleanupModal()" title="Cleanup old runs"><i class="fa-solid fa-broom"></i> Cleanup…</button>
                             <button class="btn btn-primary" onclick="studioFocusBrief()"><i class="fa-solid fa-plus"></i> Start project</button>
                         </div>
                     </div>
@@ -2796,7 +3094,81 @@
             if (n && typeof openAgentConfig === 'function') openAgentConfig(n);
         }
 
+        // ─── Live conversation panel (LLM_EXCHANGE) ───
+        const _convoState = { rows: [], filter: '', knownAgents: new Set() };
+
+        function convoClear() {
+            _convoState.rows = [];
+            const log = document.getElementById('convoLog');
+            if (log) log.innerHTML = '';
+            const empty = document.getElementById('convoEmpty');
+            if (empty) empty.style.display = 'block';
+        }
+
+        function convoRender() {
+            const log = document.getElementById('convoLog');
+            if (!log) return;
+            const filter = _convoState.filter;
+            const visible = _convoState.rows.filter(r => !filter || r.agent === filter);
+            const empty = document.getElementById('convoEmpty');
+            if (visible.length === 0) {
+                if (empty) empty.style.display = 'block';
+                log.innerHTML = '';
+                return;
+            }
+            if (empty) empty.style.display = 'none';
+            log.innerHTML = visible.slice(-100).reverse().map((r, i) => `
+                <div class="convo-row" data-idx="${i}">
+                  <div class="convo-head" onclick="this.parentElement.classList.toggle('expanded')">
+                    <span class="convo-agent">${escapeHTML(r.agent)}</span>
+                    <span class="convo-model">${escapeHTML(r.backend||'')}/${escapeHTML(r.model||'')}</span>
+                    <time>${new Date(r.ts).toLocaleTimeString()}${r.duration_ms?` · ${r.duration_ms}ms`:''}</time>
+                  </div>
+                  <div class="convo-body">
+                    ${r.system ? `<div><div class="convo-block-label">System</div><div class="convo-block">${escapeHTML(r.system)}</div></div>` : ''}
+                    <div><div class="convo-block-label">Prompt</div><div class="convo-block convo-prompt">${escapeHTML(r.prompt||'(empty)')}</div></div>
+                    <div><div class="convo-block-label">Response</div><div class="convo-block convo-response">${escapeHTML(r.response||'(empty)')}</div></div>
+                  </div>
+                </div>
+            `).join('');
+        }
+
+        function convoOnEvent(ev) {
+            if (!ev || ev.kind !== 'convo') return;
+            const meta = ev.meta || {};
+            _convoState.rows.push({
+                ts: ev.ts ? Date.parse(ev.ts) : Date.now(),
+                agent: ev.from || meta.agent || '?',
+                backend: meta.backend || '',
+                model: meta.model || '',
+                prompt: meta.prompt || '',
+                response: meta.response || '',
+                system: '',  // not currently piped to compact event; will be empty
+                duration_ms: meta.duration_ms || 0,
+            });
+            if (_convoState.rows.length > 500) _convoState.rows = _convoState.rows.slice(-500);
+            if (ev.from && !_convoState.knownAgents.has(ev.from)) {
+                _convoState.knownAgents.add(ev.from);
+                const sel = document.getElementById('convoFilter');
+                if (sel) {
+                    const opt = document.createElement('option');
+                    opt.value = ev.from; opt.textContent = ev.from;
+                    sel.appendChild(opt);
+                }
+            }
+            convoRender();
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            const sel = document.getElementById('convoFilter');
+            if (sel) sel.addEventListener('change', e => { _convoState.filter = e.target.value; convoRender(); });
+        });
+
         function handleSwarmEvent(ev) {
+            // Always feed the live-conversation panel (LLM_EXCHANGE events).
+            // Wrapped so a render bug never blocks downstream swarm handlers.
+            try { convoOnEvent(ev); } catch(e){}
+
             // CODE_PATCH_RESULT toast — fire ASAP, even if the user has the
             // activity stream paused or is on a different page. The compact
             // projection forwards meta.payload so we read both `meta.kind` and
@@ -3110,6 +3482,7 @@
                     return `<span style="white-space:nowrap;">
                         <button class="btn btn-ghost btn-xs" data-row-action title="Open" onclick="event.stopPropagation(); studioOpenProject('${s}')"><i class="fa-solid fa-folder-open"></i></button>
                         <a class="btn btn-ghost btn-xs" data-row-action title="Download zip" href="/api/studio/projects/${encodeURIComponent(r.slug)}/zip" onclick="event.stopPropagation();"><i class="fa-solid fa-download"></i></a>
+                        <button class="btn btn-ghost btn-xs" data-row-action title="Delete project" onclick="event.stopPropagation(); studioDeleteProject('${s}', this)"><i class="fa-solid fa-trash"></i></button>
                     </span>`;
                 }},
             ];
@@ -3745,6 +4118,65 @@
           if (b && !b.dataset.bound) { b.dataset.bound='1'; b.addEventListener('click', openSuggestModal); }
         });
 
+        // ─── Cleanup ───
+        function openCleanupModal() {
+          document.getElementById('cleanupModal').classList.remove('hidden');
+          document.getElementById('cuExecBtn').disabled = true;
+          const pv = document.getElementById('cuPreview');
+          if (pv) pv.innerHTML = 'Click "Preview" to see what would be removed.';
+        }
+        function closeCleanupModal() { document.getElementById('cleanupModal').classList.add('hidden'); }
+
+        function _cuParams() {
+          const days = document.getElementById('cuOlderDays').value;
+          const keep = document.getElementById('cuKeepLast').value;
+          const params = new URLSearchParams({
+            projects: document.getElementById('cuProjects').checked,
+            proposals: document.getElementById('cuProposals').checked,
+            branches: document.getElementById('cuBranches').checked,
+          });
+          if (days) params.set('older_than_days', days);
+          if (keep) params.set('keep_last', keep);
+          return params;
+        }
+        async function cuPreviewNow() {
+          const r = await fetch('/api/cleanup/preview?' + _cuParams().toString());
+          const d = await r.json();
+          document.getElementById('cuPreview').innerHTML =
+            `Will remove: <strong>${d.total_projects}</strong> projects, <strong>${d.total_proposals}</strong> proposals, <strong>${d.total_branches}</strong> branches (${(d.total_bytes/1024).toFixed(1)} KB)`;
+          document.getElementById('cuExecBtn').disabled = !(d.total_projects || d.total_proposals || d.total_branches);
+        }
+        async function cuExecuteNow() {
+          const days = document.getElementById('cuOlderDays').value;
+          const keep = document.getElementById('cuKeepLast').value;
+          const body = {
+            projects: document.getElementById('cuProjects').checked,
+            proposals: document.getElementById('cuProposals').checked,
+            branches: document.getElementById('cuBranches').checked,
+            older_than_days: days ? parseInt(days) : null,
+            keep_last: keep ? parseInt(keep) : null,
+          };
+          const btn = document.getElementById('cuExecBtn');
+          btn.disabled = true; btn.textContent = 'Deleting…';
+          const r = await fetch('/api/cleanup/execute', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+          const d = await r.json();
+          btn.textContent = `Removed ${d.projects||0}/${d.proposals||0}/${d.branches||0}`;
+          if (typeof studioRefreshProjects === 'function') studioRefreshProjects();
+          setTimeout(() => { closeCleanupModal(); btn.innerHTML = 'Delete'; }, 1200);
+        }
+        async function studioDeleteProject(slug, btn) {
+          if (!confirm(`Delete project "${slug}"?`)) return;
+          if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>'; }
+          try {
+            const r = await fetch('/api/studio/projects/' + encodeURIComponent(slug), {method:'DELETE'});
+            const d = await r.json();
+            if (d && d.error) alert('Error: ' + d.error);
+          } catch (e) {
+            alert('Error: ' + e.message);
+          }
+          if (typeof studioRefreshProjects === 'function') studioRefreshProjects();
+        }
+
         // ─── Init ───
         function refreshAll() { refreshAgents(); updateStats(); }
         connectWS();
@@ -3904,6 +4336,33 @@
         <div class="modal-foot">
           <button class="btn btn-ghost" onclick="closeSuggestModal()">Cancel</button>
           <button id="suggestSendBtn" class="btn btn-primary" onclick="submitSuggest()"><i class="fa-solid fa-paper-plane"></i> File proposal</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Cleanup Modal -->
+    <div id="cleanupModal" class="prop-modal hidden">
+      <div class="modal-backdrop" onclick="closeCleanupModal()"></div>
+      <div class="modal-card" style="max-width:520px;">
+        <div class="modal-head">
+          <i class="fa-solid fa-broom"></i>
+          <h3>Cleanup</h3>
+          <button class="btn btn-ghost btn-xs" onclick="closeCleanupModal()"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+        <div class="modal-body">
+          <label class="checkbox-row" style="display:flex;gap:.5rem;align-items:center;margin-bottom:.4rem;"><input type="checkbox" id="cuProjects" checked> Project artifacts</label>
+          <label class="checkbox-row" style="display:flex;gap:.5rem;align-items:center;margin-bottom:.4rem;"><input type="checkbox" id="cuProposals" checked> Decided proposals</label>
+          <label class="checkbox-row" style="display:flex;gap:.5rem;align-items:center;margin-bottom:.65rem;"><input type="checkbox" id="cuBranches" checked> Auto branches</label>
+          <label style="display:block;margin-bottom:.5rem;font-size:.78rem;color:var(--text-secondary);">Older than (days, blank = all)
+            <input type="number" id="cuOlderDays" placeholder="(any age)" style="width:100%;background:var(--bg-2);border:1px solid var(--border);color:var(--text-primary);padding:.4rem .55rem;border-radius:.3rem;margin-top:.25rem;"></label>
+          <label style="display:block;margin-bottom:.5rem;font-size:.78rem;color:var(--text-secondary);">Keep most-recent N (blank = none)
+            <input type="number" id="cuKeepLast" placeholder="(none kept)" style="width:100%;background:var(--bg-2);border:1px solid var(--border);color:var(--text-primary);padding:.4rem .55rem;border-radius:.3rem;margin-top:.25rem;"></label>
+          <div id="cuPreview" class="muted" style="margin-top:.65rem;font-size:.78rem;">Click "Preview" to see what would be removed.</div>
+        </div>
+        <div class="modal-foot">
+          <button class="btn btn-ghost" onclick="cuPreviewNow()">Preview</button>
+          <button class="btn btn-ghost" onclick="closeCleanupModal()">Cancel</button>
+          <button id="cuExecBtn" class="btn btn-primary" onclick="cuExecuteNow()" disabled>Delete</button>
         </div>
       </div>
     </div>
