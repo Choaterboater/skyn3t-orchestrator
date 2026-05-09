@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import select, desc, func
@@ -57,7 +57,7 @@ class MemoryStore:
                         existing.capabilities = capabilities
                         existing.config = config
                         existing.meta = meta
-                        existing.last_heartbeat = datetime.utcnow()
+                        existing.last_heartbeat = datetime.now(timezone.utc)
                     else:
                         session.add(AgentModel(
                             id=agent_id,
@@ -68,7 +68,7 @@ class MemoryStore:
                             capabilities=capabilities,
                             config=config,
                             meta=meta,
-                            last_heartbeat=datetime.utcnow(),
+                            last_heartbeat=datetime.now(timezone.utc),
                         ))
 
     async def get_agent(self, name: str) -> Optional[Dict[str, Any]]:

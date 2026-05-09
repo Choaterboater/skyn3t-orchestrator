@@ -5,7 +5,7 @@ import inspect
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 from uuid import UUID, uuid4
 
@@ -213,7 +213,7 @@ class BaseAgent(ABC):
                     )
                 )
 
-                start_time = datetime.utcnow()
+                start_time = datetime.now(timezone.utc)
                 async with tracer.span(
                     "agent.execute_task",
                     attributes={
@@ -239,7 +239,7 @@ class BaseAgent(ABC):
                         else:
                             result = await self.execute(task)
                         execution_time_sec = (
-                            datetime.utcnow() - start_time
+                            datetime.now(timezone.utc) - start_time
                         ).total_seconds()
                         result.execution_time_ms = execution_time_sec * 1000
 
@@ -291,7 +291,7 @@ class BaseAgent(ABC):
 
                     except Exception as e:
                         execution_time_sec = (
-                            datetime.utcnow() - start_time
+                            datetime.now(timezone.utc) - start_time
                         ).total_seconds()
                         span.set_status(SpanStatus.ERROR, str(e))
                         collector.record_task_failed(
@@ -328,7 +328,7 @@ class BaseAgent(ABC):
         self._errors.append(
             {
                 "error": error,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "context": context or {},
             }
         )
