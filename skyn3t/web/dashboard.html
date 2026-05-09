@@ -10,26 +10,26 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         :root {
-            --bg-0: #05070a;
-            --bg-1: #0a0f1a;
-            --bg-2: #111827;
-            --bg-3: #1a2332;
-            --border: #1e3a5f;
-            --border-hover: #00f0ff;
-            --text-primary: #e2e8f0;
-            --text-secondary: #94a3b8;
-            --text-dim: #475569;
-            --cyan: #00f0ff;
-            --cyan-glow: rgba(0,240,255,0.15);
-            --magenta: #ff00a0;
-            --magenta-glow: rgba(255,0,160,0.15);
-            --green: #00ff88;
-            --green-glow: rgba(0,255,136,0.15);
-            --yellow: #ffd700;
-            --red: #ff3366;
-            --orange: #ff8800;
-            --purple: #a855f7;
-            --grid-line: rgba(0,240,255,0.03);
+            --bg-0: #090b0d;
+            --bg-1: #0e1214;
+            --bg-2: #151a1e;
+            --bg-3: #1d2428;
+            --border: #2a3038;
+            --border-hover: #8b0000;
+            --text-primary: #d8dde1;
+            --text-secondary: #8f9aa3;
+            --text-dim: #525c66;
+            --cyan: #8b0000;
+            --cyan-glow: rgba(139,0,0,0.50);
+            --magenta: #c45000;
+            --magenta-glow: rgba(196,80,0,0.42);
+            --green: #4e7a4f;
+            --green-glow: rgba(78,122,79,0.28);
+            --yellow: #d4821a;
+            --red: #cc2200;
+            --orange: #c45000;
+            --purple: #6b1a0a;
+            --grid-line: rgba(139,0,0,0.10);
         }
         * { margin:0; padding:0; box-sizing:border-box; }
 
@@ -243,14 +243,36 @@
         /* ─── Swarm Map: ring + swimlane (single bordered card) ─── */
         .swarm-map { background: var(--bg-1); border: 1px solid var(--border); border-radius: 0.5rem; overflow: hidden; }
         /* Fullscreen toggle for swarm map card */
-        .swarm-fullscreen { position: fixed !important; inset: 0 !important; z-index: 1100; background: var(--bg-0); border-radius: 0; padding: 1rem; display: flex; flex-direction: column; gap: .75rem; }
-        .swarm-fullscreen #swarmRingWrap { height: 30vh; }
+        .swarm-fullscreen { position: fixed !important; inset: 0 !important; z-index: 9999;
+            background: var(--bg-0) !important; border-radius: 0 !important; padding: 1rem !important;
+            display: flex !important; flex-direction: column !important; gap: .75rem !important;
+            width: 100vw !important; height: 100vh !important; max-width: none !important; max-height: none !important;
+            margin: 0 !important; box-shadow: none !important; }
+        .swarm-fullscreen #swarmRingWrap { height: 60vh !important; min-height: 0 !important; resize: none !important; }
         .swarm-fullscreen #swarmTimelineWrap { flex: 1; min-height: 0; }
         .swarm-fullscreen .swim-grid { height: 100%; max-height: none; }
         .swarm-fullscreen .swarm-expand-btn i { transform: rotate(45deg); }
         .swarm-map-divider { height: 1px; background: var(--border); }
-        #swarmRingWrap { height: 130px; background: var(--bg-0); position: relative; }
+        #swarmRingWrap { height: 480px; min-height: 280px; background: var(--bg-0); position: relative; resize: vertical; overflow: auto; cursor: grab; }
+        #swarmRingWrap.grabbing { cursor: grabbing; }
+        #brainMapSvg { width: 100%; height: 100%; display: block; user-select: none; }
+        #bmZoomLayer { transition: transform 0.08s linear; }
         #swarmRingSvg { width: 100%; height: 100%; display: block; }
+        /* Brain-map cluster layout */
+        .bm-node { transition: r 0.3s, fill 0.3s, stroke 0.3s; cursor: pointer; }
+        .bm-halo { transition: opacity 0.25s; pointer-events: none; }
+        .bm-node[data-state="error"] { stroke: var(--red); }
+        .bm-node[data-state="disabled"] { opacity: 0.4; }
+        @keyframes bm-pulse { 0%, 100% { opacity: 0.30; } 50% { opacity: 0.65; } }
+        .bm-label { font-size: 11px; fill: var(--text-primary); text-anchor: middle; pointer-events: none; font-family: 'JetBrains Mono', monospace; }
+        .bm-cap   { font-size: 9px; fill: var(--text-secondary); text-anchor: middle; font-style: italic; pointer-events: none; }
+        .bm-cluster-label { font-size: 13px; font-weight: 600; text-anchor: middle; pointer-events: none; }
+        .bm-edge { stroke-linecap: round; fill: none; }
+        .bm-edge-flash { animation: bm-edge-flash-fade 1.2s ease-out forwards; }
+        @keyframes bm-edge-flash-fade { 0% { opacity: 0.95; } 100% { opacity: 0; } }
+        .bm-msg-pulse { fill: var(--cyan); filter: drop-shadow(0 0 6px var(--cyan)); }
+        .bm-hub { fill: var(--bg-1); stroke: #ffffff; stroke-width: 2; }
+        .bm-hub-label { font-size: 14px; font-weight: 700; fill: var(--text-primary); text-anchor: middle; pointer-events: none; }
         .ring-node { transition: fill 0.25s, stroke 0.25s; }
         .ring-node[data-state="idle"]     { fill: var(--green); stroke: rgba(0,255,136,0.5); }
         .ring-node[data-state="working"], .ring-node[data-state="busy"] {
@@ -598,9 +620,19 @@
         .sv-detail .sv-caps-empty { color: var(--text-dim); font-size: .85rem; }
         .sv-actionbar { position: sticky; bottom: 0; background: var(--bg-1); border-top: 1px solid var(--border); padding: .75rem 1rem; display: flex; gap: .5rem; justify-content: flex-end; }
         .sv-placeholder { display: flex; flex: 1; align-items: center; justify-content: center; color: var(--text-secondary); font-size: .9rem; padding: 2rem; text-align: center; }
+        /* Toast notifications (CODE_PATCH_RESULT etc.) */
+        #toastStack { position: fixed; top: 1rem; right: 1rem; z-index: 9000; display: flex; flex-direction: column; gap: .5rem; max-width: 400px; pointer-events: none; }
+        .toast { background: var(--bg-1); border: 1px solid var(--border); border-left: 3px solid var(--cyan); border-radius: .4rem; padding: .65rem .85rem; font-size: .82rem; box-shadow: 0 8px 24px rgba(0,0,0,.5); pointer-events: auto; opacity: 0; transform: translateX(20px); transition: opacity .2s, transform .2s; }
+        .toast.show { opacity: 1; transform: translateX(0); }
+        .toast.success { border-left-color: var(--green); }
+        .toast.error { border-left-color: var(--red); }
+        .toast .toast-title { font-weight: 600; margin-bottom: .15rem; }
+        .toast .toast-body { color: var(--text-secondary); font-size: .75rem; }
+        .toast .toast-close { float: right; cursor: pointer; color: var(--text-dim); margin-left: .5rem; }
     </style>
 </head>
 <body>
+    <div id="toastStack" aria-live="polite"></div>
     <div class="app">
         <aside class="sidebar">
             <div class="logo"><i class="fa-solid fa-robot"></i><span>SkyN3t</span></div>
@@ -700,14 +732,22 @@
                     </div>
                     <div class="page-body grid-12">
                         <div class="ui-card col-12">
-                            <div class="card-h"><h3><i class="fa-solid fa-circle-nodes"></i> Swarm Map</h3><span class="right" style="color:var(--text-dim);font-size:.7rem">ring + 5-minute swimlane <button class="btn btn-ghost btn-xs swarm-expand-btn" onclick="toggleSwarmFullscreen()" title="Open swarm map" style="margin-left:.5rem"><i class="fa-solid fa-expand"></i></button></span></div>
+                            <div class="card-h"><h3><i class="fa-solid fa-circle-nodes"></i> Swarm Map</h3><span class="right" style="color:var(--text-dim);font-size:.7rem">ring + 5-minute swimlane
+                                <button class="btn btn-ghost btn-xs" onclick="bmZoom(0.8)" title="Zoom out" style="margin-left:.5rem"><i class="fa-solid fa-magnifying-glass-minus"></i></button>
+                                <button class="btn btn-ghost btn-xs" onclick="bmZoom(1.25)" title="Zoom in"><i class="fa-solid fa-magnifying-glass-plus"></i></button>
+                                <button class="btn btn-ghost btn-xs" onclick="bmZoomReset()" title="Fit"><i class="fa-solid fa-expand-arrows-alt"></i></button>
+                                <button class="btn btn-ghost btn-xs swarm-expand-btn" onclick="toggleSwarmFullscreen()" title="Fullscreen" style="margin-left:.35rem"><i class="fa-solid fa-expand"></i></button></span></div>
                             <div class="swarm-map" style="border:none;border-radius:0;">
                                 <div id="swarmRingWrap">
-                                    <svg id="swarmRingSvg" viewBox="0 0 800 130" preserveAspectRatio="xMidYMid meet">
-                                        <g id="swarmRingArcs"></g>
-                                        <circle class="ring-center" cx="400" cy="55" r="6"></circle>
-                                        <g id="swarmRingNodes"></g>
-                                        <g id="swarmRingLabels"></g>
+                                    <svg id="brainMapSvg" viewBox="0 0 1200 720" preserveAspectRatio="xMidYMid meet">
+                                        <g id="bmZoomLayer">
+                                            <g id="bmEdges"></g>
+                                            <g id="bmClusters"></g>
+                                            <g id="bmHalos"></g>
+                                            <g id="bmNodes"></g>
+                                            <g id="bmLabels"></g>
+                                            <g id="bmPulses"></g>
+                                        </g>
                                     </svg>
                                 </div>
                                 <div class="swarm-map-divider"></div>
@@ -1078,6 +1118,23 @@
             eventHistory.unshift(event);
             if (eventHistory.length > 100) eventHistory.pop();
             renderEventStream();
+
+            // CODE_PATCH_RESULT toast — emitted by code_improver after a
+            // user-initiated edit, success or failure. SYSTEM_ALERT events
+            // are not currently projected to /ws/swarm, so we dispatch from
+            // the standard /ws stream instead.
+            if (event && event.event_type === 'SYSTEM_ALERT' && event.payload
+                && event.payload.kind === 'CODE_PATCH_RESULT') {
+                try {
+                    _maybeToastCodePatchResult(
+                        event.payload,
+                        event.payload.target || '(unknown)',
+                        !!event.payload.applied,
+                        event.payload.branch || null,
+                        event.payload.error || null,
+                    );
+                } catch (e) { console.warn('toast dispatch failed', e); }
+            }
 
             if (event.event_type === 'TASK_COMPLETED' || event.event_type === 'TASK_FAILED') {
                 taskHistory.unshift(event);
@@ -1704,113 +1761,437 @@
             return 'idle';
         }
 
-        function renderSwarmRing() {
-            const nodesG = document.getElementById('swarmRingNodes');
-            const labelsG = document.getElementById('swarmRingLabels');
-            if (!nodesG || !labelsG) return;
-            // Clear node + label positions on every full repaint so resizing doesn't accumulate stale dots
+        // ─── Brain-map cluster layout (replaces flat ring) ─────────────
+        const BM_VIEW_W = 1200;
+        const BM_VIEW_H = 720;
+        const BM_HUB_X = 600;
+        const BM_HUB_Y = 360;
+        const BM_HUB_R = 56;
+        const BM_R1 = 200;        // hub → cluster center radius
+        const BM_R2 = 340;        // hub → member node radius
+        const BM_NODE_R_IDLE = 22;
+        const BM_NODE_R_WORK = 26;
+        const BM_HALO_PAD = 10;
+        const BM_MAX_PULSES = 8;
+
+        const CLUSTERS = [
+            { key: "analysis",  label: "Research & Analysis", color: "var(--cyan)",   icon: "🔍",
+              angleStart: -135, angleEnd: -45,
+              members: ["research_agent", "brainstorm", "github_explorer", "github_ingestor", "explorer"] },
+            { key: "creative",  label: "Creative Suite",      color: "#ff6b9d",        icon: "🎨",
+              angleStart: 135,  angleEnd: 225,
+              members: ["designer", "writer", "marketer", "business_analyst"] },
+            { key: "technical", label: "Technical Stack",     color: "var(--green)",   icon: "⚙️",
+              angleStart: 45,   angleEnd: 135,
+              members: ["architect", "code_agent", "code_improver", "file_ops_agent"] },
+            { key: "cortex",    label: "Cortex",              color: "var(--purple)",  icon: "🧠",
+              angleStart: -45,  angleEnd: 45,
+              members: ["reviewer", "scheduler_agent", "project_memory"] },
+        ];
+
+        const CAP_HINTS = {
+            research_agent: "Deep research & synthesis",
+            brainstorm: "Idea expansion & framing",
+            github_explorer: "Repo & code search",
+            github_ingestor: "Bulk text ingestion",
+            explorer: "Capability discovery",
+            designer: "Visual & brand systems",
+            writer: "Content & copy",
+            marketer: "Positioning & GTM",
+            business_analyst: "Strategy & finance",
+            architect: "System design",
+            code_agent: "Code generation",
+            code_improver: "Patch drafting",
+            file_ops_agent: "File operations",
+            reviewer: "Quality & risk audit",
+            scheduler_agent: "Cron & reminders",
+            project_memory: "Project knowledge",
+        };
+
+        // Position cache: name -> {x, y, color}
+        const bmPositions = {};
+        // Pulse queue
+        const bmPulses = []; // [{el, edgeEl, start, dur, ax, ay, bx, by}]
+
+        function bmDeg2Rad(d) { return d * Math.PI / 180; }
+
+        // Resolve color via CSS var or literal
+        function bmResolveColor(c) {
+            if (!c) return '#888';
+            if (typeof c === 'string' && c.startsWith('var(')) {
+                try {
+                    const name = c.slice(4, -1).trim();
+                    const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+                    return v || c;
+                } catch(_) { return c; }
+            }
+            return c;
+        }
+
+        function bmEffectiveState(agent) {
+            if (!agent) return 'idle';
+            const raw = (agent.state || '').toLowerCase();
+            const lastFail = agent._lastFailTs || 0;
+            const recentFail = lastFail && (Date.now() - lastFail) < 60 * 1000;
+            if (raw === 'thinking') return 'thinking';
+            if (raw === 'working' || raw === 'busy') return 'working';
+            if (raw === 'disabled') return 'disabled';
+            if (raw === 'error' && recentFail) return 'error';
+            return 'idle';
+        }
+
+        function bmTrunc(s, n) {
+            if (!s) return '';
+            return s.length > n ? s.slice(0, n - 1) + '…' : s;
+        }
+
+        function renderBrainMap() {
+            const edgesG = document.getElementById('bmEdges');
+            const halosG = document.getElementById('bmHalos');
+            const nodesG = document.getElementById('bmNodes');
+            const labelsG = document.getElementById('bmLabels');
+            const clustersG = document.getElementById('bmClusters');
+            if (!edgesG || !halosG || !nodesG || !labelsG || !clustersG) return;
+            edgesG.innerHTML = '';
+            halosG.innerHTML = '';
             nodesG.innerHTML = '';
             labelsG.innerHTML = '';
-            for (const k in ringPositions) delete ringPositions[k];
-            const names = Object.keys(swarmAgents).sort();
-            if (!names.length) {
-                labelsG.innerHTML = `<text x="${RING_CX}" y="${RING_CY + 4}" class="ring-label" style="fill:var(--text-dim)">no agents online</text>`;
-                return;
+            clustersG.innerHTML = '';
+            for (const k in bmPositions) delete bmPositions[k];
+
+            // Hub
+            const hubCircle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            hubCircle.setAttribute('class', 'bm-hub');
+            hubCircle.setAttribute('cx', BM_HUB_X);
+            hubCircle.setAttribute('cy', BM_HUB_Y);
+            hubCircle.setAttribute('r', BM_HUB_R);
+            clustersG.appendChild(hubCircle);
+            const hubLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            hubLabel.setAttribute('class', 'bm-hub-label');
+            hubLabel.setAttribute('x', BM_HUB_X);
+            hubLabel.setAttribute('y', BM_HUB_Y + 5);
+            hubLabel.textContent = 'Orchestrator';
+            clustersG.appendChild(hubLabel);
+
+            // Build a set of agents present per cluster (only those known in swarmAgents)
+            const known = new Set(Object.keys(swarmAgents));
+            const placedNames = new Set();
+
+            CLUSTERS.forEach(cluster => {
+                const colorRaw = cluster.color;
+                const color = bmResolveColor(colorRaw);
+                const angMid = (cluster.angleStart + cluster.angleEnd) / 2;
+                const cxC = BM_HUB_X + BM_R1 * Math.cos(bmDeg2Rad(angMid));
+                const cyC = BM_HUB_Y + BM_R1 * Math.sin(bmDeg2Rad(angMid));
+
+                // Hub → cluster edge
+                const hubEdge = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                hubEdge.setAttribute('class', 'bm-edge');
+                hubEdge.setAttribute('x1', BM_HUB_X);
+                hubEdge.setAttribute('y1', BM_HUB_Y);
+                hubEdge.setAttribute('x2', cxC.toFixed(1));
+                hubEdge.setAttribute('y2', cyC.toFixed(1));
+                hubEdge.setAttribute('stroke', color);
+                hubEdge.setAttribute('stroke-width', '2');
+                hubEdge.setAttribute('opacity', '0.85');
+                edgesG.appendChild(hubEdge);
+
+                // Cluster center node (slightly larger glyph)
+                const clusterNode = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                clusterNode.setAttribute('cx', cxC.toFixed(1));
+                clusterNode.setAttribute('cy', cyC.toFixed(1));
+                clusterNode.setAttribute('r', 14);
+                clusterNode.setAttribute('fill', 'var(--bg-1)');
+                clusterNode.setAttribute('stroke', color);
+                clusterNode.setAttribute('stroke-width', '2');
+                clustersG.appendChild(clusterNode);
+
+                // Cluster label (positioned outward from hub by a bit beyond the cluster center)
+                const labelOffset = 28;
+                const lblX = cxC + labelOffset * Math.cos(bmDeg2Rad(angMid));
+                const lblY = cyC + labelOffset * Math.sin(bmDeg2Rad(angMid));
+                const clusterLbl = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                clusterLbl.setAttribute('class', 'bm-cluster-label');
+                clusterLbl.setAttribute('x', lblX.toFixed(1));
+                clusterLbl.setAttribute('y', lblY.toFixed(1));
+                clusterLbl.setAttribute('fill', color);
+                clusterLbl.textContent = `${cluster.icon} ${cluster.label}`;
+                clustersG.appendChild(clusterLbl);
+
+                // Member nodes spread along the angle arc at r2
+                const M = cluster.members.length;
+                cluster.members.forEach((name, i) => {
+                    // If only one member, place at the cluster mid; else evenly across the arc range
+                    let memAng;
+                    if (M === 1) {
+                        memAng = angMid;
+                    } else {
+                        memAng = cluster.angleStart + (cluster.angleEnd - cluster.angleStart) * (i / (M - 1));
+                    }
+                    const mx = BM_HUB_X + BM_R2 * Math.cos(bmDeg2Rad(memAng));
+                    const my = BM_HUB_Y + BM_R2 * Math.sin(bmDeg2Rad(memAng));
+                    bmPositions[name] = { x: mx, y: my, color };
+                    placedNames.add(name);
+
+                    // Edge cluster center → member
+                    const memEdge = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                    memEdge.setAttribute('class', 'bm-edge');
+                    memEdge.setAttribute('x1', cxC.toFixed(1));
+                    memEdge.setAttribute('y1', cyC.toFixed(1));
+                    memEdge.setAttribute('x2', mx.toFixed(1));
+                    memEdge.setAttribute('y2', my.toFixed(1));
+                    memEdge.setAttribute('stroke', color);
+                    memEdge.setAttribute('stroke-width', '1');
+                    memEdge.setAttribute('opacity', '0.6');
+                    edgesG.appendChild(memEdge);
+
+                    bmDrawNode(name, mx, my, color, halosG, nodesG, labelsG);
+                });
+            });
+
+            // Extras: any agent in swarmAgents not placed → bottom row
+            const extras = Array.from(known).filter(n => !placedNames.has(n)).sort();
+            if (extras.length) {
+                const extrasY = BM_VIEW_H - 60;
+                const extrasGap = Math.min(140, (BM_VIEW_W - 120) / Math.max(extras.length, 1));
+                const startX = (BM_VIEW_W - extrasGap * (extras.length - 1)) / 2;
+                const extrasColor = bmResolveColor('var(--orange)');
+                // Optional: a "Specialized" cluster label
+                const exLbl = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                exLbl.setAttribute('class', 'bm-cluster-label');
+                exLbl.setAttribute('x', BM_VIEW_W / 2);
+                exLbl.setAttribute('y', extrasY - 36);
+                exLbl.setAttribute('fill', extrasColor);
+                exLbl.textContent = '✨ Specialized';
+                clustersG.appendChild(exLbl);
+                extras.forEach((name, i) => {
+                    const x = startX + i * extrasGap;
+                    const y = extrasY;
+                    bmPositions[name] = { x, y, color: extrasColor };
+                    placedNames.add(name);
+                    bmDrawNode(name, x, y, extrasColor, halosG, nodesG, labelsG);
+                });
             }
-            const N = names.length;
-            names.forEach((n, i) => {
-                // Even spacing around the circle, starting at the top (-π/2)
-                const angle = (i / N) * Math.PI * 2 - Math.PI / 2;
-                const x = RING_CX + RING_R * Math.cos(angle);
-                const y = RING_CY + RING_R * Math.sin(angle);
-                ringPositions[n] = { x, y };
+        }
 
-                const state = ringEffectiveState(swarmAgents[n]);
-                const node = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-                node.setAttribute('class', 'ring-node');
-                node.setAttribute('cx', x.toFixed(1));
-                node.setAttribute('cy', y.toFixed(1));
-                node.setAttribute('r', RING_NODE_R);
-                node.setAttribute('stroke-width', '2');
-                node.setAttribute('data-name', n);
-                node.setAttribute('data-state', state);
-                // Recent activity badges (thinking ellipsis or kind icon)
-                const _rec = _agentBuf && _agentBuf.get ? _agentBuf.get(n) : null;
-                const _recentMs = _rec ? (Date.now() - (_rec.lastEvent || 0)) : Infinity;
-                if (_rec && _recentMs < 5000 && _rec.lastEventKind === 'thought') {
-                    node.classList.add('thinking-now');
-                }
-                node.addEventListener('click', () => openAgentInspector(n));
-                node.appendChild(document.createElementNS('http://www.w3.org/2000/svg', 'title'));
-                node.lastChild.textContent = `${n} · ${state}`;
-                nodesG.appendChild(node);
+        function bmDrawNode(name, x, y, color, halosG, nodesG, labelsG) {
+            const agent = swarmAgents[name] || { name, state: 'idle' };
+            const state = bmEffectiveState(agent);
+            const r = (state === 'working' || state === 'thinking') ? BM_NODE_R_WORK : BM_NODE_R_IDLE;
 
-                const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-                label.setAttribute('class', 'ring-label');
-                label.setAttribute('x', x.toFixed(1));
-                label.setAttribute('data-name', n);
-                // Label outside the ring, clear of the node
-                const ly = y + (y >= RING_CY ? RING_NODE_R + 12 : -RING_NODE_R - 6);
-                label.setAttribute('y', ly.toFixed(1));
-                let shown = n.length > 10 ? n.slice(0, 8) + '…' : n;
-                // Append a tiny indicator if there's a recent event for this agent
-                if (_rec && _recentMs < 5000) {
-                    if (_rec.lastEventKind === 'thought') shown += ' …';
-                    else if (_rec.lastEventKind === 'task' || _rec.lastEventKind === 'stage') shown += ' ▸';
-                    else if (_rec.lastEventKind === 'message') shown += ' →';
+            // Halo (rendered behind node — its own group draws first)
+            const halo = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            halo.setAttribute('class', 'bm-halo');
+            halo.setAttribute('cx', x.toFixed(1));
+            halo.setAttribute('cy', y.toFixed(1));
+            halo.setAttribute('r', (r + BM_HALO_PAD).toFixed(1));
+            halo.setAttribute('fill', color);
+            halo.setAttribute('opacity', bmHaloOpacityForState(state));
+            halo.setAttribute('data-halo-for', name);
+            if (state === 'thinking') halo.style.animation = 'bm-pulse 1.4s ease-in-out infinite';
+            halosG.appendChild(halo);
+
+            // Node
+            const node = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            node.setAttribute('class', 'bm-node');
+            node.setAttribute('cx', x.toFixed(1));
+            node.setAttribute('cy', y.toFixed(1));
+            node.setAttribute('r', r);
+            node.setAttribute('fill', color);
+            node.setAttribute('stroke', color);
+            node.setAttribute('stroke-width', '2');
+            node.setAttribute('data-name', name);
+            node.setAttribute('data-state', state);
+            node.appendChild(document.createElementNS('http://www.w3.org/2000/svg', 'title'));
+            node.lastChild.textContent = `${name} · ${state}\n${CAP_HINTS[name] || ''}`;
+            node.addEventListener('click', () => openAgentInspector(name));
+            nodesG.appendChild(node);
+
+            // Labels (name + capability hint)
+            const nameLbl = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            nameLbl.setAttribute('class', 'bm-label');
+            nameLbl.setAttribute('x', x.toFixed(1));
+            nameLbl.setAttribute('y', (y + r + 16).toFixed(1));
+            nameLbl.setAttribute('data-name', name);
+            nameLbl.textContent = bmTrunc(name, 12);
+            nameLbl.style.cursor = 'pointer';
+            nameLbl.addEventListener('click', () => openAgentInspector(name));
+            labelsG.appendChild(nameLbl);
+
+            const cap = CAP_HINTS[name] || '';
+            if (cap) {
+                const capLbl = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                capLbl.setAttribute('class', 'bm-cap');
+                capLbl.setAttribute('x', x.toFixed(1));
+                capLbl.setAttribute('y', (y + r + 28).toFixed(1));
+                capLbl.textContent = cap;
+                labelsG.appendChild(capLbl);
+            }
+        }
+
+        function bmHaloOpacityForState(state) {
+            switch (state) {
+                case 'thinking': return '0.50';
+                case 'working':  return '0.35';
+                case 'error':    return '0.40';
+                case 'disabled': return '0.05';
+                default:         return '0.10';
+            }
+        }
+
+        function bmSetState(name, state) {
+            if (swarmAgents[name]) swarmAgents[name].state = state;
+            const node = document.querySelector(`#bmNodes circle.bm-node[data-name="${CSS.escape(name)}"]`);
+            if (node) {
+                const eff = swarmAgents[name] ? bmEffectiveState(swarmAgents[name]) : state;
+                node.setAttribute('data-state', eff);
+                const newR = (eff === 'working' || eff === 'thinking') ? BM_NODE_R_WORK : BM_NODE_R_IDLE;
+                node.setAttribute('r', newR);
+                if (node.firstChild) node.firstChild.textContent = `${name} · ${eff}\n${CAP_HINTS[name] || ''}`;
+                const halo = document.querySelector(`#bmHalos circle.bm-halo[data-halo-for="${CSS.escape(name)}"]`);
+                if (halo) {
+                    halo.setAttribute('opacity', bmHaloOpacityForState(eff));
+                    halo.setAttribute('r', newR + BM_HALO_PAD);
+                    halo.style.animation = (eff === 'thinking') ? 'bm-pulse 1.4s ease-in-out infinite' : '';
                 }
-                label.textContent = shown;
-                label.addEventListener('click', () => openAgentInspector(n));
-                labelsG.appendChild(label);
+            } else {
+                renderBrainMap();
+            }
+        }
+
+        function bmPosFor(name) {
+            return bmPositions[name] || { x: BM_HUB_X, y: BM_HUB_Y, color: bmResolveColor('var(--cyan)') };
+        }
+
+        // ── Pan / zoom ──────────────────────────────────────────────
+        const _bmView = { scale: 1, tx: 0, ty: 0 };
+        let _bmDrag = null;
+        function _bmApplyTransform() {
+            const layer = document.getElementById('bmZoomLayer');
+            if (!layer) return;
+            layer.setAttribute('transform',
+                `translate(${_bmView.tx} ${_bmView.ty}) scale(${_bmView.scale})`);
+        }
+        function bmZoom(factor, cx, cy) {
+            const svg = document.getElementById('brainMapSvg');
+            if (!svg) return;
+            const r = svg.getBoundingClientRect();
+            // map mouse to viewBox coords (1200×720)
+            const ux = cx == null ? r.width / 2 : (cx - r.left);
+            const uy = cy == null ? r.height / 2 : (cy - r.top);
+            const vbx = (ux / r.width) * 1200;
+            const vby = (uy / r.height) * 720;
+            // zoom keeping (vbx,vby) fixed
+            const newScale = Math.max(0.3, Math.min(4, _bmView.scale * factor));
+            _bmView.tx = vbx - (vbx - _bmView.tx) * (newScale / _bmView.scale);
+            _bmView.ty = vby - (vby - _bmView.ty) * (newScale / _bmView.scale);
+            _bmView.scale = newScale;
+            _bmApplyTransform();
+        }
+        function bmZoomReset() { _bmView.scale = 1; _bmView.tx = 0; _bmView.ty = 0; _bmApplyTransform(); }
+        function _bmInitPanZoom() {
+            const svg = document.getElementById('brainMapSvg');
+            const wrap = document.getElementById('swarmRingWrap');
+            if (!svg || !wrap || svg.dataset.pzbound) return;
+            svg.dataset.pzbound = '1';
+            // wheel zoom
+            svg.addEventListener('wheel', (e) => {
+                e.preventDefault();
+                bmZoom(e.deltaY < 0 ? 1.12 : 0.89, e.clientX, e.clientY);
+            }, { passive: false });
+            // drag pan — but don't pan when clicking a node (let click bubble)
+            svg.addEventListener('mousedown', (e) => {
+                if (e.target.closest('.bm-node, .bm-label')) return;
+                _bmDrag = { x: e.clientX, y: e.clientY, tx: _bmView.tx, ty: _bmView.ty };
+                wrap.classList.add('grabbing');
+            });
+            window.addEventListener('mousemove', (e) => {
+                if (!_bmDrag) return;
+                const r = svg.getBoundingClientRect();
+                const dx = (e.clientX - _bmDrag.x) * (1200 / r.width);
+                const dy = (e.clientY - _bmDrag.y) * (720 / r.height);
+                _bmView.tx = _bmDrag.tx + dx;
+                _bmView.ty = _bmDrag.ty + dy;
+                _bmApplyTransform();
+            });
+            window.addEventListener('mouseup', () => {
+                _bmDrag = null;
+                wrap.classList.remove('grabbing');
+            });
+            // double-click to reset
+            svg.addEventListener('dblclick', (e) => {
+                if (e.target.closest('.bm-node, .bm-label')) return;
+                bmZoomReset();
+            });
+            // keyboard: + / - / 0 when card is focused
+            wrap.tabIndex = 0;
+            wrap.addEventListener('keydown', (e) => {
+                if (e.key === '+' || e.key === '=') bmZoom(1.2);
+                else if (e.key === '-' || e.key === '_') bmZoom(0.83);
+                else if (e.key === '0') bmZoomReset();
             });
         }
+        document.addEventListener('DOMContentLoaded', _bmInitPanZoom);
 
-        function ringSetState(name, state) {
-            // Persist on the agent record so re-renders pick the correct color
-            if (swarmAgents[name]) swarmAgents[name].state = state;
-            const node = document.querySelector(`#swarmRingNodes circle[data-name="${CSS.escape(name)}"]`);
-            const effective = swarmAgents[name] ? ringEffectiveState(swarmAgents[name]) : state;
-            if (node) {
-                node.setAttribute('data-state', effective);
-                if (node.firstChild) node.firstChild.textContent = `${name} · ${effective}`;
-            } else {
-                // New agent — re-render
-                renderSwarmRing();
-            }
-        }
+        function brainMapTravelingPulse(fromAgent, toAgent) {
+            const pulsesG = document.getElementById('bmPulses');
+            const edgesG = document.getElementById('bmEdges');
+            if (!pulsesG || !edgesG) return;
+            const a = bmPosFor(fromAgent);
+            const b = (!toAgent || toAgent === '*') ? { x: BM_HUB_X, y: BM_HUB_Y, color: a.color } : bmPosFor(toAgent);
 
-        function ringFlashArc(from, to) {
-            const arcsG = document.getElementById('swarmRingArcs');
-            if (!arcsG) return;
-            const a = ringPosFor(from);
-            const b = (!to || to === '*') ? { x: RING_CX, y: RING_CY } : ringPosFor(to);
-            // Curve via center
-            const mx = (a.x + b.x) / 2;
-            const my = (a.y + b.y) / 2;
-            // Pull control point toward center for chord-like curve
-            const cx = mx + (RING_CX - mx) * 0.4;
-            const cy = my + (RING_CY - my) * 0.4;
-            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-            path.setAttribute('class', 'ring-arc');
-            path.setAttribute('d', `M ${a.x.toFixed(1)} ${a.y.toFixed(1)} Q ${cx.toFixed(1)} ${cy.toFixed(1)} ${b.x.toFixed(1)} ${b.y.toFixed(1)}`);
-            path.style.animation = 'ring-arc-fade 1.2s ease-out forwards';
-            arcsG.appendChild(path);
-            ringArcsState.push({ el: path, ts: Date.now() });
-            // Cap on-screen arcs
-            while (ringArcsState.length > RING_MAX_ARCS) {
-                const old = ringArcsState.shift();
+            // Cap concurrent pulses
+            while (bmPulses.length >= BM_MAX_PULSES) {
+                const old = bmPulses.shift();
                 try { old.el.remove(); } catch(_) {}
+                try { old.edgeEl && old.edgeEl.remove(); } catch(_) {}
             }
-            // Cleanup after fade
-            setTimeout(() => {
-                try { path.remove(); } catch(_) {}
-                const i = ringArcsState.findIndex(x => x.el === path);
-                if (i !== -1) ringArcsState.splice(i, 1);
-            }, 1300);
+
+            // Transient flashing edge overlay
+            const edgeFlash = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+            edgeFlash.setAttribute('class', 'bm-edge bm-edge-flash');
+            edgeFlash.setAttribute('x1', a.x.toFixed(1));
+            edgeFlash.setAttribute('y1', a.y.toFixed(1));
+            edgeFlash.setAttribute('x2', b.x.toFixed(1));
+            edgeFlash.setAttribute('y2', b.y.toFixed(1));
+            edgeFlash.setAttribute('stroke', bmResolveColor('var(--cyan)'));
+            edgeFlash.setAttribute('stroke-width', '2');
+            edgeFlash.setAttribute('stroke-dasharray', '4 4');
+            edgesG.appendChild(edgeFlash);
+            setTimeout(() => { try { edgeFlash.remove(); } catch(_) {} }, 1300);
+
+            // Pulse dot
+            const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            dot.setAttribute('class', 'bm-msg-pulse');
+            dot.setAttribute('r', '4');
+            dot.setAttribute('cx', a.x.toFixed(1));
+            dot.setAttribute('cy', a.y.toFixed(1));
+            pulsesG.appendChild(dot);
+
+            const pulse = { el: dot, edgeEl: edgeFlash, start: performance.now(), dur: 800, ax: a.x, ay: a.y, bx: b.x, by: b.y };
+            bmPulses.push(pulse);
+
+            const step = (now) => {
+                const t = Math.min(1, (now - pulse.start) / pulse.dur);
+                const x = pulse.ax + (pulse.bx - pulse.ax) * t;
+                const y = pulse.ay + (pulse.by - pulse.ay) * t;
+                dot.setAttribute('cx', x.toFixed(1));
+                dot.setAttribute('cy', y.toFixed(1));
+                if (t < 1 && bmPulses.indexOf(pulse) !== -1) {
+                    requestAnimationFrame(step);
+                } else {
+                    try { dot.remove(); } catch(_) {}
+                    const i = bmPulses.indexOf(pulse);
+                    if (i !== -1) bmPulses.splice(i, 1);
+                }
+            };
+            requestAnimationFrame(step);
         }
 
-        function swarmRingHandle(ev) {
-            // New agent? add to map and re-render layout
+        // Per-agent thinking-state timer cache
+        const _bmThinkingTimers = {};
+
+        function brainMapHandle(ev) {
             const candidates = [ev.from, ev.to].filter(x => x && x !== '*');
             let added = false;
             const nowMs = Date.now();
@@ -1822,24 +2203,68 @@
                 swarmAgents[name]._lastSeenTs = nowMs;
             });
             if (added) {
-                renderSwarmRing();
+                renderBrainMap();
                 renderSwarmTimelineLanes();
             }
-            // State changes — only mark error on TASK_FAILED_FINAL or AGENT_ERROR
-            if (ev.event_type === 'TASK_EXECUTION_STARTED' && ev.from) ringSetState(ev.from, 'working');
-            else if (ev.event_type === 'TASK_COMPLETED' && ev.from)    ringSetState(ev.from, 'idle');
-            else if (ev.event_type === 'TASK_FAILED_FINAL' && ev.from) {
+
+            // Task lifecycle
+            if (ev.event_type === 'TASK_EXECUTION_STARTED' && ev.from) {
+                bmSetState(ev.from, 'working');
+            } else if (ev.event_type === 'TASK_COMPLETED' && ev.from) {
+                bmSetState(ev.from, 'idle');
+            } else if (ev.event_type === 'TASK_FAILED' && ev.from) {
+                bmSetState(ev.from, 'idle');
+            } else if (ev.event_type === 'TASK_FAILED_FINAL' && ev.from) {
                 if (swarmAgents[ev.from]) swarmAgents[ev.from]._lastFailTs = nowMs;
-                ringSetState(ev.from, 'error');
-            }
-            else if (ev.event_type === 'AGENT_ERROR' && ev.from) {
+                bmSetState(ev.from, 'error');
+            } else if (ev.event_type === 'AGENT_ERROR' && ev.from) {
                 if (swarmAgents[ev.from]) swarmAgents[ev.from]._lastFailTs = nowMs;
-                ringSetState(ev.from, 'error');
+                bmSetState(ev.from, 'error');
             }
-            // Message arc
+
+            // Thought → set thinking briefly, then revert
+            if (ev.kind === 'thought' && ev.from) {
+                const name = ev.from;
+                // Capture pre-thought state to revert to (if not error)
+                const prevState = (swarmAgents[name] && swarmAgents[name].state) || 'idle';
+                bmSetState(name, 'thinking');
+                if (_bmThinkingTimers[name]) clearTimeout(_bmThinkingTimers[name]);
+                _bmThinkingTimers[name] = setTimeout(() => {
+                    delete _bmThinkingTimers[name];
+                    // Revert: prefer 'working' if a recent task is running, else 'idle' (or 'error' on recent fail)
+                    const ag = swarmAgents[name];
+                    if (!ag) return;
+                    const lastFail = ag._lastFailTs || 0;
+                    const recentFail = lastFail && (Date.now() - lastFail) < 60 * 1000;
+                    let next = 'idle';
+                    if (recentFail) next = 'error';
+                    else if (prevState === 'working' || prevState === 'busy') next = 'working';
+                    bmSetState(name, next);
+                }, 1500);
+            }
+
+            // A2A message → traveling pulse
             if (ev.kind === 'message' && ev.from) {
-                ringFlashArc(ev.from, ev.to);
+                brainMapTravelingPulse(ev.from, ev.to);
             }
+        }
+
+        // Backward-compatible wrappers — keep existing call sites working
+        function renderSwarmRing() {
+            return renderBrainMap();
+        }
+        function swarmRingHandle(ev) {
+            return brainMapHandle(ev);
+        }
+        function ringSetState(name, state) {
+            return bmSetState(name, state);
+        }
+        function ringFlashArc(from, to) {
+            return brainMapTravelingPulse(from, to);
+        }
+        function ringPosFor(name) {
+            const p = bmPositions[name];
+            return p ? { x: p.x, y: p.y } : { x: BM_HUB_X, y: BM_HUB_Y };
         }
 
         function setAgentState(name, state) {
@@ -2024,23 +2449,34 @@
         }
 
         // ─── Swarm fullscreen toggle ─────────────────────────────────────────
+        // Move the swarm-map DOM node into <body> as a fixed overlay so it isn't
+        // constrained by ancestor transforms or overflow:hidden parents.
+        let _swarmFsState = null;  // { el, parent, nextSibling, onKey }
         function toggleSwarmFullscreen() {
             const el = document.querySelector('.swarm-map')
                 || document.getElementById('swarmRingWrap')?.closest('.card, .ui-card, [class*="card"]');
             if (!el) return;
-            const on = el.classList.toggle('swarm-fullscreen');
-            // re-fit ring + swim on toggle
-            window.dispatchEvent(new Event('resize'));
-            if (on) {
+            if (_swarmFsState) {
+                // Restore in-place
+                const s = _swarmFsState;
+                el.classList.remove('swarm-fullscreen');
+                if (s.parent) s.parent.insertBefore(el, s.nextSibling);
+                document.removeEventListener('keydown', s.onKey);
+                document.body.style.overflow = '';
+                _swarmFsState = null;
+            } else {
+                const parent = el.parentNode;
+                const nextSibling = el.nextSibling;
                 const onKey = (e) => {
-                    if (e.key === 'Escape') {
-                        el.classList.remove('swarm-fullscreen');
-                        document.removeEventListener('keydown', onKey);
-                        window.dispatchEvent(new Event('resize'));
-                    }
+                    if (e.key === 'Escape') toggleSwarmFullscreen();
                 };
+                _swarmFsState = { el, parent, nextSibling, onKey };
+                document.body.appendChild(el);
+                el.classList.add('swarm-fullscreen');
+                document.body.style.overflow = 'hidden';
                 document.addEventListener('keydown', onKey);
             }
+            window.dispatchEvent(new Event('resize'));
         }
 
         // Repaint ring + swimlane on viewport resize (also fires on fullscreen toggle)
@@ -2178,6 +2614,47 @@
 
         function escapeHTML(s) {
             return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        }
+
+        // ─── Toast notifications ───
+        // Used for transient banners — most importantly CODE_PATCH_RESULT events
+        // emitted by code_improver when a user-initiated edit ("redesign this")
+        // succeeds or fails. The WebSocket handlers below dispatch into showToast.
+        function showToast(opts) {
+            const stack = document.getElementById('toastStack');
+            if (!stack) return;
+            const t = document.createElement('div');
+            t.className = 'toast ' + (opts.kind || '');
+            t.innerHTML = `<span class="toast-close" onclick="this.parentElement.remove()">×</span>
+                           <div class="toast-title">${escapeHTML(opts.title || '')}</div>
+                           ${opts.body ? `<div class="toast-body">${escapeHTML(opts.body)}</div>` : ''}`;
+            stack.appendChild(t);
+            requestAnimationFrame(() => t.classList.add('show'));
+            setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 250); }, opts.duration || 6000);
+        }
+
+        // De-dupe toasts when both /ws and /ws/swarm carry the same alert.
+        const _toastSeen = new Set();
+        function _maybeToastCodePatchResult(meta, target, applied, branch, error) {
+            // Build a stable key from the salient fields.
+            const key = `cpr:${target}|${applied}|${branch || ''}|${(error || '').slice(0, 80)}`;
+            if (_toastSeen.has(key)) return;
+            _toastSeen.add(key);
+            // Trim the dedup set so it doesn't grow forever.
+            if (_toastSeen.size > 200) {
+                const it = _toastSeen.values();
+                for (let i = 0; i < 50; i++) _toastSeen.delete(it.next().value);
+            }
+            showToast({
+                kind: applied ? 'success' : 'error',
+                title: applied
+                    ? `Branch skyn3t/auto/${(branch || '').replace(/^skyn3t\/auto\//, '')} ready`
+                    : `LLM diff couldn't apply: ${target}`,
+                body: applied
+                    ? `Patch applied to ${target}${branch ? ` on ${branch}` : ''}`
+                    : (error || 'Diff could not apply'),
+                duration: 8000,
+            });
         }
 
         // ─── Per-agent Inspector buffers + drawer ───
@@ -2320,6 +2797,29 @@
         }
 
         function handleSwarmEvent(ev) {
+            // CODE_PATCH_RESULT toast — fire ASAP, even if the user has the
+            // activity stream paused or is on a different page. The compact
+            // projection forwards meta.payload so we read both `meta.kind` and
+            // `meta.payload.kind` defensively.
+            try {
+                if (ev && ev.event_type === 'SYSTEM_ALERT') {
+                    const meta = ev.meta || {};
+                    const p = meta.payload || {};
+                    const cprKind = (meta.kind === 'CODE_PATCH_RESULT') ? meta
+                                  : (p.kind === 'CODE_PATCH_RESULT') ? p
+                                  : null;
+                    if (cprKind) {
+                        _maybeToastCodePatchResult(
+                            cprKind,
+                            cprKind.target || '(unknown)',
+                            !!cprKind.applied,
+                            cprKind.branch || null,
+                            cprKind.error || null,
+                        );
+                    }
+                }
+            } catch (e) { console.warn('swarm toast dispatch failed', e); }
+
             // Always feed the inspector buffers regardless of paused/activity-stream state
             try { _onSwarmEventForInspector(ev); } catch(e){}
             if (swarmActivityState.paused) return;
@@ -2845,6 +3345,7 @@
                 document.getElementById('propModalKind').textContent = p.kind||'';
                 document.getElementById('propModalKind').className = _kindClass(p.kind);
                 document.getElementById('propModalTitle').textContent = p.title||'';
+                document.getElementById('propModalTitle').dataset.pid = pid;
                 document.getElementById('propModalSummary').textContent = p.summary||'';
                 document.getElementById('propModalDetail').textContent = p.detail||'';
                 const approveBtn = document.getElementById('propApproveBtn');
@@ -2865,7 +3366,20 @@
                 document.getElementById('proposalModal').classList.remove('hidden');
             } catch(e) { console.warn('openProposalModal', e); }
         }
-        function closeProposalModal() { document.getElementById('proposalModal').classList.add('hidden'); }
+        function closeProposalModal() {
+            const modal = document.getElementById('proposalModal');
+            // mark current modal's proposal as dismissed so it doesn't re-pop
+            const titleEl = document.getElementById('propModalTitle');
+            if (titleEl && titleEl.dataset.pid) {
+                window._dismissedProposals.add(titleEl.dataset.pid);
+            }
+            modal.classList.add('hidden');
+        }
+
+        // Track proposal IDs we've already auto-popped so reconnect/re-snapshot doesn't re-pop.
+        window._poppedProposals = window._poppedProposals || new Set();
+        // Track dismissed proposals — user closed modal without acting; don't re-pop until status changes.
+        window._dismissedProposals = window._dismissedProposals || new Set();
 
         function _connectProposalsWS() {
             try {
@@ -2877,12 +3391,18 @@
                         if (m.type === 'snapshot') {
                             _propsState.pending = m.proposals || [];
                             renderCortex();
+                            // NEVER auto-pop on snapshot — only on fresh `created` events
                         } else if (m.type === 'created') {
+                            // Filter out user-initiated (auto-applied) proposals
+                            if (m.proposal.requires_approval === false) { return; }
                             _propsState.pending = [m.proposal, ..._propsState.pending];
                             renderCortex();
-                            // Auto-popup if no modal currently open
+                            // De-dupe: only pop ONCE per proposal id, never if dismissed
+                            const pid = m.proposal.id;
+                            if (window._poppedProposals.has(pid) || window._dismissedProposals.has(pid)) return;
+                            window._poppedProposals.add(pid);
                             if (document.getElementById('proposalModal').classList.contains('hidden')) {
-                                openProposalModal(m.proposal.id);
+                                openProposalModal(pid);
                             }
                         } else if (m.type === 'approved' || m.type === 'rejected' || m.type === 'applied' || m.type === 'failed') {
                             _propsState.pending = _propsState.pending.filter(p => p.id !== m.proposal.id);
