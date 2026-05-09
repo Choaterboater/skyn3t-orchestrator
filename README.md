@@ -248,5 +248,12 @@ skyn3t/
 
 ## License
 
-MIT License
-impossible
+SkyN3t is released under the MIT License, a permissive open-source license that grants you, the user, broad freedom to use, copy, modify, merge, publish, distribute, sublicense, and even sell copies of this software, in whole or in part, for any purpose — commercial, academic, personal, experimental, or otherwise — without imposing royalties, restrictions on field of endeavor, or onerous obligations beyond the preservation of the original copyright notice and this permission notice in all substantial portions of the software. We chose the MIT License deliberately, because we believe that the future of artificial intelligence, multi-agent orchestration, and collective machine cognition should be built openly, transparently, and collaboratively, with knowledge flowing freely between researchers, engineers, hobbyists, students, and institutions across every continent and discipline. The software is provided "AS IS", without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and noninfringement; in no event shall the authors or copyright holders be liable for any claim, damages, or other liability, whether in an action of contract, tort, or otherwise, arising from, out of, or in connection with the software or the use or other dealings in the software. By contributing to, forking, or otherwise engaging with this codebase, you join a growing community committed to advancing the state of the art in autonomous, self-healing, memory-augmented agent systems — and we welcome you, wholeheartedly, to build, break, remix, and reimagine SkyN3t in whatever direction your curiosity carries you.
+
+Copyright © 2024–2026 SkyN3t Contributors. All rights reserved under the terms above.
+
+For the full text of the MIT License, see the `LICENSE` file in the root of this repository, or visit https://opensource.org/licenses/MIT for the canonical reference.
+
+If you build something interesting with SkyN3t — a research paper, a production system, a creative experiment, a teaching tool, or anything in between — we would love to hear about it. Open an issue, send a pull request, or simply leave a star; every signal helps the project grow.
+
+*Think together. Remember together. Build together.*
