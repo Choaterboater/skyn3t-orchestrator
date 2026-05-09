@@ -82,13 +82,20 @@ class CodeImproverAgent(BaseAgent):
         except Exception as e:
             return TaskResult(task_id=task.task_id, success=False, error=f"proposal store unavailable: {e}")
 
+        # When the caller marked this run as user-initiated (Studio project, REPL, etc.),
+        # skip the approval modal and auto-apply to a branch.
+        intent = (input_data or {}).get("intent", "")
+        user_initiated = intent in {"frontend_redesign", "studio_debug", "studio_run"} \
+                         or (input_data or {}).get("user_initiated", False)
         proposal = get_store().create(
             kind="code_patch",
             title=f"Patch {target}",
             summary=rationale or "auto-generated improvement proposal",
             detail=f"Target: `{target}`\n\nReason: {rationale}\n\n```diff\n{patch_text}\n```",
-            payload={"target_file": target, "patch": patch_text, "rationale": rationale},
+            payload={"target_file": target, "patch": patch_text, "rationale": rationale,
+                     "user_initiated": user_initiated},
             source="code_improver",
+            requires_approval=not user_initiated,
         )
         return TaskResult(task_id=task.task_id, success=True,
                           output={"proposed": True, "proposal_id": proposal.id,

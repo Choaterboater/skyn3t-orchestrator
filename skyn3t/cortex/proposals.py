@@ -20,6 +20,7 @@ class Proposal:
     decided_at: Optional[float] = None
     applied_at: Optional[float] = None
     error: Optional[str] = None
+    requires_approval: bool = True   # False → auto-apply on creation (user-initiated)
 
     def to_public(self) -> Dict[str, Any]:
         return asdict(self)
@@ -53,12 +54,23 @@ class ProposalStore:
 
     # CRUD ---
     def create(self, *, kind: str, title: str, summary: str, detail: str,
-               payload: Dict[str, Any] | None = None, source: str = "") -> Proposal:
+               payload: Dict[str, Any] | None = None, source: str = "",
+               requires_approval: bool = True) -> Proposal:
         p = Proposal(kind=kind, title=title, summary=summary, detail=detail,
-                     payload=payload or {}, source=source)
+                     payload=payload or {}, source=source,
+                     requires_approval=requires_approval)
         self._write(p)
         self._emit({"type": "created", "proposal": p.to_public()})
+        # User-initiated proposals (requires_approval=False) skip the modal and apply immediately.
+        if not requires_approval:
+            asyncio.create_task(self._auto_apply(p.id))
         return p
+
+    async def _auto_apply(self, pid: str) -> None:
+        try:
+            await self.approve(pid)
+        except Exception:
+            logger.exception("auto-apply failed for %s", pid)
 
     def list(self, status: Optional[str] = None) -> List[Proposal]:
         out: List[Proposal] = []
