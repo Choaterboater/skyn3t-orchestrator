@@ -3,8 +3,16 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 data/
+data/vector_db/
+data/proposals/
+data/embedding_cache/
+data/explorer_state.json
+data/review_watcher_seen.json
 logs/
 projects/
 .env
 .DS_Store
 /tmp_*.txt
+*.tar.gz
+*.log
+_clarifications.json

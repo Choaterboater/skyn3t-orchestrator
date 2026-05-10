@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import os
 from pathlib import Path
@@ -105,7 +106,7 @@ class GitHubIngestorAgent(BaseAgent):
             name=name,
             agent_type="github_ingestor",
             provider="github",
-            event_bus=event_bus,
+            event_bus=event_bus or EventBus(),
             config=config,
             **kw,
         )
@@ -114,6 +115,17 @@ class GitHubIngestorAgent(BaseAgent):
         self.seeds_path = seeds_path
         self._github_client: Any = None
         self._http_client: Any = None
+        # Persistent SHA cache so re-running ingestion across the same seeds
+        # doesn't burn one API call per (repo, path) when nothing has changed.
+        # Format: {f"{repo}::{path}": {"sha": str, "content": str|null}}
+        self._sha_cache_path = Path("data/.github_cache/sha_index.json")
+        self._sha_cache: Dict[str, Dict[str, Any]] = {}
+        try:
+            self._sha_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            if self._sha_cache_path.exists():
+                self._sha_cache = json.loads(self._sha_cache_path.read_text())
+        except Exception:
+            self._sha_cache = {}
         self.add_capability(
             AgentCapability(
                 name="github_ingest",
@@ -138,22 +150,25 @@ class GitHubIngestorAgent(BaseAgent):
     # ------------------------------------------------------------------ lifecycle
 
     async def initialize(self) -> None:
-        """Initialize a GitHub client (PyGithub preferred, httpx fallback)."""
-        # Try PyGithub first.
-        try:
-            from github import Github  # type: ignore
+        """Initialize a GitHub client.
 
-            if self.github_token:
+        For anonymous access we prefer the lightweight HTTP client so rate
+        limits fail fast instead of triggering PyGithub's long backoff loop.
+        """
+        self._github_client = None
+        self._http_client = None
+
+        if self.github_token:
+            try:
+                from github import Github  # type: ignore
+
                 self._github_client = Github(self.github_token)
-            else:
-                self._github_client = Github()
-            self.metadata["client"] = "pygithub"
-            self.metadata["authenticated"] = bool(self.github_token)
-        except ImportError:
-            self._github_client = None
+                self.metadata["client"] = "pygithub"
+                self.metadata["authenticated"] = True
+            except ImportError:
+                self._github_client = None
 
         if self._github_client is None:
-            # Fallback to httpx (already a project dep per requirements.txt).
             try:
                 import httpx  # type: ignore
 
@@ -169,6 +184,15 @@ class GitHubIngestorAgent(BaseAgent):
                 self.metadata["authenticated"] = bool(self.github_token)
             except ImportError:
                 self._http_client = None
+
+        if self._github_client is None and self._http_client is None:
+            try:
+                from github import Github  # type: ignore
+
+                self._github_client = Github()
+                self.metadata["client"] = "pygithub"
+                self.metadata["authenticated"] = False
+            except ImportError:
                 self.metadata["client"] = None
 
         self.metadata["initialized"] = True
@@ -432,11 +456,45 @@ class GitHubIngestorAgent(BaseAgent):
 
         return []
 
+    def _cache_key(self, repo_full_name: str, path: str) -> str:
+        return f"{repo_full_name}::{path}"
+
+    def _cache_get(self, repo_full_name: str, path: str) -> Optional[Tuple[str, Optional[str]]]:
+        entry = self._sha_cache.get(self._cache_key(repo_full_name, path))
+        if not entry:
+            return None
+        sha = entry.get("sha")
+        if not isinstance(sha, str):
+            return None
+        content = entry.get("content")
+        if content is not None and not isinstance(content, str):
+            content = None
+        return sha, content
+
+    def _cache_put(
+        self, repo_full_name: str, path: str, sha: str, content: Optional[str]
+    ) -> None:
+        self._sha_cache[self._cache_key(repo_full_name, path)] = {
+            "sha": sha, "content": content,
+        }
+        try:
+            tmp = self._sha_cache_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self._sha_cache, indent=2, sort_keys=True))
+            os.replace(tmp, self._sha_cache_path)
+        except Exception:
+            pass
+
     async def _fetch_file_content(
         self, repo_full_name: str, path: str, max_bytes: int
     ) -> Optional[str]:
-        """Fetch and decode a file's text content. Returns None for binary/oversized."""
+        """Fetch and decode a file's text content. Returns None for binary/oversized.
+
+        Uses a (repo, path) → sha SHA cache so unchanged files don't re-download:
+        we still pay the contents-API call, but skip the base64 decode + write
+        when the sha matches and we already have content for that sha.
+        """
         if self._github_client is not None:
+            cached = self._cache_get(repo_full_name, path)
             def _do_fetch() -> Optional[str]:
                 repo = self._github_client.get_repo(repo_full_name)
                 content = repo.get_contents(path)
@@ -445,6 +503,9 @@ class GitHubIngestorAgent(BaseAgent):
                 size = getattr(content, "size", 0) or 0
                 if max_bytes and size > max_bytes:
                     return None
+                sha = getattr(content, "sha", "") or ""
+                if cached and cached[0] == sha and cached[1] is not None:
+                    return cached[1]
                 raw = content.content or ""
                 try:
                     decoded = base64.b64decode(raw)
@@ -453,13 +514,17 @@ class GitHubIngestorAgent(BaseAgent):
                 if max_bytes and len(decoded) > max_bytes:
                     decoded = decoded[:max_bytes]
                 try:
-                    return decoded.decode("utf-8")
+                    text = decoded.decode("utf-8")
                 except UnicodeDecodeError:
+                    self._cache_put(repo_full_name, path, sha, None)
                     return None
+                self._cache_put(repo_full_name, path, sha, text)
+                return text
 
             return await asyncio.to_thread(_do_fetch)
 
         if self._http_client is not None:
+            cached = self._cache_get(repo_full_name, path)
             def _do_http_fetch() -> Optional[str]:
                 resp = self._http_client.get(
                     f"/repos/{repo_full_name}/contents/{path}"
@@ -475,6 +540,9 @@ class GitHubIngestorAgent(BaseAgent):
                 size = int(data.get("size") or 0)
                 if max_bytes and size > max_bytes:
                     return None
+                sha = str(data.get("sha") or "")
+                if cached and cached[0] == sha and cached[1] is not None:
+                    return cached[1]
                 raw = data.get("content") or ""
                 if data.get("encoding") == "base64":
                     try:
@@ -486,9 +554,12 @@ class GitHubIngestorAgent(BaseAgent):
                 if max_bytes and len(decoded) > max_bytes:
                     decoded = decoded[:max_bytes]
                 try:
-                    return decoded.decode("utf-8")
+                    text = decoded.decode("utf-8")
                 except UnicodeDecodeError:
+                    self._cache_put(repo_full_name, path, sha, None)
                     return None
+                self._cache_put(repo_full_name, path, sha, text)
+                return text
 
             return await asyncio.to_thread(_do_http_fetch)
 
@@ -627,7 +698,7 @@ class GitHubIngestorAgent(BaseAgent):
 
     # ------------------------------------------------------------------ entrypoint
 
-    async def execute(self, task: TaskRequest) -> TaskResult:
+    async def execute(self, task: TaskRequest, stdin_data: str | None = None) -> TaskResult:
         """Execute a github_ingest task."""
         # Lazy initialize so the agent works outside of orchestrator.start().
         if not self.metadata.get("initialized"):

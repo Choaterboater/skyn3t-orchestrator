@@ -1,21 +1,26 @@
 """Persistent memory store for SkyN3t — the swarm's long-term memory."""
 
 import asyncio
-import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select, desc, func
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyn3t.core.models import (
     Agent as AgentModel,
-    Task as TaskModel,
-    Message as MessageModel,
+)
+from skyn3t.core.models import (
+    AgentStatus,
     KnowledgeDocument,
     SystemLog,
-    AgentStatus,
     TaskStatus,
+)
+from skyn3t.core.models import (
+    Message as MessageModel,
+)
+from skyn3t.core.models import (
+    Task as TaskModel,
 )
 from skyn3t.memory.database import get_session_maker
 
@@ -33,7 +38,8 @@ class MemoryStore:
 
     async def _session(self) -> AsyncSession:
         """Get a new database session."""
-        return self._session_maker()
+        session: AsyncSession = self._session_maker()
+        return session
 
     # ------------------------------------------------------------------
     # Agent state
@@ -430,14 +436,14 @@ class MemoryStore:
             result = await session.execute(query)
             return [
                 {
-                    "id": l.id,
-                    "level": l.level,
-                    "source": l.source,
-                    "message": l.message,
-                    "meta": l.meta,
-                    "created_at": l.created_at.isoformat(),
+                    "id": log_entry.id,
+                    "level": log_entry.level,
+                    "source": log_entry.source,
+                    "message": log_entry.message,
+                    "meta": log_entry.meta,
+                    "created_at": log_entry.created_at.isoformat(),
                 }
-                for l in result.scalars().all()
+                for log_entry in result.scalars().all()
             ]
 
     # ------------------------------------------------------------------

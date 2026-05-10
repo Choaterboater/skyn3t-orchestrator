@@ -10,12 +10,16 @@ import logging
 import threading
 import time
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @dataclass
@@ -293,7 +297,7 @@ class AuditLog:
         """Export the full audit log to a JSON file."""
         with self._lock:
             data = {
-                "exported_at": datetime.utcnow().isoformat(),
+                "exported_at": _utcnow().isoformat(),
                 "total_entries": len(self._entries),
                 "chain_valid": self.verify_chain()[0],
                 "entries": [e.to_dict() for e in self._entries],

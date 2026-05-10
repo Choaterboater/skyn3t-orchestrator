@@ -4,12 +4,16 @@ import asyncio
 import random
 import statistics
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
 
-from skyn3t.core.agent import BaseAgent, TaskRequest, TaskResult
+from skyn3t.core.agent import BaseAgent, TaskRequest
 from skyn3t.core.events import Event, EventBus, EventType
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @dataclass
@@ -50,7 +54,7 @@ class AgentPerformanceRecord:
 
     def record_task(self, success: bool, latency_ms: float, capability: str = "") -> None:
         self.total_tasks += 1
-        self.last_used = datetime.utcnow()
+        self.last_used = _utcnow()
         self.total_latency_ms += latency_ms
         self.task_latencies_ms.append(latency_ms)
         if len(self.task_latencies_ms) > 500:
@@ -215,7 +219,7 @@ class ABTestManager:
         exp = self._experiments.get(experiment_id)
         if exp:
             exp.results[variant].append(
-                {"success": success, "latency_ms": latency_ms, "timestamp": datetime.utcnow()}
+                {"success": success, "latency_ms": latency_ms, "timestamp": _utcnow()}
             )
 
     def get_winner(self, experiment_id: str) -> Optional[str]:
@@ -239,7 +243,7 @@ class ABTestManager:
         exp = self._experiments.get(experiment_id)
         if not exp:
             return {}
-        report = {"name": exp.name, "variants": {}}
+        report: Dict[str, Any] = {"name": exp.name, "variants": {}}
         for variant, results in exp.results.items():
             if not results:
                 report["variants"][variant] = {"tasks": 0, "success_rate": 0, "avg_latency_ms": 0}

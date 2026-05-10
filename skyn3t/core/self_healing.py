@@ -2,10 +2,14 @@
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from skyn3t.core.events import Event, EventBus, EventType
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @dataclass
@@ -15,7 +19,7 @@ class HealingAction:
     agent_name: str
     action_type: str
     reason: str
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=_utcnow)
     attempts: int = 0
     max_attempts: int = 3
     resolved: bool = False
@@ -37,7 +41,7 @@ class SelfHealingManager:
         self.healing_history: List[HealingAction] = []
         self._running = False
         self._healing_task: Optional[asyncio.Task] = None
-        self._healing_handlers: Dict[str, Callable[[HealingAction], None]] = {}
+        self._healing_handlers: Dict[str, Callable[[HealingAction], Any]] = {}
 
         # Register default handlers
         self.register_healing_handler("restart", self._handle_restart)
@@ -48,7 +52,7 @@ class SelfHealingManager:
         self.register_healing_handler("increase_timeout", self._handle_increase_timeout)
 
     def register_healing_handler(
-        self, action_type: str, handler: Callable[[HealingAction], None]
+        self, action_type: str, handler: Callable[[HealingAction], Any]
     ) -> None:
         """Register a healing action handler."""
         self._healing_handlers[action_type] = handler
@@ -80,6 +84,11 @@ class SelfHealingManager:
     async def stop(self) -> None:
         """Stop the healing manager."""
         self._running = False
+        # Wake the loop without waiting for the next 1s timeout.
+        try:
+            self.healing_queue.put_nowait(None)  # type: ignore[arg-type]
+        except Exception:
+            pass
         if self._healing_task:
             self._healing_task.cancel()
             try:
@@ -91,10 +100,10 @@ class SelfHealingManager:
         """Main healing loop."""
         while self._running:
             try:
-                action = await asyncio.wait_for(self.healing_queue.get(), timeout=1.0)
+                action = await self.healing_queue.get()
+                if action is None or not self._running:
+                    break
                 await self._perform_healing(action)
-            except asyncio.TimeoutError:
-                continue
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -141,7 +150,7 @@ class SelfHealingManager:
         self.healing_history.append(action)
 
     async def _run_handler(
-        self, handler: Callable[[HealingAction], None], action: HealingAction
+        self, handler: Callable[[HealingAction], Any], action: HealingAction
     ) -> None:
         """Run a healing handler, supporting both sync and async."""
         result = handler(action)

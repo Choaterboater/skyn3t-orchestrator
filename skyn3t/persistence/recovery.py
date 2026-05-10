@@ -1,12 +1,11 @@
 """Crash recovery system."""
 
-import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from skyn3t.core.events import EventBus
-from skyn3t.persistence.checkpoint import Checkpoint, CheckpointManager
+from skyn3t.persistence.checkpoint import CheckpointManager
 
 _logger = logging.getLogger("skyn3t.memory.recovery")
 
@@ -37,7 +36,7 @@ class RecoveryManager:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
-        recovery_report = {
+        recovery_report: Dict[str, Any] = {
             "recovered": True,
             "checkpoint_id": checkpoint.checkpoint_id,
             "checkpoint_timestamp": checkpoint.timestamp,

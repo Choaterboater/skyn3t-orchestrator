@@ -9,8 +9,10 @@ Signals consumed:
 All filed as Proposal(kind='feature') — same review path as tunings/patches.
 """
 from __future__ import annotations
-import asyncio, logging, time
-from collections import Counter, defaultdict
+
+import logging
+import time
+from collections import Counter
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("skyn3t.cortex.feature_suggester")
@@ -28,10 +30,19 @@ class FeatureSuggester:
         self._observation_buf: List[Dict[str, Any]] = []
 
     def start(self) -> None:
-        if self._wired: return
+        if self._wired:
+            return
         self._wired = True
+        # We care about three discrete signal sources:
+        #  - TASK_FAILED / TASK_FAILED_FINAL → repeated failure patterns
+        #  - SYSTEM_ALERT (kind=capability_gap from explorer; kind=pattern/observation/
+        #    anomaly from meta_agent)
+        # Subscribing globally was a per-event tax on a busy bus.
         try:
-            self.event_bus.subscribe(self._on_event)
+            from skyn3t.core.events import EventType
+            self.event_bus.subscribe(self._on_event, EventType.TASK_FAILED)
+            self.event_bus.subscribe(self._on_event, EventType.TASK_FAILED_FINAL)
+            self.event_bus.subscribe(self._on_event, EventType.SYSTEM_ALERT)
         except Exception:
             logger.exception("subscribe failed")
 
@@ -81,7 +92,12 @@ class FeatureSuggester:
                 self._observation_buf.append(payload)
                 if len(self._observation_buf) >= 5:
                     # naive: file a digest
-                    digest = "; ".join((o.get("summary") or "")[:120] for o in self._observation_buf if o.get("summary"))[:500]
+                    observations = list(self._observation_buf)
+                    digest = "; ".join(
+                        (observation.get("summary") or "")[:120]
+                        for observation in observations
+                        if observation.get("summary")
+                    )[:500]
                     self._observation_buf.clear()
                     if digest:
                         self._maybe_file(
@@ -89,7 +105,7 @@ class FeatureSuggester:
                             title="Meta-agent: behavior trend detected",
                             summary=digest[:140],
                             detail=f"_MetaAgent aggregated 5 observations:_\n\n{digest}",
-                            payload={"observations": self._observation_buf, "action": "review"},
+                            payload={"observations": observations, "action": "review"},
                             source="feature_suggester:meta",
                         )
         except Exception:
@@ -97,7 +113,8 @@ class FeatureSuggester:
 
     def file_user_idea(self, idea: str, *, source: str = "user") -> Optional[str]:
         idea = (idea or "").strip()
-        if not idea: return None
+        if not idea:
+            return None
         try:
             from skyn3t.cortex import get_store
             p = get_store().create(
@@ -107,6 +124,7 @@ class FeatureSuggester:
                 detail=f"_Submitted by user via dashboard ‘Suggest improvement’ button._\n\n{idea}",
                 payload={"idea": idea, "source": source, "action": "user_request"},
                 source=source,
+                origin="user",
             )
             return p.id
         except Exception:
@@ -117,7 +135,8 @@ class FeatureSuggester:
                      payload: Dict[str, Any], source: str) -> None:
         now = time.time()
         last = self._last_filed.get(signature, 0)
-        if now - last < self.cooldown: return
+        if now - last < self.cooldown:
+            return
         self._last_filed[signature] = now
         try:
             from skyn3t.cortex import get_store

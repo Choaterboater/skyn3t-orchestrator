@@ -11,8 +11,8 @@ from skyn3t.intelligence.planner import (
     Milestone,
     MilestoneStatus,
     Plan,
-    PlanStatus,
     Planner,
+    PlanStatus,
     PriorityManager,
     ProgressTracker,
     ResourceAllocator,
@@ -26,8 +26,8 @@ from skyn3t.intelligence.reflection import (
     ReflectionEngine,
 )
 from skyn3t.intelligence.task_decomposer import (
-    DependencyGraph,
     DecompositionTemplate,
+    DependencyGraph,
     ResultAggregator,
     SubTask,
     TaskDecomposer,

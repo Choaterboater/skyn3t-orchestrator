@@ -1,10 +1,12 @@
 """Event system for inter-agent communication."""
 
 import logging
+import threading
+from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum, auto
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional
 from uuid import UUID, uuid4
 
 logger = logging.getLogger("skyn3t.events")
@@ -53,6 +55,7 @@ class EventType(Enum):
     INGEST_STARTED = auto()
     INGEST_PROGRESS = auto()
     INGEST_COMPLETE = auto()
+    LLM_EXCHANGE = auto()
 
 
 @dataclass
@@ -63,7 +66,7 @@ class Event:
     source: str
     payload: Dict[str, Any]
     event_id: UUID = field(default_factory=uuid4)
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     target: Optional[str] = None
     correlation_id: Optional[str] = None
     priority: int = 0  # Higher = more urgent
@@ -89,8 +92,10 @@ class EventBus:
             et: [] for et in EventType
         }
         self._global_subscribers: List[Callable[[Event], None]] = []
-        self._history: List[Event] = []
         self._max_history = 1000
+        self._history: Deque[Event] = deque(maxlen=self._max_history)
+        # RLock so a callback that re-publishes (or subscribes) doesn't deadlock.
+        self._lock = threading.RLock()
 
     def subscribe(
         self,
@@ -98,10 +103,11 @@ class EventBus:
         event_type: Optional[EventType] = None,
     ) -> None:
         """Subscribe to events."""
-        if event_type:
-            self._subscribers[event_type].append(callback)
-        else:
-            self._global_subscribers.append(callback)
+        with self._lock:
+            if event_type:
+                self._subscribers[event_type].append(callback)
+            else:
+                self._global_subscribers.append(callback)
 
     def unsubscribe(
         self,
@@ -109,28 +115,33 @@ class EventBus:
         event_type: Optional[EventType] = None,
     ) -> None:
         """Unsubscribe from events."""
-        if event_type:
-            self._subscribers[event_type] = [
-                cb for cb in self._subscribers[event_type] if cb != callback
-            ]
-        else:
-            self._global_subscribers = [cb for cb in self._global_subscribers if cb != callback]
+        with self._lock:
+            if event_type:
+                self._subscribers[event_type] = [
+                    cb for cb in self._subscribers[event_type] if cb != callback
+                ]
+            else:
+                self._global_subscribers = [
+                    cb for cb in self._global_subscribers if cb != callback
+                ]
 
     def publish(self, event: Event) -> None:
         """Publish an event to all subscribers."""
-        self._history.append(event)
-        if len(self._history) > self._max_history:
-            self._history = self._history[-self._max_history :]
+        # Snapshot subscribers under the lock so concurrent subscribe/unsubscribe
+        # cannot mutate the lists while we iterate. Callbacks run outside the lock
+        # to avoid stalling other publishers if a callback is slow.
+        with self._lock:
+            self._history.append(event)
+            type_subs = list(self._subscribers.get(event.event_type, ()))
+            global_subs = list(self._global_subscribers)
 
-        # Notify type-specific subscribers
-        for callback in self._subscribers.get(event.event_type, []):
+        for callback in type_subs:
             try:
                 callback(event)
             except Exception as e:
                 logger.exception("Error in event subscriber: %s", e)
 
-        # Notify global subscribers
-        for callback in self._global_subscribers:
+        for callback in global_subs:
             try:
                 callback(event)
             except Exception as e:
@@ -143,7 +154,8 @@ class EventBus:
         limit: int = 100,
     ) -> List[Event]:
         """Get event history with optional filtering."""
-        events = self._history
+        with self._lock:
+            events: List[Event] = list(self._history)
         if event_type:
             events = [e for e in events if e.event_type == event_type]
         if source:
@@ -152,4 +164,5 @@ class EventBus:
 
     def clear_history(self) -> None:
         """Clear event history."""
-        self._history.clear()
+        with self._lock:
+            self._history.clear()

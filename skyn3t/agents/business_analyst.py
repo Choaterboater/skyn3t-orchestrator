@@ -1,7 +1,10 @@
 """Business Analyst Agent - market scan, business model, pitch outline.
 
-LLM-free. Picks a revenue model based on brief keywords, generates a 5-comp
-table, and emits a 10-slide pitch outline.
+Tries the configured LLM first to produce brief-aware market analysis,
+business model recommendations, and a pitch outline. Falls back to the
+deterministic templates below (revenue model picked from brief keywords,
+seeded competitor table, generic 10-slide pitch) when the LLM is unavailable
+or returns a stub.
 """
 
 from __future__ import annotations
@@ -11,7 +14,6 @@ from typing import Any, Dict, List, Optional
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
-
 
 _REVENUE_MODELS = {
     "subscription": {
@@ -65,14 +67,14 @@ class BusinessAnalystAgent(BaseAgent):
     def __init__(
         self,
         name: str = "business_analyst",
-        event_bus: EventBus = None,
+        event_bus: EventBus | None = None,
         config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             name=name,
             agent_type="business_analyst",
             provider="local",
-            event_bus=event_bus,
+            event_bus=event_bus or EventBus(),
             config=config,
         )
         self.add_capability(AgentCapability(
@@ -92,7 +94,7 @@ class BusinessAnalystAgent(BaseAgent):
     async def health_check(self) -> bool:
         return True
 
-    async def execute(self, task: TaskRequest) -> TaskResult:
+    async def execute(self, task: TaskRequest, stdin_data: str | None = None) -> TaskResult:
         await self.think(f"{self.name} starting on {task.task_id}")
 
         data = task.input_data or {}
@@ -110,17 +112,67 @@ class BusinessAnalystAgent(BaseAgent):
         revenue_key = _pick_revenue_model(brief)
         revenue = _REVENUE_MODELS[revenue_key]
 
-        market_md = self._render_market_scan(idea, comps)
+        # STEP 0: try LLM for market_scan.md, fall back to deterministic template.
+        market_role_prompt = (
+            "You are a startup market analyst. Research and identify 5 specific "
+            "competitor products (use real names if the space is obvious; otherwise "
+            "use plausible named placeholders). Produce a markdown market scan with "
+            "these sections (## headings):\n"
+            "- TAM / SAM / SOM with rough numeric estimates and how you got there\n"
+            "- ICP (ideal customer profile) description\n"
+            "- 5 named competitors, each with a one-line gap analysis\n"
+            "- Feature comparison table (markdown table) with us vs each competitor\n"
+            "- Why now (2-3 specific tailwinds)\n"
+            "Be specific and grounded in the brief."
+        )
+        fallback_market = self._render_market_scan(idea, comps)
+        market_md = await self._llm_generate(
+            role_prompt=market_role_prompt,
+            brief=brief,
+            fallback=fallback_market,
+        )
         market_path = artifact_dir / "market_scan.md"
         market_path.write_text(market_md, encoding="utf-8")
         await self.think(f"wrote {market_path.name}")
 
-        model_md = self._render_business_model(idea, revenue_key, revenue)
+        # STEP 0: try LLM for business_model.md, fall back to deterministic template.
+        model_role_prompt = (
+            "You are a SaaS pricing strategist. Recommend a revenue model "
+            "(be specific - subscription / usage-based / freemium / marketplace / "
+            "transactional / etc.) that fits the brief. Then produce a markdown "
+            "document with these sections (## headings):\n"
+            "- Revenue model (named, with rationale)\n"
+            "- 3 pricing tiers with concrete prices and what each includes "
+            "(use a markdown table)\n"
+            "- Key unit economics (CAC, ACV, gross margin, payback, NRR target) "
+            "with concrete numbers\n"
+            "- Risks to the model (3-5 specific risks)\n"
+            "Match the brief's actual scope and audience."
+        )
+        fallback_model = self._render_business_model(idea, revenue_key, revenue)
+        model_md = await self._llm_generate(
+            role_prompt=model_role_prompt,
+            brief=brief,
+            fallback=fallback_model,
+        )
         model_path = artifact_dir / "business_model.md"
         model_path.write_text(model_md, encoding="utf-8")
         await self.think(f"wrote {model_path.name}")
 
-        pitch_md = self._render_pitch(idea, brief, revenue["label"], comps)
+        # STEP 0: try LLM for pitch_outline.md, fall back to deterministic template.
+        pitch_role_prompt = (
+            "You are an investor-pitch coach. Produce a 10-slide pitch deck outline "
+            "in markdown. Use one ## heading per slide (numbered 1-10) with 2-3 "
+            "concise bullets each. Suggested slides: Title, Problem, Solution, "
+            "Why now, Market size, Product / demo, Business model, Competition, "
+            "Team, Ask. Make every slide specific to the brief - no generic filler."
+        )
+        fallback_pitch = self._render_pitch(idea, brief, revenue["label"], comps)
+        pitch_md = await self._llm_generate(
+            role_prompt=pitch_role_prompt,
+            brief=brief,
+            fallback=fallback_pitch,
+        )
         pitch_path = artifact_dir / "pitch_outline.md"
         pitch_path.write_text(pitch_md, encoding="utf-8")
         await self.think(f"wrote {pitch_path.name}")
@@ -304,3 +356,31 @@ class BusinessAnalystAgent(BaseAgent):
             "1 GTM hire. Use of funds: 70% R&D, 20% GTM, 10% operations.",
             "",
         ])
+
+    async def _llm_generate(self, *, role_prompt: str, brief: str, fallback: str) -> str:
+        """Ask the configured LLM for a markdown artifact.
+
+        Returns the LLM output, or the deterministic ``fallback`` if the LLM is
+        unavailable / returned a stub.
+        """
+        try:
+            client = self.get_llm() if hasattr(self, "get_llm") else None
+            if client is None:
+                from skyn3t.adapters import LLMClient
+                client = LLMClient(
+                    default_model=self.config.get("model"),
+                    backend=self.config.get("backend"),
+                    event_bus=self.event_bus,
+                    caller_name=self.name,
+                )
+            prompt = (
+                f"{role_prompt}\n\nBrief from user:\n{brief}\n\n"
+                "Produce ONLY the markdown content for the artifact. "
+                "No code fences, no preamble, no commentary."
+            )
+            out = await client.complete(prompt, max_tokens=2500, temperature=0.6)
+            if out and "[deterministic-stub]" not in out and len(out.strip()) > 80:
+                return out.strip()
+        except Exception:
+            pass
+        return fallback

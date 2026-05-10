@@ -2,7 +2,6 @@
 
 import asyncio
 import time
-from datetime import datetime, timezone
 
 import pytest
 
@@ -22,21 +21,17 @@ from skyn3t.observability.logging import (
     log_task_event,
 )
 from skyn3t.observability.metrics import (
-    AgentMetricsCollector,
     generate_metrics,
     get_collector,
     reset_collector,
-    set_metrics_registry,
     timed,
 )
 from skyn3t.observability.tracing import (
     ConsoleExporter,
     SpanStatus,
     TraceContext,
-    TraceSpan,
     Tracer,
-    get_tracer,
-    set_tracer,
+    TraceSpan,
     trace_task,
 )
 

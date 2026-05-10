@@ -1,7 +1,8 @@
 """Marketer Agent - GTM scaffolding.
 
-LLM-free. Produces positioning, channel plan, and a launch checklist from a
-brief. Channels default to: twitter, linkedin, hn, producthunt, content, ads.
+LLM-first. Reads the brief, asks an LLM to choose channels appropriate to the
+audience and to draft positioning + launch checklist material specific to the
+product. If the LLM is offline, falls back to a curated default playbook.
 """
 
 from __future__ import annotations
@@ -11,7 +12,6 @@ from typing import Any, Dict, List, Optional
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
-
 
 _DEFAULT_CHANNELS = ["twitter", "linkedin", "hn", "producthunt", "content", "ads"]
 
@@ -65,14 +65,14 @@ class MarketerAgent(BaseAgent):
     def __init__(
         self,
         name: str = "marketer",
-        event_bus: EventBus = None,
+        event_bus: EventBus | None = None,
         config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             name=name,
             agent_type="marketer",
             provider="local",
-            event_bus=event_bus,
+            event_bus=event_bus or EventBus(),
             config=config,
         )
         self.add_capability(AgentCapability(
@@ -92,7 +92,7 @@ class MarketerAgent(BaseAgent):
     async def health_check(self) -> bool:
         return True
 
-    async def execute(self, task: TaskRequest) -> TaskResult:
+    async def execute(self, task: TaskRequest, stdin_data: str | None = None) -> TaskResult:
         await self.think(f"{self.name} starting on {task.task_id}")
 
         data = task.input_data or {}
@@ -109,17 +109,17 @@ class MarketerAgent(BaseAgent):
         except Exception as e:
             return TaskResult(task_id=task.task_id, success=False, error=f"artifact_dir error: {e}")
 
-        positioning_md = self._render_positioning(brief, audience)
+        positioning_md = await self._render_positioning(brief, audience)
         positioning_path = artifact_dir / "positioning.md"
         positioning_path.write_text(positioning_md, encoding="utf-8")
         await self.think(f"wrote {positioning_path.name}")
 
-        channels_md = self._render_channels(brief, channels)
+        channels_md = await self._render_channels(brief, audience, channels)
         channels_path = artifact_dir / "channel_plan.md"
         channels_path.write_text(channels_md, encoding="utf-8")
         await self.think(f"wrote {channels_path.name}")
 
-        checklist_md = self._render_checklist(brief)
+        checklist_md = await self._render_checklist(brief)
         checklist_path = artifact_dir / "launch_checklist.md"
         checklist_path.write_text(checklist_md, encoding="utf-8")
         await self.think(f"wrote {checklist_path.name}")
@@ -151,7 +151,61 @@ class MarketerAgent(BaseAgent):
             },
         )
 
-    def _render_positioning(self, brief: str, audience: str) -> str:
+    # ------------------------------------------------------------------
+    # LLM helper
+    # ------------------------------------------------------------------
+    async def _llm_generate(
+        self,
+        *,
+        role_prompt: str,
+        brief: str,
+        fallback: str,
+        max_tokens: int = 2500,
+    ) -> str:
+        try:
+            client = self.get_llm() if hasattr(self, "get_llm") else None
+            if client is None:
+                from skyn3t.adapters import LLMClient
+                client = LLMClient(
+                    default_model=self.config.get("model"),
+                    backend=self.config.get("backend"),
+                    event_bus=self.event_bus,
+                    caller_name=self.name,
+                )
+            prompt = (
+                f"{role_prompt}\n\nBrief from user:\n{brief}\n\n"
+                "Produce ONLY the markdown (or JSON if asked) - no code fences, no preamble."
+            )
+            out = await client.complete(prompt, max_tokens=max_tokens, temperature=0.7)
+            if out and "[deterministic-stub]" not in out and len(out.strip()) > 80:
+                return out.strip()
+        except Exception:
+            pass
+        return fallback
+
+    # ------------------------------------------------------------------
+    # Positioning
+    # ------------------------------------------------------------------
+    async def _render_positioning(self, brief: str, audience: str) -> str:
+        fallback = self._render_positioning_fallback(brief, audience)
+        role = (
+            "You are a senior product marketer. Produce a markdown positioning "
+            "doc specific to this product. Required sections (in order): "
+            "JTBD framing, ICP description (a SPECIFIC persona, not a "
+            "generic segment), Value proposition (one sentence), 3 "
+            "differentiators (concrete and verifiable, not generic), 3 likely "
+            "objections + responses (objections that THIS audience would "
+            "actually raise). Avoid hype words. No filler.\n\n"
+            f"Default audience guess if the brief doesn't specify one: {audience}"
+        )
+        return await self._llm_generate(
+            role_prompt=role,
+            brief=brief,
+            fallback=fallback,
+            max_tokens=1800,
+        )
+
+    def _render_positioning_fallback(self, brief: str, audience: str) -> str:
         first = brief.split(".")[0][:80] or "the project"
         out = [
             f"# Positioning - {first}",
@@ -196,7 +250,36 @@ class MarketerAgent(BaseAgent):
         ]
         return "\n".join(out)
 
-    def _render_channels(self, brief: str, channels: List[str]) -> str:
+    # ------------------------------------------------------------------
+    # Channel plan
+    # ------------------------------------------------------------------
+    async def _render_channels(
+        self,
+        brief: str,
+        audience: str,
+        channels: List[str],
+    ) -> str:
+        fallback = self._render_channels_fallback(brief, channels)
+        role = (
+            "You are a head of growth. Read the brief and choose the 4-6 most "
+            "relevant channels for THIS audience. Do NOT default to "
+            "twitter/linkedin/hn/producthunt unless those are genuinely where "
+            "this audience lives. Think hard about who'd actually use this "
+            "product and where they spend time online.\n\n"
+            "Output a markdown channel plan with: a one-line statement of who "
+            "the audience is, a markdown table with columns "
+            "Channel | Cadence | Message angle | KPI, and a short Sequencing "
+            "section explaining the order to activate channels in.\n\n"
+            f"Audience hint (override if the brief implies a different one): {audience}"
+        )
+        return await self._llm_generate(
+            role_prompt=role,
+            brief=brief,
+            fallback=fallback,
+            max_tokens=1500,
+        )
+
+    def _render_channels_fallback(self, brief: str, channels: List[str]) -> str:
         first = brief.split(".")[0][:60] or "the project"
         out = [
             f"# Channel plan - {first}",
@@ -229,7 +312,26 @@ class MarketerAgent(BaseAgent):
         out.append("")
         return "\n".join(out)
 
-    def _render_checklist(self, brief: str) -> str:
+    # ------------------------------------------------------------------
+    # Launch checklist
+    # ------------------------------------------------------------------
+    async def _render_checklist(self, brief: str) -> str:
+        fallback = self._render_checklist_fallback(brief)
+        role = (
+            "You are a launch lead. Produce a markdown launch checklist with "
+            "the sections T-14, T-7, T-1, T-0, T+7 (in that order). Each "
+            "section must contain checklist items (- [ ] ...) that are "
+            "SPECIFIC to this product - not generic. Tasks should reflect "
+            "the actual surface area of the product and audience."
+        )
+        return await self._llm_generate(
+            role_prompt=role,
+            brief=brief,
+            fallback=fallback,
+            max_tokens=1500,
+        )
+
+    def _render_checklist_fallback(self, brief: str) -> str:
         first = brief.split(".")[0][:60] or "the project"
         return "\n".join([
             f"# Launch checklist - {first}",

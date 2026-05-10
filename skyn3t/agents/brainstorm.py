@@ -8,9 +8,10 @@ questions.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import json
 import logging
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -85,7 +86,7 @@ class BrainstormAgent(BaseAgent):
     async def health_check(self) -> bool:
         return True
 
-    async def execute(self, task: TaskRequest) -> TaskResult:
+    async def execute(self, task: TaskRequest, stdin_data: str | None = None) -> TaskResult:
         try:
             await self.think(f"brainstorming: {task.title or task.task_id}")
         except Exception:
@@ -100,9 +101,36 @@ class BrainstormAgent(BaseAgent):
             ).strip()
             artifact_dir = input_data.get("artifact_dir") or "."
             next_agent = input_data.get("next_agent")
+            require_clarification = bool(input_data.get("require_clarification"))
 
             if not brief:
                 brief = "(no brief provided - produce an exploration of likely directions)"
+
+            # Clarification check: ambiguous briefs should ask questions instead of guessing.
+            # Skip if user already provided clarifications (passed via input_data.clarifications).
+            if not input_data.get("clarifications"):
+                questions = await self._maybe_ask_clarifications(
+                    brief,
+                    force=require_clarification,
+                )
+                if require_clarification and not questions:
+                    questions = self._kickoff_questions(brief)
+                if questions:
+                    # Write a marker file so the runner can pick it up
+                    ad = Path(artifact_dir)
+                    ad.mkdir(parents=True, exist_ok=True)
+                    clarify_path = ad / "_clarifications.json"
+                    clarify_path.write_text(json.dumps({"questions": questions, "asked_by": self.name},
+                                                        indent=2), encoding="utf-8")
+                    return TaskResult(
+                        task_id=task.task_id, success=True,
+                        output={
+                            "needs_clarification": True,
+                            "questions": questions,
+                            "files": [str(clarify_path)],
+                            "summary": f"Need {len(questions)} clarifications before proceeding.",
+                        },
+                    )
 
             angles = self._expand(brief)
 
@@ -111,7 +139,7 @@ class BrainstormAgent(BaseAgent):
             if panel is None:
                 panel = [
                     {"backend": "claude_cli", "model": "opus",      "label": "claude-opus"},
-                    {"backend": "kimi_cli",   "model": "kimi-k2.6", "label": "kimi"},
+                    {"backend": "kimi_cli",   "model": "kimi-code/kimi-for-coding", "label": "kimi-k2.6"},
                 ]
             for member in panel:
                 line = await self._consult(brief, member)
@@ -123,7 +151,7 @@ class BrainstormAgent(BaseAgent):
             lens = (input_data.get("lens") or "fidelity").lower()
             if lens == "fidelity":
                 primary = brief.strip()
-                alternatives = []
+                alternatives: List[str] = []
                 if panel_results:
                     alternatives.extend(p["framing"] for p in panel_results if p.get("framing"))
                 alternatives.extend(a["framing"] for a in angles[:5] if a.get("framing") not in alternatives)
@@ -190,6 +218,58 @@ class BrainstormAgent(BaseAgent):
             return TaskResult(task_id=task.task_id, success=False, error=str(e))
 
     # ------- helpers ----------
+    async def _maybe_ask_clarifications(self, brief: str, *, force: bool = False) -> List[str]:
+        """Ask LLM if brief is ambiguous; if so return up to 3 short questions."""
+        if not brief or len(brief.strip()) < 10:
+            return []
+        try:
+            client = self.get_llm() if hasattr(self, "get_llm") else None
+            if client is None:
+                from skyn3t.adapters import LLMClient
+                client = LLMClient(default_model=self.config.get("model"),
+                                   backend=self.config.get("backend"),
+                                   event_bus=self.event_bus, caller_name=self.name)
+            system = (
+                "You are a senior product manager triaging a project brief. Decide if the brief "
+                "is specific enough to act on. Reply with valid JSON only:\n"
+                '{"clear": true/false, "questions": ["q1", "q2"]}\n'
+                "Set clear=true if you can confidently produce useful artifacts (architecture, brand, "
+                "code) without further input. Set clear=false ONLY when there are critical ambiguities. "
+                "Limit to AT MOST 3 short, specific questions. Don't ask about preferences a designer "
+                "could just pick (color, font). DO ask about platform/audience/scope when unclear. "
+                "Return empty questions array if clear."
+            )
+            if force:
+                system += (
+                    " The user explicitly wants an early confirmation pass, so ask 2-3 short kickoff "
+                    "questions even if the brief looks mostly clear."
+                )
+            prompt = f"Brief:\n{brief}\n\nReply JSON."
+            out = await asyncio.wait_for(
+                client.complete(prompt, system=system, max_tokens=400, temperature=0.0),
+                timeout=30,
+            )
+            if not out or "[deterministic-stub]" in out:
+                return []
+            import re as _re
+            m = _re.search(r"\{[\s\S]*\}", out)
+            if not m:
+                return []
+            data = json.loads(m.group(0))
+            if data.get("clear"):
+                return []
+            qs = data.get("questions") or []
+            return [str(q)[:200] for q in qs if q][:3]
+        except Exception:
+            return []
+
+    def _kickoff_questions(self, brief: str) -> List[str]:
+        return [
+            "Who is the primary user or customer for this first version?",
+            "What must the first deliverable do end-to-end before you would call it useful?",
+            "What important constraint, non-goal, or risk should the swarm avoid?",
+        ]
+
     def _seed(self, brief: str) -> int:
         return int(hashlib.sha256(brief.encode("utf-8")).hexdigest()[:8], 16)
 
@@ -256,10 +336,12 @@ class BrainstormAgent(BaseAgent):
             client = LLMClient(default_model=member.get("model"), backend=member.get("backend"))
             prompt = (
                 "Reframe the following brief as one fresh, concrete problem framing. "
+                "Think briefly: what's the SHARPEST framing that the user might NOT have considered? "
                 "One sentence. No preamble, no quotes, no list formatting.\n\n"
                 f"Brief: {brief}"
             )
-            out = await client.complete(prompt, max_tokens=120, temperature=0.7)
+            out = await asyncio.wait_for(
+                client.complete(prompt, max_tokens=120, temperature=0.9), timeout=45)
             line = (out or "").strip().splitlines()[0] if out else ""
             line = line.strip(" \"'`-•*").strip()
             if not line or line.startswith("[deterministic-stub]"):

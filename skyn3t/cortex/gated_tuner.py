@@ -1,8 +1,10 @@
 from __future__ import annotations
-import json, logging, time
-from dataclasses import dataclass
+
+import json
+import logging
+import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 logger = logging.getLogger("skyn3t.cortex.gated_tuner")
 
@@ -27,7 +29,8 @@ class GatedTuner:
         self._wired = False
 
     def start(self) -> None:
-        if self._wired: return
+        if self._wired:
+            return
         self._wired = True
         # register handler with the proposal store
         try:
@@ -35,11 +38,12 @@ class GatedTuner:
             get_store().register_handler("tuning", self._apply_tuning)
         except Exception:
             logger.exception("could not register tuning handler")
-        # subscribe to SelfTuningEngine emissions; we don't know exactly what event it
-        # publishes — be permissive: hook EventType.SYSTEM_ALERT and filter by kind.
+        # SelfTuningEngine publishes via SYSTEM_ALERT with kind="tuning_suggestion".
+        # Subscribe specifically rather than to every event in the system, which
+        # added a per-event tax on a busy bus.
         try:
             from skyn3t.core.events import EventType
-            self.event_bus.subscribe(self._on_event)  # subscribe to all
+            self.event_bus.subscribe(self._on_event, EventType.SYSTEM_ALERT)
         except Exception:
             logger.exception("could not subscribe to event bus")
 
@@ -77,8 +81,10 @@ class GatedTuner:
         # snapshot current config
         existing: Dict[str, Any] = {}
         if self.config_path.exists():
-            try: existing = json.loads(self.config_path.read_text())
-            except Exception: existing = {}
+            try:
+                existing = json.loads(self.config_path.read_text())
+            except Exception:
+                existing = {}
         snap_path = SNAPSHOTS_DIR / f"{int(time.time())}.json"
         snap_path.write_text(json.dumps(existing, indent=2))
         # merge: simple key replacement
@@ -90,11 +96,13 @@ class GatedTuner:
             self.event_bus.publish(Event(event_type=EventType.SYSTEM_ALERT, source="gated_tuner",
                                          payload={"kind": "TUNING_APPLIED", "change": change,
                                                   "snapshot": str(snap_path)}))
-        except Exception: pass
+        except Exception:
+            logger.debug("TUNING_APPLIED event publish failed", exc_info=True)
         return {"applied": True, "snapshot": str(snap_path), "config_path": str(self.config_path)}
 
     def rollback(self, snapshot_name: str) -> Dict[str, Any]:
         snap = SNAPSHOTS_DIR / snapshot_name
-        if not snap.exists(): return {"ok": False, "error": "snapshot not found"}
+        if not snap.exists():
+            return {"ok": False, "error": "snapshot not found"}
         self.config_path.write_text(snap.read_text())
         return {"ok": True, "restored_from": str(snap)}

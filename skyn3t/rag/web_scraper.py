@@ -1,7 +1,8 @@
 """Web scraper for RAG knowledge ingestion."""
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
+from urllib import robotparser
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -10,12 +11,23 @@ import httpx
 class WebScraper:
     """Scrape web pages and extract clean text for RAG."""
 
-    def __init__(self, timeout: int = 30, max_depth: int = 2, respect_robots: bool = True):
+    DEFAULT_UA = "skyn3t-scraper/0.1"
+
+    def __init__(
+        self,
+        timeout: int = 30,
+        max_depth: int = 2,
+        respect_robots: bool = True,
+        user_agent: str = DEFAULT_UA,
+    ):
         self.timeout = timeout
         self.max_depth = max_depth
         self.respect_robots = respect_robots
+        self.user_agent = user_agent
         self._visited: set = set()
-        self._robots_cache: Dict[str, bool] = {}
+        # Cache parsed RobotFileParser instances per host so each host's
+        # robots.txt is fetched at most once per scraper.
+        self._robots_parsers: Dict[str, robotparser.RobotFileParser] = {}
 
     async def scrape_url(
         self, url: str, depth: int = 0
@@ -68,7 +80,7 @@ class WebScraper:
         self, url: str, max_pages: int = 10
     ) -> List[Dict[str, Any]]:
         """Scrape a URL and follow links recursively."""
-        results = []
+        results: List[Dict[str, Any]] = []
         to_visit = [(url, 0)]
 
         while to_visit and len(results) < max_pages:
@@ -117,9 +129,12 @@ class WebScraper:
             from bs4 import BeautifulSoup
 
             soup = BeautifulSoup(html, "html.parser")
-            links = []
+            links: List[str] = []
             for a in soup.find_all("a", href=True):
-                href = urljoin(base_url, a["href"])
+                href_raw = a.get("href")
+                if not isinstance(href_raw, str):
+                    continue
+                href = urljoin(base_url, href_raw)
                 if urlparse(href).netloc == urlparse(base_url).netloc:
                     links.append(href)
             return links[:20]
@@ -140,27 +155,29 @@ class WebScraper:
         return ""
 
     async def _can_fetch(self, url: str) -> bool:
-        """Check robots.txt."""
+        """Check robots.txt using urllib.robotparser scoped to our UA.
+
+        Conservative: on fetch failure we allow the fetch (matches the previous
+        behavior). On a 4xx other than 404, also allow (host has no robots.txt
+        policy). 404 → no robots.txt → allow. 200 → respect the policy.
+        """
         parsed = urlparse(url)
-        robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
-
-        if robots_url in self._robots_cache:
-            return self._robots_cache[robots_url]
-
+        host_key = f"{parsed.scheme}://{parsed.netloc}"
+        rp = self._robots_parsers.get(host_key)
+        if rp is None:
+            rp = robotparser.RobotFileParser()
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    response = await client.get(f"{host_key}/robots.txt")
+                    if response.status_code == 200:
+                        rp.parse(response.text.splitlines())
+                    else:
+                        # Treat any non-200 as "no policy" → allow.
+                        rp.parse([])
+            except Exception:
+                rp.parse([])
+            self._robots_parsers[host_key] = rp
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.get(robots_url)
-                if response.status_code == 200:
-                    # Simple check - look for Disallow of our path
-                    path = parsed.path or "/"
-                    for line in response.text.split("\n"):
-                        if line.lower().startswith("disallow:"):
-                            disallowed = line.split(":", 1)[1].strip()
-                            if path.startswith(disallowed):
-                                self._robots_cache[robots_url] = False
-                                return False
+            return rp.can_fetch(self.user_agent, url)
         except Exception:
-            pass
-
-        self._robots_cache[robots_url] = True
-        return True
+            return True

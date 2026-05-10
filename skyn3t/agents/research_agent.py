@@ -1,10 +1,14 @@
 """Research Agent - searches, summarizes, compares, and fact-checks information."""
 
+import logging
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
+
+logger = logging.getLogger("skyn3t.agents.research_agent")
 
 
 class ResearchAgent(BaseAgent):
@@ -13,14 +17,14 @@ class ResearchAgent(BaseAgent):
     def __init__(
         self,
         name: str = "research_agent",
-        event_bus: EventBus = None,
+        event_bus: EventBus | None = None,
         config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             name=name,
             agent_type="research",
             provider="local",
-            event_bus=event_bus,
+            event_bus=event_bus or EventBus(),
             config=config,
         )
         self.add_capability(
@@ -46,8 +50,12 @@ class ResearchAgent(BaseAgent):
         )
         self.add_capability(
             AgentCapability(
-                name="fact_check",
-                description="Verify facts against known sources",
+                name="corroborate_against_sources",
+                description=(
+                    "Heuristic substring corroboration of a claim against the "
+                    "supplied sources. Not a real fact-checker — does not query "
+                    "knowledge bases or verify truth."
+                ),
                 parameters={"claim": "str", "sources": "list"},
             )
         )
@@ -69,7 +77,7 @@ class ResearchAgent(BaseAgent):
         except Exception:
             return False
 
-    async def execute(self, task: TaskRequest) -> TaskResult:
+    async def execute(self, task: TaskRequest, stdin_data: str | None = None) -> TaskResult:
         """Execute a research-related task."""
         task_type = task.input_data.get("task_type", "web_search")
 
@@ -77,6 +85,8 @@ class ResearchAgent(BaseAgent):
             "web_search": self._web_search,
             "summarization": self._summarize,
             "comparison": self._compare,
+            "corroborate_against_sources": self._fact_check,
+            # Back-compat alias for callers still passing the old name.
             "fact_check": self._fact_check,
         }
 
@@ -103,27 +113,73 @@ class ResearchAgent(BaseAgent):
             )
 
     async def _web_search(self, task: TaskRequest) -> Dict[str, Any]:
-        """Simulate web search with a placeholder implementation."""
+        """LLM-grounded research; falls back to placeholder if no backend."""
         query = (task.input_data.get("query")
                  or task.input_data.get("brief")
                  or task.input_data.get("idea")
                  or task.input_data.get("description")
                  or "")
         num_results = task.input_data.get("num_results", 5)
+        artifact_dir = task.input_data.get("artifact_dir")
 
         if not query:
             return {"success": False, "error": "No query provided"}
 
-        # Placeholder search results
+        # Try LLM-grounded research; falls back to placeholder if backend is deterministic
         results = []
-        for i in range(min(num_results, 10)):
-            results.append({
-                "title": f"Result {i + 1} for '{query}'",
-                "url": f"https://example.com/search/{i + 1}",
-                "snippet": f"This is a simulated search result snippet for '{query}'. "
-                           f"In a production environment, this would contain actual search results.",
-                "source": "placeholder",
-            })
+        notes = ""
+        try:
+            client = self.get_llm() if hasattr(self, "get_llm") else None
+            if client is None:
+                from skyn3t.adapters import LLMClient
+                client = LLMClient(default_model=self.config.get("model"),
+                                    backend=self.config.get("backend"))
+            prompt = (
+                f"Research brief:\n{query}\n\n"
+                f"Produce {num_results} concise findings or considerations relevant to this brief. "
+                f"Format as a markdown bullet list. Each bullet must be one sentence, "
+                f"actionable, and grounded in known facts/tools/patterns. No preamble."
+            )
+            out = await client.complete(prompt, max_tokens=900, temperature=0.3)
+            if out and "[deterministic-stub]" not in out:
+                notes = out.strip()
+                # parse bullets into results
+                for line in notes.splitlines():
+                    line = line.strip()
+                    if line.startswith(("- ", "* ", "• ")):
+                        results.append({"title": line[2:].strip()[:100], "snippet": line[2:].strip(),
+                                        "source": "llm"})
+                    if len(results) >= num_results:
+                        break
+        except Exception:
+            pass
+
+        # Placeholder fallback if LLM gave nothing
+        if not results:
+            for i in range(min(num_results, 5)):
+                results.append({"title": f"Consider angle {i+1} for '{query[:40]}'",
+                                "snippet": f"Placeholder finding {i+1}.",
+                                "source": "placeholder"})
+            notes = "\n".join(f"- {r['snippet']}" for r in results)
+
+        # Write research.md to artifact_dir for downstream stages
+        files_written = []
+        if artifact_dir:
+            try:
+                ad = Path(artifact_dir)
+                ad.mkdir(parents=True, exist_ok=True)
+                md_path = ad / "research.md"
+                md_path.write_text(
+                    f"# Research\n\n## Query\n{query}\n\n## Findings\n{notes}\n",
+                    encoding="utf-8")
+                files_written.append(str(md_path))
+                if hasattr(self, "think"):
+                    try:
+                        await self.think(f"wrote {md_path.name} ({len(results)} findings)")
+                    except Exception:
+                        logger.debug("think() failed after research write", exc_info=True)
+            except Exception:
+                pass
 
         entry = {
             "query": query,
@@ -140,6 +196,9 @@ class ResearchAgent(BaseAgent):
             "query": query,
             "results": results,
             "total_results": len(results),
+            "files": files_written,
+            "summary": f"Researched '{query[:60]}': {len(results)} findings, "
+                       f"{len(files_written)} file(s) written.",
         }
 
     async def _summarize(self, task: TaskRequest) -> Dict[str, Any]:
@@ -239,7 +298,12 @@ class ResearchAgent(BaseAgent):
         }
 
     async def _fact_check(self, task: TaskRequest) -> Dict[str, Any]:
-        """Fact-check a claim against provided or known sources."""
+        """Corroborate a claim by substring-matching against provided sources.
+
+        Despite the historical name, this is **not** a fact checker: it does
+        not consult knowledge bases or verify truth. It only reports whether
+        the claim text (or its words) appear in the supplied source strings.
+        """
         claim = task.input_data.get("claim", "")
         sources = task.input_data.get("sources", [])
 

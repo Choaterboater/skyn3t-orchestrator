@@ -2,11 +2,10 @@
 
 import asyncio
 import shutil
-import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from skyn3t.config.settings import get_settings
 
@@ -108,7 +107,7 @@ class HealthRegistry:
                         status=HealthStatus.UNHEALTHY,
                         error=str(result),
                     )
-                elif result is not None:
+                elif isinstance(result, HealthCheck):
                     results[name] = result
 
         self._last_results.update(results)

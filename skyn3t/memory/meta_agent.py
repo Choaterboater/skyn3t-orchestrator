@@ -9,12 +9,40 @@ handling the repetitive optimization work.
 """
 
 import asyncio
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+import logging
+import time
+from collections import deque
+from datetime import datetime, timezone
+from typing import Any, Deque, Dict, List, Optional
 
 from skyn3t.core.events import Event, EventBus, EventType
-from skyn3t.memory.store import MemoryStore
 from skyn3t.memory.consciousness import CollectiveConsciousness
+from skyn3t.memory.store import MemoryStore
+
+logger = logging.getLogger("skyn3t.memory.meta_agent")
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+# Threshold-based proposal-filing config.
+# Each kind of proposal has a 4-hour dedup cooldown so the cortex isn't
+# spammed with identical findings.
+PROPOSAL_DEDUP_SECONDS = 4 * 3600
+
+# Window over which to evaluate the "agent failed >3 times in last hour" rule.
+AGENT_FAILURE_WINDOW_SECONDS = 3600
+AGENT_FAILURE_THRESHOLD = 3
+
+# Window over which we accumulate per-project retry counts (tracked by slug,
+# observed via TASK_COMPLETED/FAILED events whose payloads carry a "slug" or
+# whose task titles include one). Threshold is "retried >2 times".
+PROJECT_RETRY_THRESHOLD = 2
+
+# Rolling-window of review scores; if the mean of the last N drops below this,
+# file a proposal.
+REVIEW_SCORE_WINDOW = 5
+REVIEW_SCORE_FLOOR = 50.0
 
 
 class MetaAgent:
@@ -52,6 +80,24 @@ class MetaAgent:
         # Observation window
         self._observation_window: List[Dict[str, Any]] = []
         self._max_window = 50
+
+        # ── Threshold-watch state ─────────────────────────────────────
+        # Per-agent timestamp deque of recent failures.
+        self._agent_failures: Dict[str, Deque[float]] = {}
+        # Per-project retry counts (slug → max retry observed).
+        self._project_retries: Dict[str, int] = {}
+        # Rolling review scores (most recent first cap at REVIEW_SCORE_WINDOW).
+        self._review_scores: Deque[float] = deque(maxlen=REVIEW_SCORE_WINDOW)
+        # Per-signature dedup map for proposal filing (sig → last-fired ts).
+        self._proposal_last_filed: Dict[str, float] = {}
+
+        # Subscribe to the events that drive threshold detection. These are
+        # all best-effort: handler is wrapped so a malformed event never
+        # raises into the bus.
+        try:
+            self.event_bus.subscribe(self._on_event_safely)
+        except Exception:
+            logger.exception("meta_agent: event subscription failed")
 
     async def start(self) -> None:
         """Start the meta-agent observation loop."""
@@ -97,7 +143,7 @@ class MetaAgent:
     async def _observe(self) -> None:
         """Collect system observations."""
         observation = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": _utcnow().isoformat(),
             "agent_count": 0,
             "task_queue_depth": 0,
             "failure_patterns": [],
@@ -122,13 +168,215 @@ class MetaAgent:
         if len(self._observation_window) > self._max_window:
             self._observation_window = self._observation_window[-self._max_window:]
 
+        # Evaluate threshold-based proposal triggers each tick.
+        try:
+            self._check_thresholds()
+        except Exception:
+            logger.exception("meta_agent: _check_thresholds failed")
+
+    # ------------------------------------------------------------------
+    # Event-driven counters for threshold detection
+    # ------------------------------------------------------------------
+
+    def _on_event_safely(self, event: Event) -> None:
+        """Defensive wrapper — event subscribers must never raise."""
+        try:
+            self._on_event(event)
+        except Exception:
+            logger.exception("meta_agent: _on_event failed")
+
+    def _on_event(self, event: Event) -> None:
+        etype = getattr(event, "event_type", None)
+        payload = getattr(event, "payload", {}) or {}
+        source = getattr(event, "source", "")
+        now = time.time()
+
+        # 1) Track agent failures for the failure-rate threshold.
+        if etype in (EventType.TASK_FAILED, EventType.TASK_FAILED_FINAL):
+            agent_name = payload.get("agent") or source or "unknown"
+            dq = self._agent_failures.setdefault(agent_name, deque())
+            dq.append(now)
+            # Trim old entries outside the window.
+            cutoff = now - AGENT_FAILURE_WINDOW_SECONDS
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+
+        # 2) Track per-project retries. Retry count rides along the event
+        # payload; the project slug may be in payload["slug"] (set by Studio
+        # runner) or the input_data.
+        retry_count = payload.get("retry_count")
+        if isinstance(retry_count, int) and retry_count > 0:
+            slug = (
+                payload.get("slug")
+                or payload.get("project_slug")
+                or (payload.get("input_data") or {}).get("slug")
+            )
+            if slug:
+                prev = self._project_retries.get(slug, 0)
+                if retry_count > prev:
+                    self._project_retries[slug] = retry_count
+
+        # 3) Capture reviewer scores from TASK_COMPLETED events whose
+        # payload includes the reviewer's score.
+        if etype == EventType.TASK_COMPLETED:
+            output = payload.get("output") or {}
+            if isinstance(output, dict):
+                score = output.get("score")
+                # Reviewer publishes a numeric 0-100 score.
+                if isinstance(score, (int, float)) and 0 <= score <= 100:
+                    # Heuristic: only count it as a review score if the source
+                    # agent looks like a reviewer (or output carries a verdict).
+                    if "verdict" in output or "review" in str(source).lower():
+                        self._review_scores.append(float(score))
+
+    # ------------------------------------------------------------------
+    # Threshold-based proposal filing
+    # ------------------------------------------------------------------
+
+    def _check_thresholds(self) -> None:
+        """Evaluate threshold rules and file feature proposals when crossed."""
+        # Rule A: agent failed >AGENT_FAILURE_THRESHOLD in last hour.
+        now = time.time()
+        cutoff = now - AGENT_FAILURE_WINDOW_SECONDS
+        # Drop dedup entries older than 24h so _proposal_last_filed doesn't
+        # grow forever as new signatures are minted.
+        dedup_cutoff = now - 86400
+        stale_sigs = [s for s, ts in self._proposal_last_filed.items() if ts < dedup_cutoff]
+        for s in stale_sigs:
+            self._proposal_last_filed.pop(s, None)
+        for agent_name, dq in list(self._agent_failures.items()):
+            # Trim old entries first.
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+            # Drop empty deques so _agent_failures doesn't accumulate
+            # entries for agents that haven't failed recently.
+            if not dq:
+                self._agent_failures.pop(agent_name, None)
+                continue
+            if len(dq) > AGENT_FAILURE_THRESHOLD:
+                self._file_threshold_proposal(
+                    signature=f"agent_failures:{agent_name}",
+                    title=f"Investigate {agent_name} repeated failures",
+                    summary=(
+                        f"Agent '{agent_name}' has failed {len(dq)} times in the "
+                        f"last hour (threshold {AGENT_FAILURE_THRESHOLD})."
+                    ),
+                    detail=(
+                        f"_MetaAgent threshold trip._\n\n"
+                        f"- agent: `{agent_name}`\n"
+                        f"- recent failures (1h): **{len(dq)}**\n"
+                        f"- window: {AGENT_FAILURE_WINDOW_SECONDS}s\n\n"
+                        f"Investigate root cause: bad model, broken backend, "
+                        f"prompt regression, or a recurring input pattern."
+                    ),
+                    payload={
+                        "kind": "agent_repeated_failures",
+                        "agent": agent_name,
+                        "count": len(dq),
+                    },
+                )
+
+        # Rule B: project retried >PROJECT_RETRY_THRESHOLD times.
+        for slug, retries in list(self._project_retries.items()):
+            if retries > PROJECT_RETRY_THRESHOLD:
+                self._file_threshold_proposal(
+                    signature=f"project_retries:{slug}",
+                    title=f"Pattern: {slug} needs structural rethink",
+                    summary=(
+                        f"Project '{slug}' has been retried {retries} times "
+                        f"(threshold {PROJECT_RETRY_THRESHOLD}). The brief or "
+                        f"plan likely has a structural problem."
+                    ),
+                    detail=(
+                        f"_MetaAgent threshold trip._\n\n"
+                        f"- project: `{slug}`\n"
+                        f"- retries: **{retries}**\n\n"
+                        f"Repeated retries usually signal that the brief is "
+                        f"ambiguous, the chosen pipeline is mis-fit, or an "
+                        f"earlier stage is producing artifacts the next "
+                        f"stage can't consume. Worth a manual review."
+                    ),
+                    payload={
+                        "kind": "project_repeated_retries",
+                        "slug": slug,
+                        "retries": retries,
+                    },
+                )
+
+        # Rule C: avg review score across last N projects < floor.
+        if len(self._review_scores) >= REVIEW_SCORE_WINDOW:
+            avg = sum(self._review_scores) / len(self._review_scores)
+            if avg < REVIEW_SCORE_FLOOR:
+                self._file_threshold_proposal(
+                    signature="review_score_low",
+                    title="Reviewer scoring trending low — investigate brief quality",
+                    summary=(
+                        f"Average review score over the last "
+                        f"{REVIEW_SCORE_WINDOW} projects is {avg:.1f} "
+                        f"(floor {REVIEW_SCORE_FLOOR:.0f})."
+                    ),
+                    detail=(
+                        f"_MetaAgent threshold trip._\n\n"
+                        f"- window: last {REVIEW_SCORE_WINDOW} reviews\n"
+                        f"- average score: **{avg:.1f}/100**\n"
+                        f"- recent scores: {list(self._review_scores)}\n\n"
+                        f"Either the briefs are getting harder, the brief "
+                        f"quality has dropped, or the reviewer's heuristic "
+                        f"weights need recalibration."
+                    ),
+                    payload={
+                        "kind": "review_score_trending_low",
+                        "avg": avg,
+                        "samples": list(self._review_scores),
+                    },
+                )
+
+    def _file_threshold_proposal(
+        self,
+        *,
+        signature: str,
+        title: str,
+        summary: str,
+        detail: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        """File a 'feature' proposal with a per-signature dedup cooldown."""
+        now = time.time()
+        last = self._proposal_last_filed.get(signature, 0.0)
+        if now - last < PROPOSAL_DEDUP_SECONDS:
+            return
+        try:
+            from skyn3t.cortex import get_store
+            get_store().create(
+                kind="feature",
+                title=title,
+                summary=summary,
+                detail=detail,
+                payload=payload,
+                source="meta_agent:thresholds",
+            )
+            self._proposal_last_filed[signature] = now
+            self._actions.append({
+                "type": "threshold_proposal_filed",
+                "signature": signature,
+                "title": title,
+                "timestamp": _utcnow().isoformat(),
+                "result": "filed",
+            })
+            if len(self._actions) > self._max_actions:
+                self._actions = self._actions[-self._max_actions:]
+        except Exception:
+            logger.exception(
+                "meta_agent: failed to file threshold proposal %s", signature
+            )
+
     # ------------------------------------------------------------------
     # Think
     # ------------------------------------------------------------------
 
     async def _think(self) -> List[Dict[str, Any]]:
         """Generate improvement hypotheses from observations."""
-        hypotheses = []
+        hypotheses: List[Dict[str, Any]] = []
 
         if not self._observation_window:
             return hypotheses
@@ -201,7 +449,7 @@ class MetaAgent:
             "type": action_type,
             "confidence": hypothesis.get("confidence", 0.5),
             "reason": hypothesis.get("reason", ""),
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": _utcnow().isoformat(),
             "result": "pending",
         }
 

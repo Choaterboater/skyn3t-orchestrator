@@ -5,16 +5,11 @@ network controls, and syscall logging for agent command execution.
 """
 
 import asyncio
-import fcntl
-import hashlib
 import logging
 import os
 import platform
-import re
 import resource
 import shutil
-import signal
-import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -411,7 +406,7 @@ class Sandbox:
                 "file_size_mb": self.config.max_file_size_mb,
             }
 
-        except Exception as e:
+        except Exception:
             execution_time_ms = (time.monotonic() - start_time) * 1000
             raise
         finally:

@@ -113,15 +113,12 @@ class DocumentProcessor:
         """Chunk Python code by functions and classes."""
         chunks = []
         current_chunk = []
-        indent_level = 0
 
         for line in code.split("\n"):
             stripped = line.lstrip()
             if not stripped:
                 current_chunk.append(line)
                 continue
-
-            current_indent = len(line) - len(stripped)
 
             # Detect function/class definitions
             if stripped.startswith(("def ", "class ", "async def ")):
@@ -131,10 +128,9 @@ class DocumentProcessor:
                         # Split large chunks
                         subchunks = self._chunk_text(chunk_text)
                         chunks.extend(subchunks)
-                    else:
-                        chunks.append(chunk_text)
+                else:
+                    chunks.append(chunk_text)
                 current_chunk = [line]
-                indent_level = current_indent
             else:
                 current_chunk.append(line)
 

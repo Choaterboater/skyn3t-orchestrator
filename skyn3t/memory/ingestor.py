@@ -7,7 +7,10 @@ and stored in the vector database. This means agents can semantically recall
 
 import asyncio
 import hashlib
+import json
 import logging
+import os
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from skyn3t.core.events import Event, EventBus, EventType
@@ -34,12 +37,21 @@ class ExperienceIngestor:
         event_bus: Optional[EventBus] = None,
         rag_engine: Optional[RAGEngine] = None,
         memory_store: Optional[Any] = None,
+        seen_hashes_path: Optional[Path] = None,
     ):
         self.event_bus = event_bus
         self.rag = rag_engine or RAGEngine()
         self._memory = memory_store
         self._running = False
-        self._seen_hashes: set[str] = set()
+        # Persist seen hashes to disk so a restart doesn't re-ingest every
+        # task experience the agent has ever processed (which both wastes
+        # vector-DB writes and pollutes search results with duplicates).
+        self._seen_hashes_path = (
+            seen_hashes_path or Path("data/.ingestor_seen_hashes.json")
+        )
+        self._seen_hashes: set[str] = self._load_seen_hashes()
+        # Track when we last persisted so we batch writes (every 32 adds).
+        self._unflushed_adds = 0
 
         if event_bus:
             event_bus.subscribe(self._on_task_completed, EventType.TASK_COMPLETED)
@@ -141,7 +153,7 @@ class ExperienceIngestor:
             metadata=metadata,
         )
         if embedding_id:
-            self._seen_hashes.add(content_hash)
+            self._record_seen(content_hash)
             await self._persist_doc(title, content, agent_name, doc_type, metadata, embedding_id)
         return embedding_id
 
@@ -176,7 +188,7 @@ class ExperienceIngestor:
             metadata=metadata,
         )
         if embedding_id:
-            self._seen_hashes.add(content_hash)
+            self._record_seen(content_hash)
             await self._persist_doc(title, content, "reflection", "lesson", metadata, embedding_id)
         return embedding_id
 
@@ -213,7 +225,7 @@ class ExperienceIngestor:
             metadata=metadata,
         )
         if embedding_id:
-            self._seen_hashes.add(content_hash)
+            self._record_seen(content_hash)
             await self._persist_doc(title, content, agent_name, "insight", metadata, embedding_id)
         return embedding_id
 
@@ -249,7 +261,7 @@ class ExperienceIngestor:
             metadata=metadata,
         )
         if embedding_id:
-            self._seen_hashes.add(content_hash)
+            self._record_seen(content_hash)
             await self._persist_doc(title, content, "reflection", "pattern", metadata, embedding_id)
         return embedding_id
 
@@ -303,6 +315,35 @@ class ExperienceIngestor:
     def _hash(self, content: str) -> str:
         """Create a content hash for deduplication."""
         return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+
+    def _load_seen_hashes(self) -> set[str]:
+        """Restore the seen-hashes set from disk, if any."""
+        try:
+            if self._seen_hashes_path.exists():
+                data = json.loads(self._seen_hashes_path.read_text())
+                if isinstance(data, list):
+                    return set(str(h) for h in data)
+        except Exception:
+            logger.exception("seen_hashes load failed")
+        return set()
+
+    def _persist_seen_hashes(self) -> None:
+        """Atomically write the seen-hashes set to disk."""
+        try:
+            self._seen_hashes_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._seen_hashes_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(sorted(self._seen_hashes)))
+            os.replace(tmp, self._seen_hashes_path)
+            self._unflushed_adds = 0
+        except Exception:
+            logger.exception("seen_hashes persist failed")
+
+    def _record_seen(self, content_hash: str) -> None:
+        """Add a hash to the seen set; flush every 32 adds."""
+        self._seen_hashes.add(content_hash)
+        self._unflushed_adds += 1
+        if self._unflushed_adds >= 32:
+            self._persist_seen_hashes()
 
     async def _is_duplicate(self, content_hash: str) -> bool:
         """Check if content with this hash was already ingested this session."""

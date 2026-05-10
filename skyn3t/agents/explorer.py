@@ -1,5 +1,8 @@
 from __future__ import annotations
-import asyncio, json, logging, os, time
+
+import json
+import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -56,13 +59,23 @@ class ExplorerAgent(BaseAgent):
     # state ---
     def _load_state(self) -> Dict[str, Any]:
         if self.state_path.exists():
-            try: return json.loads(self.state_path.read_text())
-            except Exception: pass
+            try:
+                data = json.loads(self.state_path.read_text())
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                logger.debug(
+                    "explorer state parse failed at %s",
+                    self.state_path,
+                    exc_info=True,
+                )
         return {"last_run_ts": 0, "today_count": 0, "today_date": ""}
 
     def _save_state(self) -> None:
-        try: self.state_path.write_text(json.dumps(self._state, indent=2))
-        except Exception: logger.exception("save state failed")
+        try:
+            self.state_path.write_text(json.dumps(self._state, indent=2))
+        except Exception:
+            logger.exception("save state failed")
 
     def _check_budget(self) -> Optional[str]:
         now = time.time()
@@ -79,12 +92,16 @@ class ExplorerAgent(BaseAgent):
         return None
 
     # main ---
-    async def execute(self, task: TaskRequest) -> TaskResult:
+    async def execute(self, task: TaskRequest, stdin_data: str | None = None) -> TaskResult:
         if hasattr(self, "think"):
             await self.think(f"explorer starting: {task.title or task.task_id}")
         gate = self._check_budget()
         if gate:
-            return TaskResult(success=True, output={"skipped": True, "reason": gate})
+            return TaskResult(
+                task_id=task.task_id,
+                success=True,
+                output={"skipped": True, "reason": gate},
+            )
 
         mode = (task.input_data or {}).get("mode", "gap_scan")
         proposals_made: List[Dict[str, Any]] = []
@@ -97,16 +114,27 @@ class ExplorerAgent(BaseAgent):
                 proposals_made = await self._gap_scan(task)
         except Exception as e:
             logger.exception("explorer failed")
-            return TaskResult(success=False, error=str(e))
+            return TaskResult(task_id=task.task_id, success=False, error=str(e))
 
         self._state["last_run_ts"] = time.time()
         self._state["today_count"] = self._state.get("today_count", 0) + len(proposals_made)
         self._save_state()
         if hasattr(self, "share_learning"):
-            try: await self.share_learning(f"explorer: {len(proposals_made)} proposals", scope="cortex")
-            except Exception: pass
-        return TaskResult(success=True, output={"proposals": proposals_made,
-                                                "summary": f"filed {len(proposals_made)} proposals (mode={mode})"})
+            try:
+                await self.share_learning(
+                    f"explorer: {len(proposals_made)} proposals",
+                    scope="cortex",
+                )
+            except Exception:
+                logger.debug("share_learning(explorer) failed", exc_info=True)
+        return TaskResult(
+            task_id=task.task_id,
+            success=True,
+            output={
+                "proposals": proposals_made,
+                "summary": f"filed {len(proposals_made)} proposals (mode={mode})",
+            },
+        )
 
     async def _gap_scan(self, task: TaskRequest) -> List[Dict[str, Any]]:
         topics = list(DEFAULT_TOPICS)

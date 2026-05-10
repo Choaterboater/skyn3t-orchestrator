@@ -1,8 +1,8 @@
-"""Writer Agent - templated copy/content generator.
+"""Writer Agent - copy/content generator.
 
-LLM-free. Picks a template by ``kind`` and interpolates the brief plus a
-tone-specific adjective bank. Future LLM variants can subclass and override
-``_render``.
+Tries the configured LLM first for brief-aware content. Falls back to the
+deterministic templates below (templated by ``kind`` with a tone-specific
+adjective bank) when the LLM is unavailable or returns a stub.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ from typing import Any, Dict, List, Optional
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
-
 
 _TONE_ADJECTIVES: Dict[str, List[str]] = {
     "professional": ["reliable", "rigorous", "measured", "trusted", "disciplined"],
@@ -24,20 +23,51 @@ _TONE_ADJECTIVES: Dict[str, List[str]] = {
 _LENGTH_TARGET: Dict[str, int] = {"short": 1, "medium": 2, "long": 3}
 
 
+# Per-kind extra instructions appended to the role prompt for LLM generation.
+_KIND_INSTRUCTIONS: Dict[str, str] = {
+    "readme": (
+        "Include: a clear title, a one-paragraph description grounded in the brief, "
+        "an Install section with realistic commands, a Usage section with concrete "
+        "examples, a Contributing section, and a License section. Do not include "
+        "placeholder badges unless they make sense."
+    ),
+    "landing_copy": (
+        "Include: a strong headline, a supporting subheadline, exactly 3 benefit "
+        "bullets that name concrete outcomes, a short social-proof beat, and a "
+        "clear primary CTA. Keep it tight - no filler."
+    ),
+    "email": (
+        "Include: a Subject line, a Preview line, a personalized greeting, 2-3 short "
+        "paragraphs grounded in the brief, a single clear CTA, and a signoff. "
+        "Use {first_name} / {sender_name} placeholders."
+    ),
+    "blog": (
+        "Include: a title, a hook intro paragraph, 3-5 H2 sections with substantive "
+        "content (not placeholders) that draw on the brief, and a closing paragraph "
+        "with a CTA. Avoid generic filler - make every section earn its place."
+    ),
+    "spec": (
+        "Include: Goals, Non-goals, Requirements (numbered, e.g. R1/R2/...), "
+        "Milestones with rough timelines, and Open Questions. Each requirement "
+        "should be specific to the brief, not generic."
+    ),
+}
+
+
 class WriterAgent(BaseAgent):
     """Produces a single ``<kind>.md`` artifact from a brief."""
 
     def __init__(
         self,
         name: str = "writer",
-        event_bus: EventBus = None,
+        event_bus: EventBus | None = None,
         config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             name=name,
             agent_type="writer",
             provider="local",
-            event_bus=event_bus,
+            event_bus=event_bus or EventBus(),
             config=config,
         )
         self.add_capability(AgentCapability(
@@ -62,7 +92,7 @@ class WriterAgent(BaseAgent):
     async def health_check(self) -> bool:
         return True
 
-    async def execute(self, task: TaskRequest) -> TaskResult:
+    async def execute(self, task: TaskRequest, stdin_data: str | None = None) -> TaskResult:
         await self.think(f"{self.name} starting on {task.task_id}")
 
         data = task.input_data or {}
@@ -89,7 +119,23 @@ class WriterAgent(BaseAgent):
         }.get(kind, self._render_readme)
 
         adjectives = _TONE_ADJECTIVES[tone]
-        body = renderer(brief, adjectives, length)
+        fallback_body = renderer(brief, adjectives, length)
+
+        # STEP 0: try LLM, fall back to the deterministic template.
+        kind_instructions = _KIND_INSTRUCTIONS.get(kind, _KIND_INSTRUCTIONS["readme"])
+        role_prompt = (
+            "You are a sharp copywriter. "
+            f"Tone: {tone}. Length: {length}. "
+            f"Produce a {kind} document in markdown. "
+            "Be specific and grounded - refer to concrete details from the brief. "
+            "Avoid corporate filler. "
+            f"{kind_instructions}"
+        )
+        body = await self._llm_generate(
+            role_prompt=role_prompt,
+            brief=brief,
+            fallback=fallback_body,
+        )
         out_path = artifact_dir / f"{kind}.md"
         out_path.write_text(body, encoding="utf-8")
         await self.think(f"wrote {out_path.name}")
@@ -206,7 +252,7 @@ class WriterAgent(BaseAgent):
             "",
             "---",
             "",
-            f"Hi {{first_name}},",
+            "Hi {first_name},",
             "",
             f"I'm reaching out because {title} just shipped. {brief}",
             "",
@@ -234,7 +280,7 @@ class WriterAgent(BaseAgent):
             f"_{brief}_",
             "",
             f"There's a quiet shift happening in how teams ship. The {a1} approach",
-            f"that worked at 10 people falls apart at 50. We've been thinking about",
+            "that worked at 10 people falls apart at 50. We've been thinking about",
             f"this for a while, and {title} is what came out the other side.",
             "",
         ]
@@ -304,8 +350,40 @@ class WriterAgent(BaseAgent):
     @staticmethod
     def _verb_for(brief: str) -> str:
         b = brief.lower()
-        if any(k in b for k in ("ship", "deploy")): return "ship faster"
-        if any(k in b for k in ("learn", "study")): return "learn smarter"
-        if any(k in b for k in ("track", "monitor")): return "stay on top of things"
-        if any(k in b for k in ("sell", "market")): return "grow revenue"
+        if any(k in b for k in ("ship", "deploy")):
+            return "ship faster"
+        if any(k in b for k in ("learn", "study")):
+            return "learn smarter"
+        if any(k in b for k in ("track", "monitor")):
+            return "stay on top of things"
+        if any(k in b for k in ("sell", "market")):
+            return "grow revenue"
         return "get more done"
+
+    async def _llm_generate(self, *, role_prompt: str, brief: str, fallback: str) -> str:
+        """Ask the configured LLM for a markdown artifact.
+
+        Returns the LLM output, or the deterministic ``fallback`` if the LLM is
+        unavailable / returned a stub.
+        """
+        try:
+            client = self.get_llm() if hasattr(self, "get_llm") else None
+            if client is None:
+                from skyn3t.adapters import LLMClient
+                client = LLMClient(
+                    default_model=self.config.get("model"),
+                    backend=self.config.get("backend"),
+                    event_bus=self.event_bus,
+                    caller_name=self.name,
+                )
+            prompt = (
+                f"{role_prompt}\n\nBrief from user:\n{brief}\n\n"
+                "Produce ONLY the markdown content for the artifact. "
+                "No code fences, no preamble, no commentary."
+            )
+            out = await client.complete(prompt, max_tokens=2500, temperature=0.6)
+            if out and "[deterministic-stub]" not in out and len(out.strip()) > 80:
+                return out.strip()
+        except Exception:
+            pass
+        return fallback
