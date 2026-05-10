@@ -1,23 +1,20 @@
 # Brainstorm
-_generated: 2026-05-08T22:36:48.449992+00:00_
+_generated: 2026-05-10T15:44:18.190964+00:00_
 
 ## Brief
 > (no brief provided - produce an exploration of likely directions)
 
-## Candidate direction (rotated, unbiased)
-**Design a lightweight, local-first daily review agent that reads my last 24 hours of Gmail threads, calendar holds, and Drive edits, then surfaces the three decisions I've been quietly avoiding rather than the tasks I've already triaged.**
+## Your direction (verbatim)
+**(no brief provided - produce an exploration of likely directions)**
 
-_Selected by deterministic rotation across panelists; no model arbitrates._
+_This is what you wrote. Downstream agents must work from this, not from agent rephrasings._
 
-## Other candidate directions
+## Optional alternative angles (advisory only — do not replace your direction)
 - Take the unfashionable position and steel-man it.
 - Treat the deliverable as a kit of small pieces that can be reassembled.
 - What part can be automated end-to-end with zero human in the loop?
 - Map the user's existing workflow and slot in alongside it.
 - Reframe as a user job: 'When I the user's current workflow, I want to creating (no brief provided - produce, so I can they can move faster with less friction.'
-
-## Panel contributions
-- **claude-opus** — Design a lightweight, local-first daily review agent that reads my last 24 hours of Gmail threads, calendar holds, and Drive edits, then surfaces the three decisions I've been quietly avoiding rather than the tasks I've already triaged.
 
 ## Jobs-to-be-done framing
 When the user encounters the situation behind '(no brief provided - produce an exploration of likely directions)', they want to accomplish (no brief provided - produce, so they can reduce time, friction, or risk.
