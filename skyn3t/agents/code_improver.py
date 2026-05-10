@@ -47,7 +47,8 @@ class CodeImproverAgent(BaseAgent):
     ``kind=CODE_PATCH_RESULT`` so the dashboard can show a toast.
     """
 
-    def __init__(self, name: str = "code_improver", *, event_bus: Optional[EventBus] = None,
+    def __init__(self, name: str = "code_improver", *,
+                 event_bus: Optional[EventBus] = None,
                  config: Optional[Dict[str, Any]] = None):
         super().__init__(name=name, agent_type="code_improver", provider="local",
                          event_bus=event_bus or EventBus(), config=config)
