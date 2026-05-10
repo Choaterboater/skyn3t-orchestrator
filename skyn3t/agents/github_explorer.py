@@ -15,17 +15,17 @@ class GitHubExplorerAgent(BaseAgent):
     def __init__(
         self,
         name: str = "github_explorer",
-        event_bus: EventBus = None,
+        event_bus: EventBus | None = None,
         config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             name=name,
             agent_type="github_explorer",
             provider="github",
-            event_bus=event_bus,
+            event_bus=event_bus or EventBus(),
             config=config,
         )
-        self.github_client = None
+        self.github_client: Any = None
         self.add_capability(
             AgentCapability(
                 name="repo_analysis",
@@ -89,7 +89,7 @@ class GitHubExplorerAgent(BaseAgent):
         except Exception:
             return False
 
-    async def execute(self, task: TaskRequest) -> TaskResult:
+    async def execute(self, task: TaskRequest, stdin_data: str | None = None) -> TaskResult:
         """Execute a GitHub exploration task."""
         task_type = task.input_data.get("task_type", "repo_analysis")
 
@@ -327,14 +327,14 @@ This project is licensed under the MIT License.
                 "number": issue.number,
                 "title": issue.title,
                 "state": issue.state,
-                "labels": [l.name for l in issue.labels],
+                "labels": [label.name for label in issue.labels],
                 "created_at": issue.created_at.isoformat(),
                 "user": issue.user.login,
                 "comments": issue.comments,
             })
 
         # Group by labels
-        label_counts = {}
+        label_counts: Dict[str, int] = {}
         for issue in issue_list:
             for label in issue["labels"]:
                 label_counts[label] = label_counts.get(label, 0) + 1

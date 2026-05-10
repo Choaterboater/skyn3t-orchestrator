@@ -1,11 +1,14 @@
 from __future__ import annotations
-import asyncio, hashlib, logging, time
+
+import asyncio
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
+from skyn3t.cortex.review_utils import parse_review_markdown
 
 logger = logging.getLogger("skyn3t.agents.project_memory")
 
@@ -56,13 +59,14 @@ class ProjectMemoryAgent(BaseAgent):
         except Exception:
             logger.exception("on_event failed")
 
-    async def execute(self, task: TaskRequest) -> TaskResult:
+    async def execute(self, task: TaskRequest, stdin_data: str | None = None) -> TaskResult:
         slug = (task.input_data or {}).get("slug")
         if not slug:
             return TaskResult(task_id=task.task_id, success=False, error="missing slug")
         try:
             await self.think(f"ingesting project {slug}")
-        except Exception: pass
+        except Exception:
+            logger.debug("think() failed during ingest start", exc_info=True)
         result = await self._ingest_project(slug, task.input_data or {})
         return TaskResult(task_id=task.task_id, success=True, output=result)
 
@@ -76,8 +80,10 @@ class ProjectMemoryAgent(BaseAgent):
 
         # 1. ingest each artifact
         for p in sorted(root.rglob("*")):
-            if any(part in SKIP_NAMES for part in p.parts): continue
-            if not p.is_file(): continue
+            if any(part in SKIP_NAMES for part in p.parts):
+                continue
+            if not p.is_file():
+                continue
             if p.suffix.lower() not in INGEST_EXTS:
                 files_skipped.append({"path": str(p.relative_to(root)), "reason": "extension"})
                 continue
@@ -102,8 +108,10 @@ class ProjectMemoryAgent(BaseAgent):
             }
             embedding_id = await self._add_to_rag(content=text, metadata=metadata)
             files_ingested.append({"path": metadata["path"], "embedding_id": embedding_id, "bytes": size})
-            try: await self.think(f"ingested {metadata['path']}")
-            except Exception: pass
+            try:
+                await self.think(f"ingested {metadata['path']}")
+            except Exception:
+                logger.debug("think() failed during per-file ingest", exc_info=True)
 
         # 2. write a project-level summary lesson
         summary = self._build_summary(slug, root, meta, files_ingested)
@@ -124,13 +132,15 @@ class ProjectMemoryAgent(BaseAgent):
                          "scope": "project_memory",
                          "slug": slug, "summary_id": summary_id},
             ))
-        except Exception: pass
+        except Exception:
+            logger.debug("learning event publish failed", exc_info=True)
 
         try:
             await self.share_learning(
                 f"project_memory: ingested {len(files_ingested)} files from {slug}",
                 scope="rag")
-        except Exception: pass
+        except Exception:
+            logger.debug("share_learning(rag) failed", exc_info=True)
 
         return {
             "slug": slug,
@@ -154,19 +164,17 @@ class ProjectMemoryAgent(BaseAgent):
                 import json
                 d = json.loads(proj_json.read_text())
                 brief = d.get("brief") or ""
-            except Exception: pass
+            except Exception:
+                logger.debug("project.json parse failed for %s", slug, exc_info=True)
 
         # pull review verdict if review.md exists
         verdict = ""
         review = root / "review.md"
         if review.exists():
             try:
-                t = review.read_text(encoding="utf-8")
-                for line in t.splitlines():
-                    if "verdict" in line.lower():
-                        verdict = line.strip()
-                        break
-            except Exception: pass
+                verdict, _ = parse_review_markdown(review.read_text(encoding="utf-8"))
+            except Exception:
+                logger.debug("review.md scan failed for %s", slug, exc_info=True)
 
         # pull primary direction from brainstorm.md if present
         direction = ""
@@ -177,11 +185,13 @@ class ProjectMemoryAgent(BaseAgent):
                 grab = False
                 for line in t.splitlines():
                     if line.startswith("## ") and "direction" in line.lower():
-                        grab = True; continue
+                        grab = True
+                        continue
                     if grab and line.strip().startswith("**"):
                         direction = line.strip().strip("*").strip()
                         break
-            except Exception: pass
+            except Exception:
+                logger.debug("brainstorm.md scan failed for %s", slug, exc_info=True)
 
         artifacts_summary = "\n".join(f"- {f['path']}" for f in files_ingested[:30])
         return (
@@ -200,10 +210,14 @@ class ProjectMemoryAgent(BaseAgent):
             return None
         try:
             if hasattr(self.rag, "add_knowledge_one"):
-                return await self.rag.add_knowledge_one(content=content, metadata=metadata)
+                embedding_id = await self.rag.add_knowledge_one(
+                    content=content,
+                    metadata=metadata,
+                )
+                return embedding_id if isinstance(embedding_id, str) else None
             if hasattr(self.rag, "add_knowledge"):
                 ids = await self.rag.add_knowledge(content=content, metadata=metadata)
-                return (ids[0] if isinstance(ids, list) and ids else None)
+                return str(ids[0]) if isinstance(ids, list) and ids else None
         except Exception:
             logger.exception("rag add failed")
         return None

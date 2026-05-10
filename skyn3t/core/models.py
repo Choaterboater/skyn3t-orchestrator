@@ -7,10 +7,8 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 from uuid import uuid4
 
 from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Integer, String, Text, func
-from sqlalchemy.ext.asyncio import AsyncAttrs, AsyncSession, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
-
-from skyn3t.config.settings import get_settings
+from sqlalchemy.ext.asyncio import AsyncAttrs, AsyncSession
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 class Base(AsyncAttrs, DeclarativeBase):

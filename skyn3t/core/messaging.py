@@ -10,8 +10,9 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+import weakref
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
+from typing import Any, Awaitable, Callable, Dict, List, MutableMapping, Optional, Union
 
 from skyn3t.core.events import Event, EventBus, EventType
 
@@ -150,7 +151,10 @@ class MessageBus:
 # ----------------------------------------------------------------------
 # Default-bus singleton (keyed by EventBus identity)
 # ----------------------------------------------------------------------
-_default_buses: Dict[int, MessageBus] = {}
+# Use a WeakKeyDictionary so an EventBus that goes out of scope can be GC'd
+# along with its MessageBus. The previous int-keyed dict stored stale entries
+# whose id() could be reused for a different EventBus, returning the wrong bus.
+_default_buses: "MutableMapping[EventBus, MessageBus]" = weakref.WeakKeyDictionary()
 
 
 def get_default_bus(event_bus: EventBus) -> MessageBus:
@@ -159,9 +163,8 @@ def get_default_bus(event_bus: EventBus) -> MessageBus:
     The same EventBus instance always yields the same MessageBus so that
     every agent sharing that event bus also shares its messaging fabric.
     """
-    key = id(event_bus)
-    bus = _default_buses.get(key)
+    bus = _default_buses.get(event_bus)
     if bus is None:
         bus = MessageBus(event_bus)
-        _default_buses[key] = bus
+        _default_buses[event_bus] = bus
     return bus

@@ -101,7 +101,7 @@ class SelfTuningEngine:
             urgent = bool(set(current_patterns) & self._urgent_patterns)
 
             # Count similar suggestions
-            suggestion_counts = defaultdict(int)
+            suggestion_counts: Dict[tuple[Any, Any, Any], int] = defaultdict(int)
             for p in pending:
                 sugg = p["suggestion"]
                 key = (sugg.get("type"), sugg.get("issue"), sugg.get("advice"))
@@ -163,7 +163,7 @@ class SelfTuningEngine:
         self, agent_name: str, patterns: List[str]
     ) -> List[Dict[str, Any]]:
         """Derive safe config adjustments from patterns."""
-        adjustments = []
+        adjustments: List[Dict[str, Any]] = []
         pattern_set = set(patterns)
 
         if "rate_limit" in pattern_set:

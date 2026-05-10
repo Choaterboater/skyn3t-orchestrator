@@ -4,11 +4,13 @@ import asyncio
 import inspect
 import logging
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
-from uuid import UUID, uuid4
+from uuid import uuid4
 
+from skyn3t.core.event_context import current_event_correlation_id, merge_event_payload
 from skyn3t.core.events import Event, EventBus, EventType
 from skyn3t.observability.metrics import get_collector
 from skyn3t.observability.tracing import SpanStatus, get_tracer
@@ -43,6 +45,10 @@ class TaskRequest:
     session_id: Optional[str] = None
     context_id: Optional[str] = None
     required_memory: List[str] = field(default_factory=list)
+    # Optional caller-supplied key for deduping retried submissions. If set,
+    # the orchestrator will return the prior task_id when it sees the same
+    # key within the dedup TTL instead of starting a duplicate task.
+    idempotency_key: Optional[str] = None
 
 
 @dataclass
@@ -81,20 +87,29 @@ class BaseAgent(ABC):
         self.metadata: Dict[str, Any] = {}
         self._lazy_task_queue: Optional[asyncio.Queue[TaskRequest]] = None
         self._current_task: Optional[TaskRequest] = None
+        self._current_task_started_at: Optional[datetime] = None
         self._running = False
         self._task_processor: Optional[asyncio.Task] = None
         self._health_checks: int = 0
         self._errors: List[Dict[str, Any]] = []
         self._max_errors = 10
         self.last_output: str = ""
-        self._results: Dict[str, TaskResult] = {}
+        # Bounded LRU. Without a cap, an agent that has run for weeks holds
+        # every result it has ever produced in memory.
+        self._results: "OrderedDict[str, TaskResult]" = OrderedDict()
+        self._results_max = 200
         self._enabled: bool = True
         self._llm = None
 
     @property
     def _task_queue(self) -> "asyncio.Queue[TaskRequest]":
         if self._lazy_task_queue is None:
-            self._lazy_task_queue = asyncio.Queue()
+            try:
+                from skyn3t.config.settings import get_settings
+                maxsize = int(get_settings().max_queue_depth or 0)
+            except Exception:
+                maxsize = 0
+            self._lazy_task_queue = asyncio.Queue(maxsize=maxsize)
         return self._lazy_task_queue
 
     @abstractmethod
@@ -121,6 +136,12 @@ class BaseAgent(ABC):
     async def shutdown(self) -> None:
         """Shutdown the agent gracefully."""
         self._running = False
+        # Wake the processor immediately so it observes _running=False
+        # without waiting for a queue item or timeout.
+        try:
+            self._task_queue.put_nowait(None)  # type: ignore[arg-type]
+        except Exception:
+            pass
         if self._task_processor:
             self._task_processor.cancel()
             try:
@@ -156,7 +177,39 @@ class BaseAgent(ABC):
                 )
             )
             return
-        await self._task_queue.put(task)
+        # Backpressure: if the queue has a maxsize and is full, reject rather
+        # than buffer (which can OOM under a flood). The orchestrator's
+        # fallback path can pick a different agent.
+        q = self._task_queue
+        if q.maxsize and q.full():
+            self.event_bus.publish(
+                Event(
+                    event_type=EventType.QUEUE_BACKPRESSURE_REJECT,
+                    source=self.name,
+                    payload={
+                        "task_id": task.task_id,
+                        "queue_size": q.qsize(),
+                        "queue_max": q.maxsize,
+                    },
+                    correlation_id=task.task_id,
+                )
+            )
+            self.event_bus.publish(
+                Event(
+                    event_type=EventType.TASK_FAILED,
+                    source=self.name,
+                    payload={
+                        "task_id": task.task_id,
+                        "error": (
+                            f"agent '{self.name}' queue full "
+                            f"({q.qsize()}/{q.maxsize})"
+                        ),
+                    },
+                    correlation_id=task.task_id,
+                )
+            )
+            return
+        await q.put(task)
         collector = get_collector()
         collector.record_task_submitted(self.name, self.agent_type)
         collector.set_queue_depth(self.name, self.agent_type, self._task_queue.qsize())
@@ -176,8 +229,15 @@ class BaseAgent(ABC):
     async def start(self) -> None:
         """Start the agent's task processing loop."""
         self._running = True
-        await self.initialize()
-        self._task_processor = asyncio.create_task(self._process_tasks())
+        try:
+            await self.initialize()
+            self._task_processor = asyncio.create_task(self._process_tasks())
+        except Exception as exc:
+            self._running = False
+            self._task_processor = None
+            self.status = "offline"
+            self._record_error(str(exc), {"phase": "start"})
+            raise
         self.status = "idle"
         self.event_bus.publish(
             Event(
@@ -198,8 +258,14 @@ class BaseAgent(ABC):
         tracer = get_tracer()
         while self._running:
             try:
-                task = await asyncio.wait_for(self._task_queue.get(), timeout=1.0)
+                # Block until a task arrives (or shutdown sentinel `None` is enqueued).
+                # Using bare get() avoids the per-second wait_for cancellation that
+                # races with put_nowait and silently drops messages.
+                task = await self._task_queue.get()
+                if task is None or not self._running:
+                    break
                 self._current_task = task
+                self._current_task_started_at = datetime.now(timezone.utc)
                 self.status = "busy"
                 collector.set_active_tasks(self.name, 1)
                 collector.set_queue_depth(self.name, self.agent_type, self._task_queue.qsize())
@@ -249,6 +315,9 @@ class BaseAgent(ABC):
                                 result.output.get("stdout", result.output)
                             )
                             self._results[task.task_id] = result
+                            # Evict oldest entries when over the cap.
+                            while len(self._results) > self._results_max:
+                                self._results.popitem(last=False)
                             collector.record_task_completed(
                                 self.name, self.agent_type, execution_time_sec
                             )
@@ -285,9 +354,24 @@ class BaseAgent(ABC):
 
                         if task.callback:
                             try:
-                                task.callback(result.output if result.success else {"error": result.error})
+                                cb_arg = result.output if result.success else {"error": result.error}
+                                cb_ret = task.callback(cb_arg)
+                                # If the callback is async, await it; otherwise the
+                                # coroutine would just leak as an unawaited object.
+                                if inspect.isawaitable(cb_ret):
+                                    await cb_ret
                             except Exception as e:
-                                print(f"Callback error: {e}")
+                                logger.exception(
+                                    "Callback error for task %s on agent %s",
+                                    task.task_id,
+                                    self.name,
+                                )
+                                result.metadata["callback_failed"] = True
+                                result.metadata["callback_error"] = str(e)
+                                self._record_error(
+                                    str(e),
+                                    {"task_id": task.task_id, "phase": "callback"},
+                                )
 
                     except Exception as e:
                         execution_time_sec = (
@@ -311,12 +395,11 @@ class BaseAgent(ABC):
                         )
 
                 self._current_task = None
+                self._current_task_started_at = None
                 self.status = "idle"
                 collector.set_active_tasks(self.name, 0)
                 collector.set_queue_depth(self.name, self.agent_type, self._task_queue.qsize())
 
-            except asyncio.TimeoutError:
-                continue
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -381,8 +464,8 @@ class BaseAgent(ABC):
             to_agent=to,
             kind=kind,
             content=content,
-            payload=payload or {},
-            correlation_id=correlation_id,
+            payload=merge_event_payload(payload),
+            correlation_id=current_event_correlation_id(correlation_id),
         )
         bus = get_default_bus(self.event_bus)
         await bus.send(msg)
@@ -393,7 +476,8 @@ class BaseAgent(ABC):
             Event(
                 event_type=EventType.AGENT_THOUGHT,
                 source=self.name,
-                payload={"line": line, "agent": self.name},
+                payload=merge_event_payload({"line": line, "agent": self.name}),
+                correlation_id=current_event_correlation_id(),
             )
         )
 
@@ -405,7 +489,8 @@ class BaseAgent(ABC):
             Event(
                 event_type=EventType.AGENT_LEARNING,
                 source=self.name,
-                payload={"lesson": lesson, "scope": scope, **meta},
+                payload=merge_event_payload({"lesson": lesson, "scope": scope, **meta}),
+                correlation_id=current_event_correlation_id(),
             )
         )
 
@@ -659,6 +744,8 @@ class BaseAgent(ABC):
                 self._llm = LLMClient(
                     default_model=self.config.get("model"),
                     backend=self.config.get("backend"),
+                    event_bus=self.event_bus,
+                    caller_name=self.name,
                 )
             except Exception:
                 self._llm = None
@@ -667,3 +754,84 @@ class BaseAgent(ABC):
     def get_llm(self):
         """Backward-compat accessor for ``self.llm``."""
         return self.llm
+
+    async def llm_complete(
+        self,
+        prompt: str,
+        *,
+        system: Optional[str] = None,
+        max_tokens: int = 1500,
+        temperature: float = 0.4,
+        timeout: Optional[float] = 60.0,
+        retries: int = 1,
+        fallback: str = "",
+    ) -> str:
+        """Run an LLM completion with shared retry+timeout policy.
+
+        Most agents had a near-identical block:
+
+            client = self.get_llm() or LLMClient(...)
+            try:
+                out = await client.complete(prompt, ...)
+                if out and "[deterministic-stub]" not in out:
+                    return out
+            except Exception:
+                pass
+            return fallback
+
+        That copy lived in ~10 files, each with a slightly different timeout
+        / retry / stub-detection policy. This helper centralizes it so an
+        agent that just wants "give me a real LLM response, else fall back"
+        can call ``await self.llm_complete(prompt, system=..., fallback=...)``.
+
+        On any failure (no client, exception, deterministic stub, empty,
+        timeout) returns ``fallback``. ``retries`` covers transient errors
+        only — a deterministic-stub response short-circuits without retry
+        because retrying won't change the outcome.
+        """
+        client = self.get_llm()
+        if client is None:
+            try:
+                from skyn3t.adapters import LLMClient
+                client = LLMClient(
+                    default_model=self.config.get("model"),
+                    backend=self.config.get("backend"),
+                    event_bus=self.event_bus,
+                    caller_name=self.name,
+                )
+            except Exception:
+                return fallback
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(max(1, retries + 1)):
+            try:
+                if timeout is not None:
+                    out = await asyncio.wait_for(
+                        client.complete(
+                            prompt,
+                            system=system,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                        ),
+                        timeout=timeout,
+                    )
+                else:
+                    out = await client.complete(
+                        prompt,
+                        system=system,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                    )
+                if not out or "[deterministic-stub]" in out:
+                    return fallback
+                return str(out)
+            except asyncio.TimeoutError as exc:
+                last_exc = exc
+            except Exception as exc:
+                last_exc = exc
+            # transient error — sleep with mild backoff before retrying
+            if attempt < retries:
+                await asyncio.sleep(min(2 ** attempt, 4))
+        if last_exc is not None:
+            logger.debug("llm_complete failed after retries: %s", last_exc)
+        return fallback

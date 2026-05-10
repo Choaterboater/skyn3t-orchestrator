@@ -1,9 +1,52 @@
 from __future__ import annotations
-import asyncio, logging, os
+
+import asyncio
+import logging
+import os
+import time
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, Optional
+
+from skyn3t.core.event_context import current_event_context, current_event_correlation_id
+from skyn3t.security.secrets import redact_text
 
 logger = logging.getLogger("skyn3t.adapters.llm_client")
+
+
+# Module-level fallback event bus. The first agent that creates an LLMClient
+# with an event_bus seeds this for all later ad-hoc constructions, so even
+# clients built outside the BaseAgent.llm path can publish LLM_EXCHANGE events.
+_default_event_bus = None
+
+# Module-level fallback RAG. Mirrors the event_bus pattern: the first agent
+# that creates an LLMClient with a `rag=` kwarg seeds this for all later
+# ad-hoc constructions, so provider-aware prompt augmentation works even when
+# callers don't thread RAG through every code path.
+_default_rag = None
+
+
+def _try_register_default(eb) -> None:
+    global _default_event_bus
+    if eb is not None and _default_event_bus is None:
+        _default_event_bus = eb
+
+
+def _try_register_default_rag(rag) -> None:
+    global _default_rag
+    if rag is not None and _default_rag is None:
+        _default_rag = rag
+
+
+def install_default_event_bus(bus) -> None:
+    """Explicit setter for the module-level fallback event bus."""
+    global _default_event_bus
+    _default_event_bus = bus
+
+
+def install_default_rag(rag) -> None:
+    """Explicit setter for the module-level fallback RAG instance."""
+    global _default_rag
+    _default_rag = rag
 
 
 @dataclass
@@ -44,24 +87,111 @@ class LLMClient:
     def __init__(self, *, default_model: Optional[str] = None,
                  backend: Optional[str] = None,
                  anthropic_api_key: Optional[str] = None,
-                 openrouter_api_key: Optional[str] = None):
+                 openrouter_api_key: Optional[str] = None,
+                 event_bus: Optional[Any] = None,
+                 caller_name: Optional[str] = None,
+                 rag: Optional[Any] = None):
         self.default_model = default_model or os.environ.get("SKYN3T_LLM_MODEL")
         self._backend_name = (backend or os.environ.get("SKYN3T_LLM_BACKEND") or "auto").lower()
         self._anthropic_key = anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY")
         self._openrouter_key = openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")
         self._impl = None  # lazy
+        # Seed module fallback if this is the first explicit bus we've seen.
+        _try_register_default(event_bus)
+        # Same pattern for RAG: first explicit instance becomes the fallback
+        # for any subsequent ad-hoc LLMClient constructions.
+        _try_register_default_rag(rag)
+        # Resolve final bus: explicit > module fallback. caller_name is
+        # used in published LLM_EXCHANGE events so dashboards can attribute
+        # prompts/responses to the requesting agent.
+        self._event_bus = event_bus or _default_event_bus
+        self._caller_name = caller_name
+        # Resolve final RAG: explicit > module fallback. Used by complete()
+        # to retrieve provider-aware doc snippets and prepend them to the
+        # system prompt.
+        self._rag = rag or _default_rag
+
+    async def aclose(self) -> None:
+        """Release any resources held by the backing implementation.
+
+        Some backends (notably OpenRouter) own an httpx.AsyncClient that
+        must be closed to avoid `Unclosed connection` warnings + connection
+        pool leaks. Safe to call multiple times.
+        """
+        impl = self._impl
+        if impl is None:
+            return
+        closer = getattr(impl, "aclose", None)
+        if closer is None:
+            return
+        try:
+            await closer()
+        except Exception:
+            logger.debug("LLMClient aclose failed", exc_info=True)
 
     async def complete(self, prompt: str, *, system: Optional[str] = None,
                        model: Optional[str] = None, max_tokens: int = 1500,
                        temperature: float = 0.4) -> str:
         req = LLMRequest(prompt=prompt, system=system, model=model or self.default_model,
                          max_tokens=max_tokens, temperature=temperature)
+        elapsed = 0.0
         try:
             impl = await self._get_impl()
-            return await impl.complete(req)
+            # Provider-aware augmentation: prepend retrieved docs notes to the
+            # system prompt so the active backend gets formatting hints tailored
+            # to its provider. Done after _get_impl() so self._backend_name has
+            # resolved out of "auto" if needed.
+            try:
+                from skyn3t.adapters.prompt_builder import augmentation_for
+                rag = self._rag if self._rag is not None else _default_rag
+                aug = await augmentation_for(self._backend_name, rag) if rag is not None else ""
+                if aug:
+                    req.system = aug + "\n\n" + req.system if req.system else aug
+            except Exception:
+                pass
+            start = time.monotonic()
+            out: str = await impl.complete(req)
+            elapsed = time.monotonic() - start
         except Exception as e:
             logger.warning("llm complete failed: %s", e)
             return self._fallback(req)
+
+        # Publish an LLM_EXCHANGE event for dashboards/observability. We
+        # truncate prompt/response to keep payloads compact; failures here
+        # must never break the LLM call so everything is wrapped in try/except.
+        if self._event_bus is not None:
+            try:
+                from skyn3t.core.events import Event, EventType
+                et = getattr(EventType, "LLM_EXCHANGE", None)
+                if et is not None:
+                    context = current_event_context()
+                    prompt_trunc = redact_text((req.prompt or "")[:2000])
+                    response_trunc = redact_text((out or "")[:2000])
+                    system_trunc = redact_text((req.system or "")[:500]) if req.system else ""
+                    self._event_bus.publish(Event(
+                        event_type=et,
+                        source=self._caller_name or "llm",
+                        payload={
+                            "agent": self._caller_name or "llm",
+                            "backend": self._backend_name,
+                            "model": req.model or self.default_model or "",
+                            "prompt": prompt_trunc,
+                            "response": response_trunc,
+                            "system": system_trunc,
+                            "duration_ms": int(elapsed * 1000),
+                            **{
+                                key: value
+                                for key, value in context.items()
+                                if key in {"project_slug", "project_stage", "project_template", "task_id"}
+                                and value is not None
+                            },
+                        },
+                        correlation_id=current_event_correlation_id(),
+                    ))
+            except Exception:
+                pass
+
+        return out
 
     @property
     def backend(self) -> str:
@@ -131,10 +261,16 @@ class LLMClient:
         # 2a. claude CLI (most common Pro/Max subscription).
         if await self._try_cli("claude_cli", _ClaudeCLIBackend):
             return self._impl
-        # 2b. kimi CLI (subscription).
+        # 2b. copilot CLI (common coding/general subscription).
+        if await self._try_cli("copilot_cli", _CopilotCLIBackend):
+            return self._impl
+        # 2c. OpenAI CLI (subscription/local auth).
+        if await self._try_cli("openai_cli", _OpenAICLIBackend):
+            return self._impl
+        # 2d. kimi CLI (specialist subscription).
         if await self._try_cli("kimi_cli", _KimiCLIBackend):
             return self._impl
-        # 2c. Anthropic API key (metered).
+        # 2e. Anthropic API key (metered).
         if self._anthropic_key:
             try:
                 self._impl = _AnthropicBackend(self._anthropic_key)
@@ -142,7 +278,7 @@ class LLMClient:
                 return self._impl
             except Exception:
                 logger.warning("anthropic backend init failed", exc_info=True)
-        # 2d. OpenRouter API key (metered).
+        # 2f. OpenRouter API key (metered).
         if self._openrouter_key:
             try:
                 from skyn3t.adapters.openrouter import OpenRouterBackend
@@ -151,7 +287,7 @@ class LLMClient:
                 return self._impl
             except Exception:
                 logger.warning("openrouter backend init failed", exc_info=True)
-        # 2e. Deterministic stub.
+        # 2g. Deterministic stub.
         self._impl = _DeterministicBackend()
         self._backend_name = "deterministic"
         return self._impl
@@ -272,8 +408,11 @@ class _CopilotCLIBackend:
         return await _probe_version("copilot")
 
     async def complete(self, req: LLMRequest) -> str:
-        # Use --deny-tool to keep tool surface minimal even with --allow-all-tools.
-        args = ["copilot", "--allow-all-tools", "-p", req.prompt]
+        # `--available-tools=` (empty) disables agent/tool mode so the CLI
+        # returns the model's direct response. Without this, prompts come
+        # back as multi-page agent transcripts that downstream parsers can't
+        # interpret (and which trip our deterministic-stub fallback).
+        args = ["copilot", "--available-tools=", "-p", req.prompt]
         if req.model:
             args.extend(["--model", req.model])
         return await _run_capture(args)
@@ -305,6 +444,11 @@ class _OpenAICLIBackend:
 
 
 class _AnthropicBackend:
+    # Threshold (chars) at which we wrap content in cache_control blocks.
+    # Anthropic's prompt-caching minimum is 1024 tokens; using 1024 chars as a
+    # conservative proxy avoids tokenizing here (chars <= tokens almost always).
+    _CACHE_MIN_CHARS = 1024
+
     def __init__(self, api_key: Optional[str]):
         if not api_key:
             raise RuntimeError("ANTHROPIC_API_KEY not set")
@@ -314,14 +458,106 @@ class _AnthropicBackend:
             raise ImportError("anthropic package not installed") from e
         self._anthropic = anthropic
         self.client = anthropic.AsyncAnthropic(api_key=api_key)
+        # Beta header required by older SDKs for prompt caching. Newer SDKs
+        # (>=0.34) accept the feature without the header but tolerate it.
+        self._extra_headers = {"anthropic-beta": "prompt-caching-2024-07-31"}
+
+    @staticmethod
+    def _user_prefix_is_cacheable(prompt: str) -> bool:
+        """Heuristic: does the prompt start with / contain a stable, reusable prefix?
+
+        We mark the user message for caching if it starts with our well-known
+        augmentation/RAG section headers, or contains a fenced doc block —
+        signals that the leading region is repeated across calls in a session.
+        """
+        if not prompt:
+            return False
+        head = prompt.lstrip()[:512]
+        if head.startswith("# Recent successful diffs"):
+            return True
+        if head.startswith("# Provider notes"):
+            return True
+        # Provider-doc augmentation typically embeds fenced code/doc blocks.
+        if "```" in prompt[:4000]:
+            return True
+        return False
 
     async def complete(self, req: LLMRequest) -> str:
         model = req.model or "claude-3-5-sonnet-latest"
-        kw = {"model": model, "max_tokens": req.max_tokens,
-              "temperature": req.temperature,
-              "messages": [{"role": "user", "content": req.prompt}]}
-        if req.system:
+        kw: dict = {"model": model, "max_tokens": req.max_tokens,
+                    "temperature": req.temperature}
+
+        # ----- system: cache if large -----
+        used_cache = False
+        if req.system and len(req.system) >= self._CACHE_MIN_CHARS:
+            kw["system"] = [{
+                "type": "text",
+                "text": req.system,
+                "cache_control": {"type": "ephemeral"},
+            }]
+            used_cache = True
+        elif req.system:
             kw["system"] = req.system
-        msg = await self.client.messages.create(**kw)
+        else:
+            kw["system"] = ""
+
+        # ----- user message: cache if prompt has a stable prefix worth caching -----
+        if (len(req.prompt) >= self._CACHE_MIN_CHARS
+                and self._user_prefix_is_cacheable(req.prompt)):
+            kw["messages"] = [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": req.prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+            }]
+            used_cache = True
+        else:
+            kw["messages"] = [{"role": "user", "content": req.prompt}]
+
+        # ----- call with caching, fall back to plain on schema rejection -----
+        msg = None
+        if used_cache:
+            try:
+                msg = await self.client.messages.create(
+                    **kw, extra_headers=self._extra_headers
+                )
+            except TypeError:
+                # Older SDK: extra_headers or cache_control schema unsupported.
+                msg = None
+            except Exception as e:
+                # Schema rejection from server (older API surface) — fall back.
+                err_name = type(e).__name__
+                if err_name in ("BadRequestError", "APIStatusError",
+                                "InvalidRequestError", "UnprocessableEntityError"):
+                    logger.info("anthropic prompt-caching unsupported, falling back: %s", e)
+                    msg = None
+                else:
+                    raise
+            if msg is None:
+                # Rebuild kw without cache_control and retry as plain text.
+                plain_kw: dict = {"model": model, "max_tokens": req.max_tokens,
+                                  "temperature": req.temperature,
+                                  "messages": [{"role": "user", "content": req.prompt}]}
+                if req.system:
+                    plain_kw["system"] = req.system
+                msg = await self.client.messages.create(**plain_kw)
+        else:
+            msg = await self.client.messages.create(**kw)
+
+        # ----- log cache usage when present -----
+        usage = getattr(msg, "usage", None)
+        if usage is not None:
+            cache_hit = getattr(usage, "cache_read_input_tokens", 0) or 0
+            cache_create = getattr(usage, "cache_creation_input_tokens", 0) or 0
+            if cache_hit or cache_create:
+                logger.info(
+                    "anthropic cache: hit=%d create=%d input=%d output=%d",
+                    cache_hit, cache_create,
+                    getattr(usage, "input_tokens", 0),
+                    getattr(usage, "output_tokens", 0),
+                )
+
         # concat text blocks
         return "".join(getattr(b, "text", "") for b in msg.content)

@@ -2,12 +2,16 @@
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from uuid import uuid4
 
 from skyn3t.core.agent import BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import Event, EventBus, EventType
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @dataclass
@@ -61,7 +65,7 @@ class DependencyGraph:
         self._completed.add(subtask_id)
         if subtask_id in self.subtasks:
             self.subtasks[subtask_id].status = "completed"
-            self.subtasks[subtask_id].completed_at = datetime.utcnow()
+            self.subtasks[subtask_id].completed_at = _utcnow()
 
     def mark_failed(self, subtask_id: str) -> None:
         self._failed.add(subtask_id)
@@ -352,7 +356,7 @@ class TaskDecomposer:
         async def run_subtask(st: SubTask) -> TaskResult:
             async with semaphore:
                 st.status = "running"
-                st.started_at = datetime.utcnow()
+                st.started_at = _utcnow()
 
                 if self.event_bus:
                     self.event_bus.publish(

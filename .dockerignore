@@ -1,0 +1,39 @@
+# Source-control + build artifacts
+.git
+.gitignore
+.github
+*.egg-info
+build
+dist
+
+# Local state, secrets, runtime data
+.env
+.env.*
+!.env.example
+data
+logs
+projects
+_clarifications.json
+secrets.json
+
+# Caches
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+.tox
+htmlcov
+
+# IDE / OS
+.idea
+.vscode
+.DS_Store
+
+# Tests + docs not needed at runtime
+tests
+brainstorm.md
+*.tar.gz
+*.log

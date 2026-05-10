@@ -13,7 +13,7 @@ import os
 import re
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -27,6 +27,23 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _ensure_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _env_truthy(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 # Regex to detect common secret patterns in output
 _SECRET_PATTERNS = [
     re.compile(r"[A-Za-z0-9_]{20,}[_-][A-Za-z0-9]{20,}"),  # API key style
@@ -35,7 +52,23 @@ _SECRET_PATTERNS = [
     re.compile(r"sk-ant-[a-zA-Z0-9_-]{40,}"),               # Anthropic key
     re.compile(r"Bearer\s+[A-Za-z0-9\-_]{20,}"),           # Bearer token
     re.compile(r"Basic\s+[A-Za-z0-9+/]{20,}={0,2}"),       # Basic auth
+    re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),  # JWT
+    re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),  # email
 ]
+
+
+def redact_text(text: str, *, secret_values: Optional[List[str]] = None) -> str:
+    """Redact sensitive values and common credential patterns from text."""
+    redacted = text
+    for value in secret_values or []:
+        if len(value) < 4:
+            continue
+        redacted = redacted.replace(value, "***REDACTED***")
+        if len(value) > 16:
+            redacted = redacted.replace(value[:8], "***")
+    for pattern in _SECRET_PATTERNS:
+        redacted = pattern.sub("***REDACTED***", redacted)
+    return redacted
 
 
 @dataclass
@@ -44,8 +77,8 @@ class SecretEntry:
 
     name: str
     value: str
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
+    updated_at: datetime = field(default_factory=_utcnow)
     expires_at: Optional[datetime] = None
     rotated_from: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -53,7 +86,7 @@ class SecretEntry:
     def is_expired(self) -> bool:
         if self.expires_at is None:
             return False
-        return datetime.utcnow() >= self.expires_at
+        return _utcnow() >= _ensure_utc(self.expires_at)
 
     def to_dict(self, mask_value: bool = True) -> Dict[str, Any]:
         return {
@@ -74,11 +107,18 @@ class SecretStore:
     written to logs or returned in task output.
     """
 
+    # Standardize on the all-uppercase prefix. The mixed-case
+    # ``SkyN3t_SECRET_`` form is read for back-compat but new code (and the
+    # documented .env entries) should use ``SKYN3T_SECRET_``. On case-sensitive
+    # filesystems / shells the two are different env vars.
+    LEGACY_ENV_PREFIX = "SkyN3t_SECRET_"
+
     def __init__(
         self,
         master_key: Optional[str] = None,
         storage_path: Optional[Path] = None,
-        env_prefix: str = "SkyN3t_SECRET_",
+        env_prefix: str = "SKYN3T_SECRET_",
+        allow_ephemeral: bool = False,
     ):
         if not _CRYPTO_AVAILABLE:
             raise RuntimeError(
@@ -100,6 +140,7 @@ class SecretStore:
             or os.environ.get("SKYN3T_MASTER_KEY")
             or os.environ.get("SkyN3t_MASTER_KEY")
         )
+        allow_ephemeral = allow_ephemeral or _env_truthy("SKYN3T_ALLOW_EPHEMERAL_MASTER_KEY")
         if key_material:
             # Per-secret random salts are used at encrypt/decrypt time;
             # store password to allow re-derivation. Note: changing the salt
@@ -107,9 +148,15 @@ class SecretStore:
             # this migration are unreadable.
             self._password = key_material
         else:
+            if not allow_ephemeral:
+                raise RuntimeError(
+                    "No master key provided. Set SKYN3T_MASTER_KEY or pass "
+                    "allow_ephemeral=True to use a non-persistent key."
+                )
             # Generate a new random key (secrets won't persist across restarts)
             logger.warning(
-                "No master key provided; generating ephemeral key. "
+                "No master key provided; using an ephemeral key because "
+                "SKYN3T_ALLOW_EPHEMERAL_MASTER_KEY/allow_ephemeral enabled. "
                 "Secrets will not persist across restarts."
             )
             key = Fernet.generate_key()  # bytes
@@ -163,17 +210,24 @@ class SecretStore:
         return self._fernet.decrypt(ciphertext).decode()
 
     def _load_from_environment(self) -> None:
-        """Load secrets from environment variables."""
+        """Load secrets from environment variables.
+
+        Accepts the canonical SKYN3T_SECRET_* prefix and the legacy
+        SkyN3t_SECRET_* form so existing deployments don't break on upgrade.
+        """
+        prefixes = (self._env_prefix, self.LEGACY_ENV_PREFIX)
         for key, value in os.environ.items():
-            if key.startswith(self._env_prefix):
-                name = key[len(self._env_prefix):]
-                with self._lock:
-                    self._secrets[name] = SecretEntry(
-                        name=name,
-                        value=value,
-                        metadata={"source": "environment"},
-                    )
-                    self._redacted_names.add(name)
+            matched = next((p for p in prefixes if key.startswith(p)), None)
+            if matched is None:
+                continue
+            name = key[len(matched):]
+            with self._lock:
+                self._secrets[name] = SecretEntry(
+                    name=name,
+                    value=value,
+                    metadata={"source": "environment"},
+                )
+                self._redacted_names.add(name)
 
     def _load_from_file(self) -> None:
         """Load encrypted secrets from storage file."""
@@ -188,10 +242,10 @@ class SecretStore:
                     self._secrets[entry["name"]] = SecretEntry(
                         name=entry["name"],
                         value=plaintext,
-                        created_at=datetime.fromisoformat(entry["created_at"]),
-                        updated_at=datetime.fromisoformat(entry["updated_at"]),
+                        created_at=_ensure_utc(datetime.fromisoformat(entry["created_at"])),
+                        updated_at=_ensure_utc(datetime.fromisoformat(entry["updated_at"])),
                         expires_at=(
-                            datetime.fromisoformat(entry["expires_at"])
+                            _ensure_utc(datetime.fromisoformat(entry["expires_at"]))
                             if entry.get("expires_at")
                             else None
                         ),
@@ -212,9 +266,9 @@ class SecretStore:
         if not self._storage_path or (self._fernet is None and self._password is None):
             return
         with self._lock:
-            data = {
+            data: Dict[str, Any] = {
                 "version": 2,
-                "saved_at": datetime.utcnow().isoformat(),
+                "saved_at": _utcnow().isoformat(),
                 "secrets": [],
             }
             for entry in self._secrets.values():
@@ -252,11 +306,11 @@ class SecretStore:
             rotated_from = old.value[:8] + "..." if old else None
             expires_at = None
             if expires_in_days:
-                expires_at = datetime.utcnow() + timedelta(days=expires_in_days)
+                expires_at = _utcnow() + timedelta(days=expires_in_days)
             self._secrets[name] = SecretEntry(
                 name=name,
                 value=value,
-                updated_at=datetime.utcnow(),
+                updated_at=_utcnow(),
                 expires_at=expires_at,
                 rotated_from=rotated_from,
                 metadata=metadata or {},
@@ -307,7 +361,7 @@ class SecretStore:
                 name,
                 new_value,
                 expires_in_days=expires_in_days,
-                metadata={**old.metadata, "rotated_at": datetime.utcnow().isoformat(), "previous_hash": old_hash},
+                metadata={**old.metadata, "rotated_at": _utcnow().isoformat(), "previous_hash": old_hash},
             )
         logger.info("Secret '%s' rotated", name)
         return True
@@ -322,25 +376,14 @@ class SecretStore:
 
         Scans for known secret names and common API key patterns.
         """
-        redacted = text
+        secret_values: List[str] = []
         with self._lock:
             for name in self._redacted_names:
                 entry = self._secrets.get(name)
                 if not entry:
                     continue
-                value = entry.value
-                if len(value) >= 4:
-                    # Replace exact occurrences
-                    redacted = redacted.replace(value, "***REDACTED***")
-                    # Replace partial occurrences (e.g. first 8 chars in logs)
-                    if len(value) > 16:
-                        redacted = redacted.replace(value[:8], "***")
-
-        # Pattern-based redaction
-        for pattern in _SECRET_PATTERNS:
-            redacted = pattern.sub("***REDACTED***", redacted)
-
-        return redacted
+                secret_values.append(entry.value)
+        return redact_text(text, secret_values=secret_values)
 
     def sanitize_dict(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Recursively redact secrets from a dict."""

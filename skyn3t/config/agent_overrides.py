@@ -1,6 +1,11 @@
 """Per-agent override store, persisted to data/agent_overrides.json."""
+
 from __future__ import annotations
-import json, logging, threading
+
+import json
+import logging
+import os
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -22,14 +27,28 @@ class AgentOverrideStore:
     def _load(self) -> Dict[str, Dict[str, Any]]:
         if self.path.exists():
             try:
-                return json.loads(self.path.read_text())
+                loaded = json.loads(self.path.read_text())
+                if isinstance(loaded, dict):
+                    return {
+                        str(name): dict(spec)
+                        for name, spec in loaded.items()
+                        if isinstance(spec, dict)
+                    }
             except Exception:
                 logger.exception("override store read failed")
         return {}
 
     def _save(self) -> None:
         try:
-            self.path.write_text(json.dumps(self._data, indent=2, sort_keys=True))
+            # Atomic write: tmp + os.replace so a crash mid-write doesn't
+            # corrupt the store to an unreadable file.
+            payload = json.dumps(self._data, indent=2, sort_keys=True)
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.path)
         except Exception:
             logger.exception("override store write failed")
 

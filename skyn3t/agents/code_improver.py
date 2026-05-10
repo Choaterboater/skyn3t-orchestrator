@@ -1,7 +1,15 @@
 from __future__ import annotations
-import asyncio, difflib, json, logging, os, re, subprocess, time
+
+import asyncio
+import difflib
+import json
+import logging
+import re
+import shutil
+import subprocess
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
@@ -9,6 +17,17 @@ from skyn3t.core.events import EventBus
 logger = logging.getLogger("skyn3t.agents.code_improver")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]   # /.../jarvis
+
+
+class CodePatchApplyError(RuntimeError):
+    """Raised by ``_apply_patch`` when the diff cannot be applied.
+
+    Carries a structured ``info`` dict so the caller can recover the branch /
+    rejected-diff path / error message without re-parsing the message.
+    """
+    def __init__(self, message: str, info: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.info: Dict[str, Any] = info or {}
 
 
 class CodeImproverAgent(BaseAgent):
@@ -20,6 +39,12 @@ class CodeImproverAgent(BaseAgent):
     `git apply`, runs `pytest`, and:
       - if tests pass:  leaves the branch in place and returns success.
       - if tests fail:  resets the branch (deletes it) and returns failure.
+
+    For user-initiated runs (Studio frontend_redesign / studio_debug / studio_run
+    or ``user_initiated=True``), ``execute()`` waits for the apply to actually
+    happen, surfaces a structured ``{applied, branch, error, rejected_diff_path}``
+    in TaskResult.output, and publishes a ``SYSTEM_ALERT`` event with
+    ``kind=CODE_PATCH_RESULT`` so the dashboard can show a toast.
     """
 
     def __init__(self, name: str = "code_improver", *, event_bus: Optional[EventBus] = None,
@@ -47,8 +72,211 @@ class CodeImproverAgent(BaseAgent):
         except Exception:
             return False
 
+    @staticmethod
+    def _effective_repo_root(value: Any) -> Path:
+        try:
+            if value:
+                return Path(str(value)).expanduser().resolve()
+        except Exception:
+            pass
+        return REPO_ROOT.resolve()
+
+    @staticmethod
+    def _resolve_target_path(repo_root: Path, target_file: str) -> Optional[Path]:
+        if not target_file:
+            return None
+        try:
+            path = (repo_root / target_file).resolve()
+            path.relative_to(repo_root.resolve())
+        except Exception:
+            return None
+        if not path.exists() or not path.is_file():
+            return None
+        return path
+
+    @staticmethod
+    def _relative_target(repo_root: Path, path: Path) -> str:
+        return path.resolve().relative_to(repo_root.resolve()).as_posix()
+
+    @staticmethod
+    def _proposal_dir(repo_root: Path) -> Path:
+        base_root = REPO_ROOT.resolve()
+        if repo_root.resolve() == base_root:
+            return base_root / "data" / "proposals" / "code"
+        return repo_root / ".skyn3t" / "proposals" / "code"
+
+    @staticmethod
+    def _normalize_review_risks(risks: List[str]) -> List[str]:
+        from skyn3t.cortex.review_utils import normalize_review_risks
+
+        return normalize_review_risks(risks)
+
+    @classmethod
+    def _review_risks_from_rationale(cls, rationale: str) -> List[str]:
+        if "Risks to address:" not in rationale:
+            return []
+        risks: List[str] = []
+        in_risks = False
+        for raw_line in rationale.splitlines():
+            line = raw_line.strip()
+            lower = line.lower()
+            if lower.startswith("risks to address:"):
+                in_risks = True
+                continue
+            if not in_risks:
+                continue
+            if line.startswith("- "):
+                risks.append(line[2:].strip())
+                continue
+            if line:
+                break
+        return cls._normalize_review_risks(risks)
+
+    @staticmethod
+    def _run_check_commands(
+        repo_root: Path,
+        commands: List[Tuple[List[str], str]],
+        *,
+        timeout: int = 180,
+        note: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        stdout_parts: List[str] = []
+        stderr_parts: List[str] = []
+        executed: List[str] = []
+        for args, display in commands:
+            proc = subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                cwd=str(repo_root),
+                timeout=timeout,
+            )
+            executed.append(display)
+            stdout_parts.append(f"$ {display}\n{proc.stdout}".rstrip())
+            stderr_parts.append(f"$ {display}\n{proc.stderr}".rstrip())
+            if proc.returncode != 0:
+                return {
+                    "ran": True,
+                    "ok": False,
+                    "command": " && ".join(executed),
+                    "stdout": "\n\n".join(part for part in stdout_parts if part),
+                    "stderr": "\n\n".join(part for part in stderr_parts if part),
+                    "note": note,
+                }
+        return {
+            "ran": bool(executed),
+            "ok": True,
+            "command": " && ".join(executed) if executed else None,
+            "stdout": "\n\n".join(part for part in stdout_parts if part),
+            "stderr": "\n\n".join(part for part in stderr_parts if part),
+            "note": note,
+        }
+
+    @staticmethod
+    def _node_package_manager(repo_root: Path, package_data: Dict[str, Any]) -> Optional[str]:
+        declared = str(package_data.get("packageManager") or "").strip().lower()
+        for name in ("pnpm", "yarn", "npm"):
+            if declared.startswith(name) and shutil.which(name):
+                return name
+        lockfiles = (
+            ("pnpm-lock.yaml", "pnpm"),
+            ("yarn.lock", "yarn"),
+            ("package-lock.json", "npm"),
+        )
+        for lockfile, manager in lockfiles:
+            if (repo_root / lockfile).exists() and shutil.which(manager):
+                return manager
+        for manager in ("pnpm", "yarn", "npm"):
+            if shutil.which(manager):
+                return manager
+        return None
+
+    @staticmethod
+    def _node_script_command(manager: str, script: str) -> Tuple[List[str], str]:
+        if manager == "npm":
+            if script == "test":
+                return (["npm", "test"], "npm test")
+            return (["npm", "run", script], f"npm run {script}")
+        return ([manager, script], f"{manager} {script}")
+
+    @staticmethod
+    def _run_repo_checks(repo_root: Path) -> Dict[str, Any]:
+        markers = ("pyproject.toml", "pytest.ini", "tox.ini", "setup.py", "requirements.txt")
+        has_python_checks = any((repo_root / marker).exists() for marker in markers) or (
+            repo_root / "tests"
+        ).exists()
+        if has_python_checks:
+            return CodeImproverAgent._run_check_commands(
+                repo_root,
+                [(["python3", "-m", "pytest", "-q", "--tb=line"], "python3 -m pytest -q --tb=line")],
+            )
+
+        package_json = repo_root / "package.json"
+        if package_json.exists():
+            try:
+                package_data = json.loads(package_json.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                package_data = {}
+            scripts = package_data.get("scripts")
+            if not isinstance(scripts, dict):
+                scripts = {}
+            manager = CodeImproverAgent._node_package_manager(repo_root, package_data)
+            if manager is None:
+                return {
+                    "ran": False,
+                    "ok": False,
+                    "command": None,
+                    "stdout": "",
+                    "stderr": "",
+                    "note": "package.json detected but no compatible package manager is installed",
+                }
+            commands = []
+            for script in ("test", "lint", "build"):
+                script_value = scripts.get(script)
+                if isinstance(script_value, str) and script_value.strip():
+                    commands.append(CodeImproverAgent._node_script_command(manager, script))
+            if commands:
+                return CodeImproverAgent._run_check_commands(
+                    repo_root,
+                    commands,
+                    timeout=240,
+                    note=f"validated Node repo with {manager}",
+                )
+            return {
+                "ran": False,
+                "ok": False,
+                "command": None,
+                "stdout": "",
+                "stderr": "",
+                "note": "package.json detected but no test, lint, or build script is available",
+            }
+
+        if (repo_root / "go.mod").exists():
+            return CodeImproverAgent._run_check_commands(
+                repo_root,
+                [(["go", "test", "./..."], "go test ./...")],
+                timeout=240,
+            )
+
+        if (repo_root / "Cargo.toml").exists():
+            return CodeImproverAgent._run_check_commands(
+                repo_root,
+                [(["cargo", "test"], "cargo test")],
+                timeout=240,
+            )
+
+        return {
+            "ran": False,
+            "ok": True,
+            "command": None,
+            "stdout": "",
+            "stderr": "",
+            "note": "no repo validation command detected",
+        }
+
     def _register_handler(self) -> None:
-        if self._handler_registered: return
+        if self._handler_registered:
+            return
         try:
             from skyn3t.cortex import get_store
             get_store().register_handler("code_patch", self._apply_patch)
@@ -56,77 +284,342 @@ class CodeImproverAgent(BaseAgent):
         except Exception:
             logger.exception("could not register code_patch handler")
 
-    async def execute(self, task: TaskRequest) -> TaskResult:
+    async def execute(self, task: TaskRequest, stdin_data: str | None = None) -> TaskResult:
         if hasattr(self, "think"):
-            try: await self.think(f"code_improver scanning")
-            except Exception: pass
+            try:
+                await self.think("code_improver scanning")
+            except Exception:
+                logger.debug("think() failed at code_improver scan start", exc_info=True)
         self._register_handler()  # idempotent
 
         input_data = task.input_data or {}
         target = input_data.get("target_file")  # optional explicit override
         rationale = input_data.get("rationale", "")
         diff = input_data.get("diff")  # optional pre-built diff
+        repo_root = self._effective_repo_root(input_data.get("repo_root"))
+
+        # Skip cleanly when no target was specified — the brief didn't ask for
+        # a code change. Don't invent a target or file an empty diff.
+        if not target and not diff:
+            ui = (input_data.get("intent") in {"frontend_redesign", "studio_run", "rewrite"}
+                  or input_data.get("user_initiated"))
+            try:
+                self._publish_result(applied=False, branch=None,
+                                      error="code stage skipped — no target file in brief",
+                                      target="(none)", user_initiated=bool(ui))
+            except Exception:
+                pass
+            return TaskResult(
+                task_id=task.task_id, success=True,
+                output={"proposed": False, "skipped": True,
+                        "reason": "no target_file in brief; code stage not applicable",
+                        "applied": False, "branch": None, "error": None,
+                        "rejected_diff_path": None,
+                        "summary": "Code stage skipped: brief didn't specify a target file."})
+
+        # Detect intent up-front so we can pick the right LLM mode (minimal-fix
+        # vs sweeping rewrite) before we draft the patch.
+        intent = (input_data or {}).get("intent", "")
+        # rewrite mode: large-scale changes encouraged
+        mode = "rewrite" if intent in {"frontend_redesign", "studio_run", "rewrite"} else "minimal"
+        # If we're being called FROM a studio_debug handler approval, this is a
+        # recursive retry — don't file ANOTHER studio_debug proposal on failure.
+        from_studio_debug = intent == "studio_debug"
+        if from_studio_debug:
+            review_risks = self._normalize_review_risks(input_data.get("review_risks") or [])
+            if not review_risks:
+                review_risks = self._review_risks_from_rationale(rationale)
+            if not review_risks:
+                return TaskResult(
+                    task_id=task.task_id,
+                    success=True,
+                    output={
+                        "proposed": False,
+                        "skipped": True,
+                        "reason": "review flagged no actionable risks",
+                        "applied": False,
+                        "branch": None,
+                        "error": None,
+                        "rejected_diff_path": None,
+                        "summary": "Code patch skipped: reviewer did not identify actionable risks.",
+                    },
+                )
+
+        # ─── MCP-mode path ──────────────────────────────────────────────
+        # When the caller hasn't pre-supplied a diff, try the MCP tool-loop
+        # first: the LLM directly calls read_file/apply_replacement/git_*
+        # tools to make the change, instead of emitting a fragile unified
+        # diff. Falls back to the diff-mode path below if MCP fails.
+        use_mcp = bool(input_data.get("use_mcp", True)) and repo_root == REPO_ROOT.resolve()
+        if use_mcp and target and rationale and not diff:
+            try:
+                from skyn3t.adapters.mcp_client import MCPDriver
+                from skyn3t.adapters.mcp_tools import TOOLS
+                client = self.get_llm() if hasattr(self, "get_llm") else None
+                if client is None:
+                    from skyn3t.adapters import LLMClient
+                    client = LLMClient(default_model=self.config.get("model"),
+                                       backend=self.config.get("backend"),
+                                       event_bus=self.event_bus, caller_name=self.name)
+                driver = MCPDriver(llm_client=client, tools=TOOLS, max_rounds=8)
+                # Honest success check: snapshot target hash so the driver can
+                # verify the LLM actually changed the file (not just claimed DONE).
+                if target:
+                    try:
+                        driver.set_target_for_change_check(target)
+                    except Exception:
+                        logger.exception("set_target_for_change_check failed")
+                import time as _t
+                mcp_branch = f"skyn3t/auto/mcp-{int(_t.time())}"
+                goal = (
+                    f"Make the change requested below in a NEW branch.\n\n"
+                    f"Target file: {target}\n"
+                    f"Branch name to create: {mcp_branch}\n"
+                    f"Change: {rationale}\n\n"
+                    f"Steps:\n"
+                    f"1. read_file({target!r}) to see current contents.\n"
+                    f"2. git_branch({mcp_branch!r}) to create the working branch.\n"
+                    f"3. Use apply_replacement (preferred — exact match) or write_file "
+                    f"(full replace) to make the change.\n"
+                    f"4. run_pytest() to confirm nothing is broken.\n"
+                    f"5. git_commit('chore(auto): <one-line summary>').\n"
+                    f"6. Reply DONE.\n\n"
+                    f"If apply_replacement fails because the find string doesn't appear, "
+                    f"re-read the file and try a different approach. Don't invent text."
+                )
+                result = await driver.run(goal=goal)
+                if result.get("ok"):
+                    self._publish_result(applied=True, branch=mcp_branch, error=None,
+                                         target=target, user_initiated=True)
+                    return TaskResult(
+                        task_id=task.task_id, success=True,
+                        output={
+                            "applied": True, "branch": mcp_branch, "mode": "mcp",
+                            "rounds": result.get("rounds"), "error": None,
+                            "rejected_diff_path": None,
+                            "target": target,
+                        },
+                    )
+                # MCP claimed success but didn't actually change anything — fall through.
+                mcp_err = result.get("error", "MCP path did not produce changes")
+                logger.info("MCP path didn't apply: %s; falling back to diff mode", mcp_err)
+            except Exception:
+                logger.exception("MCP path failed; falling back to diff mode")
 
         if diff and target:
             patch_text = diff
         else:
-            target, patch_text, rationale = await self._draft_patch(target=target, rationale=rationale)
+            target, patch_text, rationale = await self._draft_patch(
+                target=target, rationale=rationale, repo_root=repo_root, mode=mode)
+
+        # When the caller marked this run as user-initiated (Studio project, REPL, etc.),
+        # skip the approval modal and auto-apply to a branch.
+        # NOTE: studio_debug intent is NOT user-initiated — it's the cortex's response
+        # to a Reviewer flag, which is a *system* suggestion. We keep auto-approval ONLY
+        # for user-driven Studio runs.
+        user_initiated = intent in {"frontend_redesign", "studio_run"} \
+                         or (input_data or {}).get("user_initiated", False)
 
         if not patch_text or not target:
-            return TaskResult(task_id=task.task_id, success=True,
-                              output={"proposed": False, "reason": "no actionable diff"})
+            # Nothing actionable. Still emit a toast for user-initiated runs so it's
+            # never silent.
+            attempts = list(getattr(self, "_last_attempts", []) or [])
+
+            # If the LLM was actually tried and every backend failed, file a
+            # studio_debug proposal so the swarm can self-analyze why we can't
+            # produce a working diff for this target.
+            # SKIP filing if we're already inside a studio_debug retry — that
+            # would create an infinite loop (failed retry → new debug proposal
+            # → approve → fail → new debug → ...).
+            if attempts and not from_studio_debug:
+                try:
+                    from skyn3t.cortex import get_store
+                    attempts_summary = "\n".join(
+                        f"- {a.get('backend','?')}/{a.get('model','?')} "
+                        f"attempt {a.get('attempt',0)}: {a.get('error','?')[:160]}"
+                        for a in attempts
+                    )
+                    get_store().create(
+                        kind="studio_debug",
+                        title=f"All LLM attempts failed for {target}",
+                        summary=(
+                            f"Could not produce a valid unified diff for "
+                            f"`{target}` after {len(attempts)} attempts."
+                        ),
+                        detail=(
+                            f"## Target\n`{target}`\n\n"
+                            f"## Rationale\n{rationale}\n\n"
+                            f"## Attempts\n{attempts_summary}\n\n"
+                            f"_Possible causes: target file structure is unusual, "
+                            f"rationale is ambiguous, or model isn't matching "
+                            f"unified-diff format. Consider rephrasing the brief or "
+                            f"breaking it into smaller changes._"
+                        ),
+                        payload={
+                            "target_file": target,
+                            "rationale": rationale,
+                            "attempts": attempts,
+                        },
+                        source="code_improver",
+                        requires_approval=True,
+                    )
+                except Exception:
+                    logger.exception("could not file studio_debug proposal")
+
+            self._publish_result(applied=False, branch=None,
+                                  error="no actionable diff produced", target=target or "(unknown)",
+                                  user_initiated=bool(user_initiated))
+            success = not bool(attempts)
+            return TaskResult(task_id=task.task_id, success=success,
+                              error=None if success else "no actionable diff produced",
+                              output={"proposed": False, "reason": "no actionable diff",
+                                      "applied": False, "branch": None,
+                                      "error": "no actionable diff produced",
+                                      "rejected_diff_path": None,
+                                      "attempts": attempts})
 
         # File the proposal
         try:
             from skyn3t.cortex import get_store
         except Exception as e:
-            return TaskResult(task_id=task.task_id, success=False, error=f"proposal store unavailable: {e}")
+            self._publish_result(applied=False, branch=None,
+                                  error=f"proposal store unavailable: {e}",
+                                  target=target, user_initiated=bool(user_initiated))
+            return TaskResult(task_id=task.task_id, success=False,
+                              error=f"proposal store unavailable: {e}",
+                              output={"applied": False, "branch": None,
+                                      "error": f"proposal store unavailable: {e}",
+                                      "rejected_diff_path": None})
 
-        # When the caller marked this run as user-initiated (Studio project, REPL, etc.),
-        # skip the approval modal and auto-apply to a branch.
-        intent = (input_data or {}).get("intent", "")
-        user_initiated = intent in {"frontend_redesign", "studio_debug", "studio_run"} \
-                         or (input_data or {}).get("user_initiated", False)
+        # We always create the proposal with requires_approval=True so the store
+        # does NOT kick off its fire-and-forget background _auto_apply task. If
+        # this is user-initiated we then call approve() ourselves and await the
+        # actual result, so we can surface success/failure synchronously.
         proposal = get_store().create(
             kind="code_patch",
             title=f"Patch {target}",
             summary=rationale or "auto-generated improvement proposal",
-            detail=f"Target: `{target}`\n\nReason: {rationale}\n\n```diff\n{patch_text}\n```",
+            detail=(
+                f"Target: `{target}`\n\n"
+                f"Repo root: `{repo_root}`\n\n"
+                f"Reason: {rationale}\n\n```diff\n{patch_text}\n```"
+            ),
             payload={"target_file": target, "patch": patch_text, "rationale": rationale,
-                     "user_initiated": user_initiated},
+                     "user_initiated": user_initiated, "repo_root": str(repo_root)},
             source="code_improver",
-            requires_approval=not user_initiated,
+            requires_approval=True,
         )
-        return TaskResult(task_id=task.task_id, success=True,
-                          output={"proposed": True, "proposal_id": proposal.id,
-                                  "target": target})
 
-    async def _draft_patch(self, *, target: Optional[str], rationale: str) -> tuple[Optional[str], Optional[str], str]:
+        if not user_initiated:
+            # Background / proposal-only path — apply happens later via the
+            # approval modal. Return now.
+            return TaskResult(task_id=task.task_id, success=True,
+                              output={"proposed": True, "proposal_id": proposal.id,
+                                      "target": target,
+                                      "applied": False, "branch": None,
+                                      "error": None, "rejected_diff_path": None})
+
+        # User-initiated: drive the apply ourselves so we can await the outcome.
+        applied: bool = False
+        branch: Optional[str] = None
+        err: Optional[str] = None
+        rejected_dir: Optional[str] = None
+        try:
+            approve_res = await get_store().approve(proposal.id)
+        except Exception as e:
+            approve_res = {"ok": False, "error": f"approve raised: {e}"}
+
+        if approve_res.get("ok"):
+            inner = approve_res.get("result") or {}
+            applied = bool(inner.get("applied"))
+            branch_value = inner.get("branch")
+            branch = str(branch_value) if branch_value is not None else None
+            err = inner.get("error") if not applied else None
+            rejected_dir = inner.get("rejected_diff_path")
+        else:
+            # approve() caught an exception inside _apply_patch — recover the
+            # structured info we stashed on the agent instance.
+            err = approve_res.get("error") or "apply failed"
+            info = getattr(self, "_last_apply_info", {}) or {}
+            rejected_dir = info.get("rejected_diff_path")
+
+        self._publish_result(applied=applied, branch=branch, error=err,
+                              target=target, user_initiated=True)
+
+        return TaskResult(
+            task_id=task.task_id,
+            success=applied,
+            error=None if applied else (err or "apply failed"),
+            output={
+                "proposed": True,
+                "proposal_id": proposal.id,
+                "target": target,
+                "applied": applied,
+                "branch": branch,
+                "error": err,
+                "rejected_diff_path": rejected_dir,
+            },
+        )
+
+    def _publish_result(self, *, applied: bool, branch: Optional[str],
+                          error: Optional[str], target: str,
+                          user_initiated: bool) -> None:
+        """Publish a SYSTEM_ALERT carrying CODE_PATCH_RESULT so the dashboard
+        can render a toast notification.
+        """
+        try:
+            from skyn3t.core.events import Event, EventType
+            self.event_bus.publish(Event(
+                event_type=EventType.SYSTEM_ALERT,
+                source="code_improver",
+                payload={
+                    "kind": "CODE_PATCH_RESULT",
+                    "applied": bool(applied),
+                    "branch": branch,
+                    "error": error,
+                    "target": target,
+                    "user_initiated": bool(user_initiated),
+                },
+            ))
+        except Exception:
+            logger.exception("publish CODE_PATCH_RESULT failed")
+
+    async def _draft_patch(self, *, target: Optional[str], rationale: str,
+                               repo_root: Path,
+                               mode: str = "minimal") -> tuple[Optional[str], Optional[str], str]:
         """Draft a patch. If the caller supplied an explicit ``target`` + ``rationale``,
         try the LLM first. Falls back to a deterministic, heuristic transform that
         looks for ``datetime.utcnow()`` / TODO / FIXME markers in ``skyn3t/`` and
         produces a tiny clean-up patch. Returns ``(target, diff, rationale)``.
+
+        ``mode`` selects between minimal-change (default) and rewrite (large
+        sweeping redesign) prompting.
         """
         # 1. LLM-driven path: only when the user gave a specific file + rationale.
         if target and rationale:
-            llm_diff = await self._llm_draft(target, rationale)
+            llm_diff = await self._llm_draft(target, rationale, repo_root=repo_root, mode=mode)
             if llm_diff:
                 return target, llm_diff, rationale
 
         # 2. Deterministic fallback (unchanged behavior).
         candidates: List[Path] = []
         if target:
-            p = REPO_ROOT / target
-            if p.exists(): candidates = [p]
+            p = self._resolve_target_path(repo_root, target)
+            if p is not None:
+                candidates = [p]
         else:
+            if repo_root.resolve() != REPO_ROOT.resolve():
+                return None, None, rationale or "no focus file selected for the target repo"
             for p in (REPO_ROOT / "skyn3t").rglob("*.py"):
                 try:
                     text = p.read_text(encoding="utf-8")
-                except Exception: continue
+                except Exception:
+                    continue
                 if "datetime.utcnow()" in text or "TODO" in text or "FIXME" in text:
                     candidates.append(p)
             candidates = candidates[:1]
-        if not candidates: return None, None, rationale or "nothing to improve"
+        if not candidates:
+            return None, None, rationale or "nothing to improve"
         target_path = candidates[0]
         try:
             text = target_path.read_text(encoding="utf-8")
@@ -142,79 +635,378 @@ class CodeImproverAgent(BaseAgent):
             rationale = rationale or "replace deprecated datetime.utcnow() with timezone-aware now()"
         if new_text == text:
             return None, None, rationale or "no safe transform applied"
-        rel = target_path.relative_to(REPO_ROOT).as_posix()
+        rel = self._relative_target(repo_root, target_path)
         diff = "".join(difflib.unified_diff(
             text.splitlines(keepends=True),
             new_text.splitlines(keepends=True),
             fromfile=f"a/{rel}", tofile=f"b/{rel}"))
         return rel, diff, rationale
 
-    async def _llm_draft(self, target_file: str, rationale: str) -> Optional[str]:
+    async def _llm_draft(self, target_file: str, rationale: str, *,
+                            repo_root: Path,
+                            mode: str = "minimal") -> Optional[str]:
         """Ask the LLM for a unified diff that addresses ``rationale`` on ``target_file``.
 
-        Returns a diff string suitable for ``git apply``, or ``None`` if the LLM
-        returns a deterministic stub / non-diff output / the file is missing.
+        Tries the configured backend/model first (3 attempts), then falls back
+        through copilot_cli/gpt-5.3-codex, claude_cli/sonnet, and claude_cli/opus
+        (1 attempt each). Records every attempt on ``self._last_attempts`` so
+        ``execute()`` can surface it / file a studio_debug proposal if everything
+        fails. Returns a diff string suitable for ``git apply``, or ``None``.
+
+        ``mode`` is forwarded to the per-backend retry loop so the system prompt
+        can switch between minimal-fix and rewrite framings.
+        """
+        self._last_attempts: List[Dict[str, str]] = []
+        try:
+            path = self._resolve_target_path(repo_root, target_file)
+            if path is None:
+                return None
+
+            diff, attempts = await self._llm_draft_with_fallback(
+                target_file=target_file,
+                rationale=rationale,
+                repo_root=repo_root,
+                mode=mode,
+            )
+            self._last_attempts = attempts
+            return diff
+        except Exception:
+            logger.exception("_llm_draft failed")
+            return None
+
+    def _system_prompt(self, mode: str) -> str:
+        """Build the system prompt for the LLM based on ``mode``.
+
+        ``mode == "rewrite"`` permits/encourages large sweeping diffs (used for
+        redesigns); anything else clamps to the SMALLEST possible change.
+        """
+        base = (
+            "You are CodeImproverAgent. Output a STRICT unified diff that applies cleanly with `git apply`. "
+            "REQUIREMENTS: "
+            "- Single fenced ```diff block, nothing else. "
+            "- Exactly two header lines: `--- a/<path>` and `+++ b/<path>`. "
+            "- Hunk headers MUST include line counts: `@@ -<start>,<count> +<start>,<count> @@` (NOT bare `@@`). "
+            "- Include 3 lines of unchanged context above and below each change so the patch anchors. "
+            "- The path MUST be exactly: <target>. Don't invent files."
+        )
+        if mode == "rewrite":
+            return base + (
+                " You are doing a REDESIGN, not a bug fix. The diff CAN and SHOULD be large — "
+                "rewrite entire blocks (CSS palettes, component styles, whole sections) where it serves "
+                "the rationale. DO NOT minimize the change just for safety. Replace the requested "
+                "block FULLY with the new design. Preserve all DOM IDs, JS handlers, and structural "
+                "attributes — only style/visual content should change unless the brief says otherwise."
+                " Think step-by-step:"
+                " 1. What's the structural intent of the brief?"
+                " 2. Which sections of the file map to that intent?"
+                " 3. Plan the rewrite scope — a contiguous block, multiple non-contiguous blocks, or full replacement."
+                " 4. Construct the diff with proper line numbers."
+                " After reasoning, output ONLY the diff."
+            )
+        return base + (
+            " Make the SMALLEST possible change that addresses the issue. "
+            "Preserve all existing behavior unless the rationale says otherwise. Do not invent files or add unrelated edits."
+            " Think step-by-step BEFORE writing the diff:"
+            " 1. Identify the exact lines that need to change."
+            " 2. Note the line numbers (count from 1)."
+            " 3. Plan the hunk: a/path, +/path, then `@@ -<start>,<count> +<start>,<count> @@`."
+            " 4. Include 3 lines of unchanged context above and below."
+            " 5. Verify mentally that `git apply` would accept it."
+            " After reasoning, output ONLY the fenced ```diff block — your reasoning stays internal."
+        )
+
+    async def _self_consistency_draft(self, *, target_file: str, rationale: str,
+                                        repo_root: Path,
+                                        mode: str, backend: Optional[str],
+                                        model: Optional[str], n: int = 3) -> Optional[str]:
+        """Sample N diffs in parallel at varied temperatures; return first one that
+        passes ``git apply --check``. None if all fail.
+
+        Catches the "almost-valid diff" failure mode (model produces something
+        plausible but with off-by-one line counts) more reliably than retrying
+        sequentially with error feedback — three independent samples at spread
+        temperatures are likely to include at least one that lands cleanly.
         """
         try:
-            path = (REPO_ROOT / target_file).resolve()
-            # confine to repo
-            try:
-                path.relative_to(REPO_ROOT.resolve())
-            except ValueError:
-                return None
-            if not path.exists() or not path.is_file():
+            from skyn3t.adapters import LLMClient
+            path = self._resolve_target_path(repo_root, target_file)
+            if path is None:
                 return None
             try:
                 text = path.read_text(encoding="utf-8")
             except Exception:
                 return None
             if len(text) > 200_000:
-                text = text[:200_000] + "\n…[truncated for LLM context window]…"
+                text = text[:200_000] + "\n…[truncated]…"
+            rel = self._relative_target(repo_root, path)
+            system = self._system_prompt(mode).replace("<target>", rel)
+            prompt = (
+                f"Target file: `{rel}`\n"
+                f"Rationale (what to change and why):\n{rationale}\n\n"
+                f"Current file contents:\n```\n{text}\n```\n\n"
+                f"Reply ONLY with a fenced ```diff block."
+            )
 
-            client = None
-            try:
-                if hasattr(self, "get_llm"):
-                    client = self.get_llm()
-            except Exception:
-                client = None
-            if client is None:
+            async def _one(temp: float) -> Optional[str]:
                 try:
-                    from skyn3t.adapters import LLMClient
-                    client = LLMClient(
-                        default_model=self.config.get("model"),
-                        backend=self.config.get("backend"),
-                    )
+                    client = LLMClient(default_model=model, backend=backend,
+                                       event_bus=self.event_bus, caller_name=self.name)
+                    out = await client.complete(prompt, system=system,
+                                                  max_tokens=8000 if mode == "rewrite" else 4000,
+                                                  temperature=temp)
+                    return self._extract_diff(out, rel)
                 except Exception:
                     return None
 
-            rel = path.relative_to(REPO_ROOT.resolve()).as_posix()
-            system = (
-                "You are CodeImproverAgent inside the SkyN3t orchestrator. You produce unified diffs. "
-                "You MUST output a single fenced ```diff block, nothing else. The diff must apply with "
-                "`git apply` from the repo root. Use exactly two header lines: `--- a/<path>` and "
-                "`+++ b/<path>` followed by valid hunks. Make the SMALLEST change that addresses the "
-                "issue. Preserve all existing behavior unless the rationale says otherwise. Do not "
-                "invent files or add unrelated edits."
-            )
-            prompt = (
+            # Spread temperatures so the samples actually diverge
+            temps = [0.2, 0.4, 0.6][:n]
+            if hasattr(self, "think"):
+                try:
+                    await self.think(f"self-consistency: {n} parallel samples ({backend}/{model})")
+                except Exception:
+                    pass
+            diffs = await asyncio.gather(*[_one(t) for t in temps], return_exceptions=False)
+            # First valid diff wins
+            for d in diffs:
+                if not d:
+                    continue
+                ok, _err = self._validate_diff_with_git_check(d, repo_root=repo_root)
+                if ok:
+                    return d
+            return None
+        except Exception:
+            logger.exception("self-consistency failed")
+            return None
+
+    async def _llm_draft_with_backend(self, *, target_file: str, rationale: str,
+                                        repo_root: Path,
+                                        backend: Optional[str], model: Optional[str],
+                                        max_attempts: int = 3,
+                                        mode: str = "minimal") -> Tuple[Optional[str], List[Dict[str, str]]]:
+        """Try to draft a valid diff using the given backend/model.
+
+        Returns ``(diff, attempts_log)`` — ``diff`` is ``None`` if all
+        ``max_attempts`` failed git apply --check. ``attempts_log`` is a list of
+        ``{backend, model, attempt, error}`` dicts (success entry omitted).
+
+        ``mode`` selects the system-prompt framing (minimal-fix vs rewrite).
+        """
+        attempts_log: List[Dict[str, str]] = []
+        try:
+            path = self._resolve_target_path(repo_root, target_file)
+            if path is None:
+                return None, attempts_log
+            try:
+                text = path.read_text(encoding="utf-8")
+            except Exception:
+                return None, attempts_log
+            if len(text) > 200_000:
+                text = text[:200_000] + "\n…[truncated for LLM context window]…"
+
+            try:
+                from skyn3t.adapters import LLMClient
+                client = LLMClient(default_model=model, backend=backend)
+            except Exception as e:
+                attempts_log.append({
+                    "backend": str(backend), "model": str(model),
+                    "attempt": "0",
+                    "error": f"could not construct LLMClient: {e}",
+                })
+                return None, attempts_log
+
+            rel = self._relative_target(repo_root, path)
+            system = self._system_prompt(mode).replace("<target>", rel)
+
+            base_prompt = (
                 f"Target file: `{rel}`\n"
                 f"Rationale (what to change and why):\n{rationale}\n\n"
                 f"Current file contents:\n```\n{text}\n```\n\n"
                 f"Reply ONLY with a fenced ```diff block containing the unified diff."
             )
-
             try:
-                out = await client.complete(
-                    prompt, system=system, max_tokens=4000, temperature=0.2,
-                )
+                from skyn3t.adapters.few_shot import few_shot_block
+                shots = few_shot_block("code_diff", count=2)
+                if shots:
+                    base_prompt = shots + "\n\n# Now the new task:\n" + base_prompt
             except Exception:
-                logger.exception("_llm_draft: client.complete raised")
-                return None
+                logger.exception("few_shot_block(code_diff) failed; continuing without shots")
 
-            return self._extract_diff(out, rel)
+            # Self-consistency: try N parallel samples at spread temperatures
+            # FIRST. Catches the "almost-valid diff" failure mode much more
+            # reliably than the sequential retry-with-feedback loop below.
+            sc_diff = await self._self_consistency_draft(
+                target_file=target_file, rationale=rationale, repo_root=repo_root, mode=mode,
+                backend=backend, model=model, n=3)
+            if sc_diff:
+                return sc_diff, []   # empty attempts log; we succeeded on first volley
+
+            last_error = ""
+            for attempt in range(1, max_attempts + 1):
+                prompt = base_prompt
+                if attempt > 1 and last_error:
+                    prompt = (
+                        base_prompt
+                        + f"\n\nPrevious attempt failed `git apply --check` with: {last_error}\n"
+                        + "Try again, fix the line counts, ensure 3 lines of context."
+                    )
+                try:
+                    out = await client.complete(
+                        prompt, system=system,
+                        max_tokens=8000 if mode == "rewrite" else 4000,
+                        temperature=0.1,
+                    )
+                except Exception as e:
+                    logger.exception("_llm_draft_with_backend: client.complete raised "
+                                      "(backend=%s model=%s attempt=%d)", backend, model, attempt)
+                    last_error = f"client.complete raised: {e}"
+                    attempts_log.append({
+                        "backend": str(backend), "model": str(model),
+                        "attempt": str(attempt), "error": last_error[:300],
+                    })
+                    # client.complete blew up — no point retrying same backend
+                    return None, attempts_log
+
+                diff = self._extract_diff(out, rel)
+                if diff is None:
+                    last_error = "no fenced diff block / no @@ hunk header in response"
+                    logger.warning("_llm_draft attempt %d (%s/%s): %s",
+                                    attempt, backend, model, last_error)
+                    attempts_log.append({
+                        "backend": str(backend), "model": str(model),
+                        "attempt": str(attempt), "error": last_error,
+                    })
+                    continue
+
+                ok, gerr = self._validate_diff_with_git_check(diff, repo_root=repo_root)
+                if ok:
+                    # success → don't append a log entry for this attempt
+                    return diff, attempts_log
+                last_error = gerr or "git apply --check rejected the diff"
+                logger.warning("_llm_draft attempt %d (%s/%s) rejected by git apply --check: %s",
+                                attempt, backend, model, last_error)
+                attempts_log.append({
+                    "backend": str(backend), "model": str(model),
+                    "attempt": str(attempt), "error": last_error[:300],
+                })
+
+            return None, attempts_log
+        except Exception as e:
+            logger.exception("_llm_draft_with_backend failed (backend=%s model=%s)", backend, model)
+            attempts_log.append({
+                "backend": str(backend), "model": str(model),
+                "attempt": "0", "error": f"unexpected: {e}"[:300],
+            })
+            return None, attempts_log
+
+    # Default fallback chain. Each entry is (backend, model). Override via
+    # config["fallback_chain"] to suit a specific deployment. Any entry whose
+    # (backend, model) is not present in the live model catalog is silently
+    # skipped at runtime to avoid spamming errors for nonexistent models.
+    DEFAULT_FALLBACK_CHAIN: List[Tuple[str, str]] = [
+        ("claude_cli", "sonnet"),
+        ("claude_cli", "opus"),
+        ("openai_cli", "gpt-5"),
+    ]
+
+    async def _llm_draft_with_fallback(self, *, target_file: str,
+                                          rationale: str,
+                                          repo_root: Path,
+                                          mode: str = "minimal") -> Tuple[Optional[str], List[Dict[str, str]]]:
+        """Multi-backend fallback chain. Returns ``(diff, all_attempts_log)``.
+
+        Order:
+          1. Configured backend/model — 3 attempts.
+          2. Each entry from ``config["fallback_chain"]`` (or
+             ``DEFAULT_FALLBACK_CHAIN``) that is present in the live model
+             catalog — 1 attempt each.
+
+        Entries not registered in the catalog are silently dropped so we don't
+        waste time on models the deployment can't actually call.
+        """
+        chain: List[Tuple[Optional[str], Optional[str], int]] = []
+        primary_backend = None
+        primary_model = None
+        try:
+            primary_backend = self.config.get("backend")
+            primary_model = self.config.get("model")
         except Exception:
-            logger.exception("_llm_draft failed")
-            return None
+            pass
+        chain.append((primary_backend, primary_model, 3))
+
+        configured_chain = []
+        try:
+            configured_chain = list(self.config.get("fallback_chain") or [])
+        except Exception:
+            configured_chain = []
+        raw_fallbacks: List[Tuple[str, str]] = []
+        for entry in configured_chain:
+            try:
+                be, mdl = entry
+                raw_fallbacks.append((str(be), str(mdl)))
+            except Exception:
+                continue
+        if not raw_fallbacks:
+            raw_fallbacks = list(self.DEFAULT_FALLBACK_CHAIN)
+
+        # Filter out entries whose model isn't registered in the live catalog
+        # for that backend; spares retries on models that can't run anyway.
+        try:
+            from skyn3t.adapters.model_catalog import list_models
+        except Exception:
+            list_models = None  # type: ignore[assignment]
+        validated: List[Tuple[str, str]] = []
+        if list_models is not None:
+            for be, mdl in raw_fallbacks:
+                try:
+                    items = await list_models(be)
+                    names = {str(it.get("id") or it.get("name") or "") for it in items}
+                    if not names or mdl in names or any(n.endswith("/" + mdl) or n.startswith(mdl) for n in names):
+                        validated.append((be, mdl))
+                except Exception:
+                    # If we can't reach the catalog, fall back to including the
+                    # entry rather than silently dropping the entire chain.
+                    validated.append((be, mdl))
+        else:
+            validated = raw_fallbacks
+
+        seen = {(primary_backend, primary_model)}
+        for be, mdl in validated:
+            if (be, mdl) not in seen:
+                chain.append((be, mdl, 1))
+                seen.add((be, mdl))
+
+        all_attempts: List[Dict[str, Any]] = []
+        for backend_name, model_name, max_n in chain:
+            if hasattr(self, "think"):
+                try:
+                    await self.think(f"trying {backend_name}/{model_name}")
+                except Exception:
+                    pass
+            diff, attempts = await self._llm_draft_with_backend(
+                target_file=target_file, rationale=rationale,
+                repo_root=repo_root,
+                backend=backend_name,
+                model=model_name,
+                max_attempts=max_n,
+                mode=mode,
+            )
+            all_attempts.extend(attempts)
+            if diff:
+                return diff, all_attempts
+        return None, all_attempts
+
+    @staticmethod
+    def _validate_diff_with_git_check(diff: str, *, repo_root: Path) -> Tuple[bool, str]:
+        """Run `git apply --check` to verify the diff would apply. Returns (ok, error)."""
+        try:
+            proc = subprocess.run(
+                ["git", "apply", "--check", "-"],
+                input=diff, text=True, capture_output=True,
+                cwd=str(repo_root), timeout=30,
+            )
+            return (proc.returncode == 0, proc.stderr.strip()[:300])
+        except Exception as e:
+            return (False, str(e)[:200])
 
     def _extract_diff(self, raw: str, rel_path: str) -> Optional[str]:
         """Pull a unified diff out of an LLM response. Returns ``None`` if no
@@ -240,59 +1032,266 @@ class CodeImproverAgent(BaseAgent):
 
     # ---------------- apply handler ----------------
     async def _apply_patch(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Wrapper that runs ``_do_apply`` and raises on failure.
+
+        Raising on failure is required so the proposal store correctly marks
+        the proposal as ``status=failed`` (returning ``{ok:False}`` would leave
+        the proposal stuck on ``status=applied``, which is exactly the silent
+        failure mode this fix targets).
+        """
+        result = await self._do_apply(payload)
+        # Stash structured info so execute() can recover rejected_diff_path
+        # even when approve() catches our exception.
+        try:
+            self._last_apply_info = dict(result)
+        except Exception:
+            self._last_apply_info = {}
+        if result.get("ok"):
+            return result
+        raise CodePatchApplyError(result.get("error") or "git apply failed", info=result)
+
+    async def _do_apply(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         target_file: str = payload.get("target_file", "")
         patch: str = payload.get("patch", "")
+        repo_root = self._effective_repo_root(payload.get("repo_root"))
         if not target_file or not patch:
-            return {"ok": False, "error": "missing target_file or patch"}
+            return {"ok": False, "applied": False, "branch": None,
+                    "error": "missing target_file or patch",
+                    "rejected_diff_path": None}
+        if self._resolve_target_path(repo_root, target_file) is None:
+            return {"ok": False, "applied": False, "branch": None,
+                    "error": "target_file does not exist inside the target repo",
+                    "rejected_diff_path": None}
 
         # Are we in a git repo?
-        in_git = await asyncio.to_thread(self._run_git, ["rev-parse", "--is-inside-work-tree"])
+        in_git = await asyncio.to_thread(
+            self._run_git, ["rev-parse", "--is-inside-work-tree"], repo_root
+        )
         if not in_git["ok"]:
             # No git: write the proposed file straight to data/proposals/code/<id>/ as a preview, do NOT touch repo.
-            preview_dir = Path("data/proposals/code") / f"{int(time.time())}"
+            preview_dir = self._proposal_dir(repo_root) / f"{int(time.time())}"
             preview_dir.mkdir(parents=True, exist_ok=True)
             (preview_dir / "patch.diff").write_text(patch)
-            return {"ok": True, "applied": False, "preview_dir": str(preview_dir),
+            return {"ok": True, "applied": False, "branch": None,
+                    "preview_dir": str(preview_dir),
+                    "error": None,
+                    "rejected_diff_path": None,
                     "note": "not a git repo; saved patch as preview only"}
 
         branch = f"skyn3t/auto/{int(time.time())}"
         # Save current branch
-        cur = await asyncio.to_thread(self._run_git, ["rev-parse", "--abbrev-ref", "HEAD"])
+        cur = await asyncio.to_thread(
+            self._run_git, ["rev-parse", "--abbrev-ref", "HEAD"], repo_root
+        )
         cur_branch = (cur.get("stdout","") or "").strip() or "main"
         # Create + checkout branch
-        r = await asyncio.to_thread(self._run_git, ["checkout", "-b", branch])
+        r = await asyncio.to_thread(self._run_git, ["checkout", "-b", branch], repo_root)
         if not r["ok"]:
-            return {"ok": False, "error": f"checkout -b failed: {r.get('stderr','')}"}
-        # Apply patch
-        proc = await asyncio.to_thread(subprocess.run, ["git", "apply", "-"],
-                                        input=patch, text=True, capture_output=True, cwd=str(REPO_ROOT))
-        if proc.returncode != 0:
-            await asyncio.to_thread(self._run_git, ["checkout", cur_branch])
-            await asyncio.to_thread(self._run_git, ["branch", "-D", branch])
-            return {"ok": False, "error": f"git apply failed: {proc.stderr.strip()[:300]}"}
+            return {"ok": False, "applied": False, "branch": None,
+                    "error": f"checkout -b failed: {r.get('stderr','')}",
+                    "rejected_diff_path": None}
+        # Apply patch — try strict first, then progressively more lenient flags
+        # to tolerate LLM diffs with bare "@@" headers, fuzzy whitespace, etc.
+        apply_attempts = [
+            ["git", "apply", "-"],
+            ["git", "apply", "--recount", "-"],
+            ["git", "apply", "--recount", "--whitespace=fix", "--unidiff-zero", "-"],
+            ["git", "apply", "--recount", "--whitespace=fix", "--unidiff-zero", "-C0", "-"],
+        ]
+        last_err = ""
+        applied = False
+        for cmd in apply_attempts:
+            proc = await asyncio.to_thread(subprocess.run, cmd,
+                                            input=patch, text=True, capture_output=True,
+                                            cwd=str(repo_root))
+            if proc.returncode == 0:
+                applied = True
+                break
+            last_err = proc.stderr.strip()
+        if not applied:
+            # Last resort: parse the diff ourselves and apply by string match.
+            try:
+                if self._fallback_apply(target_file, patch, repo_root=repo_root):
+                    applied = True
+                    last_err = ""
+            except Exception as e:
+                last_err = f"{last_err} | fallback failed: {e}"
+
+        if not applied:
+            await asyncio.to_thread(self._run_git, ["checkout", cur_branch], repo_root)
+            await asyncio.to_thread(self._run_git, ["branch", "-D", branch], repo_root)
+            rejected_path: Optional[str] = None
+            try:
+                rej_dir = self._proposal_dir(repo_root) / f"rejected-{int(time.time())}"
+                rej_dir.mkdir(parents=True, exist_ok=True)
+                (rej_dir / "patch.diff").write_text(patch)
+                (rej_dir / "error.txt").write_text(last_err[:2000])
+                rejected_path = str(rej_dir)
+            except Exception:
+                logger.exception("could not write rejected diff dir")
+            return {"ok": False, "applied": False, "branch": None,
+                     "error": f"git apply failed (all attempts): {last_err[:300]}",
+                     "rejected_diff_path": rejected_path}
         # Commit
-        await asyncio.to_thread(self._run_git, ["add", target_file])
+        add_result = await asyncio.to_thread(self._run_git, ["add", target_file], repo_root)
+        if not add_result.get("ok"):
+            return {
+                "ok": False,
+                "applied": False,
+                "branch": branch,
+                "previous_branch": cur_branch,
+                "error": f"git add failed: {add_result.get('stderr', '')[:300]}",
+                "rejected_diff_path": None,
+            }
         cm = await asyncio.to_thread(self._run_git,
-            ["commit", "-m", f"chore(auto): {payload.get('rationale','code improvement')[:60]}"])
+            ["commit", "-m", f"chore(auto): {payload.get('rationale','code improvement')[:60]}"],
+            repo_root)
+        if not cm.get("ok"):
+            return {
+                "ok": False,
+                "applied": False,
+                "branch": branch,
+                "previous_branch": cur_branch,
+                "error": f"git commit failed: {cm.get('stderr', '')[:300]}",
+                "rejected_diff_path": None,
+            }
+        commit_sha = ""
+        sha_r = await asyncio.to_thread(self._run_git, ["rev-parse", "HEAD"], repo_root)
+        commit_sha = (sha_r.get("stdout") or "").strip()[:12]
         # Run tests
-        test_r = await asyncio.to_thread(subprocess.run, ["python3", "-m", "pytest", "-q", "--tb=line"],
-                                          capture_output=True, text=True, cwd=str(REPO_ROOT), timeout=180)
-        if test_r.returncode != 0:
+        check_r = await asyncio.to_thread(self._run_repo_checks, repo_root)
+        if not check_r.get("ok"):
             # roll back
-            await asyncio.to_thread(self._run_git, ["checkout", cur_branch])
-            await asyncio.to_thread(self._run_git, ["branch", "-D", branch])
-            return {"ok": False, "error": "tests failed; rolled back",
-                    "test_output": test_r.stdout[-1200:] + "\n" + test_r.stderr[-400:]}
+            checkout_result = await asyncio.to_thread(
+                self._run_git, ["checkout", cur_branch], repo_root
+            )
+            branch_result: Dict[str, Any] = {"ok": False, "stderr": ""}
+            active_branch: Optional[str] = branch
+            error = f"repo checks failed; rollback failed: {checkout_result.get('stderr', '')[:300]}"
+            if checkout_result.get("ok"):
+                branch_result = await asyncio.to_thread(
+                    self._run_git, ["branch", "-D", branch], repo_root
+                )
+                if branch_result.get("ok"):
+                    active_branch = None
+                    error = "repo checks failed; rolled back"
+                else:
+                    error = (
+                        "repo checks failed; restored previous branch but could not delete "
+                        f"{branch}: {branch_result.get('stderr', '')[:300]}"
+                    )
+            return {"ok": False, "applied": False, "branch": active_branch,
+                    "previous_branch": cur_branch,
+                    "error": error,
+                    "rejected_diff_path": None,
+                    "test_output": check_r.get("stdout", "")[-1200:] + "\n" + check_r.get("stderr", "")[-400:],
+                    "check_command": check_r.get("command")}
         # Stay on the branch — user can merge manually
         return {"ok": True, "applied": True, "branch": branch,
+                "commit": commit_sha,
                 "previous_branch": cur_branch,
-                "tests_passed": True}
+                "tests_passed": True if check_r.get("ran") else None,
+                "checks_skipped": not check_r.get("ran"),
+                "check_command": check_r.get("command"),
+                "check_note": check_r.get("note"),
+                "error": None,
+                "rejected_diff_path": None}
 
     @staticmethod
-    def _run_git(args: List[str]) -> Dict[str, Any]:
+    def _fallback_apply(target_file: str, patch: str, *, repo_root: Path) -> bool:
+        """String-based fallback when git apply rejects the diff.
+
+        Parses the unified diff manually, finds each `-` line in the file and
+        replaces with the corresponding `+` line(s). Conservative: only applies
+        if every `-` block matches exactly once. Skips additions when the diff
+        only adds (insert position guessed by the preceding context line).
+        """
+        path = repo_root / target_file
+        if not path.exists() or not path.is_file():
+            return False
+        # Read bytes so universal-newline translation in text mode doesn't
+        # strip "\r\n" before we get a chance to detect it. Diff hunks use
+        # "\n" line endings; if the file is "\r\n" we normalize for matching
+        # and restore on write.
+        original_raw = path.read_bytes().decode("utf-8")
+        had_crlf = "\r\n" in original_raw
+        original = original_raw.replace("\r\n", "\n") if had_crlf else original_raw
+        new_text = original
+
+        # Tokenize patch into hunks separated by @@ markers.
+        lines = patch.splitlines(keepends=False)
+        hunks: List[List[str]] = []
+        cur: List[str] = []
+        for ln in lines:
+            if ln.startswith("@@"):
+                if cur:
+                    hunks.append(cur)
+                cur = []
+            elif ln.startswith("--- ") or ln.startswith("+++ ") or ln.startswith("diff "):
+                continue
+            else:
+                cur.append(ln)
+        if cur:
+            hunks.append(cur)
+
+        for hunk in hunks:
+            removes: List[str] = []
+            adds: List[str] = []
+            ctx_before: List[str] = []
+            ctx_after: List[str] = []
+            saw_change = False
+            for ln in hunk:
+                if not ln:
+                    continue
+                if ln[0] == "-":
+                    removes.append(ln[1:])
+                    saw_change = True
+                elif ln[0] == "+":
+                    adds.append(ln[1:])
+                    saw_change = True
+                elif ln[0] == " ":
+                    if not saw_change:
+                        ctx_before.append(ln[1:])
+                    else:
+                        ctx_after.append(ln[1:])
+
+            # Pure deletion + addition replacement
+            if removes and adds:
+                old_block = "\n".join(removes)
+                new_block = "\n".join(adds)
+                if new_text.count(old_block) == 1:
+                    new_text = new_text.replace(old_block, new_block, 1)
+                else:
+                    return False
+            elif removes and not adds:
+                old_block = "\n".join(removes)
+                if new_text.count(old_block) == 1:
+                    new_text = new_text.replace(old_block, "", 1)
+                else:
+                    return False
+            elif adds and not removes:
+                if ctx_before:
+                    anchor = ctx_before[-1]
+                    new_block = "\n".join(adds)
+                    if new_text.count(anchor) == 1:
+                        new_text = new_text.replace(anchor, anchor + "\n" + new_block, 1)
+                    else:
+                        return False
+                else:
+                    return False  # don't know where to add
+
+        if new_text == original:
+            return False
+        if had_crlf:
+            new_text = new_text.replace("\n", "\r\n")
+        path.write_text(new_text, encoding="utf-8")
+        return True
+
+    @staticmethod
+    def _run_git(args: List[str], cwd: Path = REPO_ROOT) -> Dict[str, Any]:
         try:
             r = subprocess.run(["git", *args], capture_output=True, text=True,
-                                cwd=str(REPO_ROOT), timeout=60)
+                                cwd=str(cwd), timeout=60)
             return {"ok": r.returncode == 0, "stdout": r.stdout, "stderr": r.stderr}
         except Exception as e:
             return {"ok": False, "stderr": str(e)}

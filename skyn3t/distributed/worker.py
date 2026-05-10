@@ -2,14 +2,17 @@
 
 import asyncio
 import json
+import logging
 import os
 import signal
+import time
 from typing import Any, Dict, List, Optional
 
-from skyn3t.adapters.cli_agent import CLIAgent
-from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
-from skyn3t.core.events import Event, EventBus, EventType
+from skyn3t.core.agent import TaskRequest, TaskResult
+from skyn3t.core.events import Event, EventType
 from skyn3t.distributed.redis_bus import RedisEventBus
+
+logger = logging.getLogger("skyn3t.distributed.worker")
 
 
 class Worker:
@@ -24,9 +27,9 @@ class Worker:
         self.worker_id = worker_id or f"worker-{os.getpid()}"
         self.capabilities = capabilities or []
         self.event_bus = RedisEventBus(redis_url)
-        self._redis = None
+        self._redis: Any = None
         self._running = False
-        self._task_queue = asyncio.Queue()
+        self._task_queue: asyncio.Queue[Any] = asyncio.Queue()
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._processor_task: Optional[asyncio.Task] = None
         self._task_count = 0
@@ -54,7 +57,7 @@ class Worker:
                 {
                     "capabilities": self.capabilities,
                     "status": "idle",
-                    "started_at": str(asyncio.get_event_loop().time()),
+                    "started_at": str(time.time()),
                 }
             ),
         )
@@ -62,7 +65,7 @@ class Worker:
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         self._processor_task = asyncio.create_task(self._task_processor())
 
-        print(f"Worker {self.worker_id} started with capabilities: {self.capabilities}")
+        logger.info("Worker %s started with capabilities: %s", self.worker_id, self.capabilities)
 
     async def stop(self) -> None:
         """Stop the worker gracefully."""
@@ -88,7 +91,7 @@ class Worker:
 
         await self.event_bus.shutdown()
 
-        print(f"Worker {self.worker_id} stopped")
+        logger.info("Worker %s stopped", self.worker_id)
 
     async def _heartbeat_loop(self) -> None:
         """Send periodic heartbeats."""
@@ -102,7 +105,7 @@ class Worker:
                             "capabilities": self.capabilities,
                             "status": "idle" if self._task_queue.empty() else "busy",
                             "task_count": self._task_count,
-                            "last_seen": asyncio.get_event_loop().time(),
+                            "last_seen": time.time(),
                         }
                     ),
                 )
@@ -110,21 +113,55 @@ class Worker:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"Heartbeat error: {e}")
+                logger.warning("Heartbeat error: %s", e)
                 await asyncio.sleep(5)
 
+    # Visibility-timeout pattern: when we pop a task we move it to a per-worker
+    # processing list with BRPOPLPUSH. If we crash mid-execution, a janitor
+    # (or the worker on next start) can find tasks stranded there and either
+    # requeue or DLQ them. After successful execution we LREM the marker.
+    PROCESSING_LIST_PREFIX = "skyn3t:processing:"
+    DLQ_KEY = "skyn3t:task_queue:dlq"
+    MAX_EXECUTION_ATTEMPTS = 3
+
+    @property
+    def _processing_key(self) -> str:
+        return f"{self.PROCESSING_LIST_PREFIX}{self.worker_id}"
+
     async def _task_processor(self) -> None:
-        """Main loop pulling tasks from Redis queue."""
+        """Main loop pulling tasks from Redis queue.
+
+        Uses BRPOPLPUSH so the popped task lives on a worker-specific
+        processing list until we LREM it on success. If we crash, the entry
+        survives and can be re-queued or DLQ'd by janitors / on restart.
+        """
         consecutive_errors = 0
         max_backoff = 60
+        # On startup, drain anything left over from a prior crash by either
+        # re-queueing (if attempt budget remains) or shipping to the DLQ.
+        await self._recover_orphaned_tasks()
         while self._running:
             try:
-                # Try to get task from Redis queue
-                result = await self._redis.brpop("skyn3t:task_queue", timeout=5)
-                if result:
-                    _, task_json = result
+                # BRPOPLPUSH atomically pops the queue tail and pushes onto
+                # this worker's processing list. timeout=5 lets us notice
+                # _running flipping false without a stuck wait.
+                task_json = await self._redis.brpoplpush(
+                    "skyn3t:task_queue",
+                    self._processing_key,
+                    timeout=5,
+                )
+                if task_json:
                     task_data = json.loads(task_json)
-                    await self._execute_task(task_data)
+                    try:
+                        await self._execute_task(task_data)
+                    finally:
+                        # Remove the in-flight marker regardless of outcome;
+                        # _execute_task is responsible for re-queue / DLQ on
+                        # failure paths.
+                        try:
+                            await self._redis.lrem(self._processing_key, 1, task_json)
+                        except Exception:
+                            pass
                 else:
                     await asyncio.sleep(1)
                 consecutive_errors = 0
@@ -132,28 +169,79 @@ class Worker:
                 break
             except Exception as e:
                 consecutive_errors += 1
-                print(f"Task processor error: {e}")
+                logger.warning("Task processor error: %s", e)
                 backoff = min(2 ** (consecutive_errors - 1), max_backoff)
                 await asyncio.sleep(backoff)
 
+    async def _recover_orphaned_tasks(self) -> None:
+        """Re-queue or DLQ tasks left on the processing list from a prior run."""
+        try:
+            stranded = await self._redis.lrange(self._processing_key, 0, -1)
+        except Exception:
+            return
+        for raw in stranded or []:
+            try:
+                task_data = json.loads(raw)
+            except Exception:
+                # Garbled entry — just drop the marker.
+                try:
+                    await self._redis.lrem(self._processing_key, 1, raw)
+                except Exception:
+                    pass
+                continue
+            attempts = int(task_data.get("_exec_attempts", 0)) + 1
+            task_data["_exec_attempts"] = attempts
+            target = (
+                self.DLQ_KEY if attempts > self.MAX_EXECUTION_ATTEMPTS
+                else "skyn3t:task_queue"
+            )
+            try:
+                await self._redis.lpush(target, json.dumps(task_data))
+                await self._redis.lrem(self._processing_key, 1, raw)
+                logger.info(
+                    "Worker %s: recovered orphaned task %s → %s",
+                    self.worker_id, task_data.get("task_id"), target,
+                )
+            except Exception as e:
+                logger.warning("Failed to recover orphaned task: %s", e)
+
+    # Maximum number of times a task can ping-pong between capability-mismatched
+    # workers before it's parked on the dead-letter queue. Without this cap, a
+    # task whose capability no live worker satisfies would loop forever.
+    MAX_REQUEUE_ATTEMPTS = 5
+
     async def _execute_task(self, task_data: Dict[str, Any]) -> None:
         """Execute a task."""
-        from skyn3t.core.agent import TaskRequest
-
         # Capability matching: if task declares required capabilities, ensure this worker can handle them
         required = task_data.get("required_capabilities") or task_data.get("input_data", {}).get("required_capabilities")
         if required:
             if not isinstance(required, (list, tuple)):
                 required = [required]
             if self.capabilities and not any(c in self.capabilities for c in required):
-                print(
-                    f"Worker {self.worker_id} cannot handle task {task_data.get('task_id')} "
-                    f"(required={required}, have={self.capabilities}); re-enqueueing."
+                attempts = int(task_data.get("_requeue_attempts", 0)) + 1
+                task_data["_requeue_attempts"] = attempts
+                if attempts > self.MAX_REQUEUE_ATTEMPTS:
+                    logger.warning(
+                        "Worker %s: task %s exceeded %d re-queue attempts; "
+                        "moving to DLQ (required=%s).",
+                        self.worker_id, task_data.get("task_id"),
+                        self.MAX_REQUEUE_ATTEMPTS, required,
+                    )
+                    try:
+                        await self._redis.rpush("skyn3t:task_queue:dlq", json.dumps(task_data))
+                    except Exception as e:
+                        logger.warning("Failed to move task to DLQ: %s", e)
+                    return
+                logger.info(
+                    "Worker %s cannot handle task %s (required=%s, have=%s); "
+                    "re-enqueueing (attempt %d/%d).",
+                    self.worker_id, task_data.get("task_id"), required,
+                    self.capabilities, attempts, self.MAX_REQUEUE_ATTEMPTS,
                 )
                 try:
                     await self._redis.lpush("skyn3t:task_queue", json.dumps(task_data))
                 except Exception as e:
-                    print(f"Failed to re-enqueue task: {e}")
+                    logger.warning("Failed to re-enqueue task: %s", e)
                 await asyncio.sleep(1)
                 return
 

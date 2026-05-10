@@ -4,8 +4,14 @@ Each resolver returns a list of {id, label, context_tokens?, hint?} dicts.
 All resolvers must be cheap, robust, and never raise. Network/CLI calls are
 optional — fall back to a sensible static list per backend.
 """
+
 from __future__ import annotations
-import asyncio, json, logging, os, subprocess, time
+
+import asyncio
+import json
+import logging
+import os
+import time
 from typing import Any, Dict, List
 
 logger = logging.getLogger("skyn3t.adapters.model_catalog")
@@ -21,25 +27,22 @@ STATIC: Dict[str, List[Dict[str, Any]]] = {
         {"id": "haiku", "label": "haiku (alias)"},
     ],
     "kimi_cli": [
-        {"id": "kimi-k2.6", "label": "Kimi K2.6 (current default)"},
-        {"id": "kimi-k2.5", "label": "Kimi K2.5"},
-        {"id": "kimi-k2", "label": "Kimi K2"},
-        {"id": "kimi-thinking", "label": "Kimi Thinking (reasoning)"},
-        {"id": "moonshot-v1-128k", "label": "Moonshot v1 128K (legacy)"},
+        {"id": "kimi-code/kimi-for-coding", "label": "Kimi K2.6 (default — managed)"},
+        {"id": "(default)", "label": "Use config.toml default"},
     ],
     "copilot_cli": [
-        {"id": "gpt-5.4", "label": "GPT-5.4 (Copilot default)"},
-        {"id": "gpt-5.4-mini", "label": "GPT-5.4 mini"},
-        {"id": "gpt-5.3-codex", "label": "GPT-5.3 Codex"},
-        {"id": "gpt-5.2", "label": "GPT-5.2"},
-        {"id": "gpt-5.2-codex", "label": "GPT-5.2 Codex"},
-        {"id": "gpt-5-mini", "label": "GPT-5 mini"},
-        {"id": "gpt-4.1", "label": "GPT-4.1"},
-        {"id": "claude-sonnet-4.6", "label": "Claude Sonnet 4.6"},
-        {"id": "claude-sonnet-4.5", "label": "Claude Sonnet 4.5"},
-        {"id": "claude-haiku-4.5", "label": "Claude Haiku 4.5"},
-        {"id": "claude-opus-4.6", "label": "Claude Opus 4.6 (premium)"},
-        {"id": "claude-opus-4.5", "label": "Claude Opus 4.5 (premium)"},
+        {"id": "claude-sonnet-4.6", "label": "Claude Sonnet 4.6 (default · 1x)"},
+        {"id": "claude-sonnet-4.5", "label": "Claude Sonnet 4.5 · 1x"},
+        {"id": "claude-haiku-4.5",  "label": "Claude Haiku 4.5 · 0.33x"},
+        {"id": "claude-opus-4.6",   "label": "Claude Opus 4.6 · 3x (premium)"},
+        {"id": "claude-opus-4.5",   "label": "Claude Opus 4.5 · 3x (premium)"},
+        {"id": "gpt-5.4",           "label": "GPT-5.4 · 1x"},
+        {"id": "gpt-5.3-codex",     "label": "GPT-5.3 Codex · 1x"},
+        {"id": "gpt-5.2-codex",     "label": "GPT-5.2 Codex · 1x"},
+        {"id": "gpt-5.2",           "label": "GPT-5.2 · 1x"},
+        {"id": "gpt-5.4-mini",      "label": "GPT-5.4 mini · 0.33x"},
+        {"id": "gpt-5-mini",        "label": "GPT-5 mini · 0x (free)"},
+        {"id": "gpt-4.1",           "label": "GPT-4.1 · 0x (free)"},
     ],
     "openai_cli": [
         {"id": "gpt-5.4", "label": "GPT-5.4"},
@@ -70,15 +73,17 @@ STATIC: Dict[str, List[Dict[str, Any]]] = {
 }
 
 # in-process cache (backend → (ts, items))
-_CACHE: Dict[str, Any] = {}
+_CACHE: Dict[str, tuple[float, List[Dict[str, Any]]]] = {}
 _CACHE_TTL = 3600  # 1h
 
 
 def _cache_get(key: str) -> List[Dict[str, Any]] | None:
     v = _CACHE.get(key)
-    if not v: return None
+    if not v:
+        return None
     ts, items = v
-    if time.time() - ts > _CACHE_TTL: return None
+    if time.time() - ts > _CACHE_TTL:
+        return None
     return items
 
 
@@ -97,7 +102,8 @@ async def _claude_cli() -> List[Dict[str, Any]]:
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=4.0)
         except asyncio.TimeoutError:
-            proc.kill(); return STATIC["claude_cli"]
+            proc.kill()
+            return STATIC["claude_cli"]
         text = (out or b"").decode(errors="replace").lower()
         # If `--model` is documented, surface aliases known to work.
         if "--model" in text:
@@ -117,14 +123,18 @@ async def _openai_cli() -> List[Dict[str, Any]]:
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=8.0)
         except asyncio.TimeoutError:
-            proc.kill(); return STATIC["openai_cli"]
-        if proc.returncode != 0: return STATIC["openai_cli"]
+            proc.kill()
+            return STATIC["openai_cli"]
+        if proc.returncode != 0:
+            return STATIC["openai_cli"]
         # The CLI's default output isn't reliably JSON; try, else fall back.
         try:
             data = json.loads(out.decode(errors="replace"))
             ids = []
-            if isinstance(data, dict) and "data" in data: ids = [m["id"] for m in data["data"]]
-            elif isinstance(data, list): ids = [m.get("id") for m in data if isinstance(m, dict)]
+            if isinstance(data, dict) and "data" in data:
+                ids = [m["id"] for m in data["data"]]
+            elif isinstance(data, list):
+                ids = [m.get("id") for m in data if isinstance(m, dict)]
             ids = [i for i in ids if i]
             if ids:
                 return [{"id": i, "label": i} for i in sorted(set(ids))]
@@ -137,18 +147,30 @@ async def _openai_cli() -> List[Dict[str, Any]]:
 
 async def _anthropic() -> List[Dict[str, Any]]:
     key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key: return STATIC["anthropic"]
+    if not key:
+        return STATIC["anthropic"]
     try:
         import httpx  # type: ignore
         async with httpx.AsyncClient(timeout=10.0) as c:
-            r = await c.get("https://api.anthropic.com/v1/models",
-                            headers={"x-api-key": key, "anthropic-version": "2023-06-01"})
+            r = await c.get(
+                "https://api.anthropic.com/v1/models",
+                headers={
+                    "x-api-key": key,
+                    "anthropic-version": "2023-06-01",
+                },
+            )
             if r.status_code == 200:
                 data = r.json().get("data", [])
-                items = [{"id": m.get("id"),
-                          "label": m.get("display_name") or m.get("id")}
-                         for m in data if m.get("id")]
-                if items: return items
+                items = [
+                    {
+                        "id": m.get("id"),
+                        "label": m.get("display_name") or m.get("id"),
+                    }
+                    for m in data
+                    if m.get("id")
+                ]
+                if items:
+                    return items
     except Exception:
         logger.exception("anthropic models fetch failed")
     return STATIC["anthropic"]
@@ -164,7 +186,8 @@ async def _openrouter() -> List[Dict[str, Any]]:
                 items = []
                 for m in data:
                     mid = m.get("id")
-                    if not mid: continue
+                    if not mid:
+                        continue
                     name = m.get("name") or mid
                     ctx = m.get("context_length")
                     items.append({"id": mid, "label": name, "context_tokens": ctx})
@@ -180,7 +203,8 @@ async def _openrouter() -> List[Dict[str, Any]]:
 async def list_models(backend: str) -> List[Dict[str, Any]]:
     backend = (backend or "auto").lower()
     cached = _cache_get(backend)
-    if cached is not None: return cached
+    if cached is not None:
+        return cached
     items: List[Dict[str, Any]]
     try:
         if backend == "claude_cli":

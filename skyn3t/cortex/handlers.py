@@ -4,8 +4,11 @@ Registered with the global ProposalStore at orchestrator boot.
 Each handler is async and receives the proposal payload dict.
 """
 from __future__ import annotations
+
 import logging
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Dict
+
+from skyn3t.cortex.review_utils import normalize_review_risks
 
 logger = logging.getLogger("skyn3t.cortex.handlers")
 
@@ -28,7 +31,7 @@ def install_handlers(orchestrator) -> None:
                 return {"ok": False, "error": "code_improver agent not registered"}
             from skyn3t.core.agent import TaskRequest
             req = TaskRequest(
-                title=f"draft from feature proposal",
+                title="draft from feature proposal",
                 input_data={
                     "rationale": str(idea)[:200],
                     "intent": "feature_implementation",
@@ -76,8 +79,10 @@ def install_handlers(orchestrator) -> None:
     async def studio_debug_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
         """Approved studio_debug → run CodeImproverAgent on target_file with verdict+risks as rationale."""
         target = payload.get("target_file") or ""
-        risks = payload.get("risks") or []
+        risks = normalize_review_risks(payload.get("risks") or [])
         verdict = payload.get("verdict") or ""
+        if not risks:
+            return {"ok": False, "error": "review flagged no actionable risks"}
         rationale = (
             f"Address Reviewer's critique on `{target}`.\n\n"
             f"Verdict: {verdict}\n\n"
@@ -91,7 +96,12 @@ def install_handlers(orchestrator) -> None:
             from skyn3t.core.agent import TaskRequest
             req = TaskRequest(
                 title="studio_debug retry",
-                input_data={"target_file": target, "rationale": rationale, "intent": "studio_debug"},
+                input_data={
+                    "target_file": target,
+                    "rationale": rationale,
+                    "intent": "studio_debug",
+                    "review_risks": risks,
+                },
             )
             result = await improver.execute(req)
             ok = bool(getattr(result, "success", False))

@@ -1,8 +1,12 @@
 """Watch for Reviewer outputs and file studio_debug proposals."""
 from __future__ import annotations
-import asyncio, logging, re, time
+
+import asyncio
+import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
+
+from skyn3t.cortex.review_utils import parse_review_markdown
 
 logger = logging.getLogger("skyn3t.cortex.review_watcher")
 
@@ -14,10 +18,29 @@ class ReviewWatcher:
     def __init__(self, event_bus):
         self.event_bus = event_bus
         self._wired = False
-        self._seen: set[str] = set()  # slug -> don't re-file forever
+        self._seen_path = Path("data/review_watcher_seen.json")
+        self._seen: set[str] = self._load_seen()  # slug -> don't re-file forever
+
+    def _load_seen(self) -> set:
+        try:
+            if self._seen_path.exists():
+                import json as _j
+                return set(_j.loads(self._seen_path.read_text()))
+        except Exception:
+            pass
+        return set()
+
+    def _save_seen(self) -> None:
+        try:
+            import json as _j
+            self._seen_path.parent.mkdir(parents=True, exist_ok=True)
+            self._seen_path.write_text(_j.dumps(sorted(self._seen)))
+        except Exception:
+            pass
 
     def start(self) -> None:
-        if self._wired: return
+        if self._wired:
+            return
         self._wired = True
         try:
             self.event_bus.subscribe(self._on_event)
@@ -51,11 +74,15 @@ class ReviewWatcher:
                 return
             text = review.read_text(encoding="utf-8")
             verdict, risks = self._parse(text)
-            # Only file when there's something to fix
-            needs_fix = any(k in verdict.lower() for k in ("no-go", "go-with-fixes", "needs", "blocked"))
-            if not needs_fix and not risks:
+            # Only file when verdict is a hard "no-go" or "blocked".
+            # `go-with-fixes` is the default for almost every project — flagging
+            # it pops a useless modal every run, so we ignore it silently here.
+            v = verdict.lower()
+            needs_fix = any(k in v for k in ("no-go", "blocked"))
+            if not needs_fix or not risks:
                 return
             self._seen.add(slug)
+            self._save_seen()
             from skyn3t.cortex import get_store
             primary_artifact = self._guess_target(root)
             get_store().create(
@@ -83,20 +110,7 @@ class ReviewWatcher:
             logger.exception("ReviewWatcher._inspect failed for %s", slug)
 
     def _parse(self, text: str) -> tuple[str, list[str]]:
-        verdict = ""
-        risks: list[str] = []
-        in_risks = False
-        for line in text.splitlines():
-            low = line.lower().strip()
-            if "verdict" in low and ("go" in low or "no-go" in low or "fix" in low):
-                verdict = line.strip().lstrip("#").strip()
-            if low.startswith("## risks") or low.startswith("# risks"):
-                in_risks = True; continue
-            if in_risks:
-                if line.strip().startswith("- "):
-                    risks.append(line.strip()[2:].strip())
-                elif line.strip().startswith("##") or line.strip().startswith("#"):
-                    in_risks = False
+        verdict, risks = parse_review_markdown(text)
         return verdict, risks[:10]
 
     def _guess_target(self, root: Path) -> str:

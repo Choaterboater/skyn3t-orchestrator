@@ -31,8 +31,13 @@ class CollectiveConsciousness:
         self._working_memory: Dict[str, Dict[str, Any]] = {}
         self._default_ttl_seconds = 3600  # 1 hour
 
-        # Session contexts: session_id -> accumulated dict
+        # Session contexts: session_id -> accumulated dict.
+        # Each session_id also tracks last_active_ts so old sessions can be
+        # evicted; otherwise long-running daemons accumulate every session
+        # they have ever seen.
         self._session_contexts: Dict[str, Dict[str, Any]] = {}
+        self._session_ttl_seconds = 86400  # 24h
+        self._max_session_history = 500
 
         # Agent insights: agent_name -> list of insight dicts
         self._agent_insights: Dict[str, List[Dict[str, Any]]] = {}
@@ -126,7 +131,7 @@ class CollectiveConsciousness:
                     sess[key] = value
 
     async def add_to_session_history(self, session_id: str, entry: Dict[str, Any]) -> None:
-        """Add an entry to a session's history."""
+        """Add an entry to a session's history (bounded)."""
         async with self._lock:
             if session_id not in self._session_contexts:
                 self._session_contexts[session_id] = {
@@ -134,10 +139,23 @@ class CollectiveConsciousness:
                     "history": [],
                     "metadata": {},
                 }
-            self._session_contexts[session_id]["history"].append({
-                **entry,
-                "timestamp": time.time(),
-            })
+            sess = self._session_contexts[session_id]
+            sess["history"].append({**entry, "timestamp": time.time()})
+            sess["last_active_ts"] = time.time()
+            if len(sess["history"]) > self._max_session_history:
+                sess["history"] = sess["history"][-self._max_session_history:]
+            # Opportunistic eviction of stale sessions.
+            self._evict_stale_sessions_locked()
+
+    def _evict_stale_sessions_locked(self) -> None:
+        """Drop sessions inactive longer than _session_ttl_seconds. Lock held."""
+        now = time.time()
+        stale = [
+            sid for sid, sess in self._session_contexts.items()
+            if (now - sess.get("last_active_ts", now)) > self._session_ttl_seconds
+        ]
+        for sid in stale:
+            self._session_contexts.pop(sid, None)
 
     async def list_sessions(self) -> List[str]:
         """List active session IDs."""

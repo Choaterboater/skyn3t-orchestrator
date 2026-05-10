@@ -3,11 +3,10 @@
 import asyncio
 import json
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Optional
 
 from skyn3t.config.settings import get_settings
 from skyn3t.core.events import Event, EventBus, EventType
-
 
 logger = logging.getLogger(__name__)
 
@@ -18,11 +17,15 @@ class RedisEventBus(EventBus):
     def __init__(self, redis_url: Optional[str] = None):
         super().__init__()
         self._redis_url = redis_url or get_settings().redis_url
-        self._redis = None
-        self._pubsub = None
+        self._redis: Any = None
+        self._pubsub: Any = None
         self._listener_task: Optional[asyncio.Task] = None
         self._running = False
         self._local_only = False
+        # Strong refs to in-flight publish tasks. Without this, asyncio.create_task
+        # returns a coroutine the GC may collect before it runs, silently dropping
+        # the published event. set.discard via done callback releases on completion.
+        self._publish_tasks: "set[asyncio.Task]" = set()
 
     async def initialize(self) -> None:
         """Initialize Redis connection."""
@@ -74,7 +77,14 @@ class RedisEventBus(EventBus):
         super().publish(event)
 
         if not self._local_only and self._redis:
-            asyncio.create_task(self._publish_to_redis(event))
+            try:
+                task = asyncio.create_task(self._publish_to_redis(event))
+            except RuntimeError:
+                # Called from a thread/context with no running loop; the local
+                # publish above already happened, so just skip the Redis fan-out.
+                return
+            self._publish_tasks.add(task)
+            task.add_done_callback(self._publish_tasks.discard)
 
     async def _publish_to_redis(self, event: Event) -> None:
         """Publish event to Redis channel."""
@@ -82,7 +92,7 @@ class RedisEventBus(EventBus):
             data = json.dumps(event.to_dict(), default=str)
             await self._redis.publish("skyn3t:events", data)
         except Exception as e:
-            print(f"Redis publish error: {e}")
+            logger.warning("Redis publish failed: %s", e)
 
     async def shutdown(self) -> None:
         """Shutdown Redis connection."""

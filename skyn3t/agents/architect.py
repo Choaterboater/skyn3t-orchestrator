@@ -1,19 +1,21 @@
 """Architect Agent - scaffolds system architecture and tech stack docs.
 
-LLM-free deterministic generator. Picks a stack based on ``target`` and fills
-out an ``architecture.md`` plus ``tech_stack.json`` in the caller-provided
-artifact directory. Future LLM-powered variants can subclass.
+Tries the configured LLM first to produce brief-aware architecture content;
+falls back to the deterministic templates below when the LLM is unavailable
+or returns a stub. Picks a stack based on ``target`` and fills out an
+``architecture.md`` plus ``tech_stack.json`` in the caller-provided artifact
+directory.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
-
 
 _STACKS: Dict[str, Dict[str, Any]] = {
     "saas": {
@@ -77,14 +79,14 @@ class ArchitectAgent(BaseAgent):
     def __init__(
         self,
         name: str = "architect",
-        event_bus: EventBus = None,
+        event_bus: EventBus | None = None,
         config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             name=name,
             agent_type="architect",
             provider="local",
-            event_bus=event_bus,
+            event_bus=event_bus or EventBus(),
             config=config,
         )
         self.add_capability(
@@ -108,7 +110,7 @@ class ArchitectAgent(BaseAgent):
     async def health_check(self) -> bool:
         return bool(_STACKS)
 
-    async def execute(self, task: TaskRequest) -> TaskResult:
+    async def execute(self, task: TaskRequest, stdin_data: str | None = None) -> TaskResult:
         await self.think(f"{self.name} starting on {task.task_id}")
 
         data = task.input_data or {}
@@ -127,10 +129,47 @@ class ArchitectAgent(BaseAgent):
         stack = _STACKS[target]
         await self.think(f"selected stack profile '{target}'")
 
-        arch_md = self._render_architecture_md(brief, target, stack)
+        # STEP 0: try LLM for architecture.md, fall back to deterministic template.
+        arch_role_prompt = (
+            "You are a senior software architect. Given the user's brief, produce a "
+            "concise markdown architecture document with these sections (## headings):\n"
+            "- Overview (2-3 sentences)\n"
+            "- Components (bullet list of services/modules with one-sentence purpose each)\n"
+            "- Data model (key entities and relationships)\n"
+            "- APIs (key endpoints if applicable)\n"
+            "- Deployment (suggested infra, focused on what's needed for THIS specific project)\n"
+            "- Risks (3-5 specific risks tied to the brief)\n\n"
+            "Match the brief's actual scope - if it's a static HTML file, don't propose a "
+            "SaaS backend. If it's a marketing campaign, focus on content infrastructure "
+            "not microservices.\n\n"
+            f"Target profile hint: {target}."
+        )
+        fallback_arch_md = self._render_architecture_md(brief, target, stack)
+        arch_md = await self._llm_generate(
+            role_prompt=arch_role_prompt,
+            brief=brief,
+            fallback=fallback_arch_md,
+        )
         arch_path = artifact_dir / "architecture.md"
         arch_path.write_text(arch_md, encoding="utf-8")
         await self.think(f"wrote {arch_path.name}")
+
+        # STEP 0: try LLM for tech_stack.json, fall back to deterministic template.
+        stack_role_prompt = (
+            "Given the brief, return a JSON object with keys: frontend, backend, db, infra, ci. "
+            "Pick choices that match the actual scope of the brief. "
+            "Return ONLY valid JSON, nothing else. No code fences, no commentary."
+        )
+        llm_stack = await self._llm_generate_json(
+            role_prompt=stack_role_prompt,
+            brief=brief,
+            fallback=stack,
+        )
+        # Sanity-check: must be a dict with the expected keys; otherwise fall back.
+        if isinstance(llm_stack, dict) and all(
+            k in llm_stack for k in ("frontend", "backend", "db", "infra", "ci")
+        ):
+            stack = llm_stack
 
         stack_path = artifact_dir / "tech_stack.json"
         stack_path.write_text(json.dumps(stack, indent=2), encoding="utf-8")
@@ -301,3 +340,75 @@ class ArchitectAgent(BaseAgent):
             "Promotion is trunk-based: every merge to main builds, runs tests, and "
             "deploys to staging; production is a manual approval step."
         )
+
+    async def _llm_generate(self, *, role_prompt: str, brief: str, fallback: str) -> str:
+        """Ask the configured LLM for a markdown artifact.
+
+        Returns the LLM output, or the deterministic ``fallback`` if the LLM is
+        unavailable / returned a stub.
+        """
+        try:
+            client = self.get_llm() if hasattr(self, "get_llm") else None
+            if client is None:
+                from skyn3t.adapters import LLMClient
+                client = LLMClient(
+                    default_model=self.config.get("model"),
+                    backend=self.config.get("backend"),
+                    event_bus=self.event_bus,
+                    caller_name=self.name,
+                )
+            cot_preamble = (
+                "Think step-by-step before writing:\n"
+                "1. What's the actual scope here? (web app vs. static page vs. service)\n"
+                "2. What's the bare minimum set of components needed?\n"
+                "3. What's the data flow?\n"
+                "4. What's the riskiest dependency?\n"
+                "THEN produce the architecture document.\n\n"
+            )
+            prompt = (
+                f"{cot_preamble}{role_prompt}\n\nBrief from user:\n{brief}\n\n"
+                "Produce ONLY the markdown content for the artifact. "
+                "No code fences, no preamble, no commentary."
+            )
+            out = await client.complete(prompt, max_tokens=2500, temperature=0.4)
+            if out and "[deterministic-stub]" not in out and len(out.strip()) > 80:
+                return out.strip()
+        except Exception:
+            pass
+        return fallback
+
+    async def _llm_generate_json(
+        self, *, role_prompt: str, brief: str, fallback: Any
+    ) -> Any:
+        """Ask the LLM for a JSON object; fall back if parsing fails or stub."""
+        try:
+            client = self.get_llm() if hasattr(self, "get_llm") else None
+            if client is None:
+                from skyn3t.adapters import LLMClient
+                client = LLMClient(
+                    default_model=self.config.get("model"),
+                    backend=self.config.get("backend"),
+                    event_bus=self.event_bus,
+                    caller_name=self.name,
+                )
+            prompt = (
+                f"{role_prompt}\n\nBrief from user:\n{brief}\n\n"
+                "Return ONLY a valid JSON object. No code fences, no commentary."
+            )
+            out = await client.complete(prompt, max_tokens=800, temperature=0.4)
+            if not out or "[deterministic-stub]" in out:
+                return fallback
+            text = out.strip()
+            # Strip surrounding code fences if the model added them anyway.
+            if text.startswith("```"):
+                text = re.sub(r"^```(?:json)?\s*", "", text)
+                text = re.sub(r"\s*```$", "", text)
+            # Best-effort: extract first {...} block if there's prose around it.
+            if not text.lstrip().startswith("{"):
+                m = re.search(r"\{.*\}", text, re.DOTALL)
+                if m:
+                    text = m.group(0)
+            parsed = json.loads(text)
+            return parsed
+        except Exception:
+            return fallback

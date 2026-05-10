@@ -11,7 +11,7 @@ from skyn3t.security.permissions import (
     Policy,
     Role,
 )
-from skyn3t.security.sandbox import Sandbox, SandboxConfig, SandboxResult, CLISandboxRunner
+from skyn3t.security.sandbox import CLISandboxRunner, Sandbox, SandboxConfig, SandboxResult
 from skyn3t.security.secrets import SecretEntry, SecretStore
 
 __all__ = [

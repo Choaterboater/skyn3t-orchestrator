@@ -3,7 +3,6 @@
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from skyn3t.config.settings import get_settings
 from skyn3t.rag.document_processor import DocumentProcessor
 from skyn3t.rag.vector_store import VectorStore
 
@@ -53,10 +52,11 @@ class RAGEngine:
         documents = [c["content"] for c in chunks]
         metadatas = [c["metadata"] for c in chunks]
 
-        return await self.vector_store.add_documents(
+        document_ids: List[str] = await self.vector_store.add_documents(
             documents=documents,
             metadatas=metadatas,
         )
+        return document_ids
 
     async def add_knowledge_one(
         self,
@@ -129,16 +129,28 @@ class RAGEngine:
 
         # If an LLM provider is available, generate an answer
         if llm_provider:
-            context = retrieval["context"]
             prompt = (
-                f"Based on the following context, answer the question:\n\n"
-                f"Context:\n{context}\n\n"
-                f"Question: {query}\n\n"
-                f"Answer:"
+                f"User question:\n{query}\n\n"
+                f"Retrieved context:\n{retrieval['context']}\n\n"
+                "Answer using only the retrieved context. If the context is insufficient, "
+                "say that plainly. When useful, cite documents as [1], [2], etc."
             )
-
-            # This would call the LLM - simplified here
-            answer = f"[RAG-generated answer using {len(retrieval['documents'])} documents]"
+            system = system_prompt or (
+                "You are a retrieval-augmented assistant. Give a concise, direct answer "
+                "grounded in the provided documents only."
+            )
+            try:
+                candidate = await llm_provider.complete(
+                    prompt,
+                    system=system,
+                    max_tokens=900,
+                    temperature=0.2,
+                )
+                answer = candidate.strip()
+                if not answer or "[deterministic-stub]" in answer:
+                    answer = retrieval["documents"][0]["content"]
+            except Exception:
+                answer = retrieval["documents"][0]["content"]
         else:
             # Return top document as answer if no LLM available
             answer = retrieval["documents"][0]["content"]
@@ -149,6 +161,9 @@ class RAGEngine:
                 "source": doc["metadata"].get("source", "unknown"),
                 "title": doc["metadata"].get("title", "Untitled"),
                 "relevance": 1.0 - doc.get("distance", 0.0),
+                "content": doc["content"],
+                "snippet": doc["content"][:200],
+                "metadata": doc["metadata"],
             }
             for doc in retrieval["documents"]
         ]
@@ -160,6 +175,28 @@ class RAGEngine:
             "retrieval": retrieval,
         }
 
+    async def query_hybrid(
+        self,
+        query: str,
+        top_k: int = 5,
+        where: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Hybrid BM25 + vector retrieval with reciprocal rank fusion."""
+        if not self._initialized:
+            await self.initialize()
+        if not hasattr(self, "_hybrid"):
+            from skyn3t.rag.hybrid_search import HybridSearch
+            self._hybrid = HybridSearch(self)
+        return await self._hybrid.query(query, top_k=top_k, where=where)
+
+    def reindex_hybrid(self) -> None:
+        """Rebuild the hybrid (BM25) index from the current corpus."""
+        if not hasattr(self, "_hybrid"):
+            from skyn3t.rag.hybrid_search import HybridSearch
+            self._hybrid = HybridSearch(self)
+        self._hybrid.reindex()
+
     async def get_stats(self) -> Dict[str, Any]:
         """Get RAG system statistics."""
-        return await self.vector_store.get_collection_stats()
+        stats: Dict[str, Any] = await self.vector_store.get_collection_stats()
+        return stats

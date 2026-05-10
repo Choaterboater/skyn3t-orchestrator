@@ -1,5 +1,8 @@
 from __future__ import annotations
-import asyncio, logging, time
+
+import asyncio
+import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -35,7 +38,8 @@ class LearningLoop:
         self._wired = False
 
     def start(self) -> None:
-        if self._wired: return
+        if self._wired:
+            return
         self._wired = True
         try:
             from skyn3t.core.events import EventType
@@ -80,7 +84,8 @@ class LearningLoop:
 
     # --- workers ---
     async def _persist(self, lesson: Lesson) -> None:
-        if self.ingestor is None: return
+        if self.ingestor is None:
+            return
         try:
             res = await self.ingestor.ingest_lesson(
                 content=lesson.lesson,
@@ -95,18 +100,22 @@ class LearningLoop:
             logger.exception("ingest_lesson failed")
 
     async def _inject(self, event) -> None:
-        if self.rag is None: return
+        if self.rag is None:
+            return
         payload = event.payload or {}
         task = payload.get("task")  # orchestrator may attach the TaskRequest reference
         capability = payload.get("capability")
         title = payload.get("title") or payload.get("description") or capability or ""
-        if not title: return
+        if not title:
+            return
         try:
             hits = await self.rag.query(title, top_k=self.max_inject)
         except Exception:
-            logger.exception("rag.query during inject failed"); return
+            logger.exception("rag.query during inject failed")
+            return
         lessons = [h.get("content") for h in hits if h.get("content")]
-        if not lessons: return
+        if not lessons:
+            return
         if task is not None and hasattr(task, "input_data"):
             task.input_data.setdefault("lessons", []).extend(lessons)
 
@@ -124,7 +133,8 @@ class LearningLoop:
         try:
             from skyn3t.core.events import Event, EventType
             et = getattr(EventType, "AGENT_LEARNING", None)
-            if et is None: return
+            if et is None:
+                return
             self.event_bus.publish(Event(event_type=et, source=lesson.agent or "learning_loop",
                                          payload={"lesson": lesson.lesson, "outcome": lesson.outcome,
                                                   "capability": lesson.capability, "tags": lesson.tags}))
@@ -134,4 +144,5 @@ class LearningLoop:
     @staticmethod
     def _log_done(fut):
         exc = fut.exception()
-        if exc: logger.error("LearningLoop bg task error: %s", exc, exc_info=exc)
+        if exc:
+            logger.error("LearningLoop bg task error: %s", exc, exc_info=exc)

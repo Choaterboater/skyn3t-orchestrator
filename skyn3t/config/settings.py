@@ -4,7 +4,7 @@ import logging
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -58,6 +58,9 @@ class Settings(BaseSettings):
     task_timeout_seconds: int = Field(default=300, alias="TASK_TIMEOUT_SECONDS")
     heartbeat_interval_seconds: int = Field(default=30, alias="HEARTBEAT_INTERVAL_SECONDS")
     self_heal_enabled: bool = Field(default=True, alias="SELF_HEAL_ENABLED")
+    # Per-agent queue depth cap. submit_task drops with QUEUE_BACKPRESSURE_REJECT
+    # rather than buffering more requests when this is exceeded. 0 = unbounded.
+    max_queue_depth: int = Field(default=1000, alias="MAX_QUEUE_DEPTH")
 
     # RAG
     embedding_model: str = Field(
@@ -71,10 +74,15 @@ class Settings(BaseSettings):
     web_host: str = Field(default="0.0.0.0", alias="WEB_HOST")
     web_port: int = Field(default=6660, alias="WEB_PORT")
     cors_origins: List[str] = Field(default=["*"], alias="CORS_ORIGINS")
+    web_token: Optional[str] = Field(default=None, alias="SKYN3T_WEB_TOKEN")
 
     # Security
     security_enabled: bool = Field(default=True, alias="SECURITY_ENABLED")
     master_key: Optional[str] = Field(default=None, alias="SKYN3T_MASTER_KEY")
+    allow_ephemeral_master_key: bool = Field(
+        default=False,
+        alias="SKYN3T_ALLOW_EPHEMERAL_MASTER_KEY",
+    )
     secret_storage_path: Path = Field(default=Path("./data/secrets.json"), alias="SECRET_STORAGE_PATH")
     audit_log_dir: Path = Field(default=Path("./logs/audit"), alias="AUDIT_LOG_DIR")
     audit_max_entries_per_file: int = Field(default=10000, alias="AUDIT_MAX_ENTRIES_PER_FILE")
@@ -92,7 +100,11 @@ class Settings(BaseSettings):
     def parse_cors_origins(cls, v: Any) -> List[str]:
         if isinstance(v, str):
             return [origin.strip() for origin in v.split(",")]
-        return v
+        if isinstance(v, list):
+            return [str(origin).strip() for origin in v]
+        if v is None:
+            return []
+        return [str(v).strip()]
 
     @field_validator("data_dir", "logs_dir", "secret_storage_path", "audit_log_dir", "policy_file", mode="before")
     @classmethod
