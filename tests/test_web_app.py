@@ -580,6 +580,7 @@ def test_dashboard_html_surfaces_guided_overview():
     assert "Current handoff" in dashboard_html
     assert "Latest stage results" in dashboard_html
     assert "Live collaboration" in dashboard_html
+    assert "Mission thread" in dashboard_html
     assert "Run again" in dashboard_html
     assert "Edit as new mission" in dashboard_html
     assert "studioLaunchMode" in dashboard_html
@@ -608,8 +609,12 @@ def test_dashboard_html_surfaces_guided_overview():
     assert "Mission is live — open Activity or Projects to follow it." in dashboard_html
     assert "Open the mission to inspect the failure." in dashboard_html
     assert "studioClarificationThreadHtml" in dashboard_html
+    assert "studioSetClarificationComposerDraft" in dashboard_html
+    assert "studioParseClarificationAnswersFromText" in dashboard_html
     assert "Reply here like chat" in dashboard_html
     assert "preview stays live while you answer" in dashboard_html
+    assert "Reply in one message at the bottom while keeping the preview open on the right." in dashboard_html
+    assert "Reply in one message. SkyN3t will split it back into" in dashboard_html
     assert "Self-update inbox" in dashboard_html
     assert "overviewProposalInbox" in dashboard_html
     assert "overview-hero-layout" in dashboard_html
@@ -636,6 +641,10 @@ def test_dashboard_html_surfaces_guided_overview():
     assert "nav-item active\" onclick=\"showPage('studio')\"" in dashboard_html
     assert "id=\"page-overview\" class=\"page hidden\"" in dashboard_html
     assert "id=\"page-studio\" class=\"page\"" in dashboard_html
+    assert "Neural Activity Map" in dashboard_html
+    assert "Follow the swarm like a live control room." in dashboard_html
+    assert "Travel pulses and capability hints sharpen as you zoom in." in dashboard_html
+    assert "id=\"bmBackdrop\"" in dashboard_html
     assert "id=\"swarmMapToolbar\"" in dashboard_html
     assert "id=\"swarmMapLegend\"" in dashboard_html
     assert "id=\"bmZoomPct\"" in dashboard_html

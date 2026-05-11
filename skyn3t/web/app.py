@@ -1413,6 +1413,29 @@ async def get_tuning_status():
     return {"enabled": True, **orchestrator._tuner.get_status()}
 
 
+@app.get("/api/memory/lesson_scores")
+async def get_lesson_scores(limit: int = 10):
+    """Outcome-attributed lesson scoreboard.
+
+    Returns a summary of which injected lessons have been correlated with
+    task success vs. failure, plus the top-N helpful and hurtful lessons.
+    Empty payload when the LearningLoop / scoreboard isn't wired.
+    """
+    if not orchestrator:
+        return {"enabled": False}
+    loop = getattr(orchestrator, "_learning_loop", None)
+    sb = getattr(loop, "scoreboard", None) if loop else None
+    if sb is None:
+        return {"enabled": False}
+    limit = _clamp_limit(limit, default=10, hi=100)
+    return {
+        "enabled": True,
+        "summary": sb.summary(),
+        "top_helpful": [s.to_dict() for s in sb.top_helpful(limit=limit)],
+        "top_hurtful": [s.to_dict() for s in sb.top_hurtful(limit=limit)],
+    }
+
+
 @app.get("/api/meta/status")
 async def meta_agent_status():
     """Get meta-agent status and recent actions."""
