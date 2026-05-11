@@ -257,8 +257,23 @@ class BuildVerifierAgent(BaseAgent):
         )
 
     async def _verify_static(self, scaffold_dir: Path, probe: StackProbe) -> tuple[str, str, str, str]:
-        """Static HTML: parse it. We don't fail on missing-CSS or 404s — only
-        on actual HTML parse errors / unclosed tags."""
+        """Static HTML: two gates.
+
+        Gate 1 — parse: run html.parser strict-feed on every entry HTML
+        file. Catches unclosed tags, malformed markup. Fast, no network,
+        no external deps.
+
+        Gate 2 — render (optional): if Playwright is installed AND a
+        browser binary is available, open the first entry file in a
+        headless Chromium, wait for `load`, and capture any console-
+        error or pageerror events. Catches JS syntax errors, missing
+        script files, runtime exceptions on page load — the failure
+        class the parser-only gate misses entirely.
+
+        Render gate is best-effort: if Playwright isn't installed or the
+        browser isn't available, the static verdict reflects the parse
+        gate alone.
+        """
         from html.parser import HTMLParser
 
         class _StrictParser(HTMLParser):
@@ -292,7 +307,93 @@ class BuildVerifierAgent(BaseAgent):
                 details.append(f"{entry}: {p.errors}")
         if any_errors:
             return "no", "html.parser strict-feed", "", "\n".join(details)
-        return "yes", "html.parser strict-feed", f"parsed {len(probe.entry_files)} HTML file(s) cleanly", ""
+
+        # Parse gate passed. Try the optional render gate.
+        render_result = await asyncio.to_thread(
+            self._render_smoke_test, scaffold_dir, probe.entry_files[0],
+        )
+        if render_result is None:
+            return (
+                "yes",
+                "html.parser strict-feed (render gate skipped: playwright unavailable)",
+                f"parsed {len(probe.entry_files)} HTML file(s) cleanly",
+                "",
+            )
+        rendered_ok, rendered_errors, rendered_stdout = render_result
+        if not rendered_ok:
+            return (
+                "no",
+                "playwright headless render",
+                rendered_stdout,
+                "\n".join(rendered_errors),
+            )
+        return (
+            "yes",
+            "playwright headless render + html.parser",
+            rendered_stdout,
+            "",
+        )
+
+    @staticmethod
+    def _render_smoke_test(
+        scaffold_dir: Path, entry_html: str,
+    ) -> Optional[tuple[bool, List[str], str]]:
+        """Open ``entry_html`` in a headless Chromium and report errors.
+
+        Returns ``None`` when Playwright (or its bundled Chromium) isn't
+        installed — caller treats that as "skipped, don't penalize." Returns
+        ``(ok, errors, stdout)`` when the test actually ran. ok=False means
+        at least one console error or pageerror fired during page load.
+
+        Runs synchronously (we're already inside asyncio.to_thread). The
+        Playwright async API can't be reentered from inside an existing
+        event loop, so the sync_api is the right choice here.
+        """
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception:
+            return None  # Playwright not installed.
+        target = (scaffold_dir / entry_html).resolve()
+        if not target.exists():
+            return False, [f"render: entry HTML missing: {entry_html}"], ""
+        file_url = target.as_uri()
+        errors: List[str] = []
+        stdout_lines: List[str] = []
+        try:
+            with sync_playwright() as p:
+                try:
+                    browser = p.chromium.launch(headless=True)
+                except Exception as exc:
+                    # Chromium binary not installed — Playwright lib present
+                    # but `playwright install` was never run. Treat as
+                    # skipped so we don't fail otherwise-good scaffolds.
+                    if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc):
+                        return None
+                    return False, [f"render: chromium launch failed: {exc}"], ""
+                try:
+                    context = browser.new_context()
+                    page = context.new_page()
+                    page.on("console", lambda msg: (
+                        errors.append(f"console.{msg.type}: {msg.text}")
+                        if msg.type == "error"
+                        else stdout_lines.append(f"console.{msg.type}: {msg.text}")
+                    ))
+                    page.on("pageerror", lambda exc: errors.append(f"pageerror: {exc}"))
+                    page.on("requestfailed", lambda req: errors.append(
+                        f"requestfailed: {req.url} → {(req.failure or 'unknown')}"
+                    ))
+                    try:
+                        page.goto(file_url, wait_until="load", timeout=15000)
+                    except Exception as exc:
+                        errors.append(f"goto: {exc}")
+                    # Brief settle window for any deferred init scripts.
+                    page.wait_for_timeout(250)
+                finally:
+                    browser.close()
+        except Exception as exc:
+            errors.append(f"playwright session failed: {exc}")
+        ok = len(errors) == 0
+        return ok, errors, "\n".join(stdout_lines[-20:])
 
     async def _verify_swift(self, scaffold_dir: Path) -> tuple[str, str, str, str]:
         """Swift: `swift build` if a Package.swift exists and `swift` is on
