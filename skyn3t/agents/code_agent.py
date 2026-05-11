@@ -161,31 +161,55 @@ class CodeAgent(BaseAgent):
                                    event_bus=self.event_bus, caller_name=self.name)
 
             # ── Phase 1: plan ───────────────────────────────────────────
-            plan_system = (
-                "You are a senior engineer planning a small, runnable project. "
-                "Output a JSON object: {\"stack\": \"...\", \"files\": [{\"path\": "
-                "\"relative/path\", \"purpose\": \"one-line description\"}, ...]}. "
-                "Pick a tech stack matching the brief — HTML+JS for browser games "
-                "and static UIs, FastAPI/Flask for Python APIs, Express/Node for "
-                "JS APIs. Aim for 3-12 files: source, config, README, and a tiny "
-                "test when relevant. JSON only, no preamble."
-            )
-            plan_prompt = f"Brief:\n{brief}\n\nReturn the JSON plan."
-            await self.think("planning project structure")
-            plan_out = await client.complete(
-                plan_prompt, system=plan_system, max_tokens=4000, temperature=0.3,
-            )
-            plan: Dict[str, Any] = {}
-            if plan_out and "[deterministic-stub]" not in plan_out:
-                m = _re.search(r"\{[\s\S]*\}", plan_out)
-                if m:
-                    try:
-                        plan = _json.loads(m.group(0))
-                    except Exception:
-                        plan = {}
+            # Try deterministic stack templates first — they encode known-
+            # good file trees per ecosystem (FastAPI/Next/React/Flask/etc.).
+            # The LLM is good at writing file content, unreliable at picking
+            # the right file SHAPE for an ecosystem it's seen many variants
+            # of. A wrong shape (e.g. Next 12 `pages/` vs Next 14 `app/`)
+            # breaks the build before any code runs.
+            from skyn3t.agents.stack_templates import detect_stack, plan_for_stack
+            template_key = detect_stack(brief)
+            template_plan = plan_for_stack(template_key) if template_key else None
 
-            file_specs = plan.get("files") if isinstance(plan, dict) else None
-            stack = (plan.get("stack") if isinstance(plan, dict) else None) or "minimal"
+            plan: Dict[str, Any] = {}
+            file_specs: List[Dict[str, Any]] = []
+            stack = "minimal"
+
+            if template_plan:
+                # Skip LLM planning entirely — use the known-good shape.
+                await self.think(f"using stack template '{template_key}'")
+                stack = template_key
+                file_specs = [
+                    {"path": rel, "purpose": purpose}
+                    for rel, purpose in template_plan
+                ]
+            else:
+                plan_system = (
+                    "You are a senior engineer planning a small, runnable project. "
+                    "Output a JSON object: {\"stack\": \"...\", \"files\": [{\"path\": "
+                    "\"relative/path\", \"purpose\": \"one-line description\"}, ...]}. "
+                    "Pick a tech stack matching the brief — HTML+JS for browser games "
+                    "and static UIs, FastAPI/Flask for Python APIs, Express/Node for "
+                    "JS APIs. Aim for 3-12 files: source, config, README, and a tiny "
+                    "test when relevant. JSON only, no preamble."
+                )
+                plan_prompt = f"Brief:\n{brief}\n\nReturn the JSON plan."
+                await self.think("planning project structure")
+                plan_out = await client.complete(
+                    plan_prompt, system=plan_system, max_tokens=4000, temperature=0.3,
+                )
+                if plan_out and "[deterministic-stub]" not in plan_out:
+                    m = _re.search(r"\{[\s\S]*\}", plan_out)
+                    if m:
+                        try:
+                            plan = _json.loads(m.group(0))
+                        except Exception:
+                            plan = {}
+                raw_files = plan.get("files") if isinstance(plan, dict) else None
+                stack = (plan.get("stack") if isinstance(plan, dict) else None) or "minimal"
+                if isinstance(raw_files, list):
+                    file_specs = raw_files
+
             if not isinstance(file_specs, list) or not file_specs:
                 file_specs = []
             else:
