@@ -259,7 +259,7 @@ class CodeAgent(BaseAgent):
         import re as _re
         d = task.input_data or {}
         brief = (d.get("brief") or "").strip()
-        artifact_dir = _Path(d.get("artifact_dir") or ".")
+        artifact_dir = self.resolve_artifact_dir(d.get("artifact_dir"))
         out_dir = artifact_dir / "scaffold"
         out_dir.mkdir(parents=True, exist_ok=True)
         resolved_out_dir = out_dir.resolve()

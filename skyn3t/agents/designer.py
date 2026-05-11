@@ -179,7 +179,7 @@ class DesignerAgent(BaseAgent):
         if mood not in _PALETTES:
             mood = "minimal"
         target: str = (data.get("target") or "saas").lower()
-        artifact_dir = Path(data.get("artifact_dir") or ".")
+        artifact_dir = self.resolve_artifact_dir(data.get("artifact_dir"))
         next_agent: Optional[str] = data.get("next_agent")
 
         try:
