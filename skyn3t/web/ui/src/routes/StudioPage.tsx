@@ -18,6 +18,10 @@ export default function StudioPage() {
     queryKey: ["studio_projects"],
     queryFn: api.projects,
     refetchInterval: 5_000,
+    // The list polls every 5s, but if a fetch fails (backend restart)
+    // we don't want the page to stay frozen on a stale empty result.
+    refetchOnMount: "always",
+    refetchOnWindowFocus: true,
   });
 
   const detail = useQuery({
@@ -57,13 +61,27 @@ export default function StudioPage() {
             land in <code className="font-mono bg-bg-3 px-1 rounded">data/projects/</code>.
           </p>
         </div>
-        <button
-          onClick={newProject}
-          className="rounded bg-accent text-bg-0 text-sm font-medium px-3 py-1.5"
-        >
-          <i className="fa-solid fa-plus mr-1.5" />
-          New project
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => projects.refetch()}
+            disabled={projects.isFetching}
+            title="Refresh project list"
+            className="rounded border border-border text-xs px-2 py-1.5 text-text-secondary hover:border-border-strong disabled:opacity-60"
+          >
+            <i
+              className={`fa-solid fa-arrows-rotate ${
+                projects.isFetching ? "animate-spin" : ""
+              }`}
+            />
+          </button>
+          <button
+            onClick={newProject}
+            className="rounded bg-accent text-bg-0 text-sm font-medium px-3 py-1.5"
+          >
+            <i className="fa-solid fa-plus mr-1.5" />
+            New project
+          </button>
+        </div>
       </header>
 
       <div className="grid grid-cols-[300px_minmax(0,1fr)] gap-5">

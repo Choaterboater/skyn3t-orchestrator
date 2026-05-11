@@ -214,6 +214,13 @@ export const api = {
     fetchJson<AgentConfigView>(
       `/api/agents/${encodeURIComponent(name)}/config`,
     ),
+  agentModels: () =>
+    fetchJson<{
+      backends: Array<{
+        backend: string;
+        models: Array<{ id: string; label: string }>;
+      }>;
+    }>("/api/agents/models"),
   patchAgentConfig: (name: string, patch: Record<string, unknown>) =>
     fetchJson<any>(`/api/agents/${encodeURIComponent(name)}/config`, {
       method: "PATCH",

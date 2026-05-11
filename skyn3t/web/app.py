@@ -970,6 +970,38 @@ async def agent_disable(name: str):
     return {"ok": True}
 
 
+@app.get("/api/agents/models")
+async def agents_models():
+    """List backends and their known models for the agent edit UI.
+
+    Returns the static catalog (curated set with labels). The
+    `list_models(backend)` async path can hit live CLIs but is too
+    slow + flaky for an inline dropdown — frontends that need live
+    discovery should call that explicitly.
+    """
+    try:
+        from skyn3t.adapters.model_catalog import STATIC
+        backends = []
+        # Order matters for the dropdown — put the most-used first.
+        preferred_order = [
+            "claude_cli", "copilot_cli", "kimi_cli", "openai_cli",
+            "anthropic", "openrouter", "auto", "deterministic",
+        ]
+        seen = set()
+        for key in preferred_order:
+            if key in STATIC:
+                backends.append({"backend": key, "models": list(STATIC[key])})
+                seen.add(key)
+        # Any backend not in preferred_order tacked on at the end.
+        for key, models in STATIC.items():
+            if key in seen:
+                continue
+            backends.append({"backend": key, "models": list(models)})
+        return {"backends": backends}
+    except Exception as e:
+        return _safe_error_response(e)
+
+
 @app.get("/api/agents/types")
 async def agent_types():
     """List base types available for creating custom agents."""
