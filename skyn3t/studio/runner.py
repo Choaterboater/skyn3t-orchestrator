@@ -562,6 +562,37 @@ class StudioRunner:
                         error=stage_error,
                     )
                     self._save_manifest(artifact_dir, manifest)
+                    # Record stage timeout as a 'no' verdict for the
+                    # scoreboard so self-learning sees the failure. The
+                    # scoreboard otherwise only learns from verifier
+                    # outcomes — but stage timeouts that never reach the
+                    # verifier ARE failures, and the meta-agent should
+                    # see them. Whatever partial scaffold exists is the
+                    # shape that failed.
+                    if stage.name == "code":
+                        try:
+                            from skyn3t.intelligence.build_patterns import (
+                                get_default_scoreboard,
+                            )
+                            scaffold_dir = artifact_dir / "scaffold"
+                            stack = "unknown"
+                            shape = []
+                            if scaffold_dir.exists():
+                                try:
+                                    from skyn3t.agents.stack_templates import (
+                                        detect_stack,
+                                    )
+                                    stack = detect_stack(brief) or "unknown"
+                                except Exception:
+                                    pass
+                                shape = sorted(
+                                    p.relative_to(scaffold_dir).as_posix()
+                                    for p in scaffold_dir.rglob("*")
+                                    if p.is_file() and "__pycache__" not in p.parts
+                                )
+                            get_default_scoreboard().record(stack, shape, "no")
+                        except Exception:
+                            logger.exception("scoreboard record on stage timeout failed")
                     break
                 except Exception as e:  # noqa: BLE001 - surface failure into manifest
                     stage_error = str(e)
@@ -600,6 +631,33 @@ class StudioRunner:
                         error=stage_error,
                     )
                     self._save_manifest(artifact_dir, manifest)
+                    # Same scoreboard hook as the timeout path — record
+                    # a code-stage exception as 'no' verdict so the
+                    # learner sees it.
+                    if stage.name == "code":
+                        try:
+                            from skyn3t.intelligence.build_patterns import (
+                                get_default_scoreboard,
+                            )
+                            scaffold_dir = artifact_dir / "scaffold"
+                            stack = "unknown"
+                            shape = []
+                            if scaffold_dir.exists():
+                                try:
+                                    from skyn3t.agents.stack_templates import (
+                                        detect_stack,
+                                    )
+                                    stack = detect_stack(brief) or "unknown"
+                                except Exception:
+                                    pass
+                                shape = sorted(
+                                    p.relative_to(scaffold_dir).as_posix()
+                                    for p in scaffold_dir.rglob("*")
+                                    if p.is_file() and "__pycache__" not in p.parts
+                                )
+                            get_default_scoreboard().record(stack, shape, "no")
+                        except Exception:
+                            logger.exception("scoreboard record on stage error failed")
                     break
 
                 ok = bool(getattr(result, "success", True))
