@@ -49,10 +49,15 @@ function StatusTile() {
   });
   if (isLoading) return <Tile title="Status"><Skeleton /></Tile>;
   if (error)     return <Tile title="Status"><ErrText error={error} /></Tile>;
+  const totalAgents =
+    data?.total_agents ??
+    (data?.agents && typeof data.agents === "object"
+      ? Object.keys(data.agents).length
+      : 0);
   return (
     <Tile title="Status">
       <div className="space-y-1">
-        <Stat label="Agents registered" value={data?.agents ?? 0} />
+        <Stat label="Agents registered" value={totalAgents} />
         <Stat label="Running tasks"     value={data?.running_tasks ?? 0} />
       </div>
     </Tile>

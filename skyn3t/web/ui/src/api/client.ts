@@ -96,6 +96,12 @@ export type BuildPatternStats = {
   last_seen_at: number;
 };
 
+export class HttpError extends Error {
+  constructor(public status: number, public path: string, public body: string) {
+    super(`${status} on ${path}: ${body.slice(0, 200)}`);
+  }
+}
+
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(path, {
     headers: { "Content-Type": "application/json" },
@@ -104,13 +110,23 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!r.ok) {
     const body = await r.text();
-    throw new Error(`${r.status} ${r.statusText} on ${path}: ${body.slice(0, 200)}`);
+    throw new HttpError(r.status, path, body);
   }
   return (await r.json()) as T;
 }
 
+export type SystemStatus = {
+  // /api/status returns the orchestrator's get_system_status() shape.
+  // `agents` is a dict keyed by agent name — use `total_agents` for the count.
+  running?: boolean;
+  total_agents?: number;
+  agents?: Record<string, unknown>;
+  running_tasks?: number;
+  completed_tasks?: number;
+};
+
 export const api = {
-  status: () => fetchJson<{ agents: number; running_tasks: number }>("/api/status"),
+  status: () => fetchJson<SystemStatus>("/api/status"),
   agents: () =>
     fetchJson<{ agents: AgentRow[] }>("/api/agents").then((d) => d.agents ?? []),
   execAgent: (name: string, message: string) =>
@@ -161,6 +177,13 @@ export const api = {
       summary?: any;
       per_stack?: Record<string, { best: BuildPatternStats | null; worst: BuildPatternStats | null }>;
       shapes?: BuildPatternStats[];
-    }>(`/api/memory/build_patterns${q}`);
+    }>(`/api/memory/build_patterns${q}`).catch((err) => {
+      // Older backend builds didn't expose this endpoint. Treat 404 as
+      // "no data" so the dashboard tile stays calm.
+      if (err instanceof HttpError && err.status === 404) {
+        return { summary: {}, per_stack: {}, shapes: [] };
+      }
+      throw err;
+    });
   },
 };
