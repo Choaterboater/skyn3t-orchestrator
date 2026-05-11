@@ -2,6 +2,7 @@
 
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -125,6 +126,18 @@ class ResearchAgent(BaseAgent):
         if not query:
             return {"success": False, "error": "No query provided"}
 
+        # ── MEMORY RECALL ─────────────────────────────────────────
+        # Before spending 3-5 min on MCP web search, check the skill
+        # library for cached integration specs for each service named
+        # in the brief. If we researched Sonarr/Radarr/etc. before,
+        # the spec is already saved as a skill — read it back instead
+        # of re-fetching. This is what makes the SECOND build of any
+        # given integration sub-5min.
+        cached_specs = self._recall_cached_specs(query)
+        if cached_specs:
+            await self._log_recall_hits(cached_specs)
+        # ──────────────────────────────────────────────────────────
+
         # Try LLM-grounded research; falls back to placeholder if backend is deterministic
         results = []
         notes = ""
@@ -154,12 +167,22 @@ class ResearchAgent(BaseAgent):
             is_integration_brief = any(h in q_lower for h in integration_hints)
 
             if is_integration_brief:
+                # Build the per-service "skip these" hint from cache.
+                cached_services_str = ""
+                if cached_specs:
+                    names = ", ".join(sorted(cached_specs.keys()))
+                    cached_services_str = (
+                        f"\n\nIMPORTANT: skip these services entirely — their "
+                        f"specs are already in memory and will be appended "
+                        f"after your output: **{names}**. Do NOT include "
+                        f"`## {names.split(', ')[0]}` etc. in your response.\n"
+                    )
                 prompt = (
-                    f"Brief:\n{query}\n\n"
+                    f"Brief:\n{query}\n{cached_services_str}\n"
                     "This brief names third-party products, services, or APIs. "
                     "Produce an INTEGRATION SPEC the code-writing agent can use "
                     "to wire real API calls (not mock data).\n\n"
-                    "For each named product/service, output a markdown section:\n\n"
+                    "For each remaining product/service, output a markdown section:\n\n"
                     "## <Product name>\n"
                     "- **Base URL**: typical default (e.g. http://localhost:8989)\n"
                     "- **Auth**: header/query-param scheme (e.g. `X-Api-Key`, "
@@ -213,11 +236,18 @@ class ResearchAgent(BaseAgent):
             if out and "[deterministic-stub]" not in out:
                 notes = out.strip()
                 if is_integration_brief:
-                    # Integration spec output is structured markdown with ##
-                    # sections per service — not a bullet list. Record one
-                    # synthetic "result" so the downstream "has results"
-                    # check passes; the real value is in `notes` which gets
-                    # written to research.md verbatim.
+                    # Splice cached specs back in. The LLM only wrote
+                    # sections for services NOT in cache; we append the
+                    # remembered ones so research.md is complete.
+                    if cached_specs:
+                        cache_blocks = []
+                        for svc, spec in sorted(cached_specs.items()):
+                            cache_blocks.append(
+                                f"## {svc.title()}\n\n"
+                                f"_From memory ({time.strftime('%Y-%m-%d', time.gmtime(spec['cached_at']))})._\n\n"
+                                f"{spec['body']}"
+                            )
+                        notes = notes + "\n\n" + "\n\n".join(cache_blocks)
                     results.append({
                         "title": f"Integration spec for {query[:80]}",
                         "snippet": notes[:200],
@@ -264,6 +294,18 @@ class ResearchAgent(BaseAgent):
                         await self.think(f"wrote {md_path.name} ({len(results)} findings)")
                     except Exception:
                         logger.debug("think() failed after research write", exc_info=True)
+                # Promote LLM-produced integration sections to skills
+                # so the next build can recall them from memory. Skip
+                # if the LLM call failed (notes is empty / placeholders).
+                if (
+                    is_integration_brief
+                    and notes
+                    and "Placeholder finding" not in notes
+                ):
+                    try:
+                        self._promote_specs_to_skills(notes, cached_specs)
+                    except Exception:
+                        logger.exception("skill promotion failed")
             except Exception:
                 pass
 
@@ -286,6 +328,133 @@ class ResearchAgent(BaseAgent):
             "summary": f"Researched '{query[:60]}': {len(results)} findings, "
                        f"{len(files_written)} file(s) written.",
         }
+
+    # ─────────────────────────────────────────────────────────────────
+    # Memory recall + promotion
+    # ─────────────────────────────────────────────────────────────────
+    # The second time SkyN3t researches Sonarr, the spec is already
+    # in the skill library — read it back instead of doing 3min of
+    # MCP web search. This is the self-learning loop closing for
+    # integration research.
+
+    # Same list as planner._INTEGRATION_TARGETS — kept here so the
+    # research agent doesn't depend on planner internals.
+    _RECALL_TARGETS = (
+        "emby", "jellyfin", "plex", "sonarr", "radarr", "lidarr",
+        "prowlarr", "qbittorrent", "transmission", "sabnzbd",
+        "sonos", "home assistant", "philips hue", "lifx",
+        "unifi", "mikrotik", "pfsense", "opnsense", "tailscale",
+        "docker socket", "docker api", "portainer", "proxmox",
+        "stripe api", "twilio api", "github api", "slack api",
+        "discord api", "spotify api",
+    )
+
+    # How fresh a cached spec must be to skip re-fetching. APIs evolve;
+    # we re-validate older specs by letting the LLM produce a fresh one.
+    _CACHE_TTL_SECONDS = 30 * 24 * 3600  # 30 days
+
+    def _recall_cached_specs(self, query: str) -> Dict[str, Dict[str, Any]]:
+        """For each service named in the query, look up a cached
+        `integration-spec-{service}` skill. Return a dict
+        ``{service: {body, cached_at}}`` for fresh-enough hits.
+        """
+        q = (query or "").lower()
+        named = [t for t in self._RECALL_TARGETS if t in q]
+        if not named:
+            return {}
+        cached: Dict[str, Dict[str, Any]] = {}
+        try:
+            from skyn3t.intelligence.skill_library import get_default_library
+            lib = get_default_library()
+        except Exception:
+            return {}
+        now = time.time()
+        for svc in named:
+            # Slug used at write-time: integration-spec-<service slugged>
+            tag = f"integration-spec-{re.sub(r'[^a-z0-9]+', '-', svc).strip('-')}"
+            try:
+                hits = lib.find(tag=tag, min_score=0.0, limit=1)
+            except Exception:
+                continue
+            if not hits:
+                continue
+            skill = hits[0]
+            age = now - (skill.last_used_at or skill.created_at or 0)
+            if age > self._CACHE_TTL_SECONDS:
+                continue
+            cached[svc] = {
+                "body": skill.body,
+                "cached_at": skill.last_used_at or skill.created_at,
+            }
+        return cached
+
+    async def _log_recall_hits(self, cached: Dict[str, Dict[str, Any]]) -> None:
+        """Announce recall hits to the dashboard so the user sees the
+        self-learning loop firing."""
+        if not cached:
+            return
+        names = ", ".join(sorted(cached.keys()))
+        msg = f"recalled {len(cached)} cached integration spec(s) from memory: {names}"
+        try:
+            await self.think(msg)
+        except Exception:
+            pass
+
+    def _promote_specs_to_skills(
+        self, notes: str, already_cached: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """Parse research.md sections (## ServiceName) and save each
+        as a skill tagged ``integration-spec-{service}``. Skips
+        services already in the cache so we don't double-write.
+        """
+        try:
+            from skyn3t.intelligence.skill_library import (
+                Skill,
+                get_default_library,
+            )
+        except Exception:
+            return
+        # Split on lines that start with "## " (a service section header).
+        sections = re.split(r"\n## ", "\n" + (notes or ""))
+        # First chunk is anything before the first ## — discard.
+        sections = sections[1:]
+        lib = get_default_library()
+        for sec in sections:
+            # First line is the service name; the rest is the body.
+            head, _, body = sec.partition("\n")
+            service = head.strip().lower()
+            if not service or not body.strip():
+                continue
+            # Don't bother re-promoting what we just spliced from cache.
+            if any(c in service for c in already_cached.keys()):
+                continue
+            # Only promote sections that look like real specs — they
+            # should have at least one "Base URL" or "Auth" line and
+            # at least one method/path mention.
+            body_lc = body.lower()
+            if not (
+                ("base url" in body_lc or "auth" in body_lc)
+                and any(
+                    f"{m} /" in body_lc or f"{m}/" in body_lc
+                    for m in ("get", "post", "put", "delete", "patch")
+                )
+            ):
+                continue
+            slug = re.sub(r"[^a-z0-9]+", "-", service).strip("-")
+            tag = f"integration-spec-{slug}"
+            skill = Skill(
+                name=f"integration-spec-{slug}",
+                body=body.strip(),
+                tags=[tag, "integration-spec", "research-cache"],
+                success_count=1,
+                failure_count=0,
+                source="research_agent:auto-promote",
+            )
+            try:
+                lib.upsert(skill)
+                logger.info(f"promoted spec to skill: {slug}")
+            except Exception:
+                logger.exception(f"promote skill {slug} failed")
 
     async def _summarize(self, task: TaskRequest) -> Dict[str, Any]:
         """Summarize a document or text."""
