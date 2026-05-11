@@ -241,6 +241,197 @@ class TelegramChannel(MessagingChannel):
             self._http = None
 
 
+# ── WhatsApp Cloud API (webhook mode) ─────────────────────────────────
+
+
+class WhatsAppChannel(MessagingChannel):
+    """WhatsApp Cloud API channel (Meta's Graph API).
+
+    Meta delivers updates to your webhook URL; replies go back via
+    POST /v18.0/{phone_number_id}/messages.
+
+    Env config:
+      WHATSAPP_ACCESS_TOKEN     — long-lived Graph API token, required for send.
+      WHATSAPP_PHONE_NUMBER_ID  — the phone-number-id from the
+                                  WhatsApp Business app dashboard.
+    """
+
+    platform = "whatsapp"
+
+    def __init__(
+        self, event_bus: EventBus, *, access_token: Optional[str] = None,
+        phone_number_id: Optional[str] = None,
+    ):
+        super().__init__(event_bus)
+        self.access_token = access_token or os.getenv("WHATSAPP_ACCESS_TOKEN", "")
+        self.phone_number_id = phone_number_id or os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
+        self._http: Any = None
+
+    async def handle_inbound(self, raw: Dict[str, Any]) -> Optional[InboundMessage]:
+        """Normalize WhatsApp webhook envelope.
+
+        Shape:
+            {"entry": [{"changes": [{"value": {
+                "messages": [{
+                    "from": "1234567890",
+                    "id": "wamid.xxx",
+                    "text": {"body": "hello"}
+                }]
+            }}]}]}
+        """
+        try:
+            entries = raw.get("entry") or []
+            for entry in entries:
+                for change in entry.get("changes") or []:
+                    value = change.get("value") or {}
+                    for msg in value.get("messages") or []:
+                        text = ((msg.get("text") or {}).get("body") or "").strip()
+                        if not text:
+                            continue  # ignore non-text payloads for now
+                        return InboundMessage(
+                            platform=self.platform,
+                            channel=str(msg.get("from") or ""),
+                            sender=str(msg.get("from") or "unknown"),
+                            text=text,
+                            thread=str(msg.get("id") or "") or None,
+                            raw=raw,
+                        )
+        except Exception:
+            logger.exception("WhatsApp inbound parse failed")
+        return None
+
+    async def send(
+        self, channel: str, text: str, *, thread: Optional[str] = None
+    ) -> None:
+        if not self.access_token or not self.phone_number_id:
+            logger.warning("WhatsApp send skipped: ACCESS_TOKEN / PHONE_NUMBER_ID unset")
+            return
+        if not channel or not text:
+            return
+        if self._http is None:
+            try:
+                import httpx  # type: ignore
+                self._http = httpx.AsyncClient(timeout=15.0)
+            except Exception:
+                logger.exception("WhatsApp send: httpx unavailable")
+                return
+        url = f"https://graph.facebook.com/v18.0/{self.phone_number_id}/messages"
+        payload: Dict[str, Any] = {
+            "messaging_product": "whatsapp",
+            "to": channel,
+            "type": "text",
+            "text": {"body": text},
+        }
+        if thread:
+            # WhatsApp supports reply context via context.message_id.
+            payload["context"] = {"message_id": thread}
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        try:
+            resp = await self._http.post(url, json=payload, headers=headers)
+            if resp.status_code >= 400:
+                logger.warning("WhatsApp send %d: %s", resp.status_code, resp.text[:200])
+        except Exception:
+            logger.exception("WhatsApp send failed")
+
+
+# ── Matrix (homeserver appservice / bot pattern) ──────────────────────
+
+
+class MatrixChannel(MessagingChannel):
+    """Matrix channel using the homeserver client-server API.
+
+    Designed for bot accounts authenticated with an access token. The
+    homeserver POSTs ``/transactions`` to an appservice URL when the
+    bot is configured that way, OR a long-running client polls
+    ``/sync`` — but neither path is implemented here; this class
+    handles the **normalized message shape** so a polling/appservice
+    loop can hand events off via ``ingest()``.
+
+    Env config:
+      MATRIX_HOMESERVER_URL  — base URL like https://matrix.example.org
+      MATRIX_ACCESS_TOKEN    — bot user's access token, required for send.
+    """
+
+    platform = "matrix"
+
+    def __init__(
+        self, event_bus: EventBus, *, homeserver_url: Optional[str] = None,
+        access_token: Optional[str] = None,
+    ):
+        super().__init__(event_bus)
+        self.homeserver_url = (
+            homeserver_url or os.getenv("MATRIX_HOMESERVER_URL", "")
+        ).rstrip("/")
+        self.access_token = access_token or os.getenv("MATRIX_ACCESS_TOKEN", "")
+        self._http: Any = None
+        self._txn_counter = 0
+
+    async def handle_inbound(self, raw: Dict[str, Any]) -> Optional[InboundMessage]:
+        """Normalize a single Matrix event.
+
+        Shape (a single m.room.message of msgtype m.text):
+            {
+              "event_id": "$xxx",
+              "room_id": "!abc:example.org",
+              "sender": "@alice:example.org",
+              "content": {"msgtype": "m.text", "body": "hello"},
+              "type": "m.room.message"
+            }
+        """
+        if raw.get("type") != "m.room.message":
+            return None
+        content = raw.get("content") or {}
+        if content.get("msgtype") != "m.text":
+            return None
+        text = (content.get("body") or "").strip()
+        if not text:
+            return None
+        return InboundMessage(
+            platform=self.platform,
+            channel=str(raw.get("room_id") or ""),
+            sender=str(raw.get("sender") or "unknown"),
+            text=text,
+            thread=str(raw.get("event_id") or "") or None,
+            raw=raw,
+        )
+
+    async def send(
+        self, channel: str, text: str, *, thread: Optional[str] = None
+    ) -> None:
+        if not self.homeserver_url or not self.access_token:
+            logger.warning("Matrix send skipped: HOMESERVER_URL / ACCESS_TOKEN unset")
+            return
+        if not channel or not text:
+            return
+        if self._http is None:
+            try:
+                import httpx  # type: ignore
+                self._http = httpx.AsyncClient(timeout=15.0)
+            except Exception:
+                logger.exception("Matrix send: httpx unavailable")
+                return
+        # Matrix requires a per-request unique transaction id so retries
+        # don't deliver duplicates. We use a monotonic counter +
+        # process-start-time-derived uuid prefix.
+        self._txn_counter += 1
+        txn_id = f"skyn3t-{int(__import__('time').time())}-{self._txn_counter}"
+        url = (
+            f"{self.homeserver_url}/_matrix/client/v3/rooms/"
+            f"{channel}/send/m.room.message/{txn_id}"
+        )
+        body: Dict[str, Any] = {"msgtype": "m.text", "body": text}
+        if thread:
+            # m.thread relation per MSC 3440.
+            body["m.relates_to"] = {"rel_type": "m.thread", "event_id": thread}
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        try:
+            resp = await self._http.put(url, json=body, headers=headers)
+            if resp.status_code >= 400:
+                logger.warning("Matrix send %d: %s", resp.status_code, resp.text[:200])
+        except Exception:
+            logger.exception("Matrix send failed")
+
+
 def _strip_case_insensitive(text: str, needle: str) -> str:
     """Remove every case-insensitive occurrence of ``needle`` from ``text``."""
     out: List[str] = []
