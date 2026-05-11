@@ -124,7 +124,44 @@ class MarketerAgent(BaseAgent):
         checklist_path.write_text(checklist_md, encoding="utf-8")
         await self.think(f"wrote {checklist_path.name}")
 
-        files = [str(positioning_path), str(channels_path), str(checklist_path)]
+        # ── Real, ready-to-ship assets ───────────────────────────────────
+        # The strategy markdown above tells the user WHAT to post. These
+        # files give them ACTUAL POSTS — copy-pasteable artifacts, not
+        # descriptions of artifacts. Same pattern DesignerAgent uses for
+        # tokens.css / logo.svg.
+        product_name = self._extract_product_name(brief)
+        tweets_path = artifact_dir / "tweets.md"
+        tweets_path.write_text(
+            self._render_tweets(brief, product_name, audience),
+            encoding="utf-8",
+        )
+        await self.think(f"wrote {tweets_path.name}")
+
+        email_path = artifact_dir / "launch_email.html"
+        email_path.write_text(
+            self._render_launch_email(brief, product_name, audience),
+            encoding="utf-8",
+        )
+        await self.think(f"wrote {email_path.name}")
+
+        hero_path = artifact_dir / "hero.html"
+        hero_path.write_text(
+            self._render_hero_html(brief, product_name, audience),
+            encoding="utf-8",
+        )
+        await self.think(f"wrote {hero_path.name}")
+
+        og_path = artifact_dir / "og_image.svg"
+        og_path.write_text(
+            self._render_og_image(product_name, audience),
+            encoding="utf-8",
+        )
+        await self.think(f"wrote {og_path.name}")
+
+        files = [
+            str(positioning_path), str(channels_path), str(checklist_path),
+            str(tweets_path), str(email_path), str(hero_path), str(og_path),
+        ]
 
         if next_agent:
             await self.send_message(
@@ -202,7 +239,7 @@ class MarketerAgent(BaseAgent):
             role_prompt=role,
             brief=brief,
             fallback=fallback,
-            max_tokens=1800,
+            max_tokens=4000,
         )
 
     def _render_positioning_fallback(self, brief: str, audience: str) -> str:
@@ -276,7 +313,7 @@ class MarketerAgent(BaseAgent):
             role_prompt=role,
             brief=brief,
             fallback=fallback,
-            max_tokens=1500,
+            max_tokens=3500,
         )
 
     def _render_channels_fallback(self, brief: str, channels: List[str]) -> str:
@@ -328,7 +365,7 @@ class MarketerAgent(BaseAgent):
             role_prompt=role,
             brief=brief,
             fallback=fallback,
-            max_tokens=1500,
+            max_tokens=3500,
         )
 
     def _render_checklist_fallback(self, brief: str) -> str:
@@ -372,3 +409,173 @@ class MarketerAgent(BaseAgent):
             "- [ ] Plan v0.2 milestone based on top 3 user requests.",
             "",
         ])
+
+    # ─── Real-asset emitters ────────────────────────────────────────────
+    # The .md files above describe the campaign. These produce actual
+    # postable artifacts. Same fix pattern as DesignerAgent (tokens.css,
+    # logo.svg) — close the gap between "told you what to do" and "did it."
+
+    @staticmethod
+    def _extract_product_name(brief: str) -> str:
+        """Pull a product name from the brief, falling back to a generic."""
+        import re
+        text = brief or ""
+        # Look for explicit "called X" / "named X" patterns first.
+        m = re.search(r"\b(?:called|named)\s+['\"]?([A-Za-z0-9][A-Za-z0-9\-_.]+)['\"]?", text)
+        if m:
+            return m.group(1)
+        # Quoted name.
+        m = re.search(r"['\"]([A-Za-z0-9][A-Za-z0-9\s\-_.]{1,30})['\"]", text)
+        if m:
+            return m.group(1).strip()
+        # Don't try the "first capitalized word" trick on a freeform brief —
+        # it picks the first imperative verb (Build / Create / Launch) which
+        # is never the product. Without an explicit name, return a generic
+        # placeholder the user can find-and-replace.
+        return "the product"
+
+    @staticmethod
+    def _render_tweets(brief: str, product: str, audience: str) -> str:
+        """Five ready-to-post tweets across angles: launch, why-now, demo,
+        social-proof teaser, ask-for-feedback. Counted to <280 chars."""
+        brief_short = (brief or "").strip().split(".")[0][:140]
+        tweets = [
+            (
+                "LAUNCH",
+                f"Just shipped {product}.\n\n{brief_short}\n\nBuilt for {audience}.\n\nTry it: [link]",
+            ),
+            (
+                "WHY NOW",
+                f"After watching {audience} hack around the same problem for years, we built {product} so they don't have to.\n\nDetails ↓ [link]",
+            ),
+            (
+                "SHORT DEMO",
+                f"30 seconds of {product} in action ↓\n\n[gif]\n\nFull post: [link]",
+            ),
+            (
+                "SOCIAL PROOF TEASER",
+                f"Early users of {product} are seeing real wins.\n\nA few quotes ↓\n\n[link to landing]",
+            ),
+            (
+                "ASK FOR FEEDBACK",
+                f"{product} is live.\n\nIf you're {audience.split(' and ')[0]}, what's the #1 thing it should do that it doesn't yet?\n\nReplies open. Building in public.",
+            ),
+        ]
+        out = ["# Ready-to-post tweets", "",
+               f"_Product: **{product}** · audience: **{audience}**_", "",
+               "Copy-paste, swap `[link]`/`[gif]` placeholders, post. "
+               "Each tweet is under the 280 character limit.", ""]
+        for label, body in tweets:
+            chars = len(body)
+            out.append(f"## {label} ({chars} chars)")
+            out.append("")
+            out.append("```")
+            out.append(body)
+            out.append("```")
+            out.append("")
+        return "\n".join(out)
+
+    @staticmethod
+    def _render_launch_email(brief: str, product: str, audience: str) -> str:
+        """A single-column, plain-table HTML email — works in every client."""
+        import html as _h
+        product_e = _h.escape(product)
+        audience_e = _h.escape(audience)
+        brief_e = _h.escape((brief or "").strip())
+        return (
+            "<!doctype html>\n"
+            "<html><head><meta charset=\"utf-8\">"
+            f"<title>{product_e} — launching today</title></head>\n"
+            "<body style=\"margin:0;padding:0;background:#f5f5f4;font-family:"
+            "-apple-system,Segoe UI,Helvetica,sans-serif;color:#1a1a1a;\">\n"
+            "<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" "
+            "cellspacing=\"0\" style=\"background:#f5f5f4;padding:32px 0;\">"
+            "<tr><td align=\"center\">\n"
+            "<table role=\"presentation\" width=\"560\" cellpadding=\"0\" "
+            "cellspacing=\"0\" style=\"background:#ffffff;border-radius:8px;"
+            "overflow:hidden;\">\n"
+            "<tr><td style=\"padding:32px 32px 16px;\">\n"
+            f"<h1 style=\"margin:0 0 12px;font-size:24px;line-height:1.2;\">{product_e} is live.</h1>\n"
+            f"<p style=\"margin:0 0 16px;color:#555;font-size:15px;\">"
+            f"Built for {audience_e}.</p>\n"
+            "</td></tr>\n"
+            "<tr><td style=\"padding:0 32px 24px;font-size:15px;line-height:1.55;\">\n"
+            f"<p>{brief_e}</p>\n"
+            "<p>We'd love your feedback — reply to this email or hit us on "
+            "Twitter.</p>\n"
+            "</td></tr>\n"
+            "<tr><td align=\"center\" style=\"padding:0 32px 32px;\">\n"
+            "<a href=\"[link]\" style=\"display:inline-block;background:#1a1a1a;"
+            "color:#fff;text-decoration:none;padding:12px 24px;border-radius:6px;"
+            f"font-weight:600;\">Try {product_e}</a>\n"
+            "</td></tr>\n"
+            "<tr><td style=\"padding:16px 32px;border-top:1px solid #eee;"
+            "color:#888;font-size:12px;\">\n"
+            "You're receiving this because you signed up at our waitlist. "
+            "Unsubscribe: [unsub-link]\n"
+            "</td></tr>\n"
+            "</table>\n"
+            "</td></tr></table>\n"
+            "</body></html>\n"
+        )
+
+    @staticmethod
+    def _render_hero_html(brief: str, product: str, audience: str) -> str:
+        """A single-file landing-page hero — drop into any static host."""
+        import html as _h
+        product_e = _h.escape(product)
+        audience_e = _h.escape(audience)
+        brief_short = _h.escape((brief or "").strip().split(".")[0][:200])
+        return (
+            "<!doctype html>\n"
+            "<html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            f"<title>{product_e}</title>\n"
+            "<style>\n"
+            "  *{box-sizing:border-box;margin:0;padding:0}\n"
+            "  body{font-family:-apple-system,Segoe UI,sans-serif;background:#0a0a0a;color:#f4f4f4;min-height:100vh;display:grid;place-items:center;padding:48px 24px}\n"
+            "  .hero{max-width:720px;text-align:center}\n"
+            "  h1{font-size:clamp(2rem,5vw,3.5rem);font-weight:800;letter-spacing:-0.02em;margin-bottom:16px;line-height:1.1}\n"
+            "  .sub{font-size:1.125rem;color:#a3a3a3;margin-bottom:32px;max-width:560px;margin-left:auto;margin-right:auto}\n"
+            "  .audience{font-size:.875rem;color:#737373;text-transform:uppercase;letter-spacing:.1em;margin-bottom:24px}\n"
+            "  .cta{display:inline-flex;gap:12px;flex-wrap:wrap;justify-content:center}\n"
+            "  .btn{display:inline-block;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:600;font-size:1rem;transition:transform .15s ease}\n"
+            "  .btn-primary{background:#f4f4f4;color:#0a0a0a}\n"
+            "  .btn-ghost{border:1px solid #404040;color:#f4f4f4}\n"
+            "  .btn:hover{transform:translateY(-1px)}\n"
+            "</style></head>\n"
+            "<body><div class=\"hero\">\n"
+            f"<div class=\"audience\">For {audience_e}</div>\n"
+            f"<h1>{product_e}</h1>\n"
+            f"<p class=\"sub\">{brief_short}</p>\n"
+            "<div class=\"cta\">\n"
+            "  <a class=\"btn btn-primary\" href=\"[get-started-link]\">Get started</a>\n"
+            "  <a class=\"btn btn-ghost\" href=\"[docs-link]\">Read the docs</a>\n"
+            "</div>\n"
+            "</div></body></html>\n"
+        )
+
+    @staticmethod
+    def _render_og_image(product: str, audience: str) -> str:
+        """An OG/social-share card at 1200x630 — the standard size for Twitter,
+        LinkedIn, Slack, etc. SVG so it scales cleanly."""
+        import html as _h
+        product_e = _h.escape(product)
+        audience_e = _h.escape(audience)[:60]
+        return (
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" '
+            f'role="img" aria-label="{product_e} social card">\n'
+            '  <rect width="1200" height="630" fill="#0a0a0a"/>\n'
+            '  <rect x="60" y="60" width="1080" height="510" fill="none" '
+            'stroke="#262626" stroke-width="2" rx="16"/>\n'
+            f'  <text x="100" y="280" font-family="ui-sans-serif, system-ui" '
+            f'font-size="84" font-weight="800" fill="#f4f4f4" '
+            f'letter-spacing="-2">{product_e}</text>\n'
+            f'  <text x="100" y="360" font-family="ui-sans-serif, system-ui" '
+            f'font-size="28" fill="#a3a3a3">For {audience_e}</text>\n'
+            '  <line x1="100" y1="490" x2="1100" y2="490" stroke="#404040" '
+            'stroke-width="1"/>\n'
+            f'  <text x="100" y="540" font-family="ui-sans-serif, system-ui" '
+            f'font-size="22" fill="#737373">[your-domain].com</text>\n'
+            '</svg>\n'
+        )

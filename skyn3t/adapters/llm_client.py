@@ -54,7 +54,12 @@ class LLMRequest:
     prompt: str
     system: Optional[str] = None
     model: Optional[str] = None     # override default
-    max_tokens: int = 1500
+    # Default 4000: SkyN3t is overwhelmingly operated on subscription-backed
+    # CLIs (claude/copilot/kimi) where there's no per-token cost and a small
+    # cap mostly just truncates good output. The CLI backends ignore this
+    # value entirely; only metered API backends (Anthropic API, OpenRouter,
+    # OpenAI direct) actually apply it.
+    max_tokens: int = 4000
     temperature: float = 0.4
     metadata: dict = field(default_factory=dict)
 
@@ -130,7 +135,7 @@ class LLMClient:
             logger.debug("LLMClient aclose failed", exc_info=True)
 
     async def complete(self, prompt: str, *, system: Optional[str] = None,
-                       model: Optional[str] = None, max_tokens: int = 1500,
+                       model: Optional[str] = None, max_tokens: int = 4000,
                        temperature: float = 0.4) -> str:
         req = LLMRequest(prompt=prompt, system=system, model=model or self.default_model,
                          max_tokens=max_tokens, temperature=temperature)

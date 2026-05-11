@@ -760,7 +760,7 @@ class BaseAgent(ABC):
         prompt: str,
         *,
         system: Optional[str] = None,
-        max_tokens: int = 1500,
+        max_tokens: int = 4000,
         temperature: float = 0.4,
         timeout: Optional[float] = 60.0,
         retries: int = 1,

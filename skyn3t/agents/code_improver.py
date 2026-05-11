@@ -753,7 +753,7 @@ class CodeImproverAgent(BaseAgent):
                     client = LLMClient(default_model=model, backend=backend,
                                        event_bus=self.event_bus, caller_name=self.name)
                     out = await client.complete(prompt, system=system,
-                                                  max_tokens=8000 if mode == "rewrite" else 4000,
+                                                  max_tokens=12000 if mode == "rewrite" else 8000,
                                                   temperature=temp)
                     return self._extract_diff(out, rel)
                 except Exception:
