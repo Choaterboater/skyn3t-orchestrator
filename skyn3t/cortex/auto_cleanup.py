@@ -109,6 +109,7 @@ class AutoCleanup:
             "projects_removed": 0,
             "proposals_removed": 0,
             "branches_removed": 0,
+            "skills_archived": 0,
             "errors": [],
         }
         try:
@@ -123,8 +124,23 @@ class AutoCleanup:
             summary["branches_removed"] = self._sweep_stale_branches()
         except Exception as e:
             summary["errors"].append(f"branches: {e}")
+        try:
+            summary["skills_archived"] = self._sweep_skills()
+        except Exception as e:
+            summary["errors"].append(f"skills: {e}")
         logger.info("auto-cleanup pass: %s", summary)
         return summary
+
+    def _sweep_skills(self) -> int:
+        """Curator pass on the skill library — Hermes-equivalent. Drops
+        stale or hurtful skills, preserves pinned ones. Returns the count
+        of skills archived."""
+        try:
+            from skyn3t.intelligence.skill_library import get_default_library
+        except Exception:
+            return 0
+        result = get_default_library().curate()
+        return len(result.get("archived") or [])
 
     # ------------------------------------------------------------------
     # Sweeps

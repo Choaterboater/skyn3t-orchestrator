@@ -321,6 +321,60 @@ class SkillLibrary:
             "tags": sorted({t for s in skills for t in s.tags}),
         }
 
+    def curate(
+        self,
+        *,
+        max_stale_age_seconds: float = 30 * 86400,
+        min_score_for_keep: float = -0.34,
+        min_samples_before_demote: int = 3,
+        protect_tags: Optional[Iterable[str]] = None,
+    ) -> Dict[str, List[str]]:
+        """Hermes-style curator pass — drop stale or hurtful skills.
+
+        Removes a skill when EITHER:
+          - It hasn't been used in ``max_stale_age_seconds`` (default 30d).
+          - Its score is below ``min_score_for_keep`` AND it has at least
+            ``min_samples_before_demote`` graded samples.
+
+        Skills tagged with any name in ``protect_tags`` are NEVER removed
+        — used by an operator to pin manually-curated skills. The pinned
+        set is also auto-detected: any skill with the literal ``pinned``
+        tag is preserved regardless of age or score.
+
+        Returns ``{"archived": [...], "kept": [...]}`` so the meta-agent
+        can publish a summary event.
+        """
+        now = time.time()
+        protect_set = {t.lower() for t in (protect_tags or [])}
+        protect_set.add("pinned")
+        archived: List[str] = []
+        kept: List[str] = []
+        with self._lock:
+            for skill in self._scan():
+                tag_lc = {t.lower() for t in skill.tags}
+                if tag_lc & protect_set:
+                    kept.append(skill.name)
+                    continue
+                stale = (now - skill.last_used_at) > max_stale_age_seconds
+                samples = skill.success_count + skill.failure_count
+                hurtful = (
+                    samples >= min_samples_before_demote
+                    and skill.score < min_score_for_keep
+                )
+                if stale or hurtful:
+                    path = self.root / f"{skill.slug}.md"
+                    try:
+                        path.unlink()
+                        archived.append(skill.name)
+                    except FileNotFoundError:
+                        pass
+                    except Exception:
+                        logger.exception("curate could not delete %s", path)
+                        kept.append(skill.name)
+                else:
+                    kept.append(skill.name)
+        return {"archived": archived, "kept": kept}
+
 
 # Module-level singleton.
 _default_library: Optional[SkillLibrary] = None
