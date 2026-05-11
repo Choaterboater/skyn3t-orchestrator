@@ -28,7 +28,15 @@ export default defineConfig({
         changeOrigin: true,
         headers: { origin: "http://127.0.0.1:6660" },
       },
-      "/ws": { target: "ws://127.0.0.1:6660", ws: true, changeOrigin: true },
+      // WebSocket proxy. Same Origin-rewrite trick as the /api routes:
+      // backend's _websocket_origin_allowed rejects browser origin
+      // localhost:5173 because it differs from the upstream netloc.
+      "/ws": {
+        target: "ws://127.0.0.1:6660",
+        ws: true,
+        changeOrigin: true,
+        headers: { origin: "http://127.0.0.1:6660" },
+      },
       "/traces": {
         target: "http://127.0.0.1:6660",
         changeOrigin: true,
