@@ -182,6 +182,62 @@ class CodeAgent(BaseAgent):
                 error=str(e),
             )
 
+    def _read_prior_artifacts(self, artifact_dir) -> str:
+        """Collect prior-stage .md artifacts so CodeAgent builds on them.
+
+        Order matters: research first (API specs are the most load-bearing
+        for integration briefs), then architecture, brainstorm, components,
+        brand, anything else. Truncated per-file so the prompt doesn't
+        balloon — research gets the most room.
+        """
+        from pathlib import Path as _PP
+        try:
+            ad = _PP(artifact_dir)
+            if not ad.exists():
+                return ""
+        except Exception:
+            return ""
+
+        priority = [
+            ("research.md", 6000),
+            ("architecture.md", 3000),
+            ("brainstorm.md", 2000),
+            ("components.md", 2000),
+            ("brand.md", 1500),
+        ]
+        chunks: list[str] = []
+        seen: set[str] = set()
+        for name, max_chars in priority:
+            p = ad / name
+            if p.exists() and p.is_file():
+                try:
+                    body = p.read_text(encoding="utf-8", errors="ignore").strip()
+                except Exception:
+                    continue
+                if not body:
+                    continue
+                if len(body) > max_chars:
+                    body = body[:max_chars] + f"\n\n_[truncated to {max_chars} chars]_"
+                chunks.append(f"### {name}\n\n{body}")
+                seen.add(name)
+        # Catch any other .md at top level we didn't enumerate.
+        try:
+            for p in sorted(ad.glob("*.md")):
+                if p.name in seen or p.name.startswith("."):
+                    continue
+                try:
+                    body = p.read_text(encoding="utf-8", errors="ignore").strip()
+                except Exception:
+                    continue
+                if not body:
+                    continue
+                if len(body) > 1500:
+                    body = body[:1500] + "\n\n_[truncated]_"
+                chunks.append(f"### {p.name}\n\n{body}")
+        except Exception:
+            pass
+        return "\n\n---\n\n".join(chunks)
+
     async def _scaffold_from_brief(self, task: TaskRequest) -> TaskResult:
         """Generate new code from a brief into artifact_dir/scaffold/.
 
@@ -208,6 +264,13 @@ class CodeAgent(BaseAgent):
         out_dir.mkdir(parents=True, exist_ok=True)
         resolved_out_dir = out_dir.resolve()
         files_written: List[str] = []
+
+        # Read prior-stage artifacts so we build on what research,
+        # architecture, design, and brainstorm produced — not just the
+        # bare brief. Without this, integration-research is run, written
+        # to disk, then completely ignored when CodeAgent prompts the
+        # model — which is why integration briefs produced fake demos.
+        prior_context = self._read_prior_artifacts(artifact_dir)
 
         # Hard cap on plan size so a runaway model can't generate 1000 files.
         MAX_FILES = 25
@@ -430,13 +493,24 @@ class CodeAgent(BaseAgent):
                             pass  # fall through to LLM path
 
                 await self.think(f"building file {i}/{len(file_specs)}: {rel}")
-                file_prompt = (
-                    f"Brief:\n{brief}\n\nStack: {stack}\n\n"
-                    f"Full file plan:\n{file_index}\n\n"
-                    f"Now write the COMPLETE contents of: `{rel}`\n"
-                    f"Purpose: {purpose}\n\n"
-                    "Return ONLY the file's raw contents (no JSON, no fences)."
-                )
+                file_prompt_parts = [
+                    f"Brief:\n{brief}\n\n",
+                    f"Stack: {stack}\n\n",
+                ]
+                if prior_context:
+                    file_prompt_parts.append(
+                        "Prior stages already produced these artifacts. "
+                        "Use them — especially the API specs in research.md "
+                        "if present — to wire REAL integrations, not fake demo data:\n\n"
+                        f"{prior_context}\n\n"
+                    )
+                file_prompt_parts.extend([
+                    f"Full file plan:\n{file_index}\n\n",
+                    f"Now write the COMPLETE contents of: `{rel}`\n",
+                    f"Purpose: {purpose}\n\n",
+                    "Return ONLY the file's raw contents (no JSON, no fences).",
+                ])
+                file_prompt = "".join(file_prompt_parts)
                 # First attempt with the agent's normal backend.
                 try:
                     body = await client.complete(

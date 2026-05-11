@@ -433,6 +433,12 @@ class BaseAgent(ABC):
             "name": self.name,
             "type": self.agent_type,
             "provider": self.provider,
+            # Expose backend + model so the Agents UI can show which
+            # LLM each agent is actually wired to. Without these the
+            # dashboard looked like everything was running on the
+            # default backend even when overrides were applied.
+            "backend": self.config.get("backend"),
+            "model": self.config.get("model"),
             "status": self.status,
             "capabilities": [c.name for c in self.capabilities],
             "current_task": self._current_task.task_id if self._current_task else None,

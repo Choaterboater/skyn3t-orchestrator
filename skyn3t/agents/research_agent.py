@@ -134,13 +134,57 @@ class ResearchAgent(BaseAgent):
                 from skyn3t.adapters import LLMClient
                 client = LLMClient(default_model=self.config.get("model"),
                                     backend=self.config.get("backend"))
-            prompt = (
-                f"Research brief:\n{query}\n\n"
-                f"Produce {num_results} concise findings or considerations relevant to this brief. "
-                f"Format as a markdown bullet list. Each bullet must be one sentence, "
-                f"actionable, and grounded in known facts/tools/patterns. No preamble."
+            # Detect integration-heavy briefs. When the user names third-
+            # party products/APIs the program should talk to, the research
+            # we need is the actual API surface — endpoints, auth, response
+            # shapes — not market commentary. CodeAgent reads research.md
+            # in the next stage, so spec-style output is what unblocks
+            # real integrations vs. fake demo data.
+            q_lower = query.lower()
+            integration_hints = (
+                "emby", "jellyfin", "plex", "sonarr", "radarr", "lidarr",
+                "prowlarr", "qbittorrent", "transmission", "sabnzbd",
+                "sonos", "home assistant", "philips hue", "lifx",
+                "unifi", "mikrotik", "pfsense", "opnsense", "tailscale",
+                "docker socket", "docker api", "portainer", "proxmox",
+                "stripe api", "twilio api", "github api", "slack api",
+                "discord api", "spotify api", "rest api", "graphql endpoint",
+                "integrate with", "talk to the", "query the",
             )
-            out = await client.complete(prompt, max_tokens=900, temperature=0.3)
+            is_integration_brief = any(h in q_lower for h in integration_hints)
+
+            if is_integration_brief:
+                prompt = (
+                    f"Brief:\n{query}\n\n"
+                    "This brief names third-party products, services, or APIs. "
+                    "Produce an INTEGRATION SPEC the code-writing agent can use "
+                    "to wire real API calls (not mock data).\n\n"
+                    "For each named product/service, output a markdown section:\n\n"
+                    "## <Product name>\n"
+                    "- **Base URL**: typical default (e.g. http://localhost:8989)\n"
+                    "- **Auth**: header/query-param scheme (e.g. `X-Api-Key`, "
+                    "Bearer token, basic auth, none on local socket)\n"
+                    "- **Key endpoints**: 3-6 most useful for a dashboard, each "
+                    "with method + path + one-line of what it returns. Format: "
+                    "`GET /api/v3/queue → current download queue with progress`\n"
+                    "- **Response shape**: critical field names the UI will read "
+                    "(e.g. `series.title`, `episode.airDate`, `sizeleft`)\n"
+                    "- **Env var convention**: e.g. SONARR_URL, SONARR_API_KEY\n"
+                    "- **Gotchas**: rate limits, CORS, websocket vs REST, etc.\n\n"
+                    "Be concrete. These are real, well-documented APIs — name "
+                    "the actual endpoints, not placeholders. If you don't know "
+                    "an endpoint for sure, say so explicitly rather than "
+                    "inventing one."
+                )
+                out = await client.complete(prompt, max_tokens=4000, temperature=0.2)
+            else:
+                prompt = (
+                    f"Research brief:\n{query}\n\n"
+                    f"Produce {num_results} concise findings or considerations relevant to this brief. "
+                    f"Format as a markdown bullet list. Each bullet must be one sentence, "
+                    f"actionable, and grounded in known facts/tools/patterns. No preamble."
+                )
+                out = await client.complete(prompt, max_tokens=900, temperature=0.3)
             if out and "[deterministic-stub]" not in out:
                 notes = out.strip()
                 # parse bullets into results

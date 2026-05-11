@@ -192,10 +192,44 @@ def _heuristic_plan(brief: str) -> tuple[List[str], List[str], Dict[str, str]]:
         b,
         ["research", "explore", "competitor", "market", "what's out", "find"],
     )
-    if needs_research:
+    # Integration-heavy briefs also need research even when the brief
+    # doesn't say "research." If the user names a third-party product,
+    # service, API, or device the program should talk to, we want the
+    # ResearchAgent to fetch real API specs first — otherwise CodeAgent
+    # invents plausible-looking demo data instead of wiring the real
+    # integration. This was the root cause of fake homelab dashboards.
+    needs_research_for_integrations = _mentions_any(
+        b,
+        [
+            # Streaming / media stack
+            "emby", "jellyfin", "plex", "sonarr", "radarr", "lidarr", "readarr",
+            "prowlarr", "qbittorrent", "transmission", "deluge", "sabnzbd",
+            "nzbget", "overseerr", "tautulli",
+            # Smart home / audio
+            "sonos", "home assistant", "homeassistant", "hassio", "philips hue",
+            "lifx", "nest", "ecobee", "smartthings", "ifttt",
+            # Network gear
+            "unifi", "ubiquiti", "mikrotik", "openwrt", "pfsense", "opnsense",
+            "tailscale", "wireguard",
+            # Container / infra
+            "docker socket", "docker api", "portainer", "kubernetes api",
+            "k8s api", "proxmox", "truenas", "unraid",
+            # SaaS APIs
+            "stripe api", "twilio api", "sendgrid api", "github api",
+            "slack api", "discord api", "spotify api", "openweather",
+            # Generic integration signals
+            "rest api", "graphql endpoint", "third-party api", "webhook from",
+            "integrate with", "pull from", "talk to the", "query the",
+        ],
+    )
+    if needs_research or needs_research_for_integrations:
         chosen.append("ResearchAgent")
         arts.append("research.md")
-        why["ResearchAgent"] = "brief mentions research/competitor/market"
+        why["ResearchAgent"] = (
+            "brief names third-party APIs/services to integrate with"
+            if needs_research_for_integrations and not needs_research
+            else "brief mentions research/competitor/market"
+        )
 
     needs_arch = _mentions_any(
         b,

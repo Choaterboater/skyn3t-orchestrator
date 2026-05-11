@@ -52,7 +52,8 @@ export default function AgentsPage() {
                 <tr>
                   <Th>Name</Th>
                   <Th>Type</Th>
-                  <Th>Provider</Th>
+                  <Th>Backend</Th>
+                  <Th>Model</Th>
                   <Th align="right">Status</Th>
                   <Th align="right">Queue</Th>
                   <Th align="right">Errors</Th>
@@ -115,7 +116,8 @@ function AgentTableRow({
     >
       <Td truncate>{a.name}</Td>
       <Td>{a.agent_type ?? "—"}</Td>
-      <Td>{a.provider ?? "—"}</Td>
+      <Td mono>{a.backend ?? "default"}</Td>
+      <Td mono>{a.model ?? "default"}</Td>
       <Td align="right">
         <StatusPill status={a.status ?? "unknown"} />
       </Td>
