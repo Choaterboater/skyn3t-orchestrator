@@ -116,6 +116,25 @@ async def test_studio_project_file_rejects_prefix_escape(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_studio_project_file_accepts_legacy_same_project_prefix(monkeypatch, tmp_path):
+    projects_root = tmp_path / "projects"
+    base = projects_root / "proj"
+    base.mkdir(parents=True)
+    (base / "_clarifications.json").write_text('{"ok":true}', encoding="utf-8")
+
+    runner = SimpleNamespace(
+        projects_root=projects_root,
+        get_project=lambda slug: {"slug": slug} if slug == "proj" else None,
+    )
+    monkeypatch.setattr(web_app, "_get_studio_runner", lambda _app: runner)
+
+    response = await web_app.studio_project_file("proj", "projects/proj/_clarifications.json")
+
+    assert response.status_code == 200
+    assert response.body.decode("utf-8") == '{"ok":true}'
+
+
+@pytest.mark.asyncio
 async def test_studio_project_file_rejects_symlink(monkeypatch, tmp_path):
     projects_root = tmp_path / "projects"
     base = projects_root / "proj"
@@ -136,6 +155,51 @@ async def test_studio_project_file_rejects_symlink(monkeypatch, tmp_path):
     response = await web_app.studio_project_file("proj", "link.txt")
 
     assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_studio_project_preview_rejects_prefix_escape(monkeypatch, tmp_path):
+    projects_root = tmp_path / "projects"
+    base = projects_root / "proj"
+    other = projects_root / "proj-evil"
+    base.mkdir(parents=True)
+    other.mkdir(parents=True)
+    (other / "secret.html").write_text("<h1>nope</h1>", encoding="utf-8")
+
+    runner = SimpleNamespace(
+        projects_root=projects_root,
+        get_project=lambda slug: {"slug": slug} if slug == "proj" else None,
+    )
+    monkeypatch.setattr(web_app, "_get_studio_runner", lambda _app: runner)
+
+    response = await web_app.studio_project_preview("proj", "../proj-evil/secret.html")
+
+    assert response.status_code == 400
+
+
+def test_studio_project_preview_sets_iframe_safe_csp(monkeypatch, tmp_path):
+    projects_root = tmp_path / "projects"
+    base = projects_root / "proj"
+    base.mkdir(parents=True)
+    (base / "index.html").write_text("<html><body><h1>demo</h1></body></html>", encoding="utf-8")
+
+    runner = SimpleNamespace(
+        projects_root=projects_root,
+        get_project=lambda slug: {"slug": slug} if slug == "proj" else None,
+    )
+    monkeypatch.setattr(web_app, "_get_studio_runner", lambda _app: runner)
+    monkeypatch.setattr(
+        web_app,
+        "get_settings",
+        lambda: SimpleNamespace(web_token=None),
+    )
+
+    client = TestClient(web_app.app)
+    response = client.get("/api/studio/projects/proj/preview/index.html")
+
+    assert response.status_code == 200
+    assert "frame-ancestors 'self'" in response.headers["content-security-policy"]
+    assert "<h1>demo</h1>" in response.text
 
 
 def test_webhook_route_rejects_unsigned_payload_when_secret_missing(monkeypatch):

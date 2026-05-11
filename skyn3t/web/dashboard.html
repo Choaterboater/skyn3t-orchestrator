@@ -363,35 +363,78 @@
         #swarmRingWrap[data-zooming="wheel"] #bmZoomLayer { transition: none; }
         #swarmRingSvg { width: 100%; height: 100%; display: block; }
         /* Brain-map cluster layout */
-        .bm-node { transition: r 0.25s, fill 0.25s, stroke 0.25s, filter 0.25s; cursor: pointer; }
-        .bm-node:hover { filter: drop-shadow(0 0 10px rgba(242, 144, 108, 0.3)); }
-        .bm-halo { transition: opacity 0.25s; pointer-events: none; }
+        .bm-scene-backdrop { fill: url(#bmSceneGradient); }
+        .bm-grid-backdrop { fill: url(#bmGridPattern); opacity: 0.42; }
+        .bm-cluster-halo {
+            fill: var(--bm-color, rgba(111, 198, 255, 0.18));
+            opacity: 0.14;
+            filter: blur(58px);
+            pointer-events: none;
+        }
+        .bm-hub-glow {
+            fill: rgba(126, 205, 255, 0.18);
+            opacity: 0.68;
+            filter: blur(42px);
+            pointer-events: none;
+        }
+        .bm-cluster-orbit {
+            fill: none;
+            stroke: var(--bm-color, rgba(111, 198, 255, 0.4));
+            stroke-width: 1.4;
+            stroke-opacity: 0.22;
+            stroke-dasharray: 7 11;
+            animation: bm-edge-drift 18s linear infinite;
+        }
+        .bm-cluster-core {
+            fill: rgba(8, 13, 22, 0.92);
+            stroke: var(--bm-color, rgba(111, 198, 255, 0.8));
+            stroke-width: 2.4;
+            vector-effect: non-scaling-stroke;
+        }
+        .bm-node {
+            transition: r 0.25s, stroke 0.25s, filter 0.25s, opacity 0.25s;
+            cursor: pointer;
+            fill: rgba(8, 13, 22, 0.94);
+            stroke: var(--bm-color, var(--cyan));
+            stroke-width: 6;
+            vector-effect: non-scaling-stroke;
+        }
+        .bm-node:hover { filter: drop-shadow(0 0 16px rgba(255, 255, 255, 0.14)); }
+        .bm-halo {
+            transition: opacity 0.25s, r 0.25s;
+            pointer-events: none;
+            fill: var(--bm-color, var(--cyan));
+            filter: blur(18px);
+        }
+        .bm-node[data-state="working"],
+        .bm-node[data-state="thinking"] { stroke-width: 7; filter: drop-shadow(0 0 18px rgba(255,255,255,0.16)); }
         .bm-node[data-state="error"] { stroke: var(--red); }
         .bm-node[data-state="disabled"] { opacity: 0.4; }
-        @keyframes bm-pulse { 0%, 100% { opacity: 0.30; } 50% { opacity: 0.65; } }
+        @keyframes bm-pulse { 0%, 100% { opacity: 0.28; } 50% { opacity: 0.68; } }
+        @keyframes bm-edge-drift { 100% { stroke-dashoffset: -180; } }
         .bm-label {
             font-size: 12px;
             font-weight: 700;
-            fill: var(--text-primary);
+            fill: rgba(245, 248, 255, 0.94);
             text-anchor: middle;
             pointer-events: auto;
             cursor: pointer;
             font-family: 'Inter Tight', 'Inter', system-ui, sans-serif;
-            letter-spacing: 0.01em;
+            letter-spacing: 0.02em;
             paint-order: stroke fill;
-            stroke: rgba(6, 10, 15, 0.94);
+            stroke: rgba(7, 11, 18, 0.98);
             stroke-width: 6px;
             stroke-linejoin: round;
         }
         .bm-cap {
             font-size: 10px;
-            fill: var(--text-secondary);
+            fill: rgba(196, 208, 224, 0.84);
             text-anchor: middle;
             font-style: normal;
             pointer-events: none;
-            letter-spacing: 0.01em;
+            letter-spacing: 0.02em;
             paint-order: stroke fill;
-            stroke: rgba(6, 10, 15, 0.92);
+            stroke: rgba(7, 11, 18, 0.96);
             stroke-width: 5px;
             stroke-linejoin: round;
         }
@@ -400,28 +443,52 @@
         #swarmRingWrap[data-detail-level="compact"] .bm-cap[data-state="thinking"],
         #swarmRingWrap[data-detail-level="compact"] .bm-cap[data-state="error"] { display: block; }
         .bm-cluster-label {
-            font-size: 14px;
+            font-size: 13px;
             font-weight: 700;
             text-anchor: middle;
             pointer-events: none;
             paint-order: stroke fill;
-            stroke: rgba(6, 10, 15, 0.92);
+            fill: rgba(233, 241, 255, 0.92);
+            stroke: rgba(7, 11, 18, 0.96);
             stroke-width: 5px;
             stroke-linejoin: round;
+            letter-spacing: 0.05em;
         }
-        .bm-edge { stroke-linecap: round; fill: none; }
+        .bm-cluster-meta {
+            font-size: 10px;
+            text-anchor: middle;
+            fill: rgba(187, 198, 214, 0.72);
+            paint-order: stroke fill;
+            stroke: rgba(7, 11, 18, 0.94);
+            stroke-width: 4px;
+            stroke-linejoin: round;
+            letter-spacing: 0.04em;
+        }
+        .bm-edge {
+            stroke-linecap: round;
+            fill: none;
+            stroke-dasharray: 7 12;
+            stroke-opacity: 0.44;
+            animation: bm-edge-drift 16s linear infinite;
+        }
         .bm-edge-flash { animation: bm-edge-flash-fade 1.2s ease-out forwards; }
         @keyframes bm-edge-flash-fade { 0% { opacity: 0.95; } 100% { opacity: 0; } }
-        .bm-msg-pulse { fill: var(--cyan); filter: drop-shadow(0 0 6px var(--cyan)); }
-        .bm-hub { fill: rgba(10, 16, 24, 0.96); stroke: rgba(255, 255, 255, 0.82); stroke-width: 2.5; }
+        .bm-msg-pulse { fill: #a7ecff; filter: drop-shadow(0 0 10px rgba(102, 217, 255, 0.95)); }
+        .bm-hub {
+            fill: rgba(8, 13, 22, 0.96);
+            stroke: rgba(245, 248, 255, 0.88);
+            stroke-width: 2.8;
+            vector-effect: non-scaling-stroke;
+            filter: drop-shadow(0 0 18px rgba(147, 197, 253, 0.16));
+        }
         .bm-hub-label {
             font-size: 14px;
             font-weight: 700;
-            fill: var(--text-primary);
+            fill: rgba(245, 248, 255, 0.96);
             text-anchor: middle;
             pointer-events: none;
             paint-order: stroke fill;
-            stroke: rgba(6, 10, 15, 0.92);
+            stroke: rgba(7, 11, 18, 0.98);
             stroke-width: 5px;
             stroke-linejoin: round;
         }
@@ -632,6 +699,125 @@
         .studio-viewer .card-header h3,
         .studio-pane .card-header h3 { font-size: 0.875rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; flex: 1; }
         .studio-brief-tools { display: flex; flex-direction: column; gap: 0.65rem; }
+        .studio-launch-shell { display: flex; flex-direction: column; gap: 0.9rem; }
+        .studio-chat-thread { display: flex; flex-direction: column; gap: 0.75rem; }
+        .studio-chat-row { display: flex; width: 100%; }
+        .studio-chat-row-agent,
+        .studio-chat-row-system { justify-content: flex-start; }
+        .studio-chat-row-user { justify-content: flex-end; }
+        .studio-chat-bubble {
+            max-width: min(92%, 860px);
+            border: 1px solid var(--border);
+            border-radius: 1rem;
+            padding: 0.85rem 0.95rem;
+            color: var(--text-primary);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.16);
+        }
+        .studio-chat-bubble-agent {
+            background: linear-gradient(135deg, rgba(0,240,255,0.08), rgba(15,23,42,0.96));
+            border-color: rgba(0,240,255,0.18);
+            border-bottom-left-radius: 0.45rem;
+        }
+        .studio-chat-bubble-user {
+            background: rgba(255,255,255,0.04);
+            border-color: rgba(255,255,255,0.08);
+            border-bottom-right-radius: 0.45rem;
+        }
+        .studio-chat-bubble-system {
+            background: rgba(15,23,42,0.92);
+            border-color: rgba(255,255,255,0.08);
+            border-bottom-left-radius: 0.45rem;
+        }
+        .studio-chat-bubble-system[data-kind="info"] {
+            border-color: rgba(0,240,255,0.22);
+            color: var(--cyan);
+        }
+        .studio-chat-bubble-system[data-kind="success"] {
+            border-color: rgba(16,185,129,0.28);
+            color: var(--green);
+        }
+        .studio-chat-bubble-system[data-kind="error"] {
+            border-color: rgba(255,51,102,0.35);
+            color: #ff8aa8;
+        }
+        .studio-chat-bubble-label {
+            margin-bottom: 0.35rem;
+            font-size: 0.68rem;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--text-dim);
+        }
+        .studio-draft-bubble {
+            white-space: pre-wrap;
+            line-height: 1.58;
+            font-size: 0.92rem;
+        }
+        .studio-chat-tip {
+            margin-left: 0;
+            color: var(--text-secondary);
+            font-size: 0.76rem;
+            line-height: 1.45;
+        }
+        .studio-clarify-thread {
+            margin-top: auto;
+            padding-top: 0.85rem;
+            border-top: 1px solid rgba(255,255,255,0.06);
+        }
+        .studio-clarify-questions {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+        .studio-clarify-input {
+            width: 100%;
+            min-height: 5.75rem;
+            resize: vertical;
+            border: 1px solid var(--border);
+            border-radius: 0.8rem;
+            background: rgba(255,255,255,0.04);
+            color: var(--text-primary);
+            padding: 0.7rem 0.8rem;
+            font: inherit;
+            line-height: 1.5;
+        }
+        .studio-clarify-input:focus {
+            outline: none;
+            border-color: var(--cyan);
+            box-shadow: 0 0 0 3px var(--cyan-glow);
+        }
+        .studio-clarify-composer {
+            display: flex;
+            flex-direction: column;
+            gap: 0.7rem;
+        }
+        .studio-clarify-composer textarea {
+            min-height: 8.5rem;
+        }
+        .studio-clarify-composer-guide {
+            display: grid;
+            gap: 0.3rem;
+            padding: 0.65rem 0.75rem;
+            border-radius: 0.8rem;
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.06);
+            color: var(--text-secondary);
+            font-size: 0.74rem;
+            line-height: 1.5;
+        }
+        .studio-clarify-composer-guide code {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            color: var(--text-primary);
+        }
+        .studio-clarify-actions {
+            margin-top: 0.7rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 0.65rem;
+            flex-wrap: wrap;
+        }
         .studio-mission-card { padding: 0.75rem 0.85rem; border: 1px solid var(--border); border-radius: 0.6rem; background: linear-gradient(135deg, rgba(0,240,255,0.08), rgba(196,80,0,0.1)); color: var(--text-primary); }
         .studio-mission-card strong { color: var(--cyan); }
         .studio-chip-row { display: flex; flex-wrap: wrap; gap: 0.5rem; }
@@ -642,6 +828,25 @@
         .studio-template-hints summary { cursor: pointer; font-size: 0.78rem; font-weight: 600; color: var(--text-secondary); }
         .studio-template-hints .studio-templates { margin-top: 0.75rem; margin-bottom: 0; }
         .studio-setup-card { border: 1px solid var(--border); border-radius: 0.6rem; background: var(--bg-1); padding: 0.75rem 0.85rem; display: flex; flex-direction: column; gap: 0.75rem; }
+        .studio-setup-disclosure { padding: 0; gap: 0; overflow: hidden; }
+        .studio-setup-disclosure summary {
+            list-style: none;
+            cursor: pointer;
+            padding: 0.85rem 0.95rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.2rem;
+        }
+        .studio-setup-disclosure summary::-webkit-details-marker { display: none; }
+        .studio-setup-disclosure summary strong { color: var(--text-primary); font-size: 0.82rem; }
+        .studio-setup-disclosure summary span { color: var(--text-secondary); font-size: 0.74rem; }
+        .studio-setup-disclosure .studio-setup-disclosure-body {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+            padding: 0 0.95rem 0.95rem;
+            border-top: 1px solid rgba(255,255,255,0.04);
+        }
         .studio-setup-head { display: flex; flex-direction: column; gap: 0.2rem; }
         .studio-setup-head strong { color: var(--text-primary); font-size: 0.82rem; }
         .studio-setup-head span { color: var(--text-secondary); font-size: 0.74rem; }
@@ -681,11 +886,32 @@
         .studio-template.active { border-color: var(--cyan); box-shadow: 0 0 0 1px var(--cyan-glow) inset; }
         .studio-template .st-name { font-weight: 600; font-size: 0.8125rem; color: var(--text-primary); margin-bottom: 0.25rem; }
         .studio-template .st-desc { font-size: 0.7rem; color: var(--text-secondary); }
-        #studioBrief { width: 100%; min-height: 120px; background: var(--bg-0); border: 1px solid var(--border); border-radius: 0.5rem; padding: 0.75rem; color: var(--text-primary); font-family: 'JetBrains Mono', monospace; font-size: 0.8125rem; resize: vertical; }
+        .studio-composer-card {
+            border: 1px solid var(--border);
+            border-radius: 1rem;
+            background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(15,23,42,0.94));
+            padding: 0.9rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+        #studioBrief {
+            width: 100%;
+            min-height: 120px;
+            background: var(--bg-0);
+            border: 1px solid var(--border);
+            border-radius: 0.95rem;
+            padding: 0.95rem 1rem;
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 0.95rem;
+            line-height: 1.58;
+            resize: vertical;
+        }
         #studioBrief:focus { outline: none; border-color: var(--cyan); box-shadow: 0 0 0 3px var(--cyan-glow); }
         .studio-center-body { display:flex; flex-direction:column; gap:0.85rem; }
         .studio-mode { display:flex; flex-direction:column; gap:0.85rem; }
-        .studio-plan-preview { border: 1px solid var(--border); border-radius: 0.6rem; background: var(--bg-1); padding: 0.75rem 0.85rem; display: flex; flex-direction: column; gap: 0.65rem; }
+        .studio-plan-preview { border: 1px solid var(--border); border-radius: 0.95rem; background: var(--bg-1); padding: 0.85rem 0.95rem; display: flex; flex-direction: column; gap: 0.65rem; }
         .studio-plan-preview .spp-head { display: flex; flex-direction: column; gap: 0.25rem; }
         .studio-pill-row { display: flex; flex-wrap: wrap; gap: 0.45rem; }
         .studio-pill { border: 1px solid var(--border); border-radius: 999px; padding: 0.2rem 0.55rem; font-size: 0.68rem; color: var(--text-secondary); background: var(--bg-2); text-transform: uppercase; letter-spacing: 0.05em; }
@@ -693,6 +919,7 @@
         .studio-plan-stage strong { display: block; font-size: 0.78rem; color: var(--text-primary); }
         .studio-plan-stage small { display: block; margin-top: 0.2rem; color: var(--text-secondary); font-size: 0.72rem; }
         .studio-actions { display: flex; align-items: center; margin-top: 0.75rem; }
+        .studio-launch-actions { justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; margin-top: 0; }
         .studio-list { list-style: none; max-height: 420px; overflow-y: auto; }
         .studio-list li { padding: .5rem .65rem; border-radius: .4rem; cursor: pointer; font-size: 0.8125rem; }
         .studio-list li:hover, .studio-list li.active { background: rgba(0,240,255,.06); }
@@ -705,19 +932,36 @@
         .studio-board-hero-copy strong { color: var(--text-primary); font-size: 0.92rem; }
         .studio-board-hero-copy .muted { font-size: 0.76rem; }
         .studio-board-actions { display:flex; flex-wrap:wrap; gap:0.5rem; justify-content:flex-end; }
-        .studio-board-layout { display:grid; grid-template-columns: minmax(260px, 340px) minmax(0, 1fr); gap:0.85rem; align-items:start; }
+        .studio-board-layout { display:grid; grid-template-columns: minmax(360px, 1.1fr) minmax(420px, 1fr); gap:0.85rem; align-items:stretch; }
+        .studio-board-rail { display:flex; flex-direction:column; gap:0.85rem; min-height:0; }
         .studio-board-card { border: 1px solid var(--border); border-radius: 0.6rem; background: var(--bg-1); padding: 0.8rem 0.85rem; display:flex; flex-direction:column; gap:0.7rem; min-height: 0; }
         .studio-board-card-head { display:flex; justify-content:space-between; gap:0.75rem; align-items:flex-start; }
         .studio-board-card-head strong { color: var(--text-primary); font-size:0.8rem; }
         .studio-board-card-head span { color: var(--text-secondary); font-size:0.72rem; }
-        .studio-artifact-grid { display:flex; flex-direction:column; gap:0.55rem; max-height: 420px; overflow-y:auto; }
-        .studio-artifact-card { width:100%; text-align:left; border:1px solid var(--border); border-radius:0.55rem; background:var(--bg-2); padding:0.65rem 0.75rem; cursor:pointer; transition:all 0.15s; display:flex; flex-direction:column; gap:0.3rem; }
+        .studio-thread-card,
+        .studio-preview-card { min-height: 620px; }
+        .studio-artifact-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:0.55rem; max-height: 168px; overflow-y:auto; padding-right:0.1rem; }
+        .studio-artifact-card { width:100%; text-align:left; border:1px solid var(--border); border-radius:0.75rem; background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(15,23,42,0.9)); padding:0.65rem 0.75rem; cursor:pointer; transition:all 0.15s; display:flex; flex-direction:column; gap:0.3rem; }
         .studio-artifact-card:hover { border-color: var(--border-hover); }
         .studio-artifact-card.active { border-color: var(--cyan); box-shadow: 0 0 0 1px var(--cyan-glow) inset; }
         .studio-artifact-card strong { color: var(--text-primary); font-family: 'JetBrains Mono', monospace; font-size:0.75rem; }
         .studio-artifact-card span { color: var(--text-secondary); font-size:0.72rem; line-height:1.4; }
         .studio-artifact-empty { color: var(--text-dim); font-size:0.76rem; text-align:center; padding:1rem 0.5rem; }
-        .studio-artifact-content { white-space: pre-wrap; font-family: 'JetBrains Mono', monospace; font-size: .8rem; max-height: 380px; overflow-y: auto; padding: .65rem; background: var(--bg-2); border-radius: .5rem; color: var(--text-primary); }
+        .studio-preview-browser {
+            display: flex;
+            flex-direction: column;
+            gap: 0.55rem;
+            padding: 0.15rem 0 0.25rem;
+        }
+        .studio-live-feed { min-height: 240px; display: flex; flex: 1; flex-direction: column; gap: 0.75rem; min-height: 0; }
+        .studio-live-feed .studio-feed-list { flex: 1; min-height: 0; max-height: none; padding-right: 0.15rem; }
+        .studio-live-feed .convo-row {
+            border-radius: 1rem;
+            border-color: rgba(255,255,255,0.08);
+        }
+        .studio-preview-surface { display:flex; flex:1; min-height:0; }
+        .studio-artifact-frame { width:100%; min-height:520px; border:1px solid var(--border); border-radius:0.5rem; background:#fff; }
+        .studio-artifact-content { white-space: pre-wrap; font-family: 'JetBrains Mono', monospace; font-size: .8rem; overflow-y: auto; padding: .65rem; background: var(--bg-2); border-radius: .5rem; color: var(--text-primary); flex:1; min-height:520px; max-height:none; }
         .studio-inspector-stack { display: flex; flex-direction: column; gap: 0.75rem; }
         .studio-inspector-card { border: 1px solid var(--border); border-radius: 0.55rem; background: var(--bg-2); padding: 0.75rem; }
         .studio-inspector-card h4 { font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-secondary); margin-bottom: 0.55rem; }
@@ -738,6 +982,65 @@
         .studio-feed-list { display: flex; flex-direction: column; gap: 0.55rem; max-height: 320px; overflow-y: auto; }
         .studio-feed-empty { color: var(--text-dim); font-size: 0.76rem; text-align: center; padding: 1rem 0.5rem; }
         .studio-feed-list .convo-row { margin: 0; }
+        .studio-clarify-card {
+            border: 1px solid rgba(245,158,11,0.28);
+            border-radius: 0.95rem;
+            background: linear-gradient(180deg, rgba(245,158,11,0.08), rgba(15,23,42,0.94));
+            padding: 0.9rem 0.95rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.7rem;
+        }
+        .studio-clarify-head { display: flex; flex-direction: column; gap: 0.2rem; }
+        .studio-clarify-head strong { color: #fbbf24; font-size: 0.82rem; }
+        .studio-clarify-head span { color: var(--text-secondary); font-size: 0.74rem; }
+        .studio-clarify-question {
+            color: var(--text-primary);
+            font-size: 0.8rem;
+            line-height: 1.45;
+        }
+        .studio-clarify-answer {
+            width: 100%;
+            background: var(--bg-2);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            padding: 0.55rem 0.65rem;
+            border-radius: 0.6rem;
+            font-size: 0.85rem;
+        }
+        .studio-clarify-actions {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 0.65rem;
+            justify-content: space-between;
+        }
+        .studio-clarify-note {
+            margin-left: 0;
+            font-size: 0.74rem;
+            color: var(--text-secondary);
+        }
+        .studio-launch-note {
+            border: 1px solid var(--border);
+            border-radius: 0.7rem;
+            padding: 0.7rem 0.8rem;
+            background: var(--bg-1);
+            color: var(--text-primary);
+            font-size: 0.78rem;
+            line-height: 1.45;
+        }
+        .studio-launch-note[data-kind="error"] {
+            border-color: rgba(255,51,102,0.35);
+            color: #ff8aa8;
+        }
+        .studio-launch-note[data-kind="success"] {
+            border-color: rgba(16,185,129,0.28);
+            color: var(--green);
+        }
+        .studio-launch-note[data-kind="info"] {
+            border-color: rgba(0,240,255,0.22);
+            color: var(--cyan);
+        }
         .studio-stage-row[data-status="running"] { border-color: rgba(0,240,255,0.35); box-shadow: 0 0 0 1px rgba(0,240,255,0.12) inset; }
         .studio-stage-row[data-status="waiting"] { border-color: rgba(245,158,11,0.35); }
         .studio-stage-row[data-status="failed"] { border-color: rgba(255,51,102,0.4); }
@@ -747,6 +1050,15 @@
         .studio-history-item time { color: var(--text-dim); font-size: 0.68rem; font-family: 'JetBrains Mono', monospace; }
         .studio-history-item .shi-event { font-size: 0.74rem; font-weight: 600; color: var(--text-primary); }
         .studio-history-item .shi-meta { margin-top: 0.2rem; font-size: 0.72rem; color: var(--text-secondary); }
+        @media (max-width: 1180px) {
+            .studio-board-layout { grid-template-columns: 1fr; }
+            .studio-preview-card { min-height: 420px; }
+            .studio-artifact-frame,
+            .studio-artifact-content { min-height: 360px; }
+        }
+        @media (max-width: 980px) {
+            .studio-chat-bubble { max-width: 100%; }
+        }
         .btn-xs { font-size: .7rem; padding: .25rem .55rem; }
         .btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--text-secondary); }
         .btn-ghost:hover { border-color: var(--cyan); color: var(--text-primary); }
@@ -3316,6 +3628,15 @@
             font-size: 0.77rem;
             color: var(--text-secondary);
         }
+        .overview-diagnostics-grid {
+            display: grid;
+            grid-template-columns: repeat(12, 1fr);
+            gap: 1rem;
+        }
+        .overview-collapse-copy {
+            color: var(--text-dim);
+            font-size: 0.72rem;
+        }
 
         .recent-card,
         .proposal-review-card {
@@ -3600,31 +3921,36 @@
         .swarm-map {
             border: 1px solid var(--ui-border-strong) !important;
             border-radius: var(--ui-radius-lg) !important;
-            background: linear-gradient(180deg, rgba(8, 13, 19, 0.96), rgba(19, 29, 40, 0.98)) !important;
+            background:
+                radial-gradient(circle at 18% 12%, rgba(118, 92, 255, 0.12), transparent 30%),
+                radial-gradient(circle at 78% 8%, rgba(255, 121, 185, 0.11), transparent 26%),
+                linear-gradient(180deg, rgba(6, 10, 18, 0.98), rgba(14, 22, 34, 0.98)) !important;
             box-shadow: var(--ui-shadow-strong);
             overflow: hidden;
         }
         .swarm-map-divider {
             height: 1px;
-            background: linear-gradient(90deg, transparent, rgba(165, 184, 205, 0.62), transparent);
+            background: linear-gradient(90deg, transparent, rgba(165, 184, 205, 0.38), transparent);
         }
         #swarmRingWrap {
             background:
-                radial-gradient(circle at 15% 3%, rgba(240, 137, 101, 0.16), transparent 43%),
-                radial-gradient(circle at 85% 0%, rgba(107, 26, 10, 0.2), transparent 40%),
-                rgba(8, 13, 19, 0.95);
-            border-bottom: 1px solid rgba(165, 184, 205, 0.3);
+                radial-gradient(circle at 18% 14%, rgba(84, 147, 255, 0.18), transparent 28%),
+                radial-gradient(circle at 84% 8%, rgba(255, 121, 185, 0.14), transparent 24%),
+                radial-gradient(circle at 50% 100%, rgba(122, 255, 214, 0.12), transparent 32%),
+                rgba(7, 10, 18, 0.98);
+            border-bottom: 1px solid rgba(165, 184, 205, 0.22);
         }
         .swarm-map-toolbar {
-            background: linear-gradient(180deg, rgba(17, 26, 37, 0.96), rgba(11, 18, 26, 0.88));
+            background: linear-gradient(180deg, rgba(12, 18, 30, 0.98), rgba(8, 13, 21, 0.92));
         }
         .swarm-map-zoom-pill,
         .swarm-map-legend-chip {
-            border-color: rgba(165, 184, 205, 0.3);
-            background: rgba(8, 13, 19, 0.72);
+            border-color: rgba(165, 184, 205, 0.18);
+            background: rgba(9, 14, 24, 0.72);
         }
         .swarm-map-note {
             max-width: 32ch;
+            color: rgba(189, 201, 217, 0.82);
         }
         #swarmTimelineWrap,
         .swim-grid {
@@ -3872,7 +4198,7 @@
                     <div class="page-header">
                         <div>
                             <h2 class="page-title-h">Welcome to <span>SkyN3t</span></h2>
-                            <span class="subtitle">Start with a project, add an agent, or run a quick task.</span>
+                            <span class="subtitle">Start a project, review pending self-updates, or open Activity when you want the live detail.</span>
                         </div>
                         <div class="page-actions">
                             <button class="btn" onclick="refreshAll()" title="Refresh stats"><i class="fa-solid fa-rotate"></i></button>
@@ -3893,9 +4219,11 @@
                                         <button class="btn" onclick="quickCreateUseExample('business')">Business plan</button>
                                         <button class="btn" onclick="quickCreateUseExample('project')">Project plan</button>
                                     </div>
-                                    <div id="quickCreateStatus" class="muted">No setup wizard — describe the outcome and SkyN3t will choose a workflow, preserve shared memory, and show the swarm working live.</div>
+                                    <div id="quickCreateStatus" class="muted">No setup wizard — describe the outcome and SkyN3t will choose a workflow, preserve shared memory, and keep Activity ready when you want to watch the handoffs live.</div>
                                 </div>
-                                <div class="overview-promise-grid">
+                                <div>
+                                    <div class="section-title">What SkyN3t will do</div>
+                                    <div class="overview-promise-grid">
                                     <div class="overview-promise-card accent-cyan">
                                         <span class="overview-promise-icon"><i class="fa-solid fa-brain"></i></span>
                                         <div class="overview-promise-copy">
@@ -3917,6 +4245,7 @@
                                             <div class="muted">Open Projects or Activity to watch the AI modules talk, plan, and produce artifacts together.</div>
                                         </div>
                                     </div>
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -3933,7 +4262,7 @@
 
                         <!-- Recent runs -->
                         <div class="ui-card col-12">
-                            <div class="card-h"><h3><i class="fa-solid fa-clock-rotate-left"></i> Recent runs</h3></div>
+                            <div class="card-h"><h3><i class="fa-solid fa-clock-rotate-left"></i> Recent projects</h3></div>
                             <div class="card-b">
                                 <div id="recentRunsGrid" class="recent-grid">
                                     <div class="muted">No projects yet — create one or start from a template above.</div>
@@ -3957,50 +4286,62 @@
                             </div>
                         </div>
 
-                        <!-- What each agent does (collapsible) -->
                         <div class="ui-card col-12">
-                            <div class="card-h" onclick="toggleCapabilities()" style="cursor:pointer;">
-                                <h3><i class="fa-solid fa-users-rectangle"></i> What each agent does</h3>
-                                <span class="right" id="capChevron"><i class="fa-solid fa-chevron-down"></i></span>
+                            <div class="card-h" onclick="toggleOverviewDiagnostics()" style="cursor:pointer;">
+                                <h3 id="overviewDiagnosticsTitle"><i class="fa-solid fa-gauge-high"></i> System diagnostics</h3>
+                                <span class="right" style="display:flex;align-items:center;gap:.75rem;">
+                                    <span class="overview-collapse-copy">Stats, live activity, charts, and agent roles when you need to debug a run.</span>
+                                    <span id="overviewDiagnosticsChevron"><i class="fa-solid fa-chevron-down"></i></span>
+                                </span>
                             </div>
-                            <div class="card-b" id="capabilitiesBody" style="display:none;">
-                                <div id="capabilitiesGrid" class="capabilities-grid"></div>
-                            </div>
-                        </div>
+                            <div class="card-b" id="overviewDiagnosticsBody" style="display:none;">
+                                <div class="overview-section-note">Overview stays focused on starting work and reviewing inbox items. Open diagnostics when you want system-level detail; the Activity page still shows the full live map.</div>
+                                <div class="overview-diagnostics-grid">
+                                    <div class="ui-card col-12">
+                                        <div class="card-h" onclick="toggleCapabilities()" style="cursor:pointer;">
+                                            <h3><i class="fa-solid fa-users-rectangle"></i> What each agent does</h3>
+                                            <span class="right" id="capChevron"><i class="fa-solid fa-chevron-down"></i></span>
+                                        </div>
+                                        <div class="card-b" id="capabilitiesBody" style="display:none;">
+                                            <div id="capabilitiesGrid" class="capabilities-grid"></div>
+                                        </div>
+                                    </div>
 
-                        <!-- Quick stats (kept) -->
-                        <div class="ui-card col-3"><div class="card-b"><div class="stat-card agents" style="background:transparent;border:none;padding:0"><div class="stat-icon"><i class="fa-solid fa-robot"></i></div><div class="stat-value" id="statAgents">0</div><div class="stat-label">Active Agents</div></div></div></div>
-                        <div class="ui-card col-3"><div class="card-b"><div class="stat-card tasks" style="background:transparent;border:none;padding:0"><div class="stat-icon"><i class="fa-solid fa-bolt"></i></div><div class="stat-value" id="statTasks">0</div><div class="stat-label">Running Tasks</div></div></div></div>
-                        <div class="ui-card col-3"><div class="card-b"><div class="stat-card pipelines" style="background:transparent;border:none;padding:0"><div class="stat-icon"><i class="fa-solid fa-diagram-project"></i></div><div class="stat-value" id="statPipelines">0</div><div class="stat-label">Active Pipelines</div></div></div></div>
-                        <div class="ui-card col-3"><div class="card-b"><div class="stat-card health" style="background:transparent;border:none;padding:0"><div class="stat-icon"><i class="fa-solid fa-heart-pulse"></i></div><div class="stat-value" id="statHealth">100%</div><div class="stat-label">System Health</div></div></div></div>
+                                    <div class="ui-card col-3"><div class="card-b"><div class="stat-card agents" style="background:transparent;border:none;padding:0"><div class="stat-icon"><i class="fa-solid fa-robot"></i></div><div class="stat-value" id="statAgents">0</div><div class="stat-label">Active Agents</div></div></div></div>
+                                    <div class="ui-card col-3"><div class="card-b"><div class="stat-card tasks" style="background:transparent;border:none;padding:0"><div class="stat-icon"><i class="fa-solid fa-bolt"></i></div><div class="stat-value" id="statTasks">0</div><div class="stat-label">Running Tasks</div></div></div></div>
+                                    <div class="ui-card col-3"><div class="card-b"><div class="stat-card pipelines" style="background:transparent;border:none;padding:0"><div class="stat-icon"><i class="fa-solid fa-diagram-project"></i></div><div class="stat-value" id="statPipelines">0</div><div class="stat-label">Active Pipelines</div></div></div></div>
+                                    <div class="ui-card col-3"><div class="card-b"><div class="stat-card health" style="background:transparent;border:none;padding:0"><div class="stat-icon"><i class="fa-solid fa-heart-pulse"></i></div><div class="stat-value" id="statHealth">100%</div><div class="stat-label">System Health</div></div></div></div>
 
-                        <div class="ui-card col-8 fill">
-                            <div class="card-h"><h3><i class="fa-solid fa-list-timeline"></i> Recent Tasks</h3></div>
-                            <div class="card-b">
-                                <div id="taskTimeline" class="timeline"></div>
-                                <div id="taskTimelineEmpty" class="empty-state">
-                                    <i class="empty-icon fa-solid fa-list-check"></i>
-                                    <div>No tasks yet — submit work or start a project to populate this list.</div>
-                                    <button class="btn btn-primary empty-cta" onclick="showPage('studio')"><i class="fa-solid fa-rocket"></i> Create first project</button>
+                                    <div class="ui-card col-8 fill">
+                                        <div class="card-h"><h3><i class="fa-solid fa-list-timeline"></i> Recent Tasks</h3></div>
+                                        <div class="card-b">
+                                            <div id="taskTimeline" class="timeline"></div>
+                                            <div id="taskTimelineEmpty" class="empty-state">
+                                                <i class="empty-icon fa-solid fa-list-check"></i>
+                                                <div>No tasks yet — submit work or start a project to populate this list.</div>
+                                                <button class="btn btn-primary empty-cta" onclick="showPage('studio')"><i class="fa-solid fa-rocket"></i> Create first project</button>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div class="ui-card col-4 fill">
+                                        <div class="card-h"><h3 id="overviewLiveTitle"><i class="fa-solid fa-wave-square"></i> Recent activity</h3><span class="right" style="color:var(--text-dim);font-size:.7rem">last events</span></div>
+                                        <div class="card-b" style="padding:0">
+                                            <div id="overviewLiveStream" class="activity-stream" style="max-height:380px"></div>
+                                            <div id="overviewLiveEmpty" class="empty-state">
+                                                <i class="empty-icon fa-solid fa-tower-broadcast"></i>
+                                                <div>Run a task or project to start the live stream.</div>
+                                                <button class="btn empty-cta" onclick="showPage('playground')"><i class="fa-solid fa-flask"></i> Open Playground</button>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div class="ui-card col-12">
+                                        <div class="card-h"><h3><i class="fa-solid fa-chart-area"></i> Task Throughput</h3></div>
+                                        <div class="card-b"><div class="chart-container"><canvas id="throughputChart"></canvas></div></div>
+                                    </div>
                                 </div>
                             </div>
-                        </div>
-
-                        <div class="ui-card col-4 fill">
-                            <div class="card-h"><h3 id="overviewLiveTitle"><i class="fa-solid fa-wave-square"></i> Live Activity</h3><span class="right" style="color:var(--text-dim);font-size:.7rem">last events</span></div>
-                            <div class="card-b" style="padding:0">
-                                <div id="overviewLiveStream" class="activity-stream" style="max-height:380px"></div>
-                                <div id="overviewLiveEmpty" class="empty-state">
-                                    <i class="empty-icon fa-solid fa-tower-broadcast"></i>
-                                    <div>Run a task or project to start the live stream.</div>
-                                    <button class="btn empty-cta" onclick="showPage('playground')"><i class="fa-solid fa-flask"></i> Open Playground</button>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="ui-card col-12">
-                            <div class="card-h"><h3><i class="fa-solid fa-chart-area"></i> Task Throughput</h3></div>
-                            <div class="card-b"><div class="chart-container"><canvas id="throughputChart"></canvas></div></div>
                         </div>
                     </div>
                 </div>
@@ -4011,8 +4352,8 @@
                 <div class="page-shell">
                     <div class="page-header">
                         <div>
-                            <h2 class="page-title-h" id="swarmPageTitle">Swarm <span>Live</span></h2>
-                            <span class="subtitle">Real-time agent ring, swimlane, and activity stream.</span>
+                            <h2 class="page-title-h" id="swarmPageTitle">Activity <span>feed</span></h2>
+                            <span class="subtitle">Real-time agent map, handoffs, and activity stream.</span>
                         </div>
                         <div class="page-actions">
                             <span id="swarmConnState" style="font-size:0.75rem;color:var(--text-dim);display:flex;align-items:center;gap:0.375rem;"><span class="status-dot online"></span> connected</span>
@@ -4023,21 +4364,21 @@
                     <div class="page-body grid-12">
                         <div class="ui-card col-12">
                             <div class="card-h">
-                                <h3><i class="fa-solid fa-circle-nodes"></i> Swarm Map</h3>
-                                <span class="right" style="color:var(--text-dim);font-size:.7rem">cluster map + 5-minute swimlane</span>
+                                <h3><i class="fa-solid fa-circle-nodes"></i> Neural Activity Map</h3>
+                                <span class="right" style="color:var(--text-dim);font-size:.7rem">neural cluster map + 5-minute swimlane</span>
                             </div>
                             <div class="swarm-map swarm-map-surface">
                                 <div class="swarm-map-toolbar" id="swarmMapToolbar">
                                     <div class="swarm-map-toolbar-copy">
                                         <div>
-                                            <strong>Readable by default, detailed when you zoom in.</strong>
-                                            <p>Watch the active swarm without label overload. Scroll to zoom, drag the background to pan, and double-click or use Fit to reset.</p>
+                                            <strong>Follow the swarm like a live control room.</strong>
+                                            <p>Zoom in for capability detail, watch pulses travel between lit clusters, and keep the swimlane nearby for the last few minutes of motion.</p>
                                         </div>
                                         <div class="swarm-map-legend" id="swarmMapLegend">
                                             <span class="swarm-map-legend-chip"><span class="swarm-map-legend-dot idle"></span> Idle</span>
                                             <span class="swarm-map-legend-chip"><span class="swarm-map-legend-dot active"></span> Working</span>
                                             <span class="swarm-map-legend-chip"><span class="swarm-map-legend-dot error"></span> Needs attention</span>
-                                            <span class="swarm-map-legend-chip subtle">Capability hints appear as you zoom in.</span>
+                                            <span class="swarm-map-legend-chip subtle">Travel pulses and capability hints sharpen as you zoom in.</span>
                                         </div>
                                     </div>
                                     <div class="swarm-map-toolbar-actions">
@@ -4048,12 +4389,23 @@
                                             <button class="btn btn-ghost btn-xs" onclick="bmZoomReset()" title="Fit"><i class="fa-solid fa-expand-arrows-alt"></i></button>
                                             <button class="btn btn-ghost btn-xs swarm-expand-btn" onclick="toggleSwarmFullscreen()" title="Fullscreen"><i class="fa-solid fa-expand"></i></button>
                                         </div>
-                                        <div class="swarm-map-note" id="swarmMapHint">Use the buttons for deliberate zoom steps. Trackpad noise is filtered so the map feels steadier.</div>
+                                        <div class="swarm-map-note" id="swarmMapHint">Use the buttons for deliberate zoom steps. Trackpad noise is filtered so the map feels steadier while the swarm is moving.</div>
                                     </div>
                                 </div>
                                 <div id="swarmRingWrap">
                                     <svg id="brainMapSvg" viewBox="0 0 1200 720" preserveAspectRatio="xMidYMid meet">
+                                        <defs>
+                                            <linearGradient id="bmSceneGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                                                <stop offset="0%" stop-color="#0b1020"></stop>
+                                                <stop offset="52%" stop-color="#0a1421"></stop>
+                                                <stop offset="100%" stop-color="#050913"></stop>
+                                            </linearGradient>
+                                            <pattern id="bmGridPattern" width="48" height="48" patternUnits="userSpaceOnUse">
+                                                <path d="M 48 0 L 0 0 0 48" fill="none" stroke="rgba(173, 192, 216, 0.18)" stroke-width="1"></path>
+                                            </pattern>
+                                        </defs>
                                         <g id="bmZoomLayer">
+                                            <g id="bmBackdrop"></g>
                                             <g id="bmEdges"></g>
                                             <g id="bmClusters"></g>
                                             <g id="bmHalos"></g>
@@ -4129,8 +4481,8 @@
                 <div class="page-shell">
                     <div class="page-header">
                         <div>
-                            <h2 class="page-title-h" id="studioPageTitle">Project <span>Studio</span></h2>
-                            <span class="subtitle">Describe the outcome once. SkyN3t chooses a workflow, keeps memory, and shows the swarm live.</span>
+                            <h2 class="page-title-h" id="studioPageTitle">Projects <span>workspace</span></h2>
+                            <span class="subtitle">Describe the outcome once. SkyN3t chooses a workflow, keeps memory, and opens Activity when you need the live detail.</span>
                         </div>
                         <div class="page-actions">
                             <button class="btn btn-ghost btn-xs" onclick="toggleStudioInspector()" title="Toggle inspector"><i class="fa-solid fa-columns"></i></button>
@@ -4162,9 +4514,27 @@
                                 </div>
                                 <div class="ws-body studio-center-body">
                                     <div id="studioLaunchMode" class="studio-mode studio-launch-mode">
-                                        <div class="studio-brief-tools">
-                                            <div class="studio-mission-card" id="studioMissionSummary">
-                                                <strong>One brief in.</strong> Tell SkyN3t the outcome and it will line up the smallest useful swarm.
+                                        <div class="studio-launch-shell">
+                                            <div id="studioLaunchThread" class="studio-chat-thread">
+                                                <div class="studio-chat-row studio-chat-row-agent">
+                                                    <div id="studioMissionSummary" class="studio-chat-bubble studio-chat-bubble-agent">
+                                                        <strong>Tell me what to build.</strong> SkyN3t will answer here with a plan, ask follow-up questions in the same thread when needed, and then open the live build board.
+                                                    </div>
+                                                </div>
+                                                <div id="studioDraftBubbleRow" class="studio-chat-row studio-chat-row-user hidden">
+                                                    <div class="studio-chat-bubble studio-chat-bubble-user">
+                                                        <div class="studio-chat-bubble-label">Your mission</div>
+                                                        <div id="studioDraftBubble" class="studio-draft-bubble"></div>
+                                                    </div>
+                                                </div>
+                                                <div class="studio-chat-row studio-chat-row-agent">
+                                                    <div id="studioPlanPreview" class="studio-plan-preview studio-chat-bubble studio-chat-bubble-agent">
+                                                        <div class="muted" style="margin-left:0">How SkyN3t will approach the mission will appear here after you describe it.</div>
+                                                    </div>
+                                                </div>
+                                                <div id="studioStatusRow" class="studio-chat-row studio-chat-row-system hidden">
+                                                    <div id="studioStatus" class="studio-chat-bubble studio-chat-bubble-system" hidden></div>
+                                                </div>
                                             </div>
                                             <div class="studio-chip-row">
                                                 <button class="studio-chip" type="button" onclick="studioUseExample('app')">App idea</button>
@@ -4175,59 +4545,81 @@
                                                 <summary>Suggested workflows are optional — open this only if you want to steer the swarm.</summary>
                                                 <div class="studio-templates" id="studioTemplates"></div>
                                             </details>
-                                            <div class="studio-setup-card">
-                                                <div class="studio-setup-head">
-                                                    <strong>Mission setup</strong>
-                                                    <span>Choose the few options that really steer the run before SkyN3t starts building.</span>
-                                                </div>
-                                                <div id="studioMissionSetupControls" class="studio-setup-grid"></div>
-                                            </div>
-                                            <div class="studio-setup-card">
-                                                <div class="studio-setup-head">
-                                                    <strong>Codebase target</strong>
-                                                    <span>Point SkyN3t at another local git repo when you want it to patch real project code. Leave empty to work in the current workspace.</span>
-                                                </div>
-                                                <div class="studio-repo-grid">
-                                                    <div class="form-group" style="margin-bottom:0;">
-                                                        <label for="studioRepoPath">Local git repo path</label>
-                                                        <input id="studioRepoPath" type="text" placeholder="/Users/you/project or ../project">
+                                            <details class="studio-setup-card studio-setup-disclosure">
+                                                <summary>
+                                                    <strong>Mission options</strong>
+                                                    <span>Audience and autonomy are optional — only set them when you want to steer the run.</span>
+                                                </summary>
+                                                <div class="studio-setup-disclosure-body">
+                                                    <div class="studio-setup-head">
+                                                        <strong>Mission setup</strong>
+                                                        <span>Choose the few options that really steer the run before SkyN3t starts building.</span>
                                                     </div>
-                                                    <div class="form-group" style="margin-bottom:0;">
-                                                        <label for="studioFocusFile">Focus file (optional)</label>
-                                                        <input id="studioFocusFile" type="text" placeholder="src/app.py or web/login.tsx">
+                                                    <div id="studioMissionSetupControls" class="studio-setup-grid"></div>
+                                                </div>
+                                            </details>
+                                            <details class="studio-setup-card studio-setup-disclosure">
+                                                <summary>
+                                                    <strong>Codebase target (optional)</strong>
+                                                    <span>Point SkyN3t at another repo only when you want it to patch real project code.</span>
+                                                </summary>
+                                                <div class="studio-setup-disclosure-body">
+                                                    <div class="studio-setup-head">
+                                                        <strong>Codebase target</strong>
+                                                        <span>Point SkyN3t at another local git repo or GitHub repo URL when you want it to patch real project code. Leave empty to work in the current workspace.</span>
+                                                    </div>
+                                                    <div class="studio-repo-grid">
+                                                        <div class="form-group" style="margin-bottom:0;">
+                                                            <label for="studioRepoPath">Local git repo path or GitHub URL</label>
+                                                            <input id="studioRepoPath" type="text" placeholder="/Users/you/project, ../project, or https://github.com/org/repo">
+                                                        </div>
+                                                        <div class="form-group" style="margin-bottom:0;">
+                                                            <label for="studioFocusFile">Focus file (optional)</label>
+                                                            <input id="studioFocusFile" type="text" placeholder="src/app.py or web/login.tsx">
+                                                        </div>
                                                     </div>
                                                 </div>
+                                            </details>
+                                            <div class="studio-composer-card">
+                                                <textarea id="studioBrief" rows="6" placeholder="Describe the app, workflow, bugfix, or project you want. Keep it conversational — SkyN3t will reply here."></textarea>
+                                                <div class="studio-actions studio-launch-actions">
+                                                    <button id="studioStart" class="btn btn-primary"><i class="fa-solid fa-paper-plane"></i> Send mission</button>
+                                                    <div class="studio-chat-tip">SkyN3t replies in the thread, asks confirmation questions inline, then opens the build board once work starts.</div>
+                                                </div>
                                             </div>
-                                        </div>
-                                        <textarea id="studioBrief" rows="6" placeholder="Describe the app, workflow, business plan, or project you want. No setup wizard required."></textarea>
-                                        <div class="studio-actions">
-                                            <button id="studioStart" class="btn btn-primary"><i class="fa-solid fa-play"></i> Start swarm</button>
-                                            <span id="studioStatus" class="muted" style="margin-left:0.65rem;"></span>
-                                        </div>
-                                        <div id="studioPlanPreview" class="studio-plan-preview">
-                                            <div class="muted" style="margin-left:0">What SkyN3t will do will appear here after you describe the mission.</div>
                                         </div>
                                     </div>
                                     <div id="studioProjectMode" class="studio-mode studio-project-mode hidden">
                                         <div id="studioProjectBoardSummary" class="studio-board-hero"></div>
                                         <div class="studio-board-layout">
-                                            <div class="studio-board-card">
-                                                <div class="studio-board-card-head">
-                                                    <div>
-                                                        <strong>Artifacts</strong>
-                                                        <span id="studioArtifactMeta">Open the latest outputs without hunting through the timeline.</span>
+                                            <div class="studio-board-rail">
+                                                <div class="studio-board-card studio-thread-card">
+                                                    <div class="studio-board-card-head">
+                                                        <div>
+                                                            <strong>Mission thread</strong>
+                                                            <span id="studioLiveMeta">Read agent messages, confirmations, and handoffs in order.</span>
+                                                        </div>
+                                                    </div>
+                                                    <div id="studioLiveFeed" class="studio-live-feed">
+                                                        <div class="studio-feed-empty">Pick a project to watch the mission thread.</div>
                                                     </div>
                                                 </div>
-                                                <div id="studioArtifacts" class="studio-artifact-grid"></div>
-                                            </div>
-                                            <div class="studio-board-card">
+                                            <div class="studio-board-card studio-preview-card">
                                                 <div class="studio-board-card-head">
                                                     <div>
-                                                        <strong id="studioArtifactPreviewTitle">Artifact preview</strong>
-                                                        <span id="studioArtifactPreviewMeta">Pick an artifact to inspect it here.</span>
+                                                        <strong id="studioArtifactPreviewTitle">Demo preview</strong>
+                                                        <span id="studioArtifactPreviewMeta">Pick an artifact to inspect or demo it here.</span>
                                                     </div>
+                                                    <a id="studioPreviewOpen" class="btn btn-ghost btn-xs" target="_blank" rel="noopener noreferrer" hidden><i class="fa-solid fa-up-right-from-square"></i> Open tab</a>
                                                 </div>
-                                                <pre id="studioArtifactContent" class="studio-artifact-content"><em>Pick a project and a file…</em></pre>
+                                                <div class="studio-preview-browser">
+                                                    <span id="studioArtifactMeta">Pick a saved output and SkyN3t will render it here when it can.</span>
+                                                    <div id="studioArtifacts" class="studio-artifact-grid"></div>
+                                                </div>
+                                                <div class="studio-preview-surface">
+                                                    <iframe id="studioArtifactFrame" class="studio-artifact-frame" title="Studio artifact preview" sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads" hidden></iframe>
+                                                    <pre id="studioArtifactContent" class="studio-artifact-content"><em>Pick a project and a file…</em></pre>
+                                                </div>
                                             </div>
                                         </div>
                                     </div>
@@ -4445,8 +4837,8 @@
                 <div class="page-shell">
                     <div class="page-header">
                         <div>
-                            <h2 class="page-title-h">RAG</h2>
-                            <span class="subtitle">Retrieval-augmented knowledge base — query or add documents.</span>
+                            <h2 class="page-title-h">Knowledge <span>base</span></h2>
+                            <span class="subtitle">Search, add, and ground answers in shared knowledge.</span>
                         </div>
                         <div class="page-actions">
                             <button class="btn btn-primary" onclick="document.getElementById('ragContent').focus()"><i class="fa-solid fa-plus"></i> Add document</button>
@@ -4509,6 +4901,7 @@
         let utilChart = null;
         let eventHistory = [];
         let taskHistory = [];
+        const OVERVIEW_DIAGNOSTICS_KEY = 'skyn3t_overview_diagnostics_open';
         const DASHBOARD_DEFAULT_PAGE = 'studio';
         const DASHBOARD_PAGE_KEY = 'skyn3t_dashboard_page';
 
@@ -4721,6 +5114,7 @@
                 renderAgentsList();
                 updatePlaygroundAgents();
                 updatePipelineAgents();
+                if (typeof _syncRedesignAgents === 'function') _syncRedesignAgents();
                 updateStats();
             } catch (e) {
                 notifyDashboardError('refresh-agents', 'Could not refresh agents', e.message || 'unknown error');
@@ -5627,16 +6021,16 @@
         const BM_MAX_SCALE = 3.2;
 
         const CLUSTERS = [
-            { key: "analysis",  label: "Research & Analysis", color: "var(--cyan)",   icon: "🔍",
+            { key: "analysis",  label: "Research & Analysis", color: "#78d6ff",   icon: "🔍",
               angleStart: -135, angleEnd: -45,
               members: ["research_agent", "brainstorm", "github_explorer", "github_ingestor", "explorer"] },
-            { key: "creative",  label: "Creative Suite",      color: "#ff6b9d",        icon: "🎨",
+            { key: "creative",  label: "Creative Suite",      color: "#ff7ac6",        icon: "🎨",
               angleStart: 135,  angleEnd: 225,
               members: ["designer", "writer", "marketer", "business_analyst"] },
-            { key: "technical", label: "Technical Stack",     color: "var(--green)",   icon: "⚙️",
+            { key: "technical", label: "Technical Stack",     color: "#7cffd4",   icon: "⚙️",
               angleStart: 45,   angleEnd: 135,
               members: ["architect", "code_agent", "code_improver", "file_ops_agent"] },
-            { key: "cortex",    label: "Cortex",              color: "var(--purple)",  icon: "🧠",
+            { key: "cortex",    label: "Cortex",              color: "#b49bff",  icon: "🧠",
               angleStart: -45,  angleEnd: 45,
               members: ["reviewer", "scheduler_agent", "project_memory"] },
         ];
@@ -5698,18 +6092,43 @@
         }
 
         function renderBrainMap() {
+            const backdropG = document.getElementById('bmBackdrop');
             const edgesG = document.getElementById('bmEdges');
             const halosG = document.getElementById('bmHalos');
             const nodesG = document.getElementById('bmNodes');
             const labelsG = document.getElementById('bmLabels');
             const clustersG = document.getElementById('bmClusters');
-            if (!edgesG || !halosG || !nodesG || !labelsG || !clustersG) return;
+            if (!backdropG || !edgesG || !halosG || !nodesG || !labelsG || !clustersG) return;
+            backdropG.innerHTML = '';
             edgesG.innerHTML = '';
             halosG.innerHTML = '';
             nodesG.innerHTML = '';
             labelsG.innerHTML = '';
             clustersG.innerHTML = '';
             for (const k in bmPositions) delete bmPositions[k];
+
+            const sceneBg = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+            sceneBg.setAttribute('class', 'bm-scene-backdrop');
+            sceneBg.setAttribute('x', '0');
+            sceneBg.setAttribute('y', '0');
+            sceneBg.setAttribute('width', String(BM_VIEW_W));
+            sceneBg.setAttribute('height', String(BM_VIEW_H));
+            backdropG.appendChild(sceneBg);
+
+            const gridBg = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+            gridBg.setAttribute('class', 'bm-grid-backdrop');
+            gridBg.setAttribute('x', '0');
+            gridBg.setAttribute('y', '0');
+            gridBg.setAttribute('width', String(BM_VIEW_W));
+            gridBg.setAttribute('height', String(BM_VIEW_H));
+            backdropG.appendChild(gridBg);
+
+            const hubGlow = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            hubGlow.setAttribute('class', 'bm-hub-glow');
+            hubGlow.setAttribute('cx', BM_HUB_X);
+            hubGlow.setAttribute('cy', BM_HUB_Y);
+            hubGlow.setAttribute('r', '112');
+            backdropG.appendChild(hubGlow);
 
             // Hub
             const hubCircle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
@@ -5735,6 +6154,15 @@
                 const angMid = (cluster.angleStart + cluster.angleEnd) / 2;
                 const cxC = BM_HUB_X + BM_R1 * Math.cos(bmDeg2Rad(angMid));
                 const cyC = BM_HUB_Y + BM_R1 * Math.sin(bmDeg2Rad(angMid));
+                const haloRadius = 82 + cluster.members.length * 11;
+
+                const clusterHalo = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                clusterHalo.setAttribute('class', 'bm-cluster-halo');
+                clusterHalo.setAttribute('cx', cxC.toFixed(1));
+                clusterHalo.setAttribute('cy', cyC.toFixed(1));
+                clusterHalo.setAttribute('r', haloRadius.toFixed(1));
+                clusterHalo.style.setProperty('--bm-color', color);
+                backdropG.appendChild(clusterHalo);
 
                 // Hub → cluster edge
                 const hubEdge = document.createElementNS('http://www.w3.org/2000/svg', 'line');
@@ -5748,27 +6176,40 @@
                 hubEdge.setAttribute('opacity', '0.85');
                 edgesG.appendChild(hubEdge);
 
+                const clusterOrbit = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                clusterOrbit.setAttribute('class', 'bm-cluster-orbit');
+                clusterOrbit.setAttribute('cx', cxC.toFixed(1));
+                clusterOrbit.setAttribute('cy', cyC.toFixed(1));
+                clusterOrbit.setAttribute('r', String(42 + cluster.members.length * 7));
+                clusterOrbit.style.setProperty('--bm-color', color);
+                clustersG.appendChild(clusterOrbit);
+
                 // Cluster center node (slightly larger glyph)
                 const clusterNode = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                clusterNode.setAttribute('class', 'bm-cluster-core');
                 clusterNode.setAttribute('cx', cxC.toFixed(1));
                 clusterNode.setAttribute('cy', cyC.toFixed(1));
                 clusterNode.setAttribute('r', 14);
-                clusterNode.setAttribute('fill', 'var(--bg-1)');
-                clusterNode.setAttribute('stroke', color);
-                clusterNode.setAttribute('stroke-width', '2');
+                clusterNode.style.setProperty('--bm-color', color);
                 clustersG.appendChild(clusterNode);
 
                 // Cluster label (positioned outward from hub by a bit beyond the cluster center)
-                const labelOffset = 28;
+                const labelOffset = 36;
                 const lblX = cxC + labelOffset * Math.cos(bmDeg2Rad(angMid));
                 const lblY = cyC + labelOffset * Math.sin(bmDeg2Rad(angMid));
                 const clusterLbl = document.createElementNS('http://www.w3.org/2000/svg', 'text');
                 clusterLbl.setAttribute('class', 'bm-cluster-label');
                 clusterLbl.setAttribute('x', lblX.toFixed(1));
                 clusterLbl.setAttribute('y', lblY.toFixed(1));
-                clusterLbl.setAttribute('fill', color);
-                clusterLbl.textContent = `${cluster.icon} ${cluster.label}`;
+                clusterLbl.textContent = cluster.label;
                 clustersG.appendChild(clusterLbl);
+
+                const clusterMeta = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                clusterMeta.setAttribute('class', 'bm-cluster-meta');
+                clusterMeta.setAttribute('x', lblX.toFixed(1));
+                clusterMeta.setAttribute('y', (lblY + 14).toFixed(1));
+                clusterMeta.textContent = `${cluster.members.length} agents`;
+                clustersG.appendChild(clusterMeta);
 
                 // Member nodes spread along the angle arc at r2
                 const M = cluster.members.length;
@@ -5807,14 +6248,13 @@
                 const extrasY = BM_VIEW_H - 60;
                 const extrasGap = Math.min(140, (BM_VIEW_W - 120) / Math.max(extras.length, 1));
                 const startX = (BM_VIEW_W - extrasGap * (extras.length - 1)) / 2;
-                const extrasColor = bmResolveColor('var(--orange)');
+                const extrasColor = '#ffc575';
                 // Optional: a "Specialized" cluster label
                 const exLbl = document.createElementNS('http://www.w3.org/2000/svg', 'text');
                 exLbl.setAttribute('class', 'bm-cluster-label');
                 exLbl.setAttribute('x', BM_VIEW_W / 2);
                 exLbl.setAttribute('y', extrasY - 36);
-                exLbl.setAttribute('fill', extrasColor);
-                exLbl.textContent = '✨ Specialized';
+                exLbl.textContent = 'Specialists';
                 clustersG.appendChild(exLbl);
                 extras.forEach((name, i) => {
                     const x = startX + i * extrasGap;
@@ -5837,9 +6277,9 @@
             halo.setAttribute('cx', x.toFixed(1));
             halo.setAttribute('cy', y.toFixed(1));
             halo.setAttribute('r', (r + BM_HALO_PAD).toFixed(1));
-            halo.setAttribute('fill', color);
             halo.setAttribute('opacity', bmHaloOpacityForState(state));
             halo.setAttribute('data-halo-for', name);
+            halo.style.setProperty('--bm-color', color);
             if (state === 'thinking') halo.style.animation = 'bm-pulse 1.4s ease-in-out infinite';
             halosG.appendChild(halo);
 
@@ -5849,11 +6289,9 @@
             node.setAttribute('cx', x.toFixed(1));
             node.setAttribute('cy', y.toFixed(1));
             node.setAttribute('r', r);
-            node.setAttribute('fill', color);
-            node.setAttribute('stroke', color);
-            node.setAttribute('stroke-width', '2');
             node.setAttribute('data-name', name);
             node.setAttribute('data-state', state);
+            node.style.setProperty('--bm-color', color);
             node.appendChild(document.createElementNS('http://www.w3.org/2000/svg', 'title'));
             node.lastChild.textContent = `${name} · ${state}\n${CAP_HINTS[name] || ''}`;
             node.addEventListener('click', () => openAgentInspector(name));
@@ -6526,6 +6964,8 @@
                 overviewStream.scrollTop = overviewStream.scrollHeight;
                 const liveTitle = document.getElementById('overviewLiveTitle');
                 if (liveTitle) liveTitle.classList.add('live-pulse');
+                const diagnosticsTitle = document.getElementById('overviewDiagnosticsTitle');
+                if (diagnosticsTitle) diagnosticsTitle.classList.add('live-pulse');
             }
         }
 
@@ -6960,6 +7400,8 @@
             studioState.selectedProject = null;
             studioState.selectedProjectSlug = null;
             studioState.selectedArtifact = null;
+            const workspace = document.getElementById('studioWorkspace');
+            if (workspace) workspace.classList.remove('inspector-collapsed');
             studioRenderProjects();
             studioRenderProjectDetail();
             studioRenderProjectInspector();
@@ -6989,6 +7431,7 @@
                 studioApplyProjectToComposer(project);
             }
             studioClearProjectSelection();
+            studioSetLaunchStatus();
             studioRenderBriefPreview();
             const t = document.getElementById('studioBrief');
             if (t) {
@@ -7022,6 +7465,68 @@
             input.focus();
         }
 
+        function studioReadableErrorMessage(error) {
+            const raw = String((error && error.message) || error || '').trim();
+            if (!raw) return 'Something went wrong while reaching SkyN3t.';
+            const normalized = raw.toLowerCase();
+            if (
+                normalized === 'failed to fetch'
+                || normalized.includes('networkerror')
+                || normalized.includes('load failed')
+            ) {
+                return 'SkyN3t could not reach the local server. Refresh this page or confirm the app is still running on 127.0.0.1:6660.';
+            }
+            return raw;
+        }
+
+        function studioSetLaunchStatus(kind = '', message = '') {
+            studioState.launchStatus = message
+                ? { kind: String(kind || 'info'), message: String(message) }
+                : null;
+            const row = document.getElementById('studioStatusRow');
+            const el = document.getElementById('studioStatus');
+            if (!row || !el) return;
+            if (!message) {
+                row.hidden = true;
+                row.classList.add('hidden');
+                el.hidden = true;
+                el.textContent = '';
+                delete el.dataset.kind;
+                return;
+            }
+            row.hidden = false;
+            row.classList.remove('hidden');
+            el.hidden = false;
+            el.dataset.kind = String(kind || 'info');
+            el.textContent = String(message);
+        }
+
+        function studioWriteStatus(statusEl, kind, message) {
+            if (!statusEl) return;
+            if (statusEl.id === 'studioStatus') {
+                studioSetLaunchStatus(kind, message);
+                return;
+            }
+            statusEl.textContent = String(message || '');
+        }
+
+        function studioRenderDraftBubble(briefOverride = null) {
+            const row = document.getElementById('studioDraftBubbleRow');
+            const bubble = document.getElementById('studioDraftBubble');
+            if (!row || !bubble) return;
+            const input = document.getElementById('studioBrief');
+            const brief = briefOverride !== null
+                ? String(briefOverride || '').trim()
+                : (input ? input.value.trim() : '');
+            if (!brief) {
+                row.classList.add('hidden');
+                bubble.textContent = '';
+                return;
+            }
+            row.classList.remove('hidden');
+            bubble.textContent = brief;
+        }
+
         async function studioStartMission({template, brief, missionSetup, repoTarget, statusEl}) {
             const chosenTemplate = studioTemplateLabel(template);
             const normalizedRepoTarget = studioNormalizeRepoTarget(repoTarget);
@@ -7029,11 +7534,13 @@
             const strippedFocusFile = !!(
                 normalizedRepoTarget.focus_file && !launchRepoTarget.focus_file
             );
-            if (statusEl) {
-                statusEl.textContent = strippedFocusFile
-                    ? 'starting… focus file ignored until a repo path is set'
-                    : (chosenTemplate ? `starting with ${chosenTemplate}…` : 'starting…');
-            }
+            studioWriteStatus(
+                statusEl,
+                'info',
+                strippedFocusFile
+                    ? 'Starting — focus file ignored until a repo target is set.'
+                    : (chosenTemplate ? `Starting with ${chosenTemplate}…` : 'Starting…')
+            );
             if (strippedFocusFile) {
                 studioState.repoTarget = launchRepoTarget;
                 studioSyncRepoTargetInputs();
@@ -7055,23 +7562,25 @@
                         (d && d.repo_target) || repoTarget
                     );
                     studioSyncRepoTargetInputs();
-                    if (statusEl) {
-                        statusEl.textContent = d.slug
-                            ? `swarm dispatched · opening ${d.slug}`
-                            : 'swarm dispatched · open Activity or Projects to watch the handoff';
-                    }
+                    studioWriteStatus(
+                        statusEl,
+                        'success',
+                        d.slug
+                            ? `Mission sent — opening ${d.slug}.`
+                            : 'Mission sent — open Activity or Projects to watch the handoff.'
+                    );
                     await studioRefreshProjects();
                     if (d.slug) {
                         await studioOpenProject(d.slug);
                     }
                     return d;
                 }
-                if (statusEl) {
-                    statusEl.textContent = 'error: failed';
-                }
+                studioWriteStatus(statusEl, 'error', 'SkyN3t could not start the mission.');
             } catch (e) {
-                if (statusEl) {
-                    statusEl.textContent = 'error: ' + e.message;
+                const message = studioReadableErrorMessage(e);
+                studioWriteStatus(statusEl, 'error', message);
+                if (typeof showToast === 'function') {
+                    showToast({ kind: 'error', title: 'Could not start mission', body: message });
                 }
             }
             return null;
@@ -7183,6 +7692,8 @@
             queued: 'var(--text-secondary)',
             running: 'var(--cyan)',
             done: 'var(--green)',
+            needs_fixes: 'var(--yellow, #f59e0b)',
+            interrupted: 'var(--yellow, #f59e0b)',
             failed: 'var(--red)',
             waiting: 'var(--yellow, #f59e0b)',
             awaiting_clarification: 'var(--yellow, #f59e0b)',
@@ -7412,12 +7923,12 @@
                     return `<div class="muted" style="margin-left:0;font-size:.73rem;">Focus file pinned · <code>${escapeHTML(labels.focus)}</code></div>`;
                 }
                 if (labels.focus) {
-                    return `<div class="muted" style="margin-left:0;font-size:.73rem;">Focus file <code>${escapeHTML(labels.focus)}</code> needs a repo path before it can be pinned.</div>`;
+                    return `<div class="muted" style="margin-left:0;font-size:.73rem;">Focus file <code>${escapeHTML(labels.focus)}</code> needs a repo path or GitHub URL before it can be pinned.</div>`;
                 }
                 if (labels.path) {
                     return '<div class="muted" style="margin-left:0;font-size:.73rem;">No focus file pinned yet — SkyN3t will use the brief plus repo context.</div>';
                 }
-                return '<div class="muted" style="margin-left:0;font-size:.73rem;">Leave repo path empty only when you want SkyN3t to work in this repo.</div>';
+                return '<div class="muted" style="margin-left:0;font-size:.73rem;">Leave the repo field empty only when you want SkyN3t to work in this repo.</div>';
             })();
             return `
                 <div class="studio-repo-summary">
@@ -7442,7 +7953,6 @@
 
         function studioNormalizeQualitySummary(value, projectStatus = '') {
             if (!value || typeof value !== 'object') return null;
-            if (String(projectStatus || '').toLowerCase() === 'failed') return null;
             const verdict = String(value.verdict || '').toLowerCase();
             if (!['go', 'go-with-fixes', 'no-go'].includes(verdict)) return null;
             const score = Math.max(0, Math.min(100, Math.round(Number(value.score))));
@@ -7493,18 +8003,20 @@
             const brief = briefOverride !== null
                 ? String(briefOverride || '').trim()
                 : (input ? input.value.trim() : '');
+            studioRenderDraftBubble(brief);
             const setup = studioNormalizeMissionSetup(studioState.missionSetup);
             const setupLabels = studioMissionSetupLabels(setup);
             const repoTarget = studioNormalizeRepoTarget(studioState.repoTarget);
             const repoSummary = studioRepoTargetSummaryHtml(repoTarget, {showCurrentWorkspace: true});
 
             if (!brief) {
-                summaryEl.innerHTML = '<strong>One brief in.</strong> Tell SkyN3t the outcome, then choose only the settings that should really steer the swarm.';
+                summaryEl.innerHTML = '<strong>Tell me what to build.</strong> SkyN3t will answer here with a plan, ask follow-up questions in the same thread when needed, and then open the live build board.';
                 previewEl.innerHTML = `
-                    <div class="muted" style="margin-left:0">What SkyN3t will do will appear here after you describe the mission.</div>
+                    <div class="muted" style="margin-left:0">How SkyN3t will approach the mission will appear here after you describe it.</div>
                     ${studioMissionSetupSummaryHtml(setup)}
                     ${repoSummary}
                 `;
+                if (!studioState.selectedProject) studioRenderProjectInspector();
                 return;
             }
 
@@ -7542,10 +8054,10 @@
             }
 
             const repoLabels = studioRepoTargetLabel(repoTarget);
-            summaryEl.innerHTML = `<strong>${escapeHTML(label)}</strong> is the best current fit. Audience is <strong>${escapeHTML(setupLabels.audience)}</strong>, and SkyN3t will run in <strong>${escapeHTML(setupLabels.autonomy)}</strong> mode.${repoLabels.workspace ? ' It will use the current SkyN3t workspace.' : ` Codebase target is <strong>${escapeHTML(repoLabels.name)}</strong>.`}`;
+            summaryEl.innerHTML = `<strong>Got it — ${escapeHTML(label)}</strong> is the best current fit. I will keep the run tuned for <strong>${escapeHTML(setupLabels.audience)}</strong> and stay in <strong>${escapeHTML(setupLabels.autonomy)}</strong> mode.${repoLabels.workspace ? ' I will use the current SkyN3t workspace.' : ` I will work against <strong>${escapeHTML(repoLabels.name)}</strong>.`}`;
             previewEl.innerHTML = `
                 <div class="spp-head">
-                    <div class="form-label" style="margin-bottom:0">What SkyN3t will do</div>
+                    <div class="form-label" style="margin-bottom:0">How SkyN3t will approach it</div>
                     <div style="font-size:.88rem;font-weight:600;color:var(--text-primary);">${escapeHTML(label)}</div>
                     <div class="muted" style="margin-left:0;font-size:.76rem;">${escapeHTML(description)}</div>
                 </div>
@@ -7560,6 +8072,7 @@
                 ${repoSummary}
                 ${stageHtml}
             `;
+            if (!studioState.selectedProject) studioRenderProjectInspector();
         }
 
         function studioSyncComposer() {
@@ -7571,11 +8084,15 @@
             studioRenderBriefPreview(brief);
         }
 
+        const STUDIO_ACTIVE_PROJECT_STATUSES = new Set(['queued', 'running', 'awaiting_clarification']);
+        const STUDIO_IDLE_REFRESH_STALE_MS = 30000;
+
         const studioState = {
             templates: [],
             selectedTemplate: null,
             missionSetup: { audience: '', autonomy: 'move_fast' },
             repoTarget: { local_path: '', focus_file: '' },
+            launchStatus: null,
             missionSetupOptions: STUDIO_FALLBACK_MISSION_SETUP,
             projects: [],
             selectedProject: null,
@@ -7588,9 +8105,26 @@
             projectEventRefreshPromise: null,
             projectEventRefreshSlug: null,
             projectEventTimer: null,
+            clarificationSubmitSlug: null,
             pendingProjectRefreshSlugs: [],
+            lastProjectsRefreshAt: 0,
             initialized: false,
         };
+
+        function studioHasActiveProjects(projects = studioState.projects) {
+            return (projects || []).some(project => {
+                const manifest = project && (project.manifest || project);
+                const status = String((manifest && manifest.status) || '').toLowerCase();
+                return STUDIO_ACTIVE_PROJECT_STATUSES.has(status);
+            });
+        }
+
+        function studioProjectsRefreshDue() {
+            if (!Array.isArray(studioState.projects) || studioState.projects.length === 0) return true;
+            if (studioHasActiveProjects()) return true;
+            const last = Number(studioState.lastProjectsRefreshAt || 0);
+            return !last || (Date.now() - last) >= STUDIO_IDLE_REFRESH_STALE_MS;
+        }
 
         async function studioActivate() {
             if (!studioState.initialized) {
@@ -7614,11 +8148,18 @@
             }
             studioRenderMissionSetupControls();
             studioSyncRepoTargetInputs();
-            await studioRefreshProjects();
+            if (studioProjectsRefreshDue()) {
+                await studioRefreshProjects();
+            } else {
+                studioRenderProjects();
+                await studioRefreshSelectedProject();
+            }
             if (!studioState.pollTimer) {
                 studioState.pollTimer = setInterval(() => {
                     if (document.hidden) return;
                     if (!document.getElementById('page-studio').classList.contains('hidden')) {
+                        if (studioClarificationInteractionActive()) return;
+                        if (!studioHasActiveProjects()) return;
                         studioRefreshProjects();
                     }
                 }, 5000);
@@ -7648,6 +8189,7 @@
                 studioState.missionSetupOptions = STUDIO_FALLBACK_MISSION_SETUP;
                 notifyDashboardError('studio-templates', 'Could not load Studio templates', e.message || 'unknown error');
             }
+            if (typeof _syncRedesignTemplates === 'function') _syncRedesignTemplates();
             studioState.missionSetup = studioNormalizeMissionSetup(studioState.missionSetup);
             studioRenderTemplates();
             studioRenderMissionSetupControls();
@@ -7748,6 +8290,219 @@
                 || paths[0]
                 || ''
             );
+        }
+
+        function studioArtifactPreviewMode(path) {
+            const normalized = String(path || '').trim().toLowerCase().split('?')[0];
+            if (/\.(html?|svg|pdf|png|jpe?g|gif|webp|avif)$/i.test(normalized)) {
+                return 'frame';
+            }
+            return 'text';
+        }
+
+        function studioPreviewArtifactUrl(slug, path) {
+            const safeSlug = encodeURIComponent(String(slug || '').trim());
+            const safePath = String(path || '')
+                .split('/')
+                .filter(part => part && part !== '.')
+                .map(part => encodeURIComponent(part))
+                .join('/');
+            return `/api/studio/projects/${safeSlug}/preview/${safePath}`;
+        }
+
+        function studioSetClarificationDraft(slug, index, value) {
+            const key = String(slug || '');
+            if (!key) return;
+            window._clarifyDrafts = window._clarifyDrafts || {};
+            window._clarifyDrafts[key] = window._clarifyDrafts[key] || [];
+            window._clarifyDrafts[key][index] = value;
+        }
+
+        function studioParseClarificationAnswersFromText(value, questionCount) {
+            const total = Math.max(0, Number(questionCount || 0));
+            if (!total) return [];
+            const normalized = String(value || '').replace(/\r\n/g, '\n').trim();
+            if (!normalized) return Array.from({ length: total }, () => '');
+
+            const answers = Array.from({ length: total }, () => '');
+            const numbered = [...normalized.matchAll(/(?:^|\n)\s*(\d+)[.)-]\s+/g)];
+            if (numbered.length) {
+                numbered.forEach((match, index) => {
+                    const answerIndex = parseInt(match[1] || '', 10) - 1;
+                    if (!Number.isInteger(answerIndex) || answerIndex < 0 || answerIndex >= total) return;
+                    const start = (match.index || 0) + match[0].length;
+                    const end = index + 1 < numbered.length ? (numbered[index + 1].index || normalized.length) : normalized.length;
+                    answers[answerIndex] = normalized.slice(start, end).trim();
+                });
+                return answers;
+            }
+
+            const blocks = normalized.split(/\n\s*\n+/).map(item => item.trim()).filter(Boolean);
+            if (blocks.length === total) return blocks;
+
+            const lines = normalized.split('\n').map(item => item.trim()).filter(Boolean);
+            if (lines.length === total) return lines;
+
+            if (total === 1) return [normalized];
+            blocks.forEach((block, index) => {
+                if (index < total) answers[index] = block;
+            });
+            if (!answers.some(item => item)) answers[0] = normalized;
+            return answers;
+        }
+
+        function studioSetClarificationComposerDraft(slug, value, questionCount) {
+            const key = String(slug || '');
+            if (!key) return;
+            window._clarifyComposerDrafts = window._clarifyComposerDrafts || {};
+            window._clarifyComposerDrafts[key] = value;
+            window._clarifyDrafts = window._clarifyDrafts || {};
+            window._clarifyDrafts[key] = studioParseClarificationAnswersFromText(value, questionCount);
+        }
+
+        function studioClarificationComposerValue(slug, questionCount) {
+            const key = String(slug || '').trim();
+            if (!key) return '';
+            const composerDrafts = window._clarifyComposerDrafts || {};
+            if (typeof composerDrafts[key] === 'string') {
+                return composerDrafts[key];
+            }
+            const drafts = (window._clarifyDrafts && window._clarifyDrafts[key]) || [];
+            if (!drafts.some(answer => String(answer || '').trim())) return '';
+            return Array.from({ length: questionCount }, (_, index) => {
+                const answer = String(drafts[index] || '').trim();
+                return `${index + 1}. ${answer}`;
+            }).join('\n\n').trim();
+        }
+
+        function studioClarificationComposerPlaceholder(questionCount) {
+            const total = Math.max(1, Number(questionCount || 0));
+            if (total === 1) return 'Reply here…';
+            return Array.from({ length: total }, (_, index) => `${index + 1}. Answer question ${index + 1}…`).join('\n\n');
+        }
+
+        function studioClarificationInteractionActive(slug = studioState.selectedProjectSlug) {
+            const key = String(slug || '').trim();
+            if (!key) return false;
+            if (studioState.clarificationSubmitSlug === key) return true;
+            const active = document.activeElement;
+            if (!active || typeof active.closest !== 'function') return false;
+            const block = active.closest('[data-clarify-block]');
+            return !!(block && block.dataset && block.dataset.clarifySlug === key);
+        }
+
+        function studioClarificationThreadHtml(slug, clarification, options = {}) {
+            const key = String(slug || '').trim();
+            const data = clarification && typeof clarification === 'object' ? clarification : {};
+            const questions = Array.isArray(data.questions) ? data.questions.filter(Boolean) : [];
+            if (!key || !questions.length) return '';
+            window._clarifyDrafts = window._clarifyDrafts || {};
+            const safeSlug = key.replace(/'/g, "\\'");
+            const attrSlug = escapeHTML(key);
+            const context = String(options.context || 'project');
+            const intro = context === 'row'
+                ? 'SkyN3t paused here for clarification. Reply below and it will resume this mission.'
+                : (context === 'thread'
+                    ? 'SkyN3t paused for clarification. Reply in this thread while the preview stays open on the right.'
+                    : 'SkyN3t paused for clarification. Reply here like chat — the preview stays live while you answer.');
+            const promptHint = context === 'row'
+                ? 'Send every answer together to keep the mission moving.'
+                : (context === 'thread'
+                    ? 'Answer in one message at the bottom, keep the preview open, then send the full reply together.'
+                    : 'Answer in one message, then send all replies together to resume the run.');
+            if (context !== 'row') {
+                const composerValue = studioClarificationComposerValue(key, questions.length);
+                const placeholder = studioClarificationComposerPlaceholder(questions.length);
+                return `
+                    <div data-clarify-block data-clarify-slug="${attrSlug}" class="studio-chat-thread studio-clarify-thread">
+                        <div class="studio-chat-row studio-chat-row-agent">
+                            <div class="studio-chat-bubble studio-chat-bubble-agent">
+                                <div class="studio-chat-bubble-label">SkyN3t</div>
+                                <div class="studio-draft-bubble">${escapeHTML(intro)}</div>
+                                <div class="studio-chat-tip">${escapeHTML(promptHint)}</div>
+                            </div>
+                        </div>
+                        <div class="studio-clarify-questions">
+                            ${questions.map((question, index) => `
+                                <div class="studio-chat-row studio-chat-row-agent">
+                                    <div class="studio-chat-bubble studio-chat-bubble-agent">
+                                        <div class="studio-chat-bubble-label">SkyN3t · Question ${index + 1}</div>
+                                        <div class="studio-draft-bubble">${escapeHTML(question)}</div>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                        <div class="studio-chat-row studio-chat-row-user">
+                            <div class="studio-chat-bubble studio-chat-bubble-user">
+                                <div class="studio-chat-bubble-label">Your reply</div>
+                                <div class="studio-clarify-composer">
+                                    <textarea
+                                        class="studio-clarify-input"
+                                        data-clarify-composer="true"
+                                        data-clarify-count="${questions.length}"
+                                        placeholder="${escapeHTML(placeholder)}"
+                                        oninput="studioSetClarificationComposerDraft('${safeSlug}', this.value, ${questions.length})"
+                                    >${escapeHTML(composerValue)}</textarea>
+                                    <div class="studio-clarify-composer-guide">
+                                        <span>Reply in one message. SkyN3t will split it back into ${questions.length} numbered answer${questions.length === 1 ? '' : 's'} when you send.</span>
+                                        ${questions.length > 1 ? '<code>1. ...\n2. ...\n3. ...</code>' : '<code>Answer the question directly, then send.</code>'}
+                                    </div>
+                                </div>
+                                <div class="studio-clarify-actions">
+                                    <div class="studio-clarify-note">Preview stays live while you answer.</div>
+                                    <button class="btn btn-primary btn-sm" type="button" onclick="studioSubmitClarification('${safeSlug}', this)">
+                                        <i class="fa-solid fa-paper-plane"></i> Send replies
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+            const draft = window._clarifyDrafts[key] || [];
+            const turns = questions.map((question, index) => `
+                <div class="studio-chat-row studio-chat-row-agent">
+                    <div class="studio-chat-bubble studio-chat-bubble-agent">
+                        <div class="studio-chat-bubble-label">SkyN3t · Question ${index + 1}</div>
+                        <div class="studio-draft-bubble">${escapeHTML(question)}</div>
+                    </div>
+                </div>
+                <div class="studio-chat-row studio-chat-row-user">
+                    <div class="studio-chat-bubble studio-chat-bubble-user">
+                        <div class="studio-chat-bubble-label">Your reply</div>
+                        <textarea
+                            class="studio-clarify-input"
+                            data-clarify-q="${index}"
+                            data-clarify-slug="${safeSlug}"
+                            placeholder="Type answer..."
+                            oninput="studioSetClarificationDraft('${safeSlug}', ${index}, this.value)"
+                        >${escapeHTML(String(draft[index] || ''))}</textarea>
+                    </div>
+                </div>
+            `).join('');
+            return `
+                <div data-clarify-block data-clarify-slug="${attrSlug}" class="studio-chat-thread studio-clarify-thread">
+                    <div class="studio-chat-row studio-chat-row-agent">
+                        <div class="studio-chat-bubble studio-chat-bubble-agent">
+                            <div class="studio-chat-bubble-label">SkyN3t</div>
+                            <div class="studio-draft-bubble">${escapeHTML(intro)}</div>
+                            <div class="studio-chat-tip">${escapeHTML(promptHint)}</div>
+                        </div>
+                    </div>
+                    ${turns}
+                    <div class="studio-chat-row studio-chat-row-user">
+                        <div class="studio-chat-bubble studio-chat-bubble-user">
+                            <div class="studio-chat-bubble-label">Ready when you are</div>
+                            <div class="studio-chat-tip">SkyN3t will resume from this checkpoint after you send the replies.</div>
+                            <div class="studio-clarify-actions">
+                                <button class="btn btn-primary btn-sm" type="button" onclick="studioSubmitClarification('${safeSlug}', this)">
+                                    <i class="fa-solid fa-paper-plane"></i> Send replies
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
         }
 
         function studioUpdateWorkspaceMode() {
@@ -7866,7 +8621,11 @@
                 if (!proj) return null;
                 studioUpsertProject(proj);
                 if (studioState.selectedProjectSlug === slug) {
-                    studioSyncSelectedProjectSnapshot(proj);
+                    if (studioClarificationInteractionActive(slug)) {
+                        studioState.selectedProject = proj;
+                    } else {
+                        studioSyncSelectedProjectSnapshot(proj);
+                    }
                 }
                 studioRenderProjects();
                 return proj;
@@ -7898,7 +8657,11 @@
             const proj = await studioFetchProject(slug);
             if (!proj) return;
             studioUpsertProject(proj);
-            studioSyncSelectedProjectSnapshot(proj);
+            if (studioClarificationInteractionActive(slug)) {
+                studioState.selectedProject = proj;
+            } else {
+                studioSyncSelectedProjectSnapshot(proj);
+            }
             studioRenderProjects();
         }
 
@@ -7910,6 +8673,7 @@
                 try {
                     const d = await fetchJSON('/api/studio/projects');
                     studioState.projects = studioSortProjects(d.projects || []);
+                    studioState.lastProjectsRefreshAt = Date.now();
                 } catch (e) {
                     notifyDashboardError('studio-projects', 'Could not load Studio missions', e.message || 'unknown error');
                 }
@@ -8033,6 +8797,8 @@
             const selectedSlug = String((manifest && manifest.slug) || studioState.selectedProjectSlug || '');
             const payload = (ev.meta && ev.meta.payload) || {};
             if (selectedSlug && String(payload.project_slug || '') === selectedSlug) {
+                if (studioClarificationInteractionActive(selectedSlug)) return;
+                studioRenderProjectDetail();
                 studioRenderProjectInspector();
             }
         }
@@ -8068,8 +8834,12 @@
 
         function studioProjectFeedRows(manifest) {
             const events = studioProjectFeedEvents(manifest);
+            const slug = String((manifest && manifest.slug) || '').trim();
+            const clarifyThread = String((manifest && manifest.status) || '').toLowerCase() === 'awaiting_clarification'
+                ? studioClarificationThreadHtml(slug, manifest && manifest.clarification, {context: 'thread'})
+                : '';
             if (!events.length) {
-                return '<div class="studio-feed-empty">Live collaboration will appear here as tagged project events arrive.</div>';
+                return clarifyThread || '<div class="studio-feed-empty">Live collaboration will appear here as tagged project events arrive.</div>';
             }
             return `<div class="studio-feed-list">${events.map(ev => {
                 const meta = ev.meta || {};
@@ -8129,7 +8899,7 @@
                         </div>
                     </div>
                 `;
-            }).join('')}</div>`;
+            }).join('')}</div>${clarifyThread}`;
         }
 
         function studioRenderProjects() {
@@ -8217,40 +8987,9 @@
                         : `<li style="color:var(--text-dim);font-size:.72rem;">No artifacts yet.</li>`;
                     const more = arts.length > 30 ? `<div class="muted" style="margin-left:0;font-size:.7rem;">+${arts.length - 30} more</div>` : '';
 
-                    // Conversational clarification: when the pipeline is paused waiting for
-                    // user input, render the questions list with text inputs and a submit button.
-                    let clarifyBlock = '';
-                    if (row.status === 'awaiting_clarification') {
-                        const c = row.clarification || {};
-                        const qs = c.questions || [];
-                        const safeSlugAttr = String(row.slug || '').replace(/'/g, "\\'");
-                        // Preserve typed drafts across polling re-renders.
-                        window._clarifyDrafts = window._clarifyDrafts || {};
-                        const draftKey = String(row.slug || '');
-                        const draft = window._clarifyDrafts[draftKey] || [];
-                        const inputs = qs.map((q, i) => {
-                            const val = (draft[i] || '').replace(/"/g, '&quot;');
-                            return `<div class="muted" style="margin-top:.45rem;font-size:.78rem;">${escapeHTML(q)}</div>
-                             <input type="text" data-clarify-q="${i}" data-clarify-slug="${safeSlugAttr}"
-                               value="${val}"
-                               oninput="window._clarifyDrafts['${safeSlugAttr}']=window._clarifyDrafts['${safeSlugAttr}']||[];window._clarifyDrafts['${safeSlugAttr}'][${i}]=this.value;"
-                               placeholder="answer..."
-                               style="width:100%;background:var(--bg-2);border:1px solid var(--border);
-                                      color:var(--text-primary);padding:.4rem .55rem;border-radius:.3rem;
-                                      margin-top:.25rem;">`;
-                        }).join('');
-                        const submit = `<button class="btn btn-primary btn-xs"
-                            style="margin-top:.45rem;"
-                            onclick="studioSubmitClarification('${safeSlugAttr}', this)">Send answers</button>`;
-                        clarifyBlock = `
-                            <div data-clarify-block style="margin-top:.5rem;padding:.55rem;border:1px solid var(--border);border-radius:.35rem;background:var(--bg-2);">
-                                <div style="font-weight:600;color:var(--yellow,#f59e0b);font-size:.8rem;">
-                                    <i class="fa-solid fa-circle-question"></i> Awaiting clarification
-                                </div>
-                                ${inputs || '<div class="muted" style="font-size:.78rem;margin-top:.3rem;">(no questions recorded)</div>'}
-                                ${qs.length ? submit : ''}
-                            </div>`;
-                    }
+                    const clarifyBlock = row.status === 'awaiting_clarification'
+                        ? studioClarificationThreadHtml(row.slug, row.clarification, {context: 'row'})
+                        : '';
 
                     return `<dl class="kv">
                         <dt>Slug</dt><dd>${escapeHTML(row.slug)}</dd>
@@ -8270,47 +9009,84 @@
         }
 
         async function studioSubmitClarification(slug, btn) {
-            // Pull answers from the persistent draft cache (input fields may have been
-            // re-rendered by a poll between typing and clicking Send).
-            const drafts = (window._clarifyDrafts && window._clarifyDrafts[slug]) || [];
-            const card = btn.closest('[data-clarify-block]') || btn.closest('tr,div,li') || document;
-            const inputs = card.querySelectorAll('input[data-clarify-q]');
-            const answers = Array.from(inputs)
-                .sort((a, b) => parseInt(a.dataset.clarifyQ) - parseInt(b.dataset.clarifyQ))
-                .map((el, i) => (drafts[parseInt(el.dataset.clarifyQ)] ?? el.value) || '');
-            if (answers.some(a => !a.trim())) {
-                showToast({ kind: 'error', title: 'Missing answers', body: 'Answer all questions first.' });
+            const key = String(slug || '').trim();
+            if (!key) return;
+            const card = (btn && btn.closest && (
+                btn.closest('[data-clarify-block]') || btn.closest('tr,div,li')
+            )) || document;
+            const composer = card.querySelector('textarea[data-clarify-composer="true"]');
+            let answers = [];
+            let expectedCount = 0;
+            if (composer) {
+                expectedCount = parseInt(composer.dataset.clarifyCount || '0', 10) || 0;
+                const rawComposer = ((window._clarifyComposerDrafts || {})[key] ?? composer.value) || '';
+                answers = studioParseClarificationAnswersFromText(rawComposer, expectedCount);
+            } else {
+                const drafts = (window._clarifyDrafts && window._clarifyDrafts[key]) || [];
+                const inputs = card.querySelectorAll('textarea[data-clarify-q], input[data-clarify-q]');
+                expectedCount = inputs.length;
+                answers = Array.from(inputs)
+                    .sort((a, b) => parseInt(a.dataset.clarifyQ || '0', 10) - parseInt(b.dataset.clarifyQ || '0', 10))
+                    .map(el => (drafts[parseInt(el.dataset.clarifyQ || '0', 10)] ?? el.value) || '');
+            }
+            if (expectedCount && answers.length < expectedCount) {
+                answers = Array.from({ length: expectedCount }, (_, index) => answers[index] || '');
+            }
+            if (answers.some(answer => !String(answer || '').trim())) {
+                showToast({
+                    kind: 'error',
+                    title: 'Missing answers',
+                    body: expectedCount > 1
+                        ? `Reply with ${expectedCount} numbered answers before sending.`
+                        : 'Answer the question first.',
+                });
                 return;
             }
-            btn.disabled = true; btn.textContent = "sending...";
+            studioState.clarificationSubmitSlug = key;
+            if (btn && btn.isConnected) {
+                btn.disabled = true;
+                btn.textContent = 'Sending…';
+            }
             try {
-                const resp = await fetch('/api/studio/projects/' + encodeURIComponent(slug) + '/clarify', {
+                const resp = await fetch('/api/studio/projects/' + encodeURIComponent(key) + '/clarify', {
                     method: 'POST', headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({answers})
                 });
                 const data = await resp.json();
                 if (data.ok) {
-                    btn.textContent = "resuming...";
-                    // Clear the saved draft now that it's submitted
-                    if (window._clarifyDrafts) delete window._clarifyDrafts[slug];
+                    if (btn && btn.isConnected) {
+                        btn.textContent = 'Resuming…';
+                    }
+                    if (window._clarifyDrafts) delete window._clarifyDrafts[key];
+                    if (window._clarifyComposerDrafts) delete window._clarifyComposerDrafts[key];
                     if (typeof showToast === 'function') {
                         showToast({kind:'success', title:'Answers sent',
                                    body:`${answers.length} clarifications applied · pipeline resumed`,
                                    duration: 5000});
                     }
                 } else {
-                    btn.disabled = false; btn.textContent = "Send answers";
+                    if (btn && btn.isConnected) {
+                        btn.disabled = false;
+                        btn.textContent = 'Send replies';
+                    }
                     if (typeof showToast === 'function') {
                         showToast({kind:'error', title:'Could not send', body: data.error || 'unknown error'});
                     } else { alert(data.error || 'failed'); }
                     return;
                 }
             } catch (e) {
-                btn.disabled = false; btn.textContent = "Send answers";
+                if (btn && btn.isConnected) {
+                    btn.disabled = false;
+                    btn.textContent = 'Send replies';
+                }
                 if (typeof showToast === 'function') {
                     showToast({kind:'error', title:'Network error', body: e.message});
                 } else { alert("error: " + e.message); }
                 return;
+            } finally {
+                if (studioState.clarificationSubmitSlug === key) {
+                    studioState.clarificationSubmitSlug = null;
+                }
             }
             if (typeof studioRefreshProjects === 'function') studioRefreshProjects();
         }
@@ -8327,6 +9103,8 @@
                 studioUpsertProject(proj);
                 if (!isSameProject) studioState.selectedArtifact = null;
                 studioSyncSelectedProjectSnapshot(proj, !isSameProject);
+                const workspace = document.getElementById('studioWorkspace');
+                if (workspace && !isSameProject) workspace.classList.add('inspector-collapsed');
                 studioRenderProjects();
             } catch (e) {
                 const message = e && e.message ? e.message : 'Could not open the selected project.';
@@ -8346,19 +9124,38 @@
             const summary = document.getElementById('studioProjectBoardSummary');
             const list = document.getElementById('studioArtifacts');
             const content = document.getElementById('studioArtifactContent');
+            const frame = document.getElementById('studioArtifactFrame');
             const artifactMeta = document.getElementById('studioArtifactMeta');
             const previewTitle = document.getElementById('studioArtifactPreviewTitle');
             const previewMeta = document.getElementById('studioArtifactPreviewMeta');
+            const previewOpen = document.getElementById('studioPreviewOpen');
+            const liveFeed = document.getElementById('studioLiveFeed');
+            const liveMeta = document.getElementById('studioLiveMeta');
             studioUpdateWorkspaceMode();
             if (!list || !content) return;
             if (!proj) {
                 if (summary) summary.innerHTML = '';
                 if (dl) dl.hidden = true;
                 if (list) list.innerHTML = '';
-                if (artifactMeta) artifactMeta.textContent = 'Open the latest outputs without hunting through the timeline.';
-                if (previewTitle) previewTitle.textContent = 'Artifact preview';
-                if (previewMeta) previewMeta.textContent = 'Pick a project to inspect it here.';
+                if (artifactMeta) artifactMeta.textContent = 'Pick a saved output and SkyN3t will render it here when it can.';
+                if (previewTitle) previewTitle.textContent = 'Demo preview';
+                if (previewMeta) previewMeta.textContent = 'Pick a project to inspect or demo it here.';
+                if (previewOpen) {
+                    previewOpen.hidden = true;
+                    previewOpen.removeAttribute('href');
+                }
+                if (liveMeta) liveMeta.textContent = 'Watch what the swarm is doing while it builds.';
+                if (liveFeed) {
+                    liveFeed.innerHTML = '<div class="studio-feed-empty">Pick a project to watch the live handoffs.</div>';
+                }
+                if (frame) {
+                    frame.hidden = true;
+                    frame.dataset.path = '';
+                    frame.dataset.projectSlug = '';
+                    frame.removeAttribute('src');
+                }
                 if (content) {
+                    content.hidden = false;
                     content.dataset.path = '';
                     content.dataset.projectSlug = '';
                     content.innerHTML = '<em>Pick a project and a file…</em>';
@@ -8385,9 +9182,22 @@
                 manifest.status,
             );
             const safeSlug = String(slug || '').replace(/'/g, "\\'");
+            const projectEvents = studioProjectFeedEvents(manifest);
             if (dl) {
                 dl.hidden = false;
                 dl.href = '/api/studio/projects/' + encodeURIComponent(slug) + '/zip';
+            }
+            if (liveMeta) {
+                if (String(manifest.status || '').toLowerCase() === 'awaiting_clarification') {
+                    liveMeta.textContent = 'Reply in one message at the bottom while keeping the preview open on the right.';
+                } else {
+                    liveMeta.textContent = projectEvents.length
+                        ? `${projectEvents.length} recent project event${projectEvents.length === 1 ? '' : 's'} mirrored here.`
+                        : 'Watch what the swarm is doing while it builds.';
+                }
+            }
+            if (liveFeed) {
+                liveFeed.innerHTML = studioProjectFeedRows(manifest);
             }
             if (summary) {
                 summary.innerHTML = `
@@ -8418,14 +9228,25 @@
             }
             if (artifactMeta) {
                 artifactMeta.textContent = arts.length
-                    ? `${arts.length} saved output${arts.length === 1 ? '' : 's'} · choose one to inspect.`
+                    ? `${arts.length} saved output${arts.length === 1 ? '' : 's'} · pick one to inspect or demo without leaving the board.`
                     : 'No artifacts yet — SkyN3t is still building the project.';
             }
             if (!arts.length) {
                 if (list) list.innerHTML = '<div class="studio-artifact-empty">No artifacts yet.</div>';
-                if (previewTitle) previewTitle.textContent = 'Artifact preview';
+                if (previewTitle) previewTitle.textContent = 'Demo preview';
                 if (previewMeta) previewMeta.textContent = 'The selected project has no saved files yet.';
+                if (previewOpen) {
+                    previewOpen.hidden = true;
+                    previewOpen.removeAttribute('href');
+                }
+                if (frame) {
+                    frame.hidden = true;
+                    frame.dataset.path = '';
+                    frame.dataset.projectSlug = '';
+                    frame.removeAttribute('src');
+                }
                 if (content) {
+                    content.hidden = false;
                     content.dataset.path = '';
                     content.dataset.projectSlug = slug;
                     content.innerHTML = '<em>(swarm is still building…)</em>';
@@ -8433,13 +9254,33 @@
                 return;
             }
             const activePath = studioState.selectedArtifact || studioPreferredArtifactPath(arts);
+            const previewMode = studioArtifactPreviewMode(activePath);
             if (previewTitle) {
-                previewTitle.textContent = activePath || 'Artifact preview';
+                previewTitle.textContent = previewMode === 'frame'
+                    ? `Demo preview · ${activePath || 'artifact'}`
+                    : (activePath || 'Demo preview');
             }
             if (previewMeta) {
                 previewMeta.textContent = latestStage
-                    ? `Latest update · ${studioPrettyStageName(latestStage.name || latestStage.agent || 'stage')}`
-                    : 'Open the latest output without leaving Studio.';
+                    ? (
+                        previewMode === 'frame'
+                            ? `Latest update · ${studioPrettyStageName(latestStage.name || latestStage.agent || 'stage')} · demo-ready preview when supported.`
+                            : `Latest update · ${studioPrettyStageName(latestStage.name || latestStage.agent || 'stage')}`
+                    )
+                    : (
+                        previewMode === 'frame'
+                            ? 'Open the latest output and demo it without leaving Studio.'
+                            : 'Inspect the latest output without leaving Studio.'
+                    );
+            }
+            if (previewOpen) {
+                if (previewMode === 'frame' && activePath) {
+                    previewOpen.hidden = false;
+                    previewOpen.href = studioPreviewArtifactUrl(slug, activePath);
+                } else {
+                    previewOpen.hidden = true;
+                    previewOpen.removeAttribute('href');
+                }
             }
             list.innerHTML = arts.map(a => {
                 const path = (typeof a === 'string') ? a : (a.path || a.name || '');
@@ -8456,7 +9297,28 @@
             list.querySelectorAll('.studio-artifact-card').forEach(card => {
                 card.addEventListener('click', () => studioOpenArtifact(card.getAttribute('data-path')));
             });
-            if (content && content.dataset.path !== activePath) {
+            if (previewMode === 'frame') {
+                if (frame) {
+                    frame.hidden = false;
+                    if (frame.dataset.path !== activePath || frame.dataset.projectSlug !== slug) {
+                        frame.removeAttribute('src');
+                    }
+                }
+                if (content) {
+                    content.hidden = true;
+                }
+            } else {
+                if (frame) {
+                    frame.hidden = true;
+                    frame.dataset.path = '';
+                    frame.dataset.projectSlug = '';
+                    frame.removeAttribute('src');
+                }
+                if (content) {
+                    content.hidden = false;
+                }
+            }
+            if (content && !content.hidden && content.dataset.path !== activePath) {
                 content.innerHTML = '<em>Loading preview…</em>';
             }
         }
@@ -8467,18 +9329,71 @@
             studioState.selectedArtifact = path;
             studioRenderProjectDetail();
             const content = document.getElementById('studioArtifactContent');
+            const frame = document.getElementById('studioArtifactFrame');
             const previewTitle = document.getElementById('studioArtifactPreviewTitle');
             const previewMeta = document.getElementById('studioArtifactPreviewMeta');
+            const previewOpen = document.getElementById('studioPreviewOpen');
+            const projectSlug = studioProjectSlug(proj);
+            const previewMode = studioArtifactPreviewMode(path);
+            const previewUrl = studioPreviewArtifactUrl(projectSlug, path);
+            if (previewTitle) {
+                previewTitle.textContent = previewMode === 'frame' ? `Demo preview · ${path}` : path;
+            }
+            if (previewOpen) {
+                if (previewMode === 'frame') {
+                    previewOpen.hidden = false;
+                    previewOpen.href = previewUrl;
+                } else {
+                    previewOpen.hidden = true;
+                    previewOpen.removeAttribute('href');
+                }
+            }
+            if (previewMode === 'frame') {
+                if (previewMeta) previewMeta.textContent = 'Loading live demo preview…';
+                if (content) {
+                    content.hidden = true;
+                    content.dataset.path = path;
+                    content.dataset.projectSlug = projectSlug;
+                }
+                if (!frame) return;
+                if (
+                    frame.dataset.path === path
+                    && frame.dataset.projectSlug === projectSlug
+                ) return;
+                frame.hidden = false;
+                frame.dataset.path = path;
+                frame.dataset.projectSlug = projectSlug;
+                frame.onload = () => {
+                    const selected = studioState.selectedProject;
+                    if (
+                        selected
+                        && studioProjectSlug(selected) === projectSlug
+                        && studioState.selectedArtifact === path
+                        && previewMeta
+                    ) {
+                        previewMeta.textContent = 'Live demo previewing saved project output.';
+                    }
+                };
+                frame.src = previewUrl;
+                return;
+            }
+            if (frame) {
+                frame.hidden = true;
+                frame.onload = null;
+                frame.dataset.path = '';
+                frame.dataset.projectSlug = '';
+                frame.removeAttribute('src');
+            }
             if (!content) return;
-            if (previewTitle) previewTitle.textContent = path;
             if (previewMeta) previewMeta.textContent = 'Loading artifact preview…';
             if (
                 content.dataset.path === path
-                && content.dataset.projectSlug === studioProjectSlug(proj)
+                && content.dataset.projectSlug === projectSlug
             ) return;
+            content.hidden = false;
             content.textContent = 'loading…';
             content.dataset.path = path;
-            content.dataset.projectSlug = studioProjectSlug(proj);
+            content.dataset.projectSlug = projectSlug;
             try {
                 const url = '/api/studio/projects/' + encodeURIComponent(proj.slug) + '/file?path=' + encodeURIComponent(path);
                 const r = await fetch(url);
@@ -8643,7 +9558,7 @@
                 ? `
                     <div class="studio-inspector-card">
                         <h4>Clarification needed</h4>
-                        <div class="muted" style="margin-left:0">Answer these in the project row below to resume the mission.</div>
+                        <div class="muted" style="margin-left:0">Reply in the chat thread on the board to resume the mission while keeping the preview visible.</div>
                         <ul style="margin:.55rem 0 0;padding-left:1rem;color:var(--text-secondary);font-size:.76rem;">
                             ${(clarification.questions || []).map(question => `<li>${escapeHTML(question)}</li>`).join('')}
                         </ul>
@@ -8717,10 +9632,6 @@
                     <div class="studio-inspector-card">
                         <h4>Latest stage results</h4>
                         <div class="studio-stage-map">${stageRows}</div>
-                    </div>
-                    <div class="studio-inspector-card">
-                        <h4>Live collaboration</h4>
-                        ${studioProjectFeedRows(manifest)}
                     </div>
                     ${clarificationCard}
                     <div class="studio-inspector-card">
@@ -9346,17 +10257,22 @@
           const idea = document.getElementById('suggestText').value.trim();
           if (!idea) return;
           const btn = document.getElementById('suggestSendBtn');
-          btn.disabled = true; btn.textContent = 'filing…';
+          btn.disabled = true; btn.textContent = 'preparing…';
           try {
-            await fetchJSON('/api/proposals/feature', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({idea})});
-            if (typeof loadProposals === 'function') loadProposals();
-            showToast({kind:'success', title:'Proposal filed', body:'Your idea is now in the Cortex inbox.'});
+            const result = await fetchJSON('/api/proposals/feature', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({idea})});
+            closeSuggestModal();
+            showPage('cortex');
+            if (typeof loadProposals === 'function') await loadProposals();
+            if (result.proposal_id) await openProposalModal(result.proposal_id);
+            const targetHint = result.target_file
+              ? `Review the plan for ${result.target_file} and approve to start the self-update.`
+              : 'Review the plan in Cortex and approve to start the self-update.';
+            showToast({kind:'success', title:'Idea ready for review', body: targetHint});
           } catch (e) {
             notifyDashboardError('suggest-proposal', 'Could not file proposal', e.message || 'unknown error');
           } finally {
             btn.disabled = false;
-            btn.innerHTML = '<i class="fa-solid fa-paper-plane"></i> File proposal';
-            closeSuggestModal();
+            btn.innerHTML = '<i class="fa-solid fa-paper-plane"></i> Queue for review';
           }
         }
         document.addEventListener('DOMContentLoaded', () => {
@@ -9481,14 +10397,6 @@
                   studioState.selectedTemplate = ex.template;
                   if (typeof studioRenderTemplates === 'function') studioRenderTemplates();
                   applied = true;
-                } else if (ex.template === 'auto' && known.length > 0) {
-                  // 'auto' isn't a real template — leave the user's current selection alone
-                  // but if nothing is selected, pick the first as a sensible default.
-                  if (!studioState.selectedTemplate) {
-                    studioState.selectedTemplate = known[0];
-                    if (typeof studioRenderTemplates === 'function') studioRenderTemplates();
-                  }
-                  applied = true;
                 }
               }
             } catch (_) {}
@@ -9549,9 +10457,13 @@
               const note = (p.next_action || '').trim() || (
                 status === 'done'
                   ? 'Completed run ready to inspect.'
+                  : status === 'needs_fixes'
+                    ? 'Open the mission to review follow-up fixes.'
+                  : status === 'interrupted'
+                    ? 'Open the mission to see where the restart interrupted work.'
                   : status === 'failed'
                     ? 'Open the mission to inspect the failure.'
-                    : 'Mission is live in the swarm.'
+                    : 'Mission is live — open Activity or Projects to follow it.'
               );
               return `
                 <div class="recent-card" onclick="showPage('studio'); setTimeout(()=>{ if (typeof studioOpenProject==='function') studioOpenProject('${slug}'); }, 100)">
@@ -9605,7 +10517,29 @@
           if (!open) loadCapabilities();
         }
 
+        function syncOverviewDiagnostics(open, options = {}) {
+          const body = document.getElementById('overviewDiagnosticsBody');
+          const chevron = document.getElementById('overviewDiagnosticsChevron');
+          const title = document.getElementById('overviewDiagnosticsTitle');
+          if (!body) return;
+          const shouldOpen = !!open;
+          body.style.display = shouldOpen ? 'block' : 'none';
+          if (chevron) chevron.innerHTML = shouldOpen ? '<i class="fa-solid fa-chevron-up"></i>' : '<i class="fa-solid fa-chevron-down"></i>';
+          if (title && shouldOpen) title.classList.remove('live-pulse');
+          if (options.persist === false) return;
+          try { localStorage.setItem(OVERVIEW_DIAGNOSTICS_KEY, shouldOpen ? 'true' : 'false'); } catch (e) {}
+        }
+
+        function toggleOverviewDiagnostics() {
+          const body = document.getElementById('overviewDiagnosticsBody');
+          if (!body) return;
+          syncOverviewDiagnostics(body.style.display === 'none');
+        }
+
         document.addEventListener('DOMContentLoaded', () => {
+          let overviewDiagnosticsOpen = false;
+          try { overviewDiagnosticsOpen = localStorage.getItem(OVERVIEW_DIAGNOSTICS_KEY) === 'true'; } catch (e) {}
+          syncOverviewDiagnostics(overviewDiagnosticsOpen, { persist: false });
           loadOverviewExamples();
           loadRecentRuns();
           dashboardSetInterval(() => {
@@ -9783,13 +10717,13 @@
           <button class="btn btn-ghost btn-xs" onclick="closeSuggestModal()"><i class="fa-solid fa-xmark"></i></button>
         </div>
         <div class="modal-body">
-          <p class="muted" style="margin-bottom:.5rem;">This goes straight to the Cortex queue with all other proposals. Approve later from the Cortex page.</p>
+          <p class="muted" style="margin-bottom:.5rem;">SkyN3t will turn this into a concrete execution brief. Review it in Cortex, then approve to start the self-update.</p>
           <textarea id="suggestText" rows="4" placeholder="What should change? (e.g. 'Studio brief field needs a /paste button')"
             style="width:100%; background:var(--bg-2); border:1px solid var(--border); color:var(--text-primary); border-radius:.4rem; padding:.55rem .65rem; font-family:inherit;"></textarea>
         </div>
         <div class="modal-foot">
           <button class="btn btn-ghost" onclick="closeSuggestModal()">Cancel</button>
-          <button id="suggestSendBtn" class="btn btn-primary" onclick="submitSuggest()"><i class="fa-solid fa-paper-plane"></i> File proposal</button>
+          <button id="suggestSendBtn" class="btn btn-primary" onclick="submitSuggest()"><i class="fa-solid fa-paper-plane"></i> Queue for review</button>
         </div>
       </div>
     </div>
@@ -9892,20 +10826,23 @@
         //     in-script `let agents` and `studioState` are scope-local). ───
         const _redesignCache = { agents: [], templates: [] };
 
-        async function _refreshRedesignAgents() {
+        function _syncRedesignAgents() {
             try {
-                const r = await fetch('/api/agents');
-                const d = await r.json();
-                _redesignCache.agents = d.agents || [];
-            } catch (_) {}
+                _redesignCache.agents = Array.isArray(agents) ? agents : [];
+            } catch (_) {
+                _redesignCache.agents = [];
+            }
             _renderAgentRibbon();
         }
-        async function _refreshRedesignTemplates() {
+        function _syncRedesignTemplates() {
             try {
-                const r = await fetch('/api/studio/templates');
-                const d = await r.json();
-                _redesignCache.templates = d.templates || [];
-            } catch (_) {}
+                _redesignCache.templates =
+                    typeof studioState !== 'undefined' && studioState && Array.isArray(studioState.templates)
+                        ? studioState.templates
+                        : [];
+            } catch (_) {
+                _redesignCache.templates = [];
+            }
         }
 
         // ─── Agent Ribbon ───
@@ -9930,13 +10867,9 @@
             });
         }
 
-        // Refresh both caches periodically so command palette + ribbon stay live.
-        // Skip when tab is hidden — chrome throttles them anyway and they pile up.
-        dashboardSetInterval(_refreshRedesignAgents, 15000);
-        dashboardSetInterval(_refreshRedesignTemplates, 60000);
         document.addEventListener('DOMContentLoaded', () => {
-            _refreshRedesignAgents();
-            _refreshRedesignTemplates();
+            _syncRedesignAgents();
+            _syncRedesignTemplates();
             try { _redesignSyncTopBar(window._currentDashboardPage || DASHBOARD_DEFAULT_PAGE); } catch (_) {}
             try { _renderAgentRibbon(); } catch (_) {}
             const ragQueryInput = document.getElementById('ragQuery');

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -68,6 +69,27 @@ def test_proposal_store_filters_by_origin(tmp_path):
     assert [proposal.title for proposal in user_only] == ["User idea"]
 
 
+def test_feature_suggester_user_idea_includes_execution_brief(tmp_path, monkeypatch):
+    from skyn3t.cortex.feature_suggester import FeatureSuggester
+
+    store = ProposalStore(root=tmp_path / "proposals")
+    monkeypatch.setattr("skyn3t.cortex.get_store", lambda: store)
+    monkeypatch.setattr(
+        "skyn3t.cortex.feature_suggester.infer_feature_target_file",
+        lambda idea, repo_root=None: "skyn3t/cortex/handlers.py",
+    )
+
+    suggester = FeatureSuggester(event_bus=SimpleNamespace())
+    pid = suggester.file_user_idea("Make Cortex approvals start real work", source="user_dashboard")
+
+    proposal = store.get(str(pid))
+    assert proposal is not None
+    assert proposal.payload["action"] == "user_request"
+    assert proposal.payload["target_file"] == "skyn3t/cortex/handlers.py"
+    assert "## Planned execution" in proposal.detail
+    assert "On approval: SkyN3t will draft and auto-apply a repo patch" in proposal.detail
+
+
 @pytest.mark.asyncio
 async def test_proposal_store_approve_runs_apply_in_background(tmp_path):
     store = ProposalStore(root=tmp_path / "proposals")
@@ -90,8 +112,8 @@ async def test_proposal_store_approve_runs_apply_in_background(tmp_path):
 
     result = await store.approve(proposal.id)
 
-    assert result == {"ok": True, "applied": False, "status": "applying"}
-    assert store.get(proposal.id).status == "applying"
+    assert result == {"ok": True, "applied": False, "status": "approved"}
+    assert store.get(proposal.id).status == "approved"
 
     await asyncio.wait_for(started.wait(), timeout=1)
     for _ in range(20):
@@ -104,6 +126,155 @@ async def test_proposal_store_approve_runs_apply_in_background(tmp_path):
     assert current is not None
     assert current.status == "applied"
     assert current.applied_at is not None
+
+
+@pytest.mark.asyncio
+async def test_feature_handler_treats_nested_code_patch_as_started(tmp_path, monkeypatch):
+    from skyn3t.cortex.handlers import install_handlers
+
+    store = ProposalStore(root=tmp_path / "proposals")
+    monkeypatch.setattr("skyn3t.cortex.get_store", lambda: store)
+
+    improver_calls: list[dict] = []
+
+    class StubImprover:
+        async def execute(self, req):
+            improver_calls.append(req.input_data)
+            return SimpleNamespace(
+                success=False,
+                error="apply failed",
+                output={"proposed": True, "proposal_id": "cp123", "applied": False, "branch": None},
+            )
+
+    orchestrator = SimpleNamespace(agents={"code_improver": StubImprover()})
+    install_handlers(orchestrator)
+
+    result = await store._handlers["feature"](
+        {
+            "idea": "Make Cortex approvals start real work",
+            "target_file": "skyn3t/cortex/handlers.py",
+            "action": "user_request",
+        }
+    )
+
+    assert result == {
+        "ok": True,
+        "status": "applying",
+        "spawned": "code_improver",
+        "target_file": "skyn3t/cortex/handlers.py",
+        "code_patch_proposal_id": "cp123",
+        "branch": None,
+        "details": "Patch proposal created and is applying in the background.",
+    }
+    assert improver_calls == [
+        {
+            "target_file": "skyn3t/cortex/handlers.py",
+            "repo_root": str(Path(__file__).resolve().parents[1]),
+            "rationale": "Make Cortex approvals start real work",
+            "intent": "feature_implementation",
+            "source": "cortex.feature",
+            "user_initiated": True,
+            "use_mcp": False,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_feature_handler_collapses_duplicate_feature_runs(tmp_path, monkeypatch):
+    from skyn3t.cortex.handlers import install_handlers
+
+    store = ProposalStore(root=tmp_path / "proposals")
+    monkeypatch.setattr("skyn3t.cortex.get_store", lambda: store)
+
+    first = store.create(
+        kind="feature",
+        title="First idea",
+        summary="summary",
+        detail="detail",
+        payload={
+            "idea": "Make Cortex approvals start real work",
+            "target_file": "skyn3t/cortex/handlers.py",
+            "repo_root": str(Path(__file__).resolve().parents[1]),
+        },
+        source="user_dashboard",
+        origin="user",
+    )
+    second = store.create(
+        kind="feature",
+        title="Second idea",
+        summary="summary",
+        detail="detail",
+        payload={
+            "idea": "Make Cortex approvals start real work",
+            "target_file": "skyn3t/cortex/handlers.py",
+            "repo_root": str(Path(__file__).resolve().parents[1]),
+        },
+        source="user_dashboard",
+        origin="user",
+    )
+    current = store.get(first.id)
+    assert current is not None
+    current.status = "applying"
+    current.decided_at = time.time()
+    store._move_decided(current)
+
+    improver_calls: list[dict] = []
+
+    class StubImprover:
+        async def execute(self, req):
+            improver_calls.append(req.input_data)
+            return SimpleNamespace(success=True, output={"proposal_id": "cp123", "applied": True})
+
+    orchestrator = SimpleNamespace(agents={"code_improver": StubImprover()})
+    install_handlers(orchestrator)
+
+    result = await store._handlers["feature"](
+        {
+            "idea": "Make Cortex approvals start real work",
+            "target_file": "skyn3t/cortex/handlers.py",
+            "repo_root": str(Path(__file__).resolve().parents[1]),
+            "_proposal_id": second.id,
+        }
+    )
+
+    assert result == {
+        "ok": True,
+        "status": "already-running",
+        "target_file": "skyn3t/cortex/handlers.py",
+        "feature_proposal_id": first.id,
+        "details": "An older approved feature proposal is already running for that file.",
+    }
+    assert improver_calls == []
+
+
+@pytest.mark.asyncio
+async def test_proposal_store_apply_injects_proposal_id(tmp_path):
+    store = ProposalStore(root=tmp_path / "proposals")
+    captured: list[dict] = []
+
+    async def handler(payload):
+        captured.append(payload)
+        return {"ok": True}
+
+    store.register_handler("feature", handler)
+    proposal = store.create(
+        kind="feature",
+        title="Idea",
+        summary="summary",
+        detail="detail",
+        payload={"idea": "demo"},
+        source="user_dashboard",
+        origin="user",
+    )
+
+    await store.approve(proposal.id)
+    for _ in range(20):
+        current = store.get(proposal.id)
+        if current is not None and current.status == "applied":
+            break
+        await asyncio.sleep(0)
+
+    assert captured == [{"idea": "demo", "_proposal_id": proposal.id, "_proposal_kind": "feature"}]
 
 
 def test_review_watcher_parse_filters_placeholder_risks():
@@ -284,7 +455,7 @@ async def test_proposal_store_cancel_inflight_allows_resume(tmp_path):
     )
 
     result = await store.approve(proposal.id)
-    assert result == {"ok": True, "applied": False, "status": "applying"}
+    assert result == {"ok": True, "applied": False, "status": "approved"}
     await asyncio.wait_for(started.wait(), timeout=1)
 
     cancelled = await store.cancel_inflight()

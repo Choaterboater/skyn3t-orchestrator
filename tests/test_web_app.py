@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import skyn3t.web.app as web_app
+from skyn3t.config.settings import get_settings
 from skyn3t.core.events import Event, EventBus, EventType
 
 
@@ -153,6 +154,24 @@ async def test_studio_start_returns_reserved_slug(monkeypatch):
         "local_path": "/tmp/customer-portal",
         "focus_file": "src/login.tsx",
     }
+
+
+def test_get_studio_runner_uses_configured_projects_dir(monkeypatch, tmp_path):
+    projects_dir = tmp_path / "external-projects"
+    previous_runner = getattr(web_app.app.state, "studio_runner", None)
+
+    monkeypatch.setenv("PROJECTS_DIR", str(projects_dir))
+    monkeypatch.setattr(web_app, "event_bus", EventBus())
+    get_settings.cache_clear()
+
+    try:
+        web_app.app.state.studio_runner = None
+        runner = web_app._get_studio_runner(web_app.app)
+        assert runner.projects_root == projects_dir
+        assert runner.projects_root.exists()
+    finally:
+        web_app.app.state.studio_runner = previous_runner
+        get_settings.cache_clear()
 
 
 @pytest.mark.asyncio
@@ -565,6 +584,9 @@ def test_dashboard_html_surfaces_guided_overview():
     assert "Edit as new mission" in dashboard_html
     assert "studioLaunchMode" in dashboard_html
     assert "studioProjectMode" in dashboard_html
+    assert "studioLiveFeed" in dashboard_html
+    assert "studioArtifactFrame" in dashboard_html
+    assert "studioPreviewOpen" in dashboard_html
     assert "studioRunAgain" in dashboard_html
     assert "studioQueueProjectRefresh" in dashboard_html
     assert "studioRenderMissionSetupControls" in dashboard_html
@@ -574,26 +596,42 @@ def test_dashboard_html_surfaces_guided_overview():
     assert "studioRepoTargetForLaunch" in dashboard_html
     assert "repo_target: launchRepoTarget" in dashboard_html
     assert "studioRepoTargetSummaryHtml" in dashboard_html
+    assert "studioArtifactPreviewMode" in dashboard_html
+    assert "studioPreviewArtifactUrl" in dashboard_html
     assert "Current SkyN3t workspace" in dashboard_html
-    assert "needs a repo path before it can be pinned" in dashboard_html
-    assert "focus file ignored until a repo path is set" in dashboard_html
+    assert "Local git repo path or GitHub URL" in dashboard_html
+    assert "another local git repo or GitHub repo URL" in dashboard_html
+    assert "needs a repo path or GitHub URL before it can be pinned" in dashboard_html
+    assert "focus file ignored until a repo target is set" in dashboard_html
     assert "Could not open project" in dashboard_html
     assert "No missions yet — start one above." in dashboard_html
-    assert "Mission is live in the swarm." in dashboard_html
+    assert "Mission is live — open Activity or Projects to follow it." in dashboard_html
     assert "Open the mission to inspect the failure." in dashboard_html
+    assert "studioClarificationThreadHtml" in dashboard_html
+    assert "Reply here like chat" in dashboard_html
+    assert "preview stays live while you answer" in dashboard_html
     assert "Self-update inbox" in dashboard_html
     assert "overviewProposalInbox" in dashboard_html
     assert "overview-hero-layout" in dashboard_html
     assert "overview-promise-card" in dashboard_html
     assert "overview-section-note" in dashboard_html
+    assert "Recent projects" in dashboard_html
+    assert "System diagnostics" in dashboard_html
+    assert "Recent activity" in dashboard_html
+    assert "overviewDiagnosticsBody" in dashboard_html
     assert "Mission quality" in dashboard_html
     assert "Quality signal will appear after a reviewer or verifier stage finishes." in dashboard_html
+    assert "Demo preview" in dashboard_html
     assert "studioRenderQualityBadge" in dashboard_html
     assert "quality-summary-card" in dashboard_html
     assert "recent-quality" in dashboard_html
     assert "SkyN3t keeps building your projects. Its own upgrades wait here for review." in dashboard_html
+    assert "turn this into a concrete execution brief" in dashboard_html
+    assert "Queue for review" in dashboard_html
+    assert "openProposalModal(result.proposal_id)" in dashboard_html
     assert "_proposalOrigin" in dashboard_html
     assert "const DASHBOARD_DEFAULT_PAGE = 'studio'" in dashboard_html
+    assert "const OVERVIEW_DIAGNOSTICS_KEY = 'skyn3t_overview_diagnostics_open'" in dashboard_html
     assert "window.addEventListener('hashchange'" in dashboard_html
     assert "nav-item active\" onclick=\"showPage('studio')\"" in dashboard_html
     assert "id=\"page-overview\" class=\"page hidden\"" in dashboard_html
@@ -602,12 +640,16 @@ def test_dashboard_html_surfaces_guided_overview():
     assert "id=\"swarmMapLegend\"" in dashboard_html
     assert "id=\"bmZoomPct\"" in dashboard_html
     assert "swarm-map-toolbar" in dashboard_html
+    assert "Activity <span>feed</span>" in dashboard_html
+    assert "Projects <span>workspace</span>" in dashboard_html
+    assert "Knowledge <span>base</span>" in dashboard_html
     assert "function _bmNormalizedWheelDelta" in dashboard_html
     assert "function _bmWheelFactor" in dashboard_html
     assert "data-cap-for" in dashboard_html
     assert "function _agentRows" in dashboard_html
     assert "function _visibleAgentRows" in dashboard_html
     assert "function toggleInternalAgents" in dashboard_html
+    assert "function toggleOverviewDiagnostics" in dashboard_html
     assert "skyn3t_show_internal_agents" in dashboard_html
     assert "Show internal" in dashboard_html
     assert "Hide internal" in dashboard_html
@@ -624,6 +666,10 @@ def test_dashboard_html_surfaces_guided_overview():
     assert "async function resetServices" in dashboard_html
     assert "/api/services/reset" in dashboard_html
     assert "p.status==='applying'" in dashboard_html
+    assert "needs_fixes: 'var(--yellow, #f59e0b)'" in dashboard_html
+    assert "interrupted: 'var(--yellow, #f59e0b)'" in dashboard_html
+    assert "function studioHasActiveProjects(projects = studioState.projects)" in dashboard_html
+    assert "if (!studioHasActiveProjects()) return;" in dashboard_html
     assert "ragDocCount" in dashboard_html
     assert "ragEmbeddingModel" in dashboard_html
     assert "ragRecentList" in dashboard_html
@@ -657,6 +703,11 @@ def test_dashboard_html_surfaces_guided_overview():
     assert "labels: ['Healthy', 'Errored']" in dashboard_html
     assert "label: 'Queue depth'" in dashboard_html
     assert "data-example-index" in dashboard_html
+    assert "auto' isn't a real template" not in dashboard_html
+    assert "_syncRedesignAgents();" in dashboard_html
+    assert "_syncRedesignTemplates();" in dashboard_html
+    assert "dashboardSetInterval(_refreshRedesignAgents" not in dashboard_html
+    assert "dashboardSetInterval(_refreshRedesignTemplates" not in dashboard_html
     assert "Math.random() * 100" not in dashboard_html
     assert "onclick='startExample" not in dashboard_html
     assert "output.innerHTML = results.map" not in dashboard_html

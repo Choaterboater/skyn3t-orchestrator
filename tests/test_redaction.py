@@ -8,8 +8,7 @@ content there leaks credentials. ``redact_text`` sits between
 
 from __future__ import annotations
 
-import asyncio
-from typing import Any, Dict, List, Optional
+from typing import List
 
 import pytest
 

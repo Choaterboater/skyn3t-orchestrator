@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict
 
+from skyn3t.config.settings import get_settings
 from skyn3t.cortex.review_utils import parse_review_markdown
 
 logger = logging.getLogger("skyn3t.cortex.review_watcher")
@@ -68,7 +69,7 @@ class ReviewWatcher:
 
     async def _inspect(self, slug: str, payload: Dict[str, Any]) -> None:
         try:
-            root = Path("projects") / slug
+            root = get_settings().projects_dir / slug
             review = root / "review.md"
             if not review.exists():
                 return

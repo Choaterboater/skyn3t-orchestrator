@@ -320,8 +320,9 @@ class TestVectorStoreEmbeddingMismatch:
 
         # And confirm the source contains the guarding RuntimeError, so we
         # have at least a static check that the protection exists.
-        from skyn3t.rag import vector_store as _vs_mod
         import inspect as _inspect
+
+        from skyn3t.rag import vector_store as _vs_mod
 
         src = _inspect.getsource(_vs_mod)
         assert "embedding_model" in src

@@ -13,12 +13,14 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
+import skyn3t.cortex as cortex_mod
 import skyn3t.web.app as web_app
+from skyn3t.cortex.proposals import ProposalStore
 from skyn3t.integrations import github_webhook as gh_webhook
 
 
 @pytest.fixture(autouse=True)
-def _reset_runtime_state(monkeypatch):
+def _reset_runtime_state(monkeypatch, tmp_path):
     """Ensure each test starts from a clean slate.
 
     - Clear rate-limit buckets so 429 tests don't bleed across tests.
@@ -26,10 +28,15 @@ def _reset_runtime_state(monkeypatch):
       earlier runs.
     - Force loopback fallback (no web_token) so TestClient can reach
       every route without bootstrapping a session cookie.
+    - Isolate Cortex proposal writes so endpoint tests don't pollute
+      the real live proposal store under data/proposals/.
     """
     web_app._RATE_BUCKETS.clear()
     gh_webhook._seen_deliveries.clear()
     monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token=None))
+    store = ProposalStore(root=tmp_path / "proposals")
+    monkeypatch.setattr(cortex_mod, "get_store", lambda: store)
+    monkeypatch.setattr("skyn3t.cortex.proposals._store", store)
     yield
     web_app._RATE_BUCKETS.clear()
     gh_webhook._seen_deliveries.clear()

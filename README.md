@@ -122,6 +122,7 @@ Key settings:
 ```bash
 DEBUG=false
 SECRET_KEY=change-me-in-production
+PROJECTS_DIR=~/Documents/Skyn3t/Projects
 
 # At least one API key (for non-CLI adapters)
 OPENAI_API_KEY=sk-...
@@ -132,6 +133,8 @@ GITHUB_TOKEN=ghp_...
 USE_REDIS=false
 REDIS_URL=redis://localhost:6379/0
 ```
+
+`PROJECTS_DIR` controls where Studio writes project folders and demo artifacts. Point it at an external location like `~/Documents/Skyn3t/Projects` if you want generated work to live outside the repo checkout.
 
 ## Quick Start
 

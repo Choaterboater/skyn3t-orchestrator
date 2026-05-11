@@ -10,11 +10,16 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from skyn3t.config.settings import get_settings
+
 logger = logging.getLogger("skyn3t.cli.cleanup")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-PROJECTS_DIR = REPO_ROOT / "projects"
 PROPOSALS_DIR = REPO_ROOT / "data" / "proposals"
+
+
+def _projects_dir() -> Path:
+    return get_settings().projects_dir
 
 
 def _is_git_repo() -> bool:
@@ -28,9 +33,10 @@ def _is_git_repo() -> bool:
 
 def _list_projects() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    if not PROJECTS_DIR.exists():
+    projects_dir = _projects_dir()
+    if not projects_dir.exists():
         return out
-    for p in sorted(PROJECTS_DIR.iterdir(), reverse=True):
+    for p in sorted(projects_dir.iterdir(), reverse=True):
         if not p.is_dir():
             continue
         manifest = p / "project.json"
@@ -209,9 +215,10 @@ def execute(plan: dict[str, Any]) -> dict[str, Any]:
 
 
 def delete_project(slug: str) -> dict[str, Any]:
-    """Delete a single project by slug. Safe: refuses to traverse outside projects/."""
-    projects_root = PROJECTS_DIR.resolve()
-    p = (PROJECTS_DIR / slug).resolve()
+    """Delete a single project by slug. Safe: refuses to traverse outside the projects root."""
+    projects_dir = _projects_dir()
+    projects_root = projects_dir.resolve()
+    p = (projects_dir / slug).resolve()
     # Use relative_to instead of startswith to avoid prefix-collision attacks
     # (e.g. "/foo/projects" vs "/foo/projectsX").
     try:

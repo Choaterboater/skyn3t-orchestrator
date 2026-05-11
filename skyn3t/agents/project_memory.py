@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from skyn3t.config.settings import get_settings
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
 from skyn3t.cortex.review_utils import parse_review_markdown
@@ -71,7 +72,7 @@ class ProjectMemoryAgent(BaseAgent):
         return TaskResult(task_id=task.task_id, success=True, output=result)
 
     async def _ingest_project(self, slug: str, meta: Dict[str, Any]) -> Dict[str, Any]:
-        root = Path("projects") / slug
+        root = get_settings().projects_dir / slug
         if not root.exists():
             return {"ingested": 0, "skipped": 0, "reason": "project dir not found"}
 

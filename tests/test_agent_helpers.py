@@ -3,7 +3,6 @@ code_improver fallback patcher, and Slack event mention stripping)."""
 
 import asyncio
 import time
-from pathlib import Path
 
 import pytest
 

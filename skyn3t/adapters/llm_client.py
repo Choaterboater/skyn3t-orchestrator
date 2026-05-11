@@ -153,7 +153,12 @@ class LLMClient:
             out: str = await impl.complete(req)
             elapsed = time.monotonic() - start
         except Exception as e:
-            logger.warning("llm complete failed: %s", e)
+            logger.warning(
+                "llm complete failed; caller=%s backend=%s error=%s",
+                self._caller_name or "llm",
+                self._backend_name or "unknown",
+                str(e).strip() or type(e).__name__,
+            )
             return self._fallback(req)
 
         # Publish an LLM_EXCHANGE event for dashboards/observability. We

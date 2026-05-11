@@ -193,6 +193,8 @@ class CodeAgent(BaseAgent):
 
     def _write_fallback_scaffold(self, out_dir, brief: str) -> list[str]:
         brief_lower = (brief or "").lower()
+        if "minesweeper" in brief_lower:
+            return self._write_minesweeper_scaffold(out_dir, brief)
         if any(
             token in brief_lower
             for token in ("todo", "frontend", "ui", "website", "site", "landing", "dashboard", "app")
@@ -372,6 +374,433 @@ form.addEventListener('submit', (event) => {
 });
 
 renderTodos();
+""",
+        }
+        return self._write_scaffold_files(out_dir, files)
+
+    def _write_minesweeper_scaffold(self, out_dir, brief: str) -> list[str]:
+        files = {
+            "index.html": """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Minesweeper</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="game-panel">
+        <header class="hero">
+          <p class="eyebrow">SkyN3t scaffold</p>
+          <h1>Minesweeper</h1>
+          <p class="lede">""" + brief + """</p>
+        </header>
+
+        <section class="toolbar" aria-label="Game controls">
+          <div class="difficulty-group" role="group" aria-label="Difficulty">
+            <button type="button" class="difficulty is-active" data-difficulty="beginner">Beginner</button>
+            <button type="button" class="difficulty" data-difficulty="intermediate">Intermediate</button>
+            <button type="button" class="difficulty" data-difficulty="expert">Expert</button>
+          </div>
+          <button type="button" id="reset-btn" class="reset-btn">New game</button>
+        </section>
+
+        <section class="status-bar" aria-label="Game status">
+          <div class="stat">
+            <span class="stat-label">Mines</span>
+            <strong id="mine-count">10</strong>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Time</span>
+            <strong id="timer">0</strong>
+          </div>
+          <div class="stat">
+            <span class="stat-label">State</span>
+            <strong id="status-text">Ready</strong>
+          </div>
+        </section>
+
+        <section class="board-shell">
+          <div id="board" class="board" role="grid" aria-label="Minesweeper board"></div>
+        </section>
+
+        <p class="hint">Left click to reveal. Right click to flag. First click is always safe.</p>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
+""",
+            "styles.css": """:root {
+  color-scheme: dark;
+  font-family: Inter, system-ui, sans-serif;
+  --bg: #081c15;
+  --panel: #1b4332;
+  --panel-border: rgba(116, 198, 157, 0.24);
+  --text: #f8f9fa;
+  --muted: #b7e4c7;
+  --accent: #74c69d;
+  --accent-strong: #52b788;
+  --danger: #ef476f;
+  --cell-size: 40px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: radial-gradient(circle at top, #2d6a4f, var(--bg) 58%);
+  color: var(--text);
+}
+
+.app-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 2rem 1rem;
+}
+
+.game-panel {
+  width: min(720px, 100%);
+  background: rgba(8, 28, 21, 0.88);
+  border: 1px solid var(--panel-border);
+  border-radius: 24px;
+  padding: 1.5rem;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.28);
+}
+
+.hero h1,
+.hero p {
+  margin: 0;
+}
+
+.eyebrow {
+  margin-bottom: 0.4rem;
+  color: var(--accent);
+  font-size: 0.76rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.lede {
+  margin-top: 0.55rem;
+  color: var(--muted);
+}
+
+.toolbar,
+.status-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 1.25rem;
+}
+
+.difficulty-group {
+  display: inline-flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+button {
+  border: 0;
+  border-radius: 999px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.difficulty,
+.reset-btn {
+  padding: 0.7rem 1rem;
+  background: rgba(116, 198, 157, 0.12);
+  color: var(--text);
+  border: 1px solid rgba(116, 198, 157, 0.22);
+}
+
+.difficulty.is-active,
+.reset-btn {
+  background: var(--accent);
+  color: #081c15;
+  font-weight: 700;
+}
+
+.status-bar {
+  padding: 0.9rem 1rem;
+  background: rgba(27, 67, 50, 0.66);
+  border-radius: 18px;
+}
+
+.stat {
+  min-width: 110px;
+}
+
+.stat-label {
+  display: block;
+  color: var(--muted);
+  font-size: 0.78rem;
+  margin-bottom: 0.2rem;
+}
+
+.board-shell {
+  margin-top: 1rem;
+  overflow-x: auto;
+}
+
+.board {
+  display: grid;
+  gap: 6px;
+  justify-content: start;
+}
+
+.cell {
+  width: var(--cell-size);
+  height: var(--cell-size);
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(248, 249, 250, 0.08);
+  color: var(--text);
+  font-weight: 700;
+  transition: transform 120ms ease, background 120ms ease;
+}
+
+.cell:hover {
+  transform: translateY(-1px);
+  background: rgba(248, 249, 250, 0.14);
+}
+
+.cell.revealed {
+  background: rgba(183, 228, 199, 0.18);
+  border-color: rgba(183, 228, 199, 0.2);
+}
+
+.cell.mine {
+  background: rgba(239, 71, 111, 0.2);
+}
+
+.cell.flagged {
+  color: #ffb703;
+}
+
+.cell[data-count="1"] { color: #8ecae6; }
+.cell[data-count="2"] { color: #74c69d; }
+.cell[data-count="3"] { color: #ffd166; }
+.cell[data-count="4"] { color: #f78c6b; }
+.cell[data-count="5"] { color: #ff99c8; }
+.cell[data-count="6"] { color: #cdb4db; }
+.cell[data-count="7"] { color: #f8f9fa; }
+.cell[data-count="8"] { color: #dee2e6; }
+
+.hint {
+  margin: 1rem 0 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+""",
+            "app.js": """const boardEl = document.getElementById('board');
+const statusEl = document.getElementById('status-text');
+const mineCountEl = document.getElementById('mine-count');
+const timerEl = document.getElementById('timer');
+const resetBtn = document.getElementById('reset-btn');
+const difficultyButtons = [...document.querySelectorAll('[data-difficulty]')];
+
+const difficulties = {
+  beginner: { rows: 8, cols: 8, mines: 10 },
+  intermediate: { rows: 12, cols: 12, mines: 24 },
+  expert: { rows: 16, cols: 16, mines: 40 },
+};
+
+let difficultyKey = 'beginner';
+let state = null;
+let timerId = null;
+
+function neighbors(row, col) {
+  const points = [];
+  for (let y = row - 1; y <= row + 1; y += 1) {
+    for (let x = col - 1; x <= col + 1; x += 1) {
+      if (y === row && x === col) continue;
+      if (y < 0 || x < 0 || y >= state.rows || x >= state.cols) continue;
+      points.push([y, x]);
+    }
+  }
+  return points;
+}
+
+function createCell(row, col) {
+  return {
+    row,
+    col,
+    mine: false,
+    flagged: false,
+    revealed: false,
+    adjacent: 0,
+  };
+}
+
+function buildState() {
+  const settings = difficulties[difficultyKey];
+  const cells = Array.from({ length: settings.rows }, (_, row) =>
+    Array.from({ length: settings.cols }, (_, col) => createCell(row, col))
+  );
+  state = {
+    ...settings,
+    cells,
+    firstClick: true,
+    gameOver: false,
+    revealedSafeCells: 0,
+    flagsUsed: 0,
+    seconds: 0,
+  };
+  boardEl.style.gridTemplateColumns = `repeat(${state.cols}, var(--cell-size))`;
+  stopTimer();
+  timerEl.textContent = '0';
+  mineCountEl.textContent = String(state.mines);
+  statusEl.textContent = 'Ready';
+}
+
+function placeMines(safeRow, safeCol) {
+  const forbidden = new Set([`${safeRow}:${safeCol}`]);
+  neighbors(safeRow, safeCol).forEach(([row, col]) => forbidden.add(`${row}:${col}`));
+  const openSpots = [];
+  state.cells.forEach((row) => {
+    row.forEach((cell) => {
+      if (!forbidden.has(`${cell.row}:${cell.col}`)) openSpots.push(cell);
+    });
+  });
+  for (let i = openSpots.length - 1; i > 0; i -= 1) {
+    const swapIndex = Math.floor(Math.random() * (i + 1));
+    [openSpots[i], openSpots[swapIndex]] = [openSpots[swapIndex], openSpots[i]];
+  }
+  openSpots.slice(0, state.mines).forEach((cell) => {
+    cell.mine = true;
+  });
+  state.cells.forEach((row) => {
+    row.forEach((cell) => {
+      cell.adjacent = neighbors(cell.row, cell.col).filter(([y, x]) => state.cells[y][x].mine).length;
+    });
+  });
+}
+
+function startTimer() {
+  stopTimer();
+  timerId = window.setInterval(() => {
+    state.seconds += 1;
+    timerEl.textContent = String(state.seconds);
+  }, 1000);
+}
+
+function stopTimer() {
+  if (timerId) {
+    window.clearInterval(timerId);
+    timerId = null;
+  }
+}
+
+function revealCell(row, col) {
+  const cell = state.cells[row][col];
+  if (cell.revealed || cell.flagged || state.gameOver) return;
+  if (state.firstClick) {
+    placeMines(row, col);
+    state.firstClick = false;
+    statusEl.textContent = 'Playing';
+    startTimer();
+  }
+  cell.revealed = true;
+  if (cell.mine) {
+    finishGame(false);
+    return;
+  }
+  state.revealedSafeCells += 1;
+  if (cell.adjacent === 0) {
+    neighbors(row, col).forEach(([y, x]) => revealCell(y, x));
+  }
+  if (state.revealedSafeCells === state.rows * state.cols - state.mines) {
+    finishGame(true);
+  }
+}
+
+function toggleFlag(row, col) {
+  const cell = state.cells[row][col];
+  if (cell.revealed || state.gameOver) return;
+  cell.flagged = !cell.flagged;
+  state.flagsUsed += cell.flagged ? 1 : -1;
+  mineCountEl.textContent = String(Math.max(state.mines - state.flagsUsed, 0));
+  renderBoard();
+}
+
+function finishGame(won) {
+  state.gameOver = true;
+  stopTimer();
+  statusEl.textContent = won ? 'Cleared!' : 'Boom!';
+  state.cells.forEach((row) => {
+    row.forEach((cell) => {
+      if (cell.mine) cell.revealed = true;
+    });
+  });
+  renderBoard();
+}
+
+function renderBoard() {
+  boardEl.innerHTML = '';
+  state.cells.forEach((row) => {
+    row.forEach((cell) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'cell';
+      button.setAttribute('role', 'gridcell');
+      button.dataset.row = String(cell.row);
+      button.dataset.col = String(cell.col);
+      if (cell.revealed) {
+        button.classList.add('revealed');
+        if (cell.mine) {
+          button.classList.add('mine');
+          button.textContent = 'X';
+        } else if (cell.adjacent > 0) {
+          button.dataset.count = String(cell.adjacent);
+          button.textContent = String(cell.adjacent);
+        } else {
+          button.textContent = '';
+        }
+      } else if (cell.flagged) {
+        button.classList.add('flagged');
+        button.textContent = '!';
+      } else {
+        button.textContent = '';
+      }
+      button.addEventListener('click', () => {
+        revealCell(cell.row, cell.col);
+        renderBoard();
+      });
+      button.addEventListener('contextmenu', (event) => {
+        event.preventDefault();
+        toggleFlag(cell.row, cell.col);
+      });
+      boardEl.append(button);
+    });
+  });
+}
+
+function resetGame(nextDifficulty = difficultyKey) {
+  difficultyKey = nextDifficulty;
+  difficultyButtons.forEach((button) => {
+    button.classList.toggle('is-active', button.dataset.difficulty === difficultyKey);
+  });
+  buildState();
+  renderBoard();
+}
+
+difficultyButtons.forEach((button) => {
+  button.addEventListener('click', () => resetGame(button.dataset.difficulty));
+});
+
+resetBtn.addEventListener('click', () => resetGame(difficultyKey));
+
+resetGame('beginner');
 """,
         }
         return self._write_scaffold_files(out_dir, files)

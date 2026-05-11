@@ -2,7 +2,8 @@
 
 :class:`StudioRunner` takes a free-form brief plus a template key and
 runs the corresponding pipeline of specialist agents, persisting a
-project manifest and any artifacts they produce under ``projects/``.
+project manifest and any artifacts they produce under the configured
+projects root.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from skyn3t.config.settings import get_settings
 from skyn3t.core.agent import AgentCapability, TaskRequest
 from skyn3t.core.event_context import push_event_context
 from skyn3t.studio.mission_setup import (
@@ -57,11 +59,12 @@ class StudioRunner:
         *,
         event_bus: Any,
         rag: Any = None,
-        projects_root: Path = Path("projects"),
+        projects_root: Optional[Path] = None,
     ) -> None:
         self.event_bus = event_bus
         self.rag = rag
-        self.projects_root = Path(projects_root)
+        configured_root = projects_root if projects_root is not None else get_settings().projects_dir
+        self.projects_root = Path(configured_root).expanduser()
         self.projects_root.mkdir(parents=True, exist_ok=True)
         # Reap projects that were "running" or "queued" when the server died.
         # Their async task is gone; they'll never progress on their own.
@@ -138,19 +141,17 @@ class StudioRunner:
                     continue
                 if d.get("status") in ("running", "queued"):
                     d = self._normalize_manifest(d)
-                    d["status"] = "failed"
-                    prior_error = str(d.get("error") or "").strip()
-                    orphan_note = "[orphaned: server restarted before pipeline completed]"
-                    d["error"] = f"{prior_error}\n{orphan_note}".strip()
+                    d["status"] = "interrupted"
+                    d["error"] = None
                     d["completed_at"] = time.time()
                     d["current_stage"] = None
                     d["current_agent"] = None
                     self._clear_quality_summary(d)
-                    d["next_action"] = "Project stopped because the server restarted."
+                    d["next_action"] = "Project was interrupted because the server restarted."
                     self._append_history(
                         d,
                         "PROJECT_REAPED",
-                        status="failed",
+                        status="interrupted",
                         message="Server restarted before the queued/running project could finish.",
                     )
                     try:
@@ -593,7 +594,8 @@ class StudioRunner:
                 ok = bool(getattr(result, "success", True))
                 output = getattr(result, "output", None) or {}
                 stage_files = self._normalize_stage_files(
-                    output.get("files") if isinstance(output, dict) else None
+                    output.get("files") if isinstance(output, dict) else None,
+                    artifact_dir=artifact_dir,
                 )
                 stage_summary = self._summarize_stage_output(output)
 
@@ -733,12 +735,12 @@ class StudioRunner:
                     },
                 )
 
-            # If we exited the loop without flipping status to failed, we ran
-            # to completion successfully.
+            # If no stage failed, derive the final project outcome from the
+            # strongest available quality signal instead of always claiming a
+            # clean "done" result.
             if manifest.get("status") != "failed":
-                manifest["status"] = "done"
-                manifest["next_action"] = (
-                    "Project finished — open an artifact or download the zip."
+                manifest["status"], manifest["next_action"], manifest["error"] = (
+                    self._finalize_project_outcome(manifest.get("quality_summary"))
                 )
             else:
                 self._clear_quality_summary(manifest)
@@ -752,7 +754,7 @@ class StudioRunner:
             manifest["artifacts"] = self._scan_artifacts(artifact_dir)
             completion_message = (
                 manifest["next_action"]
-                if manifest.get("status") == "done"
+                if manifest.get("status") in {"done", "needs_fixes"}
                 else manifest.get("error") or manifest["next_action"]
             )
             self._append_history(
@@ -780,6 +782,12 @@ class StudioRunner:
                     "status": manifest["status"],
                 },
             )
+            # Auto-retry hook: if this attempt failed and we haven't already
+            # retried, launch a second attempt with the dynamic "auto" planner
+            # and inject the failure context as a lesson. The retry runs as a
+            # background task so the original call returns immediately.
+            if manifest.get("status") == "failed":
+                await self._maybe_auto_retry(manifest, brief, slug)
             return manifest
         except Exception as exc:
             # The runner itself crashed (agent init blew up, get_agent raised, etc).
@@ -911,11 +919,18 @@ class StudioRunner:
                 except Exception:
                     pass
             manifest["workflow_summary"] = workflow
+        slug = str(manifest.get("slug") or "").strip()
+        artifact_dir = (self.projects_root / slug) if slug else None
+        manifest["artifacts"] = self._normalize_stage_files(
+            manifest.get("artifacts"),
+            artifact_dir=artifact_dir,
+        )
         stage_plan_map = self._workflow_stage_map(manifest.get("workflow_summary"))
         manifest["stages"] = [
             self._normalize_stage_record(
                 entry,
                 stage_plan_map.get(str(entry.get("name") or "")),
+                artifact_dir=artifact_dir,
             )
             for entry in manifest.get("stages", [])
             if isinstance(entry, dict)
@@ -995,6 +1010,30 @@ class StudioRunner:
             "updated_at": updated_at,
         }
 
+    def _finalize_project_outcome(
+        self,
+        quality_summary: Any,
+    ) -> tuple[str, str, Optional[str]]:
+        quality = self._normalize_quality_summary(quality_summary)
+        if quality is None:
+            return "done", "Project finished — open an artifact or download the zip.", None
+
+        verdict = str(quality.get("verdict") or "").strip().lower()
+        summary = self._truncate_stage_text(quality.get("summary"), limit=240)
+        if verdict == "go":
+            return "done", "Project finished — open an artifact or download the zip.", None
+        if verdict == "go-with-fixes":
+            return (
+                "needs_fixes",
+                summary or "Project finished with follow-up fixes still needed.",
+                None,
+            )
+        return (
+            "failed",
+            summary or "Project finished, but the reviewer marked it as no-go.",
+            summary or "Reviewer marked the project as no-go.",
+        )
+
     @staticmethod
     def _quality_source_priority(source: Any) -> int:
         normalized = str(source or "").strip().lower()
@@ -1037,24 +1076,28 @@ class StudioRunner:
             return None
 
         path = Path(cleaned)
-        try:
-            return path.relative_to(artifact_dir).as_posix()
-        except ValueError:
-            pass
+        if path.is_absolute():
+            try:
+                return path.resolve().relative_to(artifact_dir.resolve()).as_posix()
+            except (OSError, RuntimeError, ValueError):
+                return None
 
-        try:
-            return path.resolve().relative_to(artifact_dir.resolve()).as_posix()
-        except (OSError, RuntimeError, ValueError):
-            pass
+        if any(part in {"", ".", ".."} for part in path.parts):
+            return None
 
-        try:
-            return (Path.cwd() / path).resolve().relative_to(artifact_dir.resolve()).as_posix()
-        except (OSError, RuntimeError, ValueError):
-            pass
+        parts = path.parts
+        slug = artifact_dir.name
+        if parts and parts[0] == "projects":
+            if len(parts) >= 3 and parts[1] == slug:
+                trimmed = Path(*parts[2:]).as_posix()
+                return trimmed or None
+            return None
 
-        if len(path.parts) <= 1:
-            return path.as_posix()
-        return None
+        if parts and parts[0] == slug:
+            trimmed = Path(*parts[1:]).as_posix()
+            return trimmed or None
+
+        return path.as_posix()
 
     def _extract_quality_candidate(
         self,
@@ -1267,7 +1310,7 @@ class StudioRunner:
             "succeeded": "done",
         }
         raw = aliases.get(raw, raw)
-        if raw in {"pending", "queued", "running", "waiting", "done", "failed"}:
+        if raw in {"pending", "queued", "running", "waiting", "done", "failed", "needs_fixes"}:
             return raw
         if ok is True:
             return "done"
@@ -1275,8 +1318,12 @@ class StudioRunner:
             return "failed"
         return "pending"
 
-    @staticmethod
-    def _normalize_stage_files(files_value: Any) -> List[str]:
+    def _normalize_stage_files(
+        self,
+        files_value: Any,
+        *,
+        artifact_dir: Optional[Path] = None,
+    ) -> List[str]:
         if isinstance(files_value, list):
             raw_files = files_value
         elif isinstance(files_value, str):
@@ -1287,7 +1334,14 @@ class StudioRunner:
         files: List[str] = []
         for item in raw_files:
             cleaned = str(item or "").strip()
-            if cleaned and cleaned not in files:
+            if not cleaned:
+                continue
+            if artifact_dir is not None:
+                relativized = self._relativize_artifact_path(artifact_dir, cleaned)
+                if relativized is None:
+                    continue
+                cleaned = relativized
+            if cleaned not in files:
                 files.append(cleaned)
         return files[:20]
 
@@ -1302,13 +1356,14 @@ class StudioRunner:
         self,
         record: Dict[str, Any],
         planned_stage: Optional[Dict[str, Any]] = None,
+        artifact_dir: Optional[Path] = None,
     ) -> Dict[str, Any]:
         planned_stage = planned_stage or {}
         output = record.get("output")
         status = self._normalize_stage_status(record.get("status"), record.get("ok"))
-        files = self._normalize_stage_files(record.get("files"))
+        files = self._normalize_stage_files(record.get("files"), artifact_dir=artifact_dir)
         if not files and isinstance(output, dict):
-            files = self._normalize_stage_files(output.get("files"))
+            files = self._normalize_stage_files(output.get("files"), artifact_dir=artifact_dir)
 
         summary = self._truncate_stage_text(record.get("summary") or record.get("message"))
         if not summary and isinstance(output, dict):
@@ -1502,6 +1557,73 @@ class StudioRunner:
         if reason:
             return reason[:240]
         return ""
+
+    async def _maybe_auto_retry(self, manifest: Dict[str, Any], brief: str, slug: str) -> None:
+        """If a project failed and hasn't already been retried, launch a second
+        attempt with the dynamic "auto" planner and the failure context as a
+        lesson. Designed to be a small, observable nudge — not an infinite
+        retry loop. Capped at one retry per project.
+
+        The retry runs as a background task so the original `start()` returns
+        immediately and the dashboard sees PROJECT_COMPLETED with status=failed
+        first, then a PROJECT_RETRY_LAUNCHED event, then a fresh project.
+        """
+        if manifest.get("_retry_count", 0) >= 1:
+            return  # already retried once; don't loop
+        # Don't retry trivially-bad inputs (empty brief, etc) where retry won't help.
+        if not brief or not brief.strip():
+            return
+        original_template = manifest.get("template", "auto")
+        error_summary = (manifest.get("error") or manifest.get("next_action") or "")[:500]
+        failed_stages = [
+            s.get("name") for s in manifest.get("stages", [])
+            if isinstance(s, dict) and self._normalize_stage_status(
+                s.get("status"), s.get("ok")
+            ) == "failed"
+        ]
+        # Build the augmented brief — the original brief plus a "previous
+        # attempt failed because X" hint that the planner will treat as a
+        # constraint when picking a new shape.
+        lesson_block = (
+            f"\n\nPrior attempt ({original_template}) failed at stages "
+            f"{failed_stages or '?'}: {error_summary}\n"
+            f"Try a different shape — pick alternative agents or a simpler stack."
+        )
+        retry_brief = (brief or "").rstrip() + lesson_block
+        retry_slug = f"{slug}-retry"
+        try:
+            self._publish(
+                "PROJECT_RETRY_LAUNCHED",
+                {
+                    "slug": slug,
+                    "retry_slug": retry_slug,
+                    "original_template": original_template,
+                    "error_summary": error_summary,
+                },
+            )
+            manifest["_retry_count"] = 1
+            manifest["_retry_slug"] = retry_slug
+            artifact_dir = self.projects_root / slug
+            try:
+                self._save_manifest(artifact_dir, manifest)
+            except Exception:
+                pass
+            # Run retry as a fire-and-forget background task with strong ref
+            # so it can't be GC'd.
+            task = asyncio.create_task(
+                self.start(
+                    "auto",
+                    retry_brief,
+                    slug=retry_slug,
+                    mission_setup=manifest.get("mission_setup"),
+                    repo_target=manifest.get("repo_target"),
+                )
+            )
+            self._retry_tasks = getattr(self, "_retry_tasks", set())
+            self._retry_tasks.add(task)
+            task.add_done_callback(self._retry_tasks.discard)
+        except Exception:
+            logger.exception("auto-retry launch failed for slug=%s", slug)
 
     def _publish(self, name: str, payload: dict) -> None:
         """Publish a project event onto the shared event bus.

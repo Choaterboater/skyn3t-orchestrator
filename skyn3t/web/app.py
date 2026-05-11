@@ -5,6 +5,7 @@ import html
 import ipaddress
 import json
 import logging
+import mimetypes
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -693,7 +694,7 @@ def _client_ip(request: Any) -> str:
     if client is not None:
         host = getattr(client, "host", None)
         if host:
-            return host
+            return str(host)
     return "unknown"
 
 
@@ -1628,11 +1629,18 @@ async def proposals_feature(payload: dict, request: Request = None):  # type: ig
     if not idea:
         return JSONResponse({"error": "idea required"}, status_code=400)
     try:
+        from skyn3t.cortex import get_store
         from skyn3t.cortex.feature_suggester import FeatureSuggester
         # use the orchestrator's instance if present, else a transient one
         suggester = getattr(orchestrator, "_feature_suggester", None) or FeatureSuggester(event_bus)
         pid = suggester.file_user_idea(idea, source="user_dashboard")
-        return {"ok": bool(pid), "proposal_id": pid}
+        if not pid:
+            return JSONResponse({"error": "could not file idea"}, status_code=500)
+        proposal = get_store().get(pid)
+        response = {"ok": True, "proposal_id": pid}
+        if proposal is not None:
+            response["target_file"] = str((proposal.payload or {}).get("target_file") or "")
+        return response
     except Exception as e:
         return _safe_error_response(e)
 
@@ -1676,7 +1684,12 @@ def _get_studio_runner(app):
     runner = getattr(app.state, "studio_runner", None)
     if runner is None:
         from skyn3t.studio import StudioRunner
-        runner = StudioRunner(event_bus=event_bus, rag=getattr(app.state, "rag_engine", None))
+        settings = get_settings()
+        runner = StudioRunner(
+            event_bus=event_bus,
+            rag=getattr(app.state, "rag_engine", None),
+            projects_root=settings.projects_dir,
+        )
         app.state.studio_runner = runner
     return runner
 
@@ -1823,35 +1836,80 @@ async def studio_project(slug: str):
     return proj
 
 
-@app.get("/api/studio/projects/{slug}/file")
-async def studio_project_file(slug: str, path: str):
-    # safe read of an artifact; reject path traversal
+def _resolve_studio_project_artifact_path(slug: str, path: str) -> Path:
     runner = _get_studio_runner(app)
     if runner.get_project(slug) is None:
-        return JSONResponse({"error": "not found"}, status_code=404)
-    base = (runner.projects_root / slug).resolve()
+        raise LookupError("not found")
+    base = (Path(runner.projects_root) / slug).resolve()
     requested = Path(path)
     if requested.is_absolute():
-        return JSONResponse({"error": "invalid path"}, status_code=400)
-    current = base
+        raise ValueError("invalid path")
+    parts = requested.parts
+    if len(parts) >= 3 and parts[0] == "projects" and parts[1] == slug:
+        requested = Path(*parts[2:])
+    elif len(parts) >= 2 and parts[0] == slug:
+        requested = Path(*parts[1:])
+    current: Path = base
     for part in requested.parts:
         if part in {"", ".", ".."}:
-            return JSONResponse({"error": "invalid path"}, status_code=400)
+            raise ValueError("invalid path")
         current = current / part
         if current.is_symlink():
-            return JSONResponse({"error": "invalid path"}, status_code=400)
+            raise ValueError("invalid path")
     target = current.resolve()
     try:
         target.relative_to(base)
-    except ValueError:
-        return JSONResponse({"error": "invalid path"}, status_code=400)
+    except ValueError as exc:
+        raise ValueError("invalid path") from exc
     if not target.is_file():
+        raise ValueError("invalid path")
+    return target
+
+
+def _studio_preview_csp() -> str:
+    return (
+        "default-src 'self' data: blob: https:; "
+        "script-src 'self' https: 'unsafe-inline'; "
+        "style-src 'self' https: 'unsafe-inline'; "
+        "font-src 'self' https: data:; "
+        "img-src 'self' data: blob: https:; "
+        "connect-src 'self' ws: wss: https:; "
+        "frame-ancestors 'self'; "
+        "base-uri 'self'"
+    )
+
+
+@app.get("/api/studio/projects/{slug}/file")
+async def studio_project_file(slug: str, path: str):
+    try:
+        target = _resolve_studio_project_artifact_path(slug, path)
+    except LookupError:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    except ValueError:
         return JSONResponse({"error": "invalid path"}, status_code=400)
     try:
         text = target.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         return JSONResponse({"error": "binary file not supported"}, status_code=415)
     return PlainTextResponse(text)
+
+
+@app.get("/api/studio/projects/{slug}/preview/{artifact_path:path}")
+async def studio_project_preview(slug: str, artifact_path: str):
+    try:
+        target = _resolve_studio_project_artifact_path(slug, artifact_path)
+    except LookupError:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    except ValueError:
+        return JSONResponse({"error": "invalid path"}, status_code=400)
+    media_type, _ = mimetypes.guess_type(str(target))
+    response = (
+        FileResponse(str(target), media_type=media_type)
+        if media_type
+        else FileResponse(str(target))
+    )
+    response.headers["Content-Security-Policy"] = _studio_preview_csp()
+    return response
 
 
 @app.get("/api/studio/projects/{slug}/zip")
@@ -1924,5 +1982,3 @@ async def cleanup_execute(payload: dict):
 async def studio_project_delete(slug: str):
     from skyn3t.cli.cleanup import delete_project
     return delete_project(slug)
-
-

@@ -20,7 +20,7 @@ class Proposal:
     detail: str = ""               # markdown/diff/plain text shown in popup
     payload: Dict[str, Any] = field(default_factory=dict)
     source: str = ""               # which module proposed it
-    status: str = "pending"        # pending | applying | approved | rejected | applied | failed
+    status: str = "pending"        # pending | approved | applying | rejected | applied | failed
     created_at: float = field(default_factory=time.time)
     decided_at: Optional[float] = None
     applied_at: Optional[float] = None
@@ -131,11 +131,11 @@ class ProposalStore:
             self._emit({"type": "failed", "proposal": p.to_public()})
             return {"ok": False, "error": p.error}
 
-        p.status = "applying"
+        p.status = "approved"
         self._move_decided(p)
         self._emit({"type": "approved", "proposal": p.to_public()})
         self._spawn_apply(pid)
-        return {"ok": True, "applied": False, "status": "applying"}
+        return {"ok": True, "applied": False, "status": "approved"}
 
     def reject(self, pid: str, reason: str = "") -> Dict[str, Any]:
         p = self.get(pid)
@@ -163,10 +163,6 @@ class ProposalStore:
                 self._emit({"type": "failed", "proposal": proposal.to_public()})
                 failed += 1
                 continue
-            if proposal.status != "applying":
-                proposal.status = "applying"
-                self._write(proposal, decided=True)
-                self._emit({"type": "approved", "proposal": proposal.to_public()})
             if self._spawn_apply(proposal.id):
                 requeued += 1
         return {"requeued": requeued, "failed_no_handler": failed}
@@ -230,7 +226,14 @@ class ProposalStore:
             self._emit({"type": "failed", "proposal": p.to_public()})
             return
         try:
-            result = await handler(p.payload)
+            if p.status != "applying":
+                p.status = "applying"
+                self._write(p, decided=True)
+                self._emit({"type": "applying", "proposal": p.to_public()})
+            payload = dict(p.payload or {})
+            payload.setdefault("_proposal_id", p.id)
+            payload.setdefault("_proposal_kind", p.kind)
+            result = await handler(payload)
             ok = True
             if isinstance(result, dict) and "ok" in result:
                 ok = bool(result.get("ok"))

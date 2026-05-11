@@ -173,14 +173,14 @@ class TestTracing:
 
         assert await do_work() == 456
 
-    def test_console_exporter(self, capsys):
+    def test_console_exporter(self, caplog):
         tracer = Tracer()
         span = tracer.start_span("exported")
         tracer.end_span(span)
         exporter = ConsoleExporter(tracer)
-        exporter.export(span)
-        captured = capsys.readouterr()
-        assert "exported" in captured.out
+        with caplog.at_level("INFO", logger="skyn3t.observability.tracing"):
+            exporter.export(span)
+        assert "exported" in caplog.text
 
 
 # ---------------------------------------------------------------------------

@@ -85,7 +85,7 @@ def project(
     repo_path: str = typer.Option(
         "",
         "--repo-path",
-        help="Optional local git repo path to target for code work",
+        help="Optional local git repo path or GitHub repo URL to target for code work",
     ),
     focus_file: str = typer.Option(
         "",

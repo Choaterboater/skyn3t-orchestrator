@@ -124,6 +124,40 @@ class TestCodeAgent:
         assert (tmp_path / "scaffold" / "app.js").exists()
 
     @pytest.mark.asyncio
+    async def test_scaffold_fallback_writes_minesweeper_files(self, tmp_path, monkeypatch):
+        from skyn3t.agents.code_agent import CodeAgent
+
+        class StubLLM:
+            async def complete(self, *args, **kwargs):
+                return "[deterministic-stub]"
+
+        agent = CodeAgent("code", EventBus())
+        await agent.initialize()
+        monkeypatch.setattr(agent, "get_llm", lambda: StubLLM())
+
+        task = TaskRequest(
+            title="Scaffold minesweeper",
+            input_data={
+                "task_type": "scaffold",
+                "brief": "Build new version of minesweeper",
+                "artifact_dir": str(tmp_path),
+            },
+        )
+        result = await agent.execute(task)
+
+        assert result.success is True
+        assert {Path(path).name for path in result.output["files"]} >= {
+            "index.html",
+            "styles.css",
+            "app.js",
+        }
+        app_js = (tmp_path / "scaffold" / "app.js").read_text(encoding="utf-8")
+        index_html = (tmp_path / "scaffold" / "index.html").read_text(encoding="utf-8")
+        assert "placeMines" in app_js
+        assert "Minesweeper" in index_html
+        assert "todo-form" not in index_html
+
+    @pytest.mark.asyncio
     async def test_scaffold_ignores_paths_outside_scaffold_dir(self, tmp_path, monkeypatch):
         from skyn3t.agents.code_agent import CodeAgent
 

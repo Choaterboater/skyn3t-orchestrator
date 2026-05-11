@@ -85,6 +85,7 @@ class Orchestrator:
 
         # Autonomy cortex (auto-booted on start)
         self._learning_loop: Optional[Any] = None
+        self._auto_cleanup: Optional[Any] = None
         self._cortex_started = False
         self._cortex_tasks: List[asyncio.Task] = []
 
@@ -348,6 +349,14 @@ class Orchestrator:
             import logging
             logging.getLogger("skyn3t.cortex").exception("tuner boot failed")
 
+        try:
+            from skyn3t.cortex.auto_cleanup import AutoCleanup
+            if getattr(self, "_auto_cleanup", None) is None:
+                self._auto_cleanup = AutoCleanup(event_bus=self.event_bus)
+                await self._auto_cleanup.start()
+        except Exception:
+            logger.exception("auto_cleanup boot failed")
+
     async def _stop_cortex(self) -> None:
         """Stop autonomy cortex components that were booted by us."""
         if not self._cortex_started:
@@ -375,6 +384,7 @@ class Orchestrator:
         await _maybe_stop(self._learning_loop)
         await _maybe_stop(self._tuner)
         await _maybe_stop(self._curiosity)
+        await _maybe_stop(getattr(self, "_auto_cleanup", None))
 
         for task in self._cortex_tasks:
             if not task.done():

@@ -53,3 +53,25 @@ async def test_llm_exchange_events_redact_obvious_secrets(monkeypatch):
     assert "***REDACTED***" in exchange.payload["system"]
     assert "dev@example.com" not in exchange.payload["prompt"]
     assert "demo@example.com" not in exchange.payload["response"]
+
+
+@pytest.mark.asyncio
+async def test_llm_complete_warning_includes_caller_backend_and_error(caplog, monkeypatch):
+    class FakeBackend:
+        async def complete(self, req):  # noqa: ARG002
+            raise RuntimeError("")
+
+    async def fake_get_impl():
+        return FakeBackend()
+
+    client = LLMClient(backend="deterministic", caller_name="planner")
+    monkeypatch.setattr(client, "_get_impl", fake_get_impl)
+
+    with caplog.at_level("WARNING", logger="skyn3t.adapters.llm_client"):
+        result = await client.complete("hello")
+
+    assert result.startswith("[deterministic-stub]")
+    assert "hello" in result
+    assert "caller=planner" in caplog.text
+    assert "backend=deterministic" in caplog.text
+    assert "error=RuntimeError" in caplog.text

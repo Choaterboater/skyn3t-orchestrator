@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+from skyn3t.config.settings import get_settings
+
 logger = logging.getLogger("skyn3t.adapters.few_shot")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -80,7 +82,7 @@ def recent_brand_artifacts(limit: int = 2) -> List[str]:
     if cached is not None:
         return cached
     out: List[str] = []
-    projects_dir = REPO_ROOT / "projects"
+    projects_dir = get_settings().projects_dir
     if not projects_dir.exists():
         return []
     # Latest projects with brand.md and review verdict not "no-go"
