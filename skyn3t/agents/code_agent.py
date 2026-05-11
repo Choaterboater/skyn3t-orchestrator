@@ -15,6 +15,66 @@ from skyn3t.core.events import EventBus
 logger = logging.getLogger("skyn3t.agents.code_agent")
 
 
+def _placeholder_for(rel_path: str, purpose: str, stack: str) -> str:
+    """Last-resort body when every LLM attempt fails.
+
+    Returns a syntactically valid file that imports resolve and the
+    build verifier can still parse — but marked with a TODO so the
+    reviewer/fix loop flags it for real implementation. Returns empty
+    string if we can't even guess a safe placeholder shape (we'd
+    rather skip the file than write garbage that breaks the build).
+    """
+    rl = rel_path.lower()
+    note = f"// TODO[skyn3t]: code generation failed for {rel_path} — {purpose or 'no purpose given'}"
+    py_note = f"# TODO[skyn3t]: code generation failed for {rel_path} — {purpose or 'no purpose given'}"
+
+    # React component (e.g. src/App.jsx, src/Header.jsx)
+    if rl.endswith((".jsx", ".tsx")) and "/src/" in rl.replace("\\", "/"):
+        # Component name from filename: App.jsx → App
+        from pathlib import Path as _P
+        name = _P(rel_path).stem
+        return (
+            f"{note}\n\n"
+            "import { useState } from 'react';\n\n"
+            f"export default function {name}() {{\n"
+            "  const [ready] = useState(false);\n"
+            "  return (\n"
+            "    <div style={{ padding: 24 }}>\n"
+            f"      <h1>{name}</h1>\n"
+            "      <p>Generation failed for this component. Replace with the real implementation.</p>\n"
+            "    </div>\n"
+            "  );\n"
+            "}\n"
+        )
+
+    # Bare JS module
+    if rl.endswith((".js", ".mjs", ".ts")) and not rl.endswith((".d.ts",)):
+        return f"{note}\n\nexport default null;\n"
+
+    # Python module
+    if rl.endswith(".py"):
+        return f"{py_note}\n\n# Replace with real implementation.\n"
+
+    # CSS — empty file is fine, imports resolve
+    if rl.endswith(".css"):
+        return f"{note}\n"
+
+    # HTML — minimal scaffold
+    if rl.endswith(".html"):
+        return (
+            "<!doctype html>\n"
+            f"<html><head><meta charset=\"utf-8\"><title>{rel_path}</title></head>\n"
+            f"<body>{note}</body></html>\n"
+        )
+
+    # Markdown
+    if rl.endswith(".md"):
+        return f"# {rel_path}\n\n{py_note.lstrip('# ')}\n"
+
+    # Unknown extension — refuse rather than break the build.
+    return ""
+
+
 class CodeAgent(BaseAgent):
     """Agent for safe code execution, analysis, refactoring, and testing."""
 
@@ -270,11 +330,30 @@ class CodeAgent(BaseAgent):
             from skyn3t.agents.stack_templates import hint_for_stack
             stack_hint = hint_for_stack(stack)
             build_system = (
-                "You are implementing one file of a small project. Given the "
-                "brief, the full file plan, the stack, and which specific file "
-                "to write, output ONLY that file's raw contents — no JSON "
-                "wrapper, no fenced code block, no preamble, no explanation. "
-                "Just the contents that should be written to disk verbatim."
+                "You are implementing one file of a real, runnable project. "
+                "Output ONLY that file's raw contents — no JSON wrapper, no "
+                "fenced code block, no preamble, no explanation. Just the "
+                "contents that should be written to disk verbatim.\n\n"
+                "Rules that override 'small project' instincts:\n"
+                "- If the brief asks the program to talk to a real system "
+                "(Docker, an HTTP API, a database, a device, a service, a "
+                "file), wire up the real integration. Use fetch / the real "
+                "client library / the real protocol. Do NOT hardcode arrays "
+                "of fake data when the brief expects live data.\n"
+                "- When you don't have the credentials at generation time, "
+                "read them from environment variables (process.env.X / "
+                "os.environ['X']) and document them in the README. Do not "
+                "invent fake credentials, but do not stub the integration "
+                "either.\n"
+                "- Loading states, errors, and empty states are part of the "
+                "implementation, not decoration. Wire them to the real "
+                "fetch lifecycle.\n"
+                "- Mock data is only acceptable in a clearly named "
+                "DEV_FIXTURES constant gated behind an env flag, and only "
+                "as a fallback when the real source is unreachable.\n"
+                "- Every file you write must be self-consistent: if you "
+                "import './App.jsx', it must exist in the plan; if you use "
+                "a library, it must be in package.json."
             )
             if stack_hint:
                 build_system = build_system + "\n\n" + stack_hint
@@ -358,6 +437,7 @@ class CodeAgent(BaseAgent):
                     f"Purpose: {purpose}\n\n"
                     "Return ONLY the file's raw contents (no JSON, no fences)."
                 )
+                # First attempt with the agent's normal backend.
                 try:
                     body = await client.complete(
                         file_prompt, system=build_system,
@@ -365,8 +445,32 @@ class CodeAgent(BaseAgent):
                     )
                 except Exception:
                     body = ""
+
+                # If the call returned nothing or a stub, retry once with
+                # cross-model fallback. Silent skip used to drop the file
+                # and break imports elsewhere (e.g. main.jsx imports
+                # ./App.jsx but App.jsx never gets written).
                 if not body or "[deterministic-stub]" in body:
-                    continue
+                    try:
+                        await self.think(f"retry {rel} on fallback backend")
+                        body = await client.complete(
+                            file_prompt, system=build_system,
+                            max_tokens=8000, temperature=0.3,
+                            skip_backends=[self.config.get("backend") or ""],
+                        )
+                    except Exception:
+                        body = ""
+
+                # If we STILL have nothing usable, write a visible
+                # placeholder so downstream imports resolve. The reviewer
+                # / verifier will flag this and the fix loop gets a real
+                # signal instead of a silent gap.
+                if not body or "[deterministic-stub]" in body:
+                    await self.think(f"FILE MISSING after retries: {rel}")
+                    body = _placeholder_for(rel, purpose, stack)
+                    if not body:
+                        continue  # genuinely can't recover this one
+
                 body = body.strip()
                 # Strip a leftover fenced block if the model wrapped one anyway.
                 fence = _re.match(r"^```[a-zA-Z0-9_+\-]*\n([\s\S]*?)\n```\s*$", body)
