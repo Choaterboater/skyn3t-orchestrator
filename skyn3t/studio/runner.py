@@ -501,9 +501,20 @@ class StudioRunner:
                     import asyncio as _asyncio
                     _stage_to = (extra or {}).get("stage_timeout") if isinstance(extra, dict) else None
                     try:
-                        _stage_to = float(_stage_to) if _stage_to else 300.0
+                        _stage_to = float(_stage_to) if _stage_to else None
                     except Exception:
-                        _stage_to = 300.0
+                        _stage_to = None
+                    if _stage_to is None:
+                        # Per-stage defaults. Code and research are the
+                        # heavy-LLM stages — code does N per-file calls
+                        # with the full prior-artifact context (research +
+                        # arch + design = ~30KB per call) and 5+ files,
+                        # research can do real web search via MCP. Both
+                        # routinely exceed the old flat 300s cap. Other
+                        # stages stay at 300s; nothing else should need
+                        # more than a single big LLM call.
+                        heavy_stages = {"code", "research"}
+                        _stage_to = 1800.0 if stage.name in heavy_stages else 300.0
                     with push_event_context(
                         project_slug=slug,
                         project_stage=stage.name,
@@ -515,7 +526,7 @@ class StudioRunner:
                             agent.execute(task), timeout=_stage_to
                         )
                 except _asyncio.TimeoutError:
-                    stage_error = "stage timeout (>300s)"
+                    stage_error = f"stage timeout (>{int(_stage_to)}s)"
                     self._publish(
                         "PROJECT_STAGE_FAILED",
                         {
@@ -547,7 +558,7 @@ class StudioRunner:
                         status="failed",
                         stage=stage.name,
                         agent=stage.agent,
-                        message="Stage timeout (>300s).",
+                        message=f"Stage timeout (>{int(_stage_to)}s).",
                         error=stage_error,
                     )
                     self._save_manifest(artifact_dir, manifest)
