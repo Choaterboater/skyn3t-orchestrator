@@ -1354,7 +1354,73 @@
         .toast .toast-title { font-weight: 600; margin-bottom: .15rem; }
         .toast .toast-body { color: var(--text-secondary); font-size: .75rem; }
         .toast .toast-close { float: right; cursor: pointer; color: var(--text-dim); margin-left: .5rem; }
-        /* Live conversation panel */
+        /* ─── Chat panel (Claude-desktop-style) ─────────────────────────
+           A scrollable transcript with avatar-tagged message bubbles and
+           a sticky composer. The user-bubble sits on the right, agent-
+           bubble on the left, both stretch to ~85% of the column so
+           short replies don't look lonely and long ones don't sprawl. */
+        .chat-msg {
+            display: flex; gap: 0.65rem; align-items: flex-end;
+            max-width: 100%;
+        }
+        .chat-msg.user { flex-direction: row-reverse; }
+        .chat-msg .chat-avatar {
+            flex: 0 0 auto;
+            width: 28px; height: 28px;
+            border-radius: 50%;
+            display: grid; place-items: center;
+            font-size: 0.7rem; font-weight: 600;
+            border: 1px solid var(--border);
+            background: var(--bg-2);
+            color: var(--accent);
+        }
+        .chat-msg.user .chat-avatar { color: var(--text-primary); border-color: var(--accent-line); background: var(--accent-soft); }
+        .chat-bubble {
+            max-width: min(640px, 85%);
+            padding: 0.65rem 0.85rem;
+            border-radius: 0.85rem;
+            background: var(--bg-2);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            font-size: 0.875rem; line-height: 1.5;
+            white-space: pre-wrap; word-break: break-word;
+        }
+        .chat-msg.user .chat-bubble {
+            background: var(--accent-soft);
+            border-color: var(--accent-line);
+            color: var(--text-primary);
+            border-top-right-radius: 0.25rem;
+        }
+        .chat-msg.agent .chat-bubble { border-top-left-radius: 0.25rem; }
+        .chat-msg .chat-meta {
+            display: block;
+            font-size: 0.65rem;
+            color: var(--text-dim);
+            margin-top: 0.25rem;
+            font-family: var(--font-mono, monospace);
+        }
+        .chat-msg.error .chat-bubble {
+            background: rgba(182, 90, 74, 0.10);
+            border-color: rgba(182, 90, 74, 0.35);
+            color: #e9bcb4;
+        }
+        .chat-typing {
+            display: inline-flex; gap: 3px; padding: 0.65rem 0.85rem;
+            background: var(--bg-2); border: 1px solid var(--border);
+            border-radius: 0.85rem; border-top-left-radius: 0.25rem;
+        }
+        .chat-typing span {
+            width: 5px; height: 5px; border-radius: 50%; background: var(--text-dim);
+            animation: chat-pulse 1.2s infinite;
+        }
+        .chat-typing span:nth-child(2) { animation-delay: 0.15s; }
+        .chat-typing span:nth-child(3) { animation-delay: 0.3s; }
+        @keyframes chat-pulse {
+            0%, 80%, 100% { opacity: 0.25; transform: scale(0.85); }
+            40% { opacity: 1; transform: scale(1.1); }
+        }
+
+        /* Live conversation panel (now the telemetry sub-view inside chat) */
         .convo-row { background: var(--bg-2); border: 1px solid var(--border); border-radius: .4rem; overflow: hidden; }
         .convo-head { display: flex; gap: .5rem; padding: .5rem .75rem; cursor: pointer; align-items: center; font-size: .8rem; border-bottom: 1px solid transparent; }
         .convo-row.expanded .convo-head { border-bottom-color: var(--border); }
@@ -4602,19 +4668,45 @@
                             </div>
                         </div>
 
-                        <div class="ui-card col-12">
+                        <div class="ui-card col-12" id="chatCard">
                             <div class="card-h">
-                                <h3><i class="fa-solid fa-comments"></i> Live conversation</h3>
+                                <h3><i class="fa-solid fa-comments"></i> Chat</h3>
                                 <span class="right">
-                                    <select id="convoFilter" style="background:var(--bg-2);border:1px solid var(--border);color:var(--text-primary);border-radius:.3rem;padding:.2rem .4rem;font-size:.7rem;">
-                                        <option value="">All agents</option>
+                                    <select id="chatAgent" style="background:var(--bg-2);border:1px solid var(--border);color:var(--text-primary);border-radius:.3rem;padding:.2rem .4rem;font-size:.75rem;" title="Send messages to this agent">
+                                        <option value="">Pick an agent…</option>
                                     </select>
-                                    <button class="btn btn-ghost btn-xs" onclick="convoClear()" title="Clear"><i class="fa-solid fa-broom"></i></button>
+                                    <button class="btn btn-ghost btn-xs" onclick="chatTogglePanel('telemetry')" id="chatTelemetryBtn" title="Show agent-to-agent telemetry (LLM_EXCHANGE log)"><i class="fa-solid fa-satellite-dish"></i></button>
+                                    <button class="btn btn-ghost btn-xs" onclick="chatClear()" title="Clear transcript"><i class="fa-solid fa-broom"></i></button>
                                 </span>
                             </div>
-                            <div class="card-b">
-                                <div id="convoLog" style="max-height: 480px; overflow-y: auto; display: flex; flex-direction: column; gap: .65rem;"></div>
-                                <div id="convoEmpty" class="muted" style="text-align:center; padding:2rem;">No exchanges yet — run a Studio project to see live agent conversation.</div>
+                            <div class="card-b" style="padding:0;">
+                                <!-- Chat transcript -->
+                                <div id="chatTranscript" style="display:flex;flex-direction:column;gap:0.75rem;padding:1rem 1.1rem;min-height:300px;max-height:500px;overflow-y:auto;"></div>
+                                <div id="chatEmpty" class="muted" style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:3rem 1rem;text-align:center;gap:0.5rem;">
+                                    <i class="fa-solid fa-comments" style="font-size:1.75rem;color:var(--text-dim);"></i>
+                                    <div style="font-weight:500;color:var(--text-secondary);">Pick an agent above and start chatting.</div>
+                                    <div style="font-size:.8rem;">Messages go through <code style="background:var(--bg-3);padding:.05rem .3rem;border-radius:3px;">POST /api/agents/{name}/exec</code>.</div>
+                                </div>
+                                <!-- Telemetry log (existing convo behaviour, hidden by default) -->
+                                <div id="chatTelemetry" style="display:none;border-top:1px solid var(--border);padding:0.85rem 1.1rem;background:var(--bg-1);">
+                                    <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.5rem;">
+                                        <span style="text-transform:uppercase;letter-spacing:.08em;font-size:.7rem;color:var(--text-secondary);">Agent ↔ LLM telemetry</span>
+                                        <select id="convoFilter" style="margin-left:auto;background:var(--bg-2);border:1px solid var(--border);color:var(--text-primary);border-radius:.3rem;padding:.15rem .35rem;font-size:.7rem;">
+                                            <option value="">All agents</option>
+                                        </select>
+                                    </div>
+                                    <div id="convoLog" style="max-height:260px;overflow-y:auto;display:flex;flex-direction:column;gap:.5rem;"></div>
+                                    <div id="convoEmpty" class="muted" style="text-align:center;padding:1.2rem;font-size:.8rem;">No LLM exchanges yet.</div>
+                                </div>
+                                <!-- Composer -->
+                                <form id="chatComposer" onsubmit="chatSend(event)" style="display:flex;gap:.5rem;padding:0.7rem 0.85rem;border-top:1px solid var(--border);background:var(--bg-1);">
+                                    <input type="text" id="chatInput" placeholder="Message the selected agent…" autocomplete="off"
+                                           style="flex:1;background:var(--bg-2);border:1px solid var(--border);color:var(--text-primary);border-radius:.45rem;padding:.55rem .7rem;font:inherit;outline:none;"
+                                           onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'">
+                                    <button type="submit" class="btn btn-primary btn-sm" id="chatSendBtn" title="Send (Enter)">
+                                        <i class="fa-solid fa-paper-plane"></i>
+                                    </button>
+                                </form>
                             </div>
                         </div>
 
@@ -7345,6 +7437,164 @@
             closeAgentInspector();
             if (n && typeof openAgentConfig === 'function') openAgentConfig(n);
         }
+
+        // ─── Chat panel (Claude-desktop-style) ───
+        // The user picks an agent in the select, types a message, and we
+        // POST it to /api/agents/{name}/exec. The transcript renders bubbles
+        // (user on the right, agent on the left). LLM_EXCHANGE telemetry is
+        // tucked behind a toggle button so power users can still see it.
+        const _chatState = {
+            transcript: [],          // [{role:'user'|'agent'|'error', text, agent?, ts}]
+            pending: false,
+            telemetryOpen: false,
+        };
+
+        function _chatEl(id) { return document.getElementById(id); }
+
+        function chatRender() {
+            const wrap = _chatEl('chatTranscript');
+            const empty = _chatEl('chatEmpty');
+            if (!wrap) return;
+            if (_chatState.transcript.length === 0 && !_chatState.pending) {
+                if (empty) empty.style.display = 'flex';
+                wrap.innerHTML = '';
+                return;
+            }
+            if (empty) empty.style.display = 'none';
+            const initials = (name) => (name || '?').slice(0, 2).toUpperCase();
+            wrap.innerHTML = _chatState.transcript.map(msg => {
+                const cls = 'chat-msg ' + msg.role;
+                const avatar = msg.role === 'user'
+                    ? `<div class="chat-avatar">You</div>`
+                    : `<div class="chat-avatar" title="${escapeHTML(msg.agent || 'agent')}">${escapeHTML(initials(msg.agent))}</div>`;
+                const ts = msg.ts ? new Date(msg.ts).toLocaleTimeString() : '';
+                const meta = msg.role !== 'user' && msg.agent
+                    ? `<span class="chat-meta">${escapeHTML(msg.agent)}${ts ? ' · ' + escapeHTML(ts) : ''}</span>`
+                    : (ts ? `<span class="chat-meta">${escapeHTML(ts)}</span>` : '');
+                return `<div class="${cls}">${avatar}<div><div class="chat-bubble">${escapeHTML(msg.text)}</div>${meta}</div></div>`;
+            }).join('');
+            if (_chatState.pending) {
+                wrap.insertAdjacentHTML(
+                    'beforeend',
+                    `<div class="chat-msg agent" id="chatTypingRow"><div class="chat-avatar">…</div><div class="chat-typing"><span></span><span></span><span></span></div></div>`,
+                );
+            }
+            wrap.scrollTop = wrap.scrollHeight;
+        }
+
+        function chatClear() {
+            _chatState.transcript = [];
+            _chatState.pending = false;
+            chatRender();
+        }
+
+        function chatTogglePanel(which) {
+            if (which === 'telemetry') {
+                _chatState.telemetryOpen = !_chatState.telemetryOpen;
+                const tele = _chatEl('chatTelemetry');
+                if (tele) tele.style.display = _chatState.telemetryOpen ? 'block' : 'none';
+                const btn = _chatEl('chatTelemetryBtn');
+                if (btn) btn.classList.toggle('active', _chatState.telemetryOpen);
+            }
+        }
+
+        async function chatSend(event) {
+            if (event) event.preventDefault();
+            const input = _chatEl('chatInput');
+            const agentSel = _chatEl('chatAgent');
+            const sendBtn = _chatEl('chatSendBtn');
+            if (!input || !agentSel) return;
+            const text = (input.value || '').trim();
+            const agent = (agentSel.value || '').trim();
+            if (!text) return;
+            if (!agent) {
+                _chatState.transcript.push({
+                    role: 'error',
+                    text: 'Pick an agent in the dropdown above before sending.',
+                    ts: Date.now(),
+                });
+                chatRender();
+                return;
+            }
+            // Push user msg + lock UI.
+            _chatState.transcript.push({ role: 'user', text, ts: Date.now() });
+            _chatState.pending = true;
+            input.value = '';
+            if (sendBtn) sendBtn.disabled = true;
+            chatRender();
+            try {
+                const res = await fetch(
+                    '/api/agents/' + encodeURIComponent(agent) + '/exec',
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ message: text }),
+                    },
+                );
+                const payload = await res.json().catch(() => ({}));
+                if (!res.ok || payload.error) {
+                    _chatState.transcript.push({
+                        role: 'error',
+                        text: (payload.error || `HTTP ${res.status}`),
+                        agent,
+                        ts: Date.now(),
+                    });
+                } else {
+                    const reply =
+                        (payload.data && payload.data.response) ||
+                        (payload.output && payload.output.response) ||
+                        (payload.response) ||
+                        (typeof payload.data === 'string' ? payload.data : '') ||
+                        '(empty response)';
+                    _chatState.transcript.push({
+                        role: 'agent',
+                        text: String(reply),
+                        agent,
+                        ts: Date.now(),
+                    });
+                }
+            } catch (err) {
+                _chatState.transcript.push({
+                    role: 'error',
+                    text: 'Network error: ' + (err && err.message || String(err)),
+                    agent,
+                    ts: Date.now(),
+                });
+            } finally {
+                _chatState.pending = false;
+                if (sendBtn) sendBtn.disabled = false;
+                chatRender();
+                input.focus();
+            }
+        }
+
+        function _chatPopulateAgentSelect() {
+            const sel = _chatEl('chatAgent');
+            if (!sel) return;
+            const previous = sel.value;
+            const rows = (typeof _redesignCache !== 'undefined' && _redesignCache.agents) || [];
+            const names = rows.map(a => a.name).filter(Boolean);
+            // Keep "pick an agent" placeholder, then list known agents.
+            sel.innerHTML = '<option value="">Pick an agent…</option>' +
+                names.map(n => `<option value="${escapeHTML(n)}">${escapeHTML(n)}</option>`).join('');
+            if (previous && names.includes(previous)) sel.value = previous;
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            // Populate the agent select on first load and whenever the
+            // sidebar agents list refreshes (handled in _refreshRedesignAgents
+            // via a post-hook below).
+            setTimeout(_chatPopulateAgentSelect, 500);
+            const inp = _chatEl('chatInput');
+            if (inp) {
+                inp.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        chatSend(null);
+                    }
+                });
+            }
+        });
 
         // ─── Live conversation panel (LLM_EXCHANGE) ───
         const _convoState = { rows: [], filter: '', knownAgents: new Set() };
@@ -10997,6 +11247,8 @@
                 _redesignCache.agents = [];
             }
             _renderAgentRibbon();
+            // Keep the chat-panel agent dropdown in sync.
+            try { _chatPopulateAgentSelect(); } catch (_) {}
         }
         function _syncRedesignTemplates() {
             try {

@@ -290,7 +290,7 @@ class ReviewerAgent(BaseAgent):
             role_prompt=role,
             brief=brief or "(no brief provided)",
             fallback="",  # Empty fallback - we handle missing LLM separately.
-            max_tokens=2200,
+            max_tokens=4000,
         )
         if not out:
             return None, None

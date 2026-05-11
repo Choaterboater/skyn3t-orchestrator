@@ -124,18 +124,34 @@ class CodeAgent(BaseAgent):
 
     async def _scaffold_from_brief(self, task: TaskRequest) -> TaskResult:
         """Generate new code from a brief into artifact_dir/scaffold/.
-        Used by Studio when the planner picks CodeAgent for a from-scratch project.
+
+        Two-phase build so the model isn't trying to fit an entire project
+        into a single LLM response:
+
+          Phase 1 — Plan: ask for a JSON file plan (path + one-line purpose
+                          per file). Cheap, structured.
+          Phase 2 — Build: loop the plan; for each file, ask the model to
+                          emit JUST that file's contents. Each file gets
+                          its own 8000-token budget — a 10-file project
+                          now gets ~10x the headroom of the old single-
+                          call scaffold, and on subscription-backed CLI
+                          providers (claude/copilot/kimi) the cap is
+                          ignored entirely.
         """
         from pathlib import Path as _Path
+        import json as _json
+        import re as _re
         d = task.input_data or {}
         brief = (d.get("brief") or "").strip()
         artifact_dir = _Path(d.get("artifact_dir") or ".")
         out_dir = artifact_dir / "scaffold"
         out_dir.mkdir(parents=True, exist_ok=True)
         resolved_out_dir = out_dir.resolve()
-        files_written = []
+        files_written: List[str] = []
 
-        # Try LLM; fall back to a minimal stub if unavailable.
+        # Hard cap on plan size so a runaway model can't generate 1000 files.
+        MAX_FILES = 25
+
         try:
             client = self.get_llm() if hasattr(self, "get_llm") else None
             if client is None:
@@ -143,36 +159,93 @@ class CodeAgent(BaseAgent):
                 client = LLMClient(default_model=self.config.get("model"),
                                    backend=self.config.get("backend"),
                                    event_bus=self.event_bus, caller_name=self.name)
-            system = (
-                "You are a senior engineer scaffolding a small project from a brief. "
-                "Output a JSON object: {\"files\": [{\"path\": \"relative/path\", \"content\": \"...\"}]}. "
-                "Pick a tech stack appropriate to the brief (HTML/JS for tiny games, Python/FastAPI for "
-                "services, etc). Keep it minimal but runnable. 1-5 files max. Only valid JSON, no preamble."
+
+            # ── Phase 1: plan ───────────────────────────────────────────
+            plan_system = (
+                "You are a senior engineer planning a small, runnable project. "
+                "Output a JSON object: {\"stack\": \"...\", \"files\": [{\"path\": "
+                "\"relative/path\", \"purpose\": \"one-line description\"}, ...]}. "
+                "Pick a tech stack matching the brief — HTML+JS for browser games "
+                "and static UIs, FastAPI/Flask for Python APIs, Express/Node for "
+                "JS APIs. Aim for 3-12 files: source, config, README, and a tiny "
+                "test when relevant. JSON only, no preamble."
             )
-            prompt = f"Brief:\n{brief}\n\nReturn the JSON manifest."
-            out = await client.complete(prompt, system=system, max_tokens=4000, temperature=0.4)
-            if out and "[deterministic-stub]" not in out:
-                import json as _json
-                import re as _re
-                m = _re.search(r"\{[\s\S]*\}", out)
+            plan_prompt = f"Brief:\n{brief}\n\nReturn the JSON plan."
+            await self.think("planning project structure")
+            plan_out = await client.complete(
+                plan_prompt, system=plan_system, max_tokens=4000, temperature=0.3,
+            )
+            plan: Dict[str, Any] = {}
+            if plan_out and "[deterministic-stub]" not in plan_out:
+                m = _re.search(r"\{[\s\S]*\}", plan_out)
                 if m:
-                    data = _json.loads(m.group(0))
-                    for f in data.get("files") or []:
-                        rel = (f.get("path") or "").lstrip("/")
-                        content = f.get("content") or ""
-                        if not rel or not content:
-                            continue
-                        # path safety
-                        target = (out_dir / rel).resolve()
-                        try:
-                            target.relative_to(resolved_out_dir)
-                        except ValueError:
-                            continue
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        target.write_text(content, encoding="utf-8")
-                        files_written.append(str(target))
+                    try:
+                        plan = _json.loads(m.group(0))
+                    except Exception:
+                        plan = {}
+
+            file_specs = plan.get("files") if isinstance(plan, dict) else None
+            stack = (plan.get("stack") if isinstance(plan, dict) else None) or "minimal"
+            if not isinstance(file_specs, list) or not file_specs:
+                file_specs = []
+            else:
+                file_specs = file_specs[:MAX_FILES]
+
+            # ── Phase 2: build one file at a time ───────────────────────
+            file_index = "\n".join(
+                f"- {(s.get('path') or '').strip()}: {(s.get('purpose') or '').strip()}"
+                for s in file_specs
+                if isinstance(s, dict) and s.get("path")
+            )
+            build_system = (
+                "You are implementing one file of a small project. Given the "
+                "brief, the full file plan, the stack, and which specific file "
+                "to write, output ONLY that file's raw contents — no JSON "
+                "wrapper, no fenced code block, no preamble, no explanation. "
+                "Just the contents that should be written to disk verbatim."
+            )
+            for i, spec in enumerate(file_specs, start=1):
+                if not isinstance(spec, dict):
+                    continue
+                rel = (spec.get("path") or "").lstrip("/").strip()
+                purpose = (spec.get("purpose") or "").strip()
+                if not rel:
+                    continue
+                target = (out_dir / rel).resolve()
+                try:
+                    target.relative_to(resolved_out_dir)
+                except ValueError:
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                await self.think(f"building file {i}/{len(file_specs)}: {rel}")
+                file_prompt = (
+                    f"Brief:\n{brief}\n\nStack: {stack}\n\n"
+                    f"Full file plan:\n{file_index}\n\n"
+                    f"Now write the COMPLETE contents of: `{rel}`\n"
+                    f"Purpose: {purpose}\n\n"
+                    "Return ONLY the file's raw contents (no JSON, no fences)."
+                )
+                try:
+                    body = await client.complete(
+                        file_prompt, system=build_system,
+                        max_tokens=8000, temperature=0.3,
+                    )
+                except Exception:
+                    body = ""
+                if not body or "[deterministic-stub]" in body:
+                    continue
+                body = body.strip()
+                # Strip a leftover fenced block if the model wrapped one anyway.
+                fence = _re.match(r"^```[a-zA-Z0-9_+\-]*\n([\s\S]*?)\n```\s*$", body)
+                if fence:
+                    body = fence.group(1)
+                try:
+                    target.write_text(body, encoding="utf-8")
+                    files_written.append(str(target))
+                except Exception:
+                    continue
         except Exception:
-            pass
+            logger.exception("scaffold-from-brief failed; falling back to deterministic stub")
 
         if not files_written:
             files_written = self._write_fallback_scaffold(out_dir, brief)

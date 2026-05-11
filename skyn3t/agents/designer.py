@@ -462,7 +462,7 @@ class DesignerAgent(BaseAgent):
             role_prompt=role,
             brief=brief,
             fallback=fallback,
-            max_tokens=1800,
+            max_tokens=4000,
             kind="brand",
         )
 
@@ -548,7 +548,7 @@ class DesignerAgent(BaseAgent):
             role_prompt=role,
             brief=brief,
             fallback=fallback,
-            max_tokens=1500,
+            max_tokens=3500,
         )
 
     def _render_components_md_fallback(self, target: str, palette: Dict[str, str]) -> str:
