@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, WebSocketException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -611,6 +612,7 @@ async def enforce_web_access(request: Request, call_next):
 
 
 _DASHBOARD_PATH = Path(__file__).parent / "dashboard.html"
+_SPA_DIST = Path(__file__).parent / "ui" / "dist"
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -621,15 +623,33 @@ async def favicon():
     return Response(status_code=204)
 
 
+@app.get("/legacy", response_class=HTMLResponse)
+async def legacy_dashboard():
+    """The original single-file dashboard.html. Kept as an escape hatch
+    while the Vite+React SPA finishes covering every view. Tagged
+    'legacy' on purpose — new work should go in skyn3t/web/ui/."""
+    return FileResponse(str(_DASHBOARD_PATH), media_type="text/html")
+
+
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    """Serve the main dashboard.
-
-    Reads from disk on each request via FileResponse so edits to dashboard.html
-    are picked up without a server restart, and the import-time blocking read
-    is removed.
-    """
+    """Serve the new Vite+React SPA when it's been built, otherwise fall
+    back to the legacy dashboard so a fresh checkout still shows
+    something. Run `npm --prefix skyn3t/web/ui run build` to populate
+    the dist/ directory."""
+    index = _SPA_DIST / "index.html"
+    if index.exists():
+        return FileResponse(str(index), media_type="text/html")
     return FileResponse(str(_DASHBOARD_PATH), media_type="text/html")
+
+
+# Serve SPA static assets (JS/CSS/images) when the build exists.
+if _SPA_DIST.exists():
+    app.mount(
+        "/assets",
+        StaticFiles(directory=str(_SPA_DIST / "assets")),
+        name="spa-assets",
+    )
 
 
 @app.get("/api/status")
