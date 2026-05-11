@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { api } from "../api/client";
+import { api, getAuthToken } from "../api/client";
 
 // Live activity stream — agents talking, tasks running, errors firing.
 // One column, newest at the top, never duplicates the Studio stage view.
@@ -25,14 +25,15 @@ export default function ActivityPage() {
   // useful even before any event has arrived.
   const snapshot = useQuery({
     queryKey: ["swarm_snapshot"],
-    queryFn: () =>
-      fetch("/api/swarm/snapshot").then((r) => r.json()),
+    queryFn: api.swarmSnapshot,
     refetchInterval: 6_000,
   });
 
   useEffect(() => {
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
-    const url = `${proto}://${window.location.host}/ws/swarm`;
+    const token = getAuthToken();
+    const qs = token ? `?token=${encodeURIComponent(token)}` : "";
+    const url = `${proto}://${window.location.host}/ws/swarm${qs}`;
     const ws = new WebSocket(url);
     wsRef.current = ws;
 
