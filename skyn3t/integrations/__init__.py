@@ -6,9 +6,11 @@ from skyn3t.integrations.github_webhook import GitHubWebhookAgent
 from skyn3t.integrations.github_webhook import router as github_webhook_router
 from skyn3t.integrations.messaging import (
     InboundMessage,
+    MatrixChannel,
     MessagingChannel,
     MessagingRouter,
     TelegramChannel,
+    WhatsAppChannel,
     get_default_router,
 )
 from skyn3t.integrations.slack_bot import SlackBot
@@ -19,10 +21,12 @@ __all__ = [
     "EmailAgent",
     "GitHubWebhookAgent",
     "InboundMessage",
+    "MatrixChannel",
     "MessagingChannel",
     "MessagingRouter",
     "SlackBot",
     "TelegramChannel",
+    "WhatsAppChannel",
     "get_default_router",
     "github_webhook_router",
     "telegram_webhook_router",
