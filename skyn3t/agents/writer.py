@@ -102,7 +102,7 @@ class WriterAgent(BaseAgent):
         if tone not in _TONE_ADJECTIVES:
             tone = "professional"
         length: str = (data.get("length") or "medium").lower()
-        artifact_dir = Path(data.get("artifact_dir") or ".")
+        artifact_dir = self.resolve_artifact_dir(data.get("artifact_dir"))
         next_agent: Optional[str] = data.get("next_agent")
 
         try:

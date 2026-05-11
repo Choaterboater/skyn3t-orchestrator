@@ -16,3 +16,14 @@ projects/
 *.tar.gz
 *.log
 _clarifications.json
+
+# Node deps for the SPA — should never be in git
+node_modules/
+skyn3t/web/ui/node_modules/
+skyn3t/web/ui/dist/
+
+# Stray project outputs that escape the sandbox land here
+_scratch/
+
+# Editable-install metadata
+*.egg-info/

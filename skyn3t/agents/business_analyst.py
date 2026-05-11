@@ -100,7 +100,7 @@ class BusinessAnalystAgent(BaseAgent):
         data = task.input_data or {}
         brief: str = (data.get("brief") or "").strip() or "Untitled project"
         idea: str = (data.get("idea") or brief).strip() or brief
-        artifact_dir = Path(data.get("artifact_dir") or ".")
+        artifact_dir = self.resolve_artifact_dir(data.get("artifact_dir"))
         next_agent: Optional[str] = data.get("next_agent")
 
         try:

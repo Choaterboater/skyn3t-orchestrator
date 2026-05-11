@@ -68,7 +68,7 @@ class ReviewerAgent(BaseAgent):
 
         data = task.input_data or {}
         brief: str = (data.get("brief") or "").strip()
-        artifact_dir = Path(data.get("artifact_dir") or ".")
+        artifact_dir = self.resolve_artifact_dir(data.get("artifact_dir"))
         next_agent: Optional[str] = data.get("next_agent")
 
         try:

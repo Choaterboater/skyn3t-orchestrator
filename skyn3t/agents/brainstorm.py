@@ -99,7 +99,7 @@ class BrainstormAgent(BaseAgent):
                 or input_data.get("description")
                 or ""
             ).strip()
-            artifact_dir = input_data.get("artifact_dir") or "."
+            artifact_dir = self.resolve_artifact_dir(input_data.get("artifact_dir"))
             next_agent = input_data.get("next_agent")
             require_clarification = bool(input_data.get("require_clarification"))
 

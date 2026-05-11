@@ -476,6 +476,35 @@ class BaseAgent(ABC):
         bus = get_default_bus(self.event_bus)
         await bus.send(msg)
 
+    def resolve_artifact_dir(self, raw: Any) -> "Path":
+        """Centralized artifact-dir resolution to stop leaks into the repo root.
+
+        Agents used to do `Path(data.get("artifact_dir") or ".")` which silently
+        wrote to CWD when called outside a Studio pipeline (Chat, direct API
+        exec, scripts). That was the root cause of stray architecture.md /
+        brainstorm.md / tech_stack.json files accumulating in the repo root.
+
+        Resolution order:
+          1. Caller-provided path (Studio pipeline path).
+          2. Per-agent scratch under <projects_dir>/_agent_scratch/<agent>/<ts>/
+             when no path provided. Keeps files in the configured projects root,
+             never the repo root.
+        """
+        from pathlib import Path as _PP
+        import time as _t
+        if raw:
+            return _PP(str(raw)).expanduser()
+        try:
+            from skyn3t.config.settings import get_settings
+            base = _PP(str(get_settings().projects_dir)).expanduser()
+        except Exception:
+            # Last resort if settings can't load — write to user's home,
+            # NOT to cwd. This is the anti-leak invariant.
+            base = _PP("~/.skyn3t/scratch").expanduser()
+        scratch = base / "_agent_scratch" / self.name / str(int(_t.time()))
+        scratch.mkdir(parents=True, exist_ok=True)
+        return scratch
+
     async def think(self, line: str) -> None:
         """Stream a "thinking" line to the dashboard."""
         self.event_bus.publish(

@@ -101,7 +101,7 @@ class MarketerAgent(BaseAgent):
         channels: List[str] = list(data.get("channels") or _DEFAULT_CHANNELS)
         if not channels:
             channels = list(_DEFAULT_CHANNELS)
-        artifact_dir = Path(data.get("artifact_dir") or ".")
+        artifact_dir = self.resolve_artifact_dir(data.get("artifact_dir"))
         next_agent: Optional[str] = data.get("next_agent")
 
         try:
