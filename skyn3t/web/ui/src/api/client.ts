@@ -18,6 +18,21 @@ export type AgentRow = {
   recent_errors?: number;
 };
 
+export type AgentConfigView = {
+  name: string;
+  agent_type?: string;
+  provider?: string;
+  enabled?: boolean;
+  capabilities?: string[];
+  config?: {
+    backend?: string;
+    model?: string;
+    system_prompt?: string;
+    temperature?: number;
+    max_tokens?: number;
+  };
+};
+
 export type ProjectRow = {
   slug: string;
   title?: string;
@@ -119,11 +134,54 @@ export class HttpError extends Error {
   }
 }
 
+// Token handling. The backend accepts the SKYN3T_WEB_TOKEN as either a
+// session cookie (set by visiting /?token=…) or an Authorization: Bearer
+// header. Vite dev runs on :5173 so the cookie path never fires — stash
+// the token in localStorage and forward it on every request.
+const TOKEN_KEY = "skyn3t_token";
+
+(function bootstrapToken() {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  const t = url.searchParams.get("token");
+  if (t) {
+    try {
+      localStorage.setItem(TOKEN_KEY, t);
+    } catch {
+      /* incognito with no storage */
+    }
+    url.searchParams.delete("token");
+    window.history.replaceState({}, "", url.toString());
+  }
+})();
+
+export function getAuthToken(): string | null {
+  try {
+    return localStorage.getItem(TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function clearAuthToken() {
+  try {
+    localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    /* */
+  }
+}
+
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers ?? {});
+  if (!headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  const token = getAuthToken();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
   const r = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
     credentials: "same-origin",
     ...init,
+    headers,
   });
   if (!r.ok) {
     const body = await r.text();
@@ -144,12 +202,37 @@ export type SystemStatus = {
 
 export const api = {
   status: () => fetchJson<SystemStatus>("/api/status"),
+  swarmSnapshot: () => fetchJson<any>("/api/swarm/snapshot"),
   agents: () =>
     fetchJson<{ agents: AgentRow[] }>("/api/agents").then((d) => d.agents ?? []),
   execAgent: (name: string, message: string) =>
     fetchJson<{ data?: { response?: string }; error?: string }>(
       `/api/agents/${encodeURIComponent(name)}/exec`,
       { method: "POST", body: JSON.stringify({ message }) },
+    ),
+  agentConfig: (name: string) =>
+    fetchJson<AgentConfigView>(
+      `/api/agents/${encodeURIComponent(name)}/config`,
+    ),
+  patchAgentConfig: (name: string, patch: Record<string, unknown>) =>
+    fetchJson<any>(`/api/agents/${encodeURIComponent(name)}/config`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  enableAgent: (name: string) =>
+    fetchJson<{ ok?: boolean }>(
+      `/api/agents/${encodeURIComponent(name)}/enable`,
+      { method: "POST", body: "{}" },
+    ),
+  disableAgent: (name: string) =>
+    fetchJson<{ ok?: boolean }>(
+      `/api/agents/${encodeURIComponent(name)}/disable`,
+      { method: "POST", body: "{}" },
+    ),
+  deleteAgent: (name: string) =>
+    fetchJson<{ ok?: boolean }>(
+      `/api/agents/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
     ),
   projects: () =>
     fetchJson<{ projects: ProjectRow[] }>("/api/studio/projects").then(
