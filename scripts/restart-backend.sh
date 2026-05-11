@@ -30,7 +30,7 @@ done
 cd "$(dirname "$0")/.."
 mkdir -p "$(dirname "$LOG")"
 
-echo "[restart] looking for skyn3t processes on :$PORT…"
+echo "[restart] looking for skyn3t processes on :$PORT..."
 PIDS=$(pgrep -f "skyn3t start.*--port $PORT" || true)
 
 if [[ -n "$PIDS" ]]; then
@@ -62,12 +62,28 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
 fi
 
 if [[ "$DO_PIP" -eq 1 ]]; then
-    echo "[restart] pip install -e . (so source routes are live)…"
-    pip install -e . > /tmp/skyn3t-install.log 2>&1 || {
-        echo "[restart] pip install failed; see /tmp/skyn3t-install.log" >&2
-        tail -20 /tmp/skyn3t-install.log >&2
-        exit 1
-    }
+    # Find a pip we can call. macOS framework Pythons usually ship
+    # `pip3` but not bare `pip`. Fall back to `python3 -m pip`.
+    PIP_CMD=""
+    if command -v pip >/dev/null 2>&1; then
+        PIP_CMD="pip"
+    elif command -v pip3 >/dev/null 2>&1; then
+        PIP_CMD="pip3"
+    elif command -v python3 >/dev/null 2>&1; then
+        PIP_CMD="python3 -m pip"
+    else
+        echo "[restart] no pip/pip3/python3 in PATH; skipping editable install" >&2
+        PIP_CMD=""
+    fi
+
+    if [[ -n "$PIP_CMD" ]]; then
+        echo "[restart] $PIP_CMD install -e . (so source routes are live)..."
+        if ! $PIP_CMD install -e . > /tmp/skyn3t-install.log 2>&1; then
+            echo "[restart] pip install failed; see /tmp/skyn3t-install.log" >&2
+            tail -20 /tmp/skyn3t-install.log >&2
+            exit 1
+        fi
+    fi
 fi
 
 echo "[restart] starting skyn3t on $HOST:$PORT (log → $LOG)"
