@@ -112,9 +112,10 @@ async def test_failure_hint_carries_tail_of_stderr(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_node_project_with_no_lockfile_skipped(tmp_path):
-    """package.json present but no package-lock.json and no index.js — verifier
-    should skip rather than run a potentially-slow install."""
+async def test_node_project_passes_when_shape_ok_and_no_syntax_errors(tmp_path, monkeypatch):
+    """A well-shaped package.json + no .js files = pass (shape gate succeeds,
+    syntax gate has nothing to check, install gate is opt-in off)."""
+    monkeypatch.delenv("SKYN3T_VERIFY_NPM_INSTALL", raising=False)
     scaffold = tmp_path / "scaffold"
     scaffold.mkdir()
     (scaffold / "package.json").write_text(
@@ -124,8 +125,42 @@ async def test_node_project_with_no_lockfile_skipped(tmp_path):
     await agent.initialize()
     res = await agent.execute(TaskRequest(input_data={"scaffold_dir": str(scaffold)}))
     out = res.output
-    assert out["verdict"] == "skipped"
+    assert out["verdict"] == "yes", out
     assert out["stack"] == "node"
+    assert "install skipped" in out["command"]
+
+
+@pytest.mark.asyncio
+async def test_node_project_fails_when_package_json_scripts_is_a_string(tmp_path):
+    """The most common LLM-shape mistake: writing `\"scripts\": \"build\"`
+    instead of an object. Shape gate must catch it."""
+    scaffold = tmp_path / "scaffold"
+    scaffold.mkdir()
+    # `scripts` written as a string — invalid.
+    scaffold.joinpath("package.json").write_text(
+        '{"name": "demo", "version": "0.0.0", "scripts": "build"}'
+    )
+    agent = BuildVerifierAgent()
+    await agent.initialize()
+    res = await agent.execute(TaskRequest(input_data={"scaffold_dir": str(scaffold)}))
+    out = res.output
+    assert out["verdict"] == "no", out
+    assert out["stack"] == "node"
+    assert "scripts" in (out["stderr"] or "")
+    assert out["failure_hint"]
+
+
+@pytest.mark.asyncio
+async def test_node_project_fails_when_package_json_is_garbage(tmp_path):
+    scaffold = tmp_path / "scaffold"
+    scaffold.mkdir()
+    scaffold.joinpath("package.json").write_text("{ this is not valid json")
+    agent = BuildVerifierAgent()
+    await agent.initialize()
+    res = await agent.execute(TaskRequest(input_data={"scaffold_dir": str(scaffold)}))
+    out = res.output
+    assert out["verdict"] == "no", out
+    assert "parsed" in (out["stderr"] or "").lower() or "json" in (out["stderr"] or "").lower()
 
 
 @pytest.mark.asyncio

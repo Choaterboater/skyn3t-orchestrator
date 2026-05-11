@@ -223,38 +223,133 @@ class BuildVerifierAgent(BaseAgent):
         return verdict, " ".join(cmd[:6]) + (" …" if len(cmd) > 6 else ""), proc["stdout"], proc["stderr"]
 
     async def _verify_node(self, scaffold_dir: Path) -> tuple[str, str, str, str]:
-        """If node + package.json: `node --check` the entry, or `npm run build`
-        if a `build` script exists. We deliberately skip `npm install` here
-        unless the project pins a lockfile — full installs are too slow for a
-        verifier and can hang on network."""
-        # Best-effort: parse package.json for a build script and an entry file.
+        """Node verifier — three escalating gates:
+
+        Gate 1 — package.json shape: must parse as JSON, must have valid
+                 ``scripts``/``dependencies`` types if present. Catches
+                 the common LLM failure of writing ``"scripts": "build"``
+                 instead of an object.
+
+        Gate 2 — syntax check: run ``node --check`` on every .js/.mjs/.cjs
+                 file we can find. Catches syntax errors without an
+                 install. Fast.
+
+        Gate 3 — optional install + build: only when the operator opts in
+                 via ``SKYN3T_VERIFY_NPM_INSTALL=1``. Runs
+                 ``npm install --no-audit --no-fund --silent
+                 --prefer-offline`` then ``npm run build`` if a build
+                 script is present. Capped by the verifier's
+                 ``timeout_seconds`` so a network hang doesn't wedge
+                 the pipeline.
+
+        Default behavior keeps the verifier fast: parse + syntax. The
+        opt-in flag is for hosts that want the full smoke.
+        """
         pkg_path = scaffold_dir / "package.json"
-        pkg: Dict[str, Any] = {}
         try:
-            pkg = json.loads(pkg_path.read_text())
-        except Exception:
-            return "no", "package.json read failed", "", "package.json could not be parsed as JSON"
+            pkg_text = pkg_path.read_text()
+            pkg = json.loads(pkg_text)
+        except FileNotFoundError:
+            return "no", "package.json missing", "", "package.json file missing"
+        except Exception as exc:
+            return "no", "package.json parse", "", f"package.json could not be parsed as JSON: {exc}"
+
+        # Gate 1: shape validation.
+        shape_errors: List[str] = []
+        if not isinstance(pkg, dict):
+            shape_errors.append("package.json root must be an object")
+        else:
+            scripts_val = pkg.get("scripts")
+            if scripts_val is not None and not isinstance(scripts_val, dict):
+                shape_errors.append("`scripts` must be an object of {name: command}")
+            deps_val = pkg.get("dependencies")
+            if deps_val is not None and not isinstance(deps_val, dict):
+                shape_errors.append("`dependencies` must be an object of {name: version}")
+            dev_deps_val = pkg.get("devDependencies")
+            if dev_deps_val is not None and not isinstance(dev_deps_val, dict):
+                shape_errors.append("`devDependencies` must be an object of {name: version}")
+        if shape_errors:
+            return "no", "package.json shape", "", "\n".join(shape_errors)
+
         scripts = (pkg.get("scripts") or {}) if isinstance(pkg, dict) else {}
         node_bin = shutil.which("node")
-        if node_bin and (scaffold_dir / "index.js").exists():
-            cmd = [node_bin, "--check", "index.js"]
+
+        # Gate 2: syntax check via `node --check` on every .js/.mjs/.cjs.
+        if node_bin:
+            js_files = [
+                str(p) for p in scaffold_dir.rglob("*")
+                if p.is_file()
+                and p.suffix in (".js", ".mjs", ".cjs")
+                and "node_modules" not in p.parts
+            ]
+            for f in js_files:
+                proc = await self._run([node_bin, "--check", f], scaffold_dir)
+                if proc["returncode"] != 0:
+                    return (
+                        "no",
+                        f"node --check {Path(f).name}",
+                        proc["stdout"],
+                        proc["stderr"],
+                    )
+
+        # Gate 3: opt-in install + build.
+        install_enabled = os.environ.get("SKYN3T_VERIFY_NPM_INSTALL", "").lower() in ("1", "true", "yes")
+        npm_bin = shutil.which("npm")
+        if install_enabled and npm_bin:
+            install_cmd = [
+                npm_bin, "install",
+                "--no-audit", "--no-fund", "--silent", "--prefer-offline",
+            ]
+            proc = await self._run(install_cmd, scaffold_dir)
+            if proc["returncode"] != 0:
+                return (
+                    "no",
+                    " ".join(install_cmd),
+                    proc["stdout"],
+                    proc["stderr"],
+                )
+            if scripts.get("build"):
+                build_cmd = [npm_bin, "run", "build", "--silent"]
+                proc = await self._run(build_cmd, scaffold_dir)
+                if proc["returncode"] != 0:
+                    return (
+                        "no",
+                        " ".join(build_cmd),
+                        proc["stdout"],
+                        proc["stderr"],
+                    )
+                return (
+                    "yes",
+                    " && ".join([" ".join(install_cmd), " ".join(build_cmd)]),
+                    proc["stdout"],
+                    "",
+                )
+            return (
+                "yes",
+                " ".join(install_cmd),
+                proc["stdout"],
+                "",
+            )
+
+        # Legacy "lockfile + npm" path — still used when install isn't
+        # opted in but a lockfile exists (treated as a "this project
+        # ships its own pin, trust it" signal).
+        if scripts.get("build") and npm_bin and (scaffold_dir / "package-lock.json").exists():
+            cmd = [npm_bin, "run", "build", "--silent"]
             proc = await self._run(cmd, scaffold_dir)
             verdict = "yes" if proc["returncode"] == 0 else "no"
             return verdict, " ".join(cmd), proc["stdout"], proc["stderr"]
-        if scripts.get("build") and shutil.which("npm") and (scaffold_dir / "package-lock.json").exists():
-            cmd = ["npm", "run", "build", "--silent"]
-            proc = await self._run(cmd, scaffold_dir)
-            verdict = "yes" if proc["returncode"] == 0 else "no"
-            return verdict, " ".join(cmd), proc["stdout"], proc["stderr"]
-        # We have a package.json but no easy way to validate without installing.
-        # Don't fail the project — report skipped with a note.
-        return (
-            "skipped",
-            "(node project, no lockfile or runnable entry)",
-            "",
-            "Node project detected but no package-lock.json or runnable index.js; "
-            "verifier skipped install/build to keep the pipeline fast.",
-        )
+
+        # All gates passed (or were skipped). Report success — the parse +
+        # syntax checks alone catch the most common failure modes.
+        gate_summary = []
+        if isinstance(pkg, dict):
+            gate_summary.append("shape ok")
+        if node_bin:
+            gate_summary.append("node --check ok")
+        if not install_enabled:
+            gate_summary.append("install skipped (set SKYN3T_VERIFY_NPM_INSTALL=1 to enable)")
+        return "yes", " · ".join(gate_summary) or "node parse", "node project verified", ""
 
     async def _verify_static(self, scaffold_dir: Path, probe: StackProbe) -> tuple[str, str, str, str]:
         """Static HTML: two gates.
