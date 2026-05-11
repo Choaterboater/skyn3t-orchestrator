@@ -206,6 +206,30 @@ export const api = {
       "/api/proposals/feature",
       { method: "POST", body: JSON.stringify({ idea }) },
     ),
+  traces: (limit = 50) =>
+    fetchJson<{ traces: any[] }>(`/traces?limit=${limit}`).then(
+      (d) => d.traces ?? [],
+    ),
+  ragStats: () => fetchJson<any>("/api/rag/stats"),
+  ragRecent: (limit = 20) =>
+    fetchJson<{ documents: any[] }>(`/api/rag/recent?limit=${limit}`).then(
+      (d) => d.documents ?? [],
+    ),
+  ragQuery: (query: string, n_results = 5) =>
+    fetchJson<any>("/api/rag/query", {
+      method: "POST",
+      body: JSON.stringify({ query, n_results }),
+    }),
+  ragAdd: (payload: {
+    content: string;
+    title?: string;
+    source?: string;
+    doc_type?: string;
+  }) =>
+    fetchJson<any>("/api/rag/add", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
   skills: (tag?: string) => {
     const q = tag ? `?tag=${encodeURIComponent(tag)}` : "";
     return fetchJson<{ summary?: any; top?: Skill[]; skills?: Skill[] }>(
