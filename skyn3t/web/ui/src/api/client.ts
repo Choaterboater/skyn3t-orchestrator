@@ -289,6 +289,29 @@ export const api = {
       "/api/proposals/feature",
       { method: "POST", body: JSON.stringify({ idea }) },
     ),
+  previewFeatureIdea: (idea: string) =>
+    fetchJson<{
+      idea: string;
+      target_file: string;
+      keywords: string[];
+      capability_hits: Array<{ keywords: string[]; related_files: string[] }>;
+      next_action: {
+        kind: "self_patch" | "blocked";
+        summary: string;
+        target_file?: string;
+        agent: string | null;
+      };
+      would_create: {
+        kind: string;
+        origin: string;
+        status: string;
+        requires_approval: boolean;
+      };
+      error?: string;
+    }>("/api/proposals/feature/preview", {
+      method: "POST",
+      body: JSON.stringify({ idea }),
+    }),
   traces: (limit = 50) =>
     fetchJson<{ traces: any[] }>(`/traces?limit=${limit}`).then(
       (d) => d.traces ?? [],
