@@ -237,7 +237,7 @@ class CodeAgent(BaseAgent):
             )
             if stack_hint:
                 build_system = build_system + "\n\n" + stack_hint
-            from skyn3t.agents.stack_templates import readme_for_stack
+            from skyn3t.agents.stack_templates import manifest_for, readme_for_stack
             for i, spec in enumerate(file_specs, start=1):
                 if not isinstance(spec, dict):
                     continue
@@ -263,6 +263,22 @@ class CodeAgent(BaseAgent):
                             target.write_text(body_static, encoding="utf-8")
                             files_written.append(str(target))
                             await self.think(f"wrote {rel} (deterministic readme for {stack})")
+                            continue
+                        except Exception:
+                            pass  # fall through to LLM path
+
+                # Manifest shortcut: requirements.txt / package.json /
+                # Package.swift have known-good versioned shapes per
+                # stack. Writing them deterministically eliminates the
+                # "model pinned react ^17 but used hooks API" failure
+                # class entirely.
+                if stack != "minimal":
+                    body_manifest = manifest_for(stack, rel, brief)
+                    if body_manifest:
+                        try:
+                            target.write_text(body_manifest, encoding="utf-8")
+                            files_written.append(str(target))
+                            await self.think(f"wrote {rel} (deterministic manifest for {stack})")
                             continue
                         except Exception:
                             pass  # fall through to LLM path
