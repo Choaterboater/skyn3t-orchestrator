@@ -187,24 +187,41 @@ class ResearchAgent(BaseAgent):
                 out = await client.complete(prompt, max_tokens=900, temperature=0.3)
             if out and "[deterministic-stub]" not in out:
                 notes = out.strip()
-                # parse bullets into results
-                for line in notes.splitlines():
-                    line = line.strip()
-                    if line.startswith(("- ", "* ", "• ")):
-                        results.append({"title": line[2:].strip()[:100], "snippet": line[2:].strip(),
-                                        "source": "llm"})
-                    if len(results) >= num_results:
-                        break
+                if is_integration_brief:
+                    # Integration spec output is structured markdown with ##
+                    # sections per service — not a bullet list. Record one
+                    # synthetic "result" so the downstream "has results"
+                    # check passes; the real value is in `notes` which gets
+                    # written to research.md verbatim.
+                    results.append({
+                        "title": f"Integration spec for {query[:80]}",
+                        "snippet": notes[:200],
+                        "source": "llm-integration-spec",
+                    })
+                else:
+                    # parse bullets into results
+                    for line in notes.splitlines():
+                        line = line.strip()
+                        if line.startswith(("- ", "* ", "• ")):
+                            results.append({"title": line[2:].strip()[:100], "snippet": line[2:].strip(),
+                                            "source": "llm"})
+                        if len(results) >= num_results:
+                            break
         except Exception:
-            pass
+            logger.exception("research LLM call failed")
 
-        # Placeholder fallback if LLM gave nothing
+        # Placeholder fallback if LLM gave nothing real to record. NOTE:
+        # for integration briefs, `notes` is the spec text — preserve it
+        # even if we're entering the fallback for `results`. The previous
+        # code overwrote `notes` with bullet placeholders here, wiping
+        # the spec.
         if not results:
             for i in range(min(num_results, 5)):
                 results.append({"title": f"Consider angle {i+1} for '{query[:40]}'",
                                 "snippet": f"Placeholder finding {i+1}.",
                                 "source": "placeholder"})
-            notes = "\n".join(f"- {r['snippet']}" for r in results)
+            if not notes:
+                notes = "\n".join(f"- {r['snippet']}" for r in results)
 
         # Write research.md to artifact_dir for downstream stages
         files_written = []
