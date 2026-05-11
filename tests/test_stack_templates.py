@@ -71,6 +71,101 @@ def test_ios_readme_mentions_xcode_and_swift_build():
     assert "Package.swift" in body
 
 
+# ─── manifest_for ──────────────────────────────────────────────────────
+
+
+def test_manifest_returns_none_for_unknown_stack_or_path():
+    from skyn3t.agents.stack_templates import manifest_for
+    assert manifest_for(None, "requirements.txt") is None
+    assert manifest_for("", "requirements.txt") is None
+    assert manifest_for("static_site", "requirements.txt") is None
+    assert manifest_for("python_cli", "weird_file.txt") is None
+    assert manifest_for("python_cli", "") is None
+
+
+@pytest.mark.parametrize("stack,rel,must_contain", [
+    ("fastapi", "requirements.txt", ("fastapi>=0.110", "uvicorn[standard]", "pydantic>=2")),
+    ("flask", "requirements.txt", ("flask>=3.0",)),
+    ("python_cli", "requirements.txt", ("argparse",)),
+])
+def test_python_manifests_pin_modern_versions(stack, rel, must_contain):
+    from skyn3t.agents.stack_templates import manifest_for
+    body = manifest_for(stack, rel)
+    assert body is not None
+    missing = [phrase for phrase in must_contain if phrase not in body]
+    assert not missing, f"{stack}/{rel} missing: {missing}"
+
+
+@pytest.mark.parametrize("stack,must_dep_pin", [
+    ("react_vite", ("react", "^18.3")),
+    ("react_vite", ("vite", "^5.4")),
+    ("next", ("next", "^14.2")),
+    ("next", ("react", "^18.3")),
+    ("next", ("typescript", "^5.4")),
+])
+def test_node_manifests_use_modern_pins(stack, must_dep_pin):
+    """Each Node-family package.json must pin to current major versions
+    matching the build hint (Next 14, React 18). Catches the 'model
+    pinned react ^17 but the code is hooks-only' failure class."""
+    import json
+    from skyn3t.agents.stack_templates import manifest_for
+    body = manifest_for(stack, "package.json")
+    assert body is not None
+    pkg = json.loads(body)
+    dep, version_floor = must_dep_pin
+    all_deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+    assert dep in all_deps, f"{stack} missing dep {dep}"
+    assert version_floor in all_deps[dep], (
+        f"{stack} dep {dep} = {all_deps[dep]} doesn't include {version_floor}"
+    )
+
+
+def test_node_manifests_are_valid_json():
+    import json
+    from skyn3t.agents.stack_templates import manifest_for
+    for stack in ("node_cli", "react_vite", "next"):
+        body = manifest_for(stack, "package.json")
+        assert body is not None
+        # Must parse; must end with newline (lockfile-tool convention).
+        pkg = json.loads(body)
+        assert isinstance(pkg, dict)
+        assert body.endswith("\n")
+        # The shape gate rejects scripts-as-string — make sure we don't
+        # ship that mistake.
+        if "scripts" in pkg:
+            assert isinstance(pkg["scripts"], dict)
+
+
+def test_node_cli_manifest_sets_esm_and_bin():
+    """node_cli template hint says `"type": "module"` + `bin` entry — the
+    manifest must back that up."""
+    import json
+    from skyn3t.agents.stack_templates import manifest_for
+    pkg = json.loads(manifest_for("node_cli", "package.json"))
+    assert pkg.get("type") == "module"
+    assert isinstance(pkg.get("bin"), dict)
+
+
+def test_ios_manifest_is_valid_swiftpm():
+    from skyn3t.agents.stack_templates import manifest_for
+    body = manifest_for("ios_app", "Package.swift")
+    assert body is not None
+    assert "swift-tools-version" in body
+    assert "PackageDescription" in body
+    assert ".iOS(.v16)" in body
+    assert ".executableTarget" in body
+
+
+def test_next_manifest_does_not_set_module_type():
+    """Next.js requires CommonJS at the package.json level (next.config.js
+    is CJS by default). Setting `"type": "module"` breaks Next builds —
+    pin this case down."""
+    import json
+    from skyn3t.agents.stack_templates import manifest_for
+    pkg = json.loads(manifest_for("next", "package.json"))
+    assert pkg.get("type") != "module"
+
+
 @pytest.mark.parametrize("brief", [
     "",
     "   ",

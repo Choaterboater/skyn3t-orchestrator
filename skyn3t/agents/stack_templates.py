@@ -401,6 +401,172 @@ _README_GENERATORS = {
 }
 
 
+# ── Per-stack deterministic manifests ──────────────────────────────────
+#
+# requirements.txt / package.json contents the LLM keeps re-deriving (and
+# sometimes drifting to outdated versions). Locking them deterministically:
+#   - kills the "model pinned react ^17 but used hooks API" failure class
+#   - eliminates one LLM call per project (~8000-token budget freed up)
+#   - lets the verifier rely on known shapes (npm-shape gate no longer
+#     guesses what was meant)
+#
+# Versions chosen to match the idiom hints (Next 14, React 18, FastAPI
+# 0.110+, etc.). Use `>=` floors so newer minor/patch releases land
+# without forcing a regenerate.
+
+
+def _manifest_python_cli(brief: str) -> str:
+    return (
+        "# Pinned runtime dependencies. Edit as needed.\n"
+        "# No external deps by default — argparse + stdlib are enough\n"
+        "# for most CLIs. Add lines below as you need them.\n"
+    )
+
+
+def _manifest_fastapi(brief: str) -> str:
+    return (
+        "fastapi>=0.110.0\n"
+        "uvicorn[standard]>=0.27.0\n"
+        "pydantic>=2.6.0\n"
+        "# Dev/test deps:\n"
+        "httpx>=0.27.0\n"
+        "pytest>=8.0.0\n"
+    )
+
+
+def _manifest_flask(brief: str) -> str:
+    return (
+        "flask>=3.0.0\n"
+        "# Dev/test deps:\n"
+        "pytest>=8.0.0\n"
+    )
+
+
+def _manifest_node_cli(brief: str) -> str:
+    # Note: package.json is JSON, not a free-form file — keep it minimal
+    # and valid. The model writes the bin name + main file but the shape
+    # is fixed here.
+    return _json_dumps_pretty({
+        "name": "scaffold",
+        "version": "0.1.0",
+        "private": True,
+        "type": "module",
+        "bin": {"app": "./index.js"},
+        "main": "index.js",
+        "scripts": {
+            "start": "node index.js",
+        },
+        "engines": {"node": ">=20"},
+        "dependencies": {},
+    })
+
+
+def _manifest_react_vite(brief: str) -> str:
+    return _json_dumps_pretty({
+        "name": "scaffold",
+        "version": "0.1.0",
+        "private": True,
+        "type": "module",
+        "scripts": {
+            "dev": "vite",
+            "build": "vite build",
+            "preview": "vite preview",
+        },
+        "dependencies": {
+            "react": "^18.3.0",
+            "react-dom": "^18.3.0",
+        },
+        "devDependencies": {
+            "@vitejs/plugin-react": "^4.3.0",
+            "vite": "^5.4.0",
+        },
+    })
+
+
+def _manifest_next(brief: str) -> str:
+    return _json_dumps_pretty({
+        "name": "scaffold",
+        "version": "0.1.0",
+        "private": True,
+        "scripts": {
+            "dev": "next dev",
+            "build": "next build",
+            "start": "next start",
+            "lint": "next lint",
+        },
+        "dependencies": {
+            "next": "^14.2.0",
+            "react": "^18.3.0",
+            "react-dom": "^18.3.0",
+        },
+        "devDependencies": {
+            "@types/node": "^20.12.0",
+            "@types/react": "^18.3.0",
+            "@types/react-dom": "^18.3.0",
+            "typescript": "^5.4.0",
+        },
+    })
+
+
+def _manifest_ios_app(brief: str) -> str:
+    return (
+        "// swift-tools-version:5.9\n"
+        "import PackageDescription\n"
+        "\n"
+        "let package = Package(\n"
+        '    name: "App",\n'
+        "    platforms: [\n"
+        "        .iOS(.v16),\n"
+        "    ],\n"
+        "    products: [\n"
+        '        .executable(name: "App", targets: ["App"]),\n'
+        "    ],\n"
+        "    targets: [\n"
+        "        .executableTarget(\n"
+        '            name: "App",\n'
+        '            path: "Sources/App"\n'
+        "        ),\n"
+        "    ]\n"
+        ")\n"
+    )
+
+
+def _json_dumps_pretty(obj) -> str:
+    """package.json convention: 2-space indent, trailing newline."""
+    import json as _json
+    return _json.dumps(obj, indent=2) + "\n"
+
+
+_MANIFEST_GENERATORS = {
+    # path → generator. Keyed by the SPECIFIC file the generator writes
+    # so CodeAgent can match on filename and short-circuit.
+    ("python_cli", "requirements.txt"): _manifest_python_cli,
+    ("fastapi", "requirements.txt"): _manifest_fastapi,
+    ("flask", "requirements.txt"): _manifest_flask,
+    ("node_cli", "package.json"): _manifest_node_cli,
+    ("react_vite", "package.json"): _manifest_react_vite,
+    ("next", "package.json"): _manifest_next,
+    ("ios_app", "Package.swift"): _manifest_ios_app,
+}
+
+
+def manifest_for(stack: Optional[str], rel_path: str, brief: str = "") -> Optional[str]:
+    """Return the deterministic manifest body for a (stack, file path)
+    combo, or None when no generator applies.
+
+    Used by CodeAgent's Phase 2 loop to short-circuit dependency files
+    (requirements.txt, package.json, Package.swift) — the LLM keeps
+    re-deriving these and sometimes drifts to outdated pins.
+    """
+    if not stack or not rel_path:
+        return None
+    # Normalize the relative path so a top-level match works regardless
+    # of incoming case/slashes.
+    key = (stack, rel_path.lstrip("/").strip())
+    gen = _MANIFEST_GENERATORS.get(key)
+    return gen(brief or "") if gen else None
+
+
 def readme_for_stack(stack: Optional[str], brief: str) -> Optional[str]:
     """Return a deterministic README.md body for the given stack, or None
     when the stack isn't recognized. ``brief`` is interpolated as the
