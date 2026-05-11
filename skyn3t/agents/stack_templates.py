@@ -89,6 +89,18 @@ STACK_TEMPLATES: Dict[str, FilePlan] = {
         ("next.config.js", "Minimal Next config; experimental flags only if needed."),
         ("README.md", "Install + run: `npm install && npm run dev`."),
     ],
+    # iOS apps use the Swift Package Manager executable shape because a
+    # real .xcodeproj is a binary-ish directory bundle the LLM can't
+    # produce correctly. SwiftPM is the supported alternative — you can
+    # open `Package.swift` in Xcode and it'll treat the package as an app
+    # target. `swift build` works on the command line. SwiftUI is the
+    # default UI framework since iOS 13.
+    "ios_app": [
+        ("Package.swift", "Swift package manifest — executable target with iOS platform requirement."),
+        ("Sources/App/App.swift", "@main App struct conforming to App protocol; WindowGroup with ContentView."),
+        ("Sources/App/ContentView.swift", "SwiftUI ContentView implementing the brief's UI."),
+        ("README.md", "How to open in Xcode + how to swift build on CLI."),
+    ],
 }
 
 
@@ -96,6 +108,12 @@ STACK_TEMPLATES: Dict[str, FilePlan] = {
 # match wins, in declaration order (so more specific patterns come
 # before more general ones — e.g. "next.js" before "react").
 _STACK_TRIGGERS: List[Tuple[str, Tuple[str, ...]]] = [
+    # iOS first — its trigger phrases are very specific and we don't want
+    # "swift" or "swiftui" to accidentally match a non-iOS Swift project.
+    ("ios_app", (
+        "ios app", "ios application", "iphone app", "ipad app",
+        "swiftui app", "swift package", "swift ios",
+    )),
     ("next", ("next.js", "nextjs", "next 14", "next 13", " next ")),
     ("react_vite", ("react", "vite", "spa", "single-page app")),
     ("fastapi", ("fastapi", "fast-api", "fast api")),
@@ -196,6 +214,15 @@ STACK_BUILD_HINTS: Dict[str, str] = {
         "app/page.tsx is the index route. metadata is exported from "
         "layout. tsconfig.json sets `strict: true` and "
         "`moduleResolution: \"bundler\"`."
+    ),
+    "ios_app": (
+        "Idiom: SwiftUI on iOS 16+, no UIKit unless strictly required. "
+        "App entry is `@main struct AppName: App` with a `WindowGroup` "
+        "containing the root view. Use `@State` / `@Binding` / "
+        "`@Observable` (Swift 5.9+) for view state — not legacy "
+        "`ObservableObject`. Package.swift declares an executable "
+        "product with `.iOS(.v16)` platform requirement. Open the "
+        "package directory in Xcode to run on a simulator."
     ),
 }
 
@@ -343,6 +370,25 @@ def _readme_next(brief: str) -> str:
     )
 
 
+def _readme_ios_app(brief: str) -> str:
+    return (
+        f"# Project\n\n"
+        f"{brief.strip()}\n\n"
+        "## Requirements\n\n"
+        "- macOS with Xcode 15+ installed\n"
+        "- iOS 16+ deployment target\n\n"
+        "## Open in Xcode\n\n"
+        "Double-click `Package.swift`. Xcode will resolve dependencies "
+        "and let you pick a simulator from the toolbar.\n\n"
+        "## Build from CLI\n\n"
+        "```bash\n"
+        "swift build\n"
+        "```\n\n"
+        "Note: `swift build` validates that the code compiles. To "
+        "actually run on a simulator you must use Xcode or `xcodebuild`.\n"
+    )
+
+
 _README_GENERATORS = {
     "static_site": _readme_static,
     "python_cli": _readme_python_cli,
@@ -351,6 +397,7 @@ _README_GENERATORS = {
     "node_cli": _readme_node_cli,
     "react_vite": _readme_react_vite,
     "next": _readme_next,
+    "ios_app": _readme_ios_app,
 }
 
 
