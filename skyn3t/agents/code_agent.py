@@ -221,6 +221,13 @@ class CodeAgent(BaseAgent):
                 for s in file_specs
                 if isinstance(s, dict) and s.get("path")
             )
+            # Stack-specific idiom hint — anchors the model to the modern
+            # shape for the chosen ecosystem (App Router for Next, hooks
+            # for React, pydantic v2 for FastAPI, etc). Without this the
+            # model defaults to whatever was most-common in its training
+            # set, which is often outdated.
+            from skyn3t.agents.stack_templates import hint_for_stack
+            stack_hint = hint_for_stack(stack)
             build_system = (
                 "You are implementing one file of a small project. Given the "
                 "brief, the full file plan, the stack, and which specific file "
@@ -228,6 +235,8 @@ class CodeAgent(BaseAgent):
                 "wrapper, no fenced code block, no preamble, no explanation. "
                 "Just the contents that should be written to disk verbatim."
             )
+            if stack_hint:
+                build_system = build_system + "\n\n" + stack_hint
             for i, spec in enumerate(file_specs, start=1):
                 if not isinstance(spec, dict):
                     continue

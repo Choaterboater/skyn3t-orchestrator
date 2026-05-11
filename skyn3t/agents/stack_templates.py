@@ -138,3 +138,70 @@ def plan_for_stack(stack: str) -> Optional[FilePlan]:
 def template_keys() -> List[str]:
     """All known stack keys, sorted for stable test assertions."""
     return sorted(STACK_TEMPLATES.keys())
+
+
+# ── Per-stack idiom hints ───────────────────────────────────────────────
+#
+# CodeAgent's Phase 2 sends a generic "write this file" prompt. Without
+# stack-specific guidance the model defaults to outdated idioms (Next.js
+# pages/ router, FastAPI app.py in repo root, Vite with deprecated config
+# shapes). Each stack here adds a short instruction block appended to the
+# build system prompt — enough to anchor the model to the modern shape
+# without bloating the prompt.
+
+STACK_BUILD_HINTS: Dict[str, str] = {
+    "static_site": (
+        "Idiom: vanilla HTML/CSS/JS, no build step. No external CDN scripts "
+        "unless absolutely required. Link script.js with `defer`. Inline "
+        "any small init logic inside script.js, not in index.html. Keep "
+        "the page accessible — semantic tags, alt text on images."
+    ),
+    "python_cli": (
+        "Idiom: a single-file CLI driven by argparse. The `main()` function "
+        "wires the parser, calls into helper functions, and returns an int "
+        "exit code. Guard with `if __name__ == \"__main__\": sys.exit(main())`. "
+        "Pin runtime deps in requirements.txt with `>=` only, no upper bounds."
+    ),
+    "fastapi": (
+        "Idiom: FastAPI 0.110+. Import `FastAPI` from fastapi. Define request/"
+        "response models with pydantic v2 (`BaseModel`, `Field`). The /health "
+        "route returns `{\"status\": \"ok\"}` with status_code=200. Tests use "
+        "fastapi.testclient.TestClient. Run with `uvicorn src.main:app "
+        "--reload`. requirements.txt pins fastapi, uvicorn[standard], pydantic."
+    ),
+    "flask": (
+        "Idiom: Flask 3+. `from flask import Flask, render_template`. The "
+        "app object is `app = Flask(__name__)`. Routes return either "
+        "render_template('index.html') for HTML or a JSON dict (Flask "
+        "auto-serializes). Static files live in static/, templates in "
+        "templates/. requirements.txt pins flask."
+    ),
+    "node_cli": (
+        "Idiom: Node 20+, no TypeScript build step. Use `process.argv` "
+        "directly or commander if more than two args. package.json sets "
+        "\"type\": \"module\" and \"bin\": {\"<name>\": \"./index.js\"}. "
+        "Add a `start` script. Shebang on index.js: `#!/usr/bin/env node`."
+    ),
+    "react_vite": (
+        "Idiom: Vite 5+ with React 18+. Use functional components and "
+        "hooks — no class components. main.jsx imports React from 'react' "
+        "and ReactDOM from 'react-dom/client', then `createRoot(...).render"
+        "(<App />)`. vite.config.js uses `defineConfig({ plugins: "
+        "[react()] })` with `@vitejs/plugin-react`."
+    ),
+    "next": (
+        "Idiom: Next 14+ with the App Router (app/ directory). NEVER use "
+        "pages/. Default export functional components from app/*.tsx. "
+        "app/layout.tsx exports a default RootLayout with `children`. "
+        "app/page.tsx is the index route. metadata is exported from "
+        "layout. tsconfig.json sets `strict: true` and "
+        "`moduleResolution: \"bundler\"`."
+    ),
+}
+
+
+def hint_for_stack(stack: Optional[str]) -> str:
+    """Return the per-stack idiom hint, or empty string when none."""
+    if not stack:
+        return ""
+    return STACK_BUILD_HINTS.get(stack, "")

@@ -110,3 +110,53 @@ def test_every_template_purpose_is_nonempty():
         for rel, purpose in plan:
             assert purpose.strip(), f"empty purpose for {key} → {rel}"
             assert len(purpose) < 200, f"purpose too long for {key} → {rel}"
+
+
+# ─── hint_for_stack ────────────────────────────────────────────────────
+
+
+def test_hint_for_unknown_or_none_returns_empty_string():
+    """No hint = empty string (not None) so callers can blindly concat."""
+    from skyn3t.agents.stack_templates import hint_for_stack
+    assert hint_for_stack(None) == ""
+    assert hint_for_stack("") == ""
+    assert hint_for_stack("definitely-not-a-stack") == ""
+
+
+@pytest.mark.parametrize("stack", sorted(STACK_TEMPLATES.keys()))
+def test_every_template_has_a_build_hint(stack):
+    """Every stack with a file template should also have an idiom hint so
+    Phase 2 is consistent across stacks."""
+    from skyn3t.agents.stack_templates import hint_for_stack
+    hint = hint_for_stack(stack)
+    assert hint, f"stack {stack} has a template but no build hint"
+    # Reasonable length — short enough to fit in the system prompt budget.
+    assert 60 <= len(hint) <= 700, f"hint length out of range for {stack}: {len(hint)}"
+
+
+@pytest.mark.parametrize("stack,must_mention", [
+    ("next", ("App Router", "app/")),
+    ("react_vite", ("Vite", "createRoot")),
+    ("fastapi", ("FastAPI", "pydantic")),
+    ("flask", ("Flask",)),
+    ("node_cli", ("Node", "process.argv")),
+    ("python_cli", ("argparse",)),
+    ("static_site", ("HTML", "defer")),
+])
+def test_hint_for_stack_carries_the_idiom_anchor(stack, must_mention):
+    """Each hint must mention the framework's modern-idiom anchor so the
+    model doesn't default to outdated shapes (Next pages/, React classes,
+    etc.)."""
+    from skyn3t.agents.stack_templates import hint_for_stack
+    hint = hint_for_stack(stack)
+    missing = [phrase for phrase in must_mention if phrase not in hint]
+    assert not missing, f"{stack} hint missing: {missing}"
+
+
+def test_next_hint_explicitly_rejects_pages_router():
+    """The single most common Next.js scaffold failure is the model
+    defaulting to pages/ instead of app/. Pin this case down."""
+    from skyn3t.agents.stack_templates import hint_for_stack
+    hint = hint_for_stack("next")
+    # Some form of "don't use pages/" must be present.
+    assert "NEVER use" in hint and "pages/" in hint
