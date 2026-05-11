@@ -66,7 +66,10 @@ class LLMRequest:
 
 # Subprocess timeouts (seconds)
 _AVAILABLE_TIMEOUT = 3.0
-_COMPLETE_TIMEOUT = 120.0
+# 120s used to time out research with multi-product integration specs and
+# code-gen with multi-file prompts. 300s gives subscription-backed CLIs
+# (claude/copilot/kimi) headroom for long thinking + large emissions.
+_COMPLETE_TIMEOUT = 300.0
 
 
 class LLMClient:

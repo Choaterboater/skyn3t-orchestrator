@@ -176,7 +176,25 @@ class ResearchAgent(BaseAgent):
                     "an endpoint for sure, say so explicitly rather than "
                     "inventing one."
                 )
-                out = await client.complete(prompt, max_tokens=4000, temperature=0.2)
+                out = ""
+                try:
+                    out = await client.complete(prompt, max_tokens=4000, temperature=0.2)
+                except Exception as e:
+                    logger.warning(f"research primary backend failed: {e}; retrying on fallback")
+                    out = ""
+                # Cross-model retry: if the configured backend timed out or
+                # returned empty, ask LLMClient to try a different backend.
+                # Integration specs are the highest-value research output —
+                # losing them to a single timeout is wasteful.
+                if not out or "[deterministic-stub]" in out:
+                    try:
+                        out = await client.complete(
+                            prompt, max_tokens=4000, temperature=0.2,
+                            skip_backends=[self.config.get("backend") or ""],
+                        )
+                    except Exception as e:
+                        logger.warning(f"research fallback backend also failed: {e}")
+                        out = ""
             else:
                 prompt = (
                     f"Research brief:\n{query}\n\n"
