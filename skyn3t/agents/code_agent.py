@@ -177,12 +177,53 @@ class CodeAgent(BaseAgent):
 
             if template_plan:
                 # Skip LLM planning entirely — use the known-good shape.
-                await self.think(f"using stack template '{template_key}'")
                 stack = template_key
+                # Outer-loop self-learning: consult the build-pattern
+                # scoreboard for the chosen stack. If a different shape
+                # has accumulated a meaningfully better success rate
+                # than the default template (≥3 samples, ≥75% wins, and
+                # at least 10 percentage points above the template's own
+                # success rate when known), prefer it. Otherwise stick
+                # with the default. Wrapped so a missing/empty store
+                # never blocks scaffolding.
                 file_specs = [
                     {"path": rel, "purpose": purpose}
                     for rel, purpose in template_plan
                 ]
+                try:
+                    from skyn3t.intelligence.build_patterns import get_default_scoreboard
+                    sb = get_default_scoreboard()
+                    best = sb.best_shape(stack, min_samples=3)
+                    if best and best.success_rate >= 0.75 and best.shape:
+                        # Default-template shape, for comparison:
+                        default_shape = sorted(rel for rel, _ in template_plan)
+                        # Find the default's own stats (if any) so we
+                        # don't switch on a tie.
+                        default_rate = 0.0
+                        for s in sb.all_stats_for(stack):
+                            if sorted(s.shape) == default_shape:
+                                default_rate = s.success_rate
+                                break
+                        if best.success_rate - default_rate >= 0.10:
+                            # Use the learned shape. Purpose strings
+                            # don't carry through the scoreboard, so we
+                            # use a short generic one — the per-file
+                            # prompt has the brief + stack hint already.
+                            file_specs = [
+                                {"path": rel, "purpose": "(learned: high-success shape)"}
+                                for rel in best.shape
+                            ]
+                            await self.think(
+                                f"using learned shape for '{template_key}' "
+                                f"(success {best.success_rate:.0%} vs default {default_rate:.0%})"
+                            )
+                        else:
+                            await self.think(f"using stack template '{template_key}'")
+                    else:
+                        await self.think(f"using stack template '{template_key}'")
+                except Exception:
+                    logger.debug("build-pattern bias lookup failed", exc_info=True)
+                    await self.think(f"using stack template '{template_key}'")
             else:
                 plan_system = (
                     "You are a senior engineer planning a small, runnable project. "
