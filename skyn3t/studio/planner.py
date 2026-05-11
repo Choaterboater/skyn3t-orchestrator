@@ -128,6 +128,14 @@ async def plan_pipeline(*, brief: str, llm_client=None) -> List[PlannedStage]:
     if not chosen_agents:
         chosen_agents, expected_artifacts, rationales = _heuristic_plan(brief)
 
+    # Safety net: even if the LLM planner ignored the integration cue,
+    # post-process the plan to add ResearchAgent for briefs that name
+    # third-party APIs/services the code must talk to. Without research,
+    # CodeAgent will fabricate fake demo data for those integrations.
+    chosen_agents, expected_artifacts, rationales = _ensure_research_for_integrations(
+        brief, chosen_agents, expected_artifacts, rationales,
+    )
+
     chosen_agents, expected_artifacts, rationales = _ensure_code_stage(
         brief,
         chosen_agents,
@@ -325,6 +333,14 @@ async def _llm_plan(brief: str, llm_client) -> tuple[List[str], List[str], Dict[
         "marketing, copy, or strategy work with no code, omit code agents entirely. "
         "Only include DesignerAgent when the brief explicitly asks for UI, UX, brand, "
         "landing page, or visual direction. "
+        "**ALWAYS include ResearchAgent** when the brief names third-party "
+        "products, services, APIs, or devices the program must talk to "
+        "(examples: sonarr, radarr, sonos, emby, plex, docker, home assistant, "
+        "unifi, stripe, twilio, github api, slack api, spotify api, REST API, "
+        "GraphQL endpoint, 'integrate with X', 'pull from Y'). For these "
+        "briefs CodeAgent CANNOT write real integrations without API specs "
+        "from ResearchAgent. Place ResearchAgent BEFORE ArchitectAgent so "
+        "the architecture decisions can be informed by the API surface. "
         "Reply ONLY with valid JSON of the form: "
         '{"agents": ["AgentA", "AgentB"], "expected_artifacts": ["a.md", "b.md"], '
         '"rationale": {"AgentA": "why...", "AgentB": "why..."}}'
@@ -436,6 +452,63 @@ def _insert_expected_artifact(expected_artifacts: List[str], artifact: str) -> N
         len(expected_artifacts),
     )
     expected_artifacts.insert(insert_at, artifact)
+
+
+_INTEGRATION_TARGETS = (
+    "emby", "jellyfin", "plex", "sonarr", "radarr", "lidarr", "readarr",
+    "prowlarr", "qbittorrent", "transmission", "deluge", "sabnzbd",
+    "nzbget", "overseerr", "tautulli",
+    "sonos", "home assistant", "homeassistant", "hassio", "philips hue",
+    "lifx", "nest", "ecobee", "smartthings", "ifttt",
+    "unifi", "ubiquiti", "mikrotik", "openwrt", "pfsense", "opnsense",
+    "tailscale", "wireguard",
+    "docker socket", "docker api", "portainer", "kubernetes api",
+    "k8s api", "proxmox", "truenas", "unraid",
+    "stripe api", "twilio api", "sendgrid api", "github api",
+    "slack api", "discord api", "spotify api", "openweather",
+    "rest api", "graphql endpoint", "third-party api", "webhook from",
+    "integrate with", "pull from", "talk to the", "query the",
+)
+
+
+def _ensure_research_for_integrations(
+    brief: str,
+    chosen_agents: List[str],
+    expected_artifacts: List[str],
+    rationales: Dict[str, str],
+) -> tuple[List[str], List[str], Dict[str, str]]:
+    """Post-process safety net for integration-heavy briefs.
+
+    If the LLM planner skipped ResearchAgent but the brief names third-
+    party services the code must talk to, inject ResearchAgent BEFORE
+    ArchitectAgent (or BrainstormAgent if no architect). Without API
+    specs from research, CodeAgent fabricates demo data instead of
+    real integrations.
+    """
+    if "ResearchAgent" in chosen_agents:
+        return chosen_agents, expected_artifacts, rationales
+    b = (brief or "").lower()
+    if not any(t in b for t in _INTEGRATION_TARGETS):
+        return chosen_agents, expected_artifacts, rationales
+    # Find the right spot: before architect if present, else before brainstorm,
+    # else at the start.
+    insert_at = 0
+    for anchor in ("ArchitectAgent", "BrainstormAgent"):
+        if anchor in chosen_agents:
+            insert_at = chosen_agents.index(anchor) + (0 if anchor == "ArchitectAgent" else 1)
+            break
+    chosen_agents.insert(insert_at, "ResearchAgent")
+    # Mirror the insertion into expected_artifacts so positions line up.
+    if insert_at < len(expected_artifacts):
+        expected_artifacts.insert(insert_at, "research.md")
+    else:
+        expected_artifacts.append("research.md")
+    rationales.setdefault(
+        "ResearchAgent",
+        "brief names third-party APIs/services; injected by safety net to "
+        "produce integration specs CodeAgent needs",
+    )
+    return chosen_agents, expected_artifacts, rationales
 
 
 def _ensure_code_stage(
