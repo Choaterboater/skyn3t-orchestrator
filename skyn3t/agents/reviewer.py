@@ -249,12 +249,13 @@ class ReviewerAgent(BaseAgent):
         if not contents:
             return None, None
 
-        # Build a compact "Files" block. We cap each artifact (1500 chars) AND
-        # the total combined size (TOTAL_BUDGET) so a project with many files
-        # can't blow the model's context window. When over budget, every
-        # artifact is fairly downsized rather than dropping the tail.
-        TOTAL_BUDGET = 30000  # chars across all artifacts in the prompt
-        PER_FILE_CAP = 1500
+        # Build a "Files" block. Caps used to be 1500/30000 — that
+        # truncated App.jsx (37KB) to its first 1500 chars and the LLM
+        # confabulated the rest, producing a review of files it never
+        # actually saw. Subscription-backed CLIs (kimi/claude/copilot)
+        # have plenty of context budget for full artifacts now.
+        TOTAL_BUDGET = 100000  # ~25K tokens of artifact text
+        PER_FILE_CAP = 12000   # full App.jsx fits in one piece
         items = list(contents.items())
         # Initial per-file truncation.
         snippets: List[Tuple[str, str]] = []
@@ -299,7 +300,7 @@ class ReviewerAgent(BaseAgent):
             role_prompt=role,
             brief=brief or "(no brief provided)",
             fallback="",  # Empty fallback - we handle missing LLM separately.
-            max_tokens=4000,
+            max_tokens=8000,
         )
         if not out:
             return None, None
