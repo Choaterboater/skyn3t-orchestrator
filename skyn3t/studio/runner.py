@@ -1362,6 +1362,12 @@ class StudioRunner:
         "reviewer",       # is itself the critique step
         "verifier",       # mechanical pass/fail
         "build_verifier", # mechanical pass/fail
+        # Code is skipped because a revision re-runs the ENTIRE per-file
+        # scaffold loop — 5-6 min × 7 files = ~40 min per revision.
+        # BuildVerifier + Reviewer already grade the scaffold. Re-enable
+        # this once CodeAgent supports per-file revision instead of
+        # full re-scaffold.
+        "code",
     }
 
     async def _critique_and_revise(
