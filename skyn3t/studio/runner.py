@@ -829,6 +829,19 @@ class StudioRunner:
                                         status="running",
                                         message=f"In-place fix round {attempt} cleared the build.",
                                     )
+                                    # Persist the fix as a learned skill —
+                                    # "this kind of build failure was solved
+                                    # this way." Next time the same stack
+                                    # sees a similar error tail, the skill
+                                    # is already in the system prompt.
+                                    try:
+                                        self._persist_fix_as_skill(
+                                            stack=(build_result or {}).get("stack") or "unknown",
+                                            fix_round=attempt,
+                                            prior_summary=manifest.get("build_verification", {}).get("summary"),
+                                        )
+                                    except Exception:
+                                        logger.exception("persist fix-as-skill failed")
                                     break
                             # Still failing after the fix loop → mark failed
                             # so PR #2's auto-retry can take a different shape.
@@ -1138,6 +1151,64 @@ class StudioRunner:
                 logger.exception("could not write fix to %s", target)
                 continue
         return wrote_any
+
+    def _persist_fix_as_skill(
+        self,
+        *,
+        stack: str,
+        fix_round: int,
+        prior_summary: Optional[str] = None,
+    ) -> None:
+        """Write a learned skill for a successful in-place fix.
+
+        The skill is keyed by (stack, fix-round) so two stacks with
+        independent fix patterns don't collide. Body captures the prior
+        verifier summary as the "this is the failure mode" anchor and
+        notes that the fix loop resolved it in round N. The next time
+        CodeAgent scaffolds for the same stack, this skill ends up in
+        the system prompt and biases the model toward producing the
+        already-fixed shape on the first try.
+        """
+        try:
+            from skyn3t.intelligence.skill_library import Skill, get_default_library
+        except Exception:
+            return
+        if not stack or stack == "unknown":
+            return
+        name = f"{stack}-fix-loop-round-{fix_round}"
+        body_lines = [
+            f"# Build fix learned for `{stack}`.",
+            "",
+            f"The in-place fix loop resolved a build failure on round {fix_round}.",
+            "",
+        ]
+        if prior_summary:
+            body_lines.extend([
+                "## Original failure",
+                "",
+                prior_summary.strip()[:1000],
+                "",
+            ])
+        body_lines.extend([
+            "## Action",
+            "",
+            "When generating files for this stack, watch for the failure shape "
+            "above and pre-emptively apply the patch the fix round produced. "
+            "Re-using this skill should reduce the number of fix rounds the "
+            "next similar build needs.",
+        ])
+        skill = Skill(
+            name=name,
+            tags=[stack, "fix-loop", "build-success"],
+            success_count=1,
+            failure_count=0,
+            source="runner:in_place_fix_loop",
+            body="\n".join(body_lines),
+        )
+        try:
+            get_default_library().upsert(skill)
+        except Exception:
+            logger.exception("skill upsert failed for fix-loop skill %s", name)
 
     async def _run_build_verifier(self, scaffold_dir: str, brief: str) -> Optional[Dict[str, Any]]:
         """Invoke BuildVerifierAgent in-process and return its output dict.
