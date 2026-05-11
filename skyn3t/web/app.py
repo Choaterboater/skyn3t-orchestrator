@@ -29,7 +29,7 @@ from skyn3t.core.agent import BaseAgent
 from skyn3t.core.events import Event, EventBus, EventType
 from skyn3t.core.models import init_db
 from skyn3t.core.orchestrator import Orchestrator
-from skyn3t.integrations import github_webhook_router
+from skyn3t.integrations import github_webhook_router, telegram_webhook_router
 from skyn3t.observability.health import get_health_registry
 from skyn3t.observability.metrics import generate_metrics
 from skyn3t.observability.tracing import get_tracer
@@ -395,6 +395,7 @@ app = FastAPI(
 
 # Include webhook routers
 app.include_router(github_webhook_router)
+app.include_router(telegram_webhook_router)
 
 # CORS
 settings = get_settings()
