@@ -317,6 +317,18 @@ class DesignerAgent(BaseAgent):
                 f"{cot_preamble}{role_prompt}\n\nBrief from user:\n{brief}\n\n"
                 "Produce ONLY the markdown (or JSON if asked) - no code fences, no preamble."
             )
+            # Inject learned design skills (palette recipes, density
+            # patterns, etc.) so the agent builds on accumulated wisdom
+            # instead of re-deriving every time.
+            try:
+                skills_block = self.load_skills_for_prompt(
+                    tags=["designer", "palette", "dashboard", "ui-pattern", "dark-mode"],
+                    limit=3,
+                )
+                if skills_block:
+                    prompt = prompt + skills_block
+            except Exception:
+                pass
             # For brand artifacts, prepend few-shot examples from prior projects.
             if kind == "brand":
                 try:

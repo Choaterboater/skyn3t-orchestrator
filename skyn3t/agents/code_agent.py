@@ -427,21 +427,37 @@ class CodeAgent(BaseAgent):
             # "system recorded what worked" to "system uses what worked."
             try:
                 from skyn3t.intelligence.skill_library import get_default_library
+                lib = get_default_library()
+                # Query multiple tags: stack-specific shape skills,
+                # role-specific skills (code_agent), and topic skills
+                # (polling, websocket, etc.). Dedupe by skill name.
+                seen: set[str] = set()
                 skill_lines: List[str] = []
-                for s in get_default_library().find(tag=stack, min_score=0.0, limit=3):
-                    snippet = (s.body or "").strip()
-                    if not snippet:
+                topic_tags = ["code_agent", stack, "react", "polling",
+                              "websocket", "integration", "ux"]
+                for tag in topic_tags:
+                    if not tag:
                         continue
-                    # Keep each skill compact — we don't want the system
-                    # prompt to balloon. 1200 chars per skill is enough
-                    # for a useful pattern + a short example.
-                    if len(snippet) > 1200:
-                        snippet = snippet[:1200] + "\n…[truncated]"
-                    skill_lines.append(f"### Skill: {s.name}\n{snippet}")
+                    for s in lib.find(tag=tag, min_score=0.0, limit=3):
+                        if s.name in seen:
+                            continue
+                        seen.add(s.name)
+                        snippet = (s.body or "").strip()
+                        if not snippet:
+                            continue
+                        # Keep each skill compact — system prompt budget
+                        # is finite. 1200 chars covers pattern + example.
+                        if len(snippet) > 1200:
+                            snippet = snippet[:1200] + "\n…[truncated]"
+                        skill_lines.append(f"### Skill: {s.name}\n{snippet}")
+                        if len(skill_lines) >= 5:
+                            break
+                    if len(skill_lines) >= 5:
+                        break
                 if skill_lines:
                     build_system = (
                         build_system
-                        + "\n\nLearned skills for this stack — apply when relevant:\n\n"
+                        + "\n\nLearned skills — apply when relevant:\n\n"
                         + "\n\n".join(skill_lines)
                     )
             except Exception:
