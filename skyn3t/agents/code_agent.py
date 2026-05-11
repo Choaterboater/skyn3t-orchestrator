@@ -520,17 +520,24 @@ class CodeAgent(BaseAgent):
                 except Exception:
                     body = ""
 
-                # If the call returned nothing or a stub, retry once with
-                # cross-model fallback. Silent skip used to drop the file
-                # and break imports elsewhere (e.g. main.jsx imports
-                # ./App.jsx but App.jsx never gets written).
+                # If the call returned nothing or a stub, retry on a
+                # different backend. skip_backends is a CONSTRUCTOR arg
+                # on LLMClient, not a per-call kwarg — the prior version
+                # passed it inline and raised TypeError silently. Build
+                # a fresh client for the retry.
                 if not body or "[deterministic-stub]" in body:
+                    primary = self.config.get("backend") or ""
                     try:
                         await self.think(f"retry {rel} on fallback backend")
-                        body = await client.complete(
+                        from skyn3t.adapters import LLMClient as _LLMClient
+                        retry_client = _LLMClient(
+                            default_model=None,
+                            backend=None,  # "auto" picks next available
+                            skip_backends=[primary] if primary else [],
+                        )
+                        body = await retry_client.complete(
                             file_prompt, system=build_system,
                             max_tokens=8000, temperature=0.3,
-                            skip_backends=[self.config.get("backend") or ""],
                         )
                     except Exception:
                         body = ""
