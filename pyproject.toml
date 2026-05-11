@@ -85,6 +85,9 @@ smoke = [
 
 [project.scripts]
 skyn3t = "skyn3t.cli.main:app"
+# Agent Client Protocol entry point — IDE registry manifests point at
+# this so Zed/JetBrains can spawn us as an ACP subprocess.
+skyn3t-acp = "skyn3t.integrations.acp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
