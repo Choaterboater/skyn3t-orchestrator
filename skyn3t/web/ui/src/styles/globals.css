@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Match the atelier display class the existing dashboard uses, so
+   shared headings render the same. */
+.display {
+  font-family: var(--font-display, "Instrument Serif", Georgia, serif);
+  font-style: italic;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  line-height: 1.05;
+}
+
+/* Atelier background: warm bloom + dot grain on a graphite base.
+   Same recipe used in dashboard.html so the SPA and the legacy
+   dashboard look like the same product. */
+.bg-atelier {
+  position: relative;
+  background-color: #0f0e0c;
+}
+.bg-atelier::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 1200px 800px at 10% -10%,
+      rgba(201, 169, 110, 0.10), transparent 60%),
+    radial-gradient(ellipse 900px 700px at 100% 110%,
+      rgba(58, 38, 28, 0.55), transparent 70%);
+  pointer-events: none;
+  z-index: 0;
+}
+.bg-atelier::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background-image:
+    radial-gradient(circle at 1px 1px, rgba(201, 169, 110, 0.04) 1px, transparent 0);
+  background-size: 22px 22px;
+  opacity: 0.5;
+  mix-blend-mode: overlay;
+  pointer-events: none;
+  z-index: 0;
+}
