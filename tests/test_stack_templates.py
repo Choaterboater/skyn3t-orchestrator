@@ -160,3 +160,56 @@ def test_next_hint_explicitly_rejects_pages_router():
     hint = hint_for_stack("next")
     # Some form of "don't use pages/" must be present.
     assert "NEVER use" in hint and "pages/" in hint
+
+
+# ─── readme_for_stack ──────────────────────────────────────────────────
+
+
+def test_readme_unknown_returns_none():
+    from skyn3t.agents.stack_templates import readme_for_stack
+    assert readme_for_stack(None, "anything") is None
+    assert readme_for_stack("", "anything") is None
+    assert readme_for_stack("definitely-not-a-stack", "anything") is None
+
+
+@pytest.mark.parametrize("stack", sorted(STACK_TEMPLATES.keys()))
+def test_every_template_has_a_readme_generator(stack):
+    """Every stack with a file template should have a deterministic
+    README generator so CodeAgent never burns an LLM call on boilerplate."""
+    from skyn3t.agents.stack_templates import readme_for_stack
+    body = readme_for_stack(stack, "Smoke project")
+    assert body is not None, f"stack {stack} has a template but no README generator"
+    assert body.strip(), f"empty README body for {stack}"
+
+
+@pytest.mark.parametrize("stack,must_mention", [
+    ("static_site", ("index.html", "browser", "defer")),
+    ("python_cli", ("pip install", "python main.py")),
+    ("fastapi", ("uvicorn", "/health", "pytest")),
+    ("flask", ("flask --app app run",)),
+    ("node_cli", ("npm install", "node index.js")),
+    ("react_vite", ("npm run dev", "5173")),
+    ("next", ("npm run dev", "3000")),
+])
+def test_readme_carries_run_instructions_for_stack(stack, must_mention):
+    """Each README must tell the receiver how to ACTUALLY RUN the project."""
+    from skyn3t.agents.stack_templates import readme_for_stack
+    body = readme_for_stack(stack, "A small project")
+    missing = [phrase for phrase in must_mention if phrase not in body]
+    assert not missing, f"{stack} README missing: {missing}"
+
+
+def test_readme_interpolates_brief():
+    """The brief becomes the project description so users see what they
+    asked for in the README."""
+    from skyn3t.agents.stack_templates import readme_for_stack
+    body = readme_for_stack("python_cli", "A tool that pings URLs and reports latency")
+    assert "tool that pings URLs" in body
+
+
+def test_readme_handles_empty_brief():
+    """An empty brief shouldn't crash — just leaves the description blank."""
+    from skyn3t.agents.stack_templates import readme_for_stack
+    body = readme_for_stack("static_site", "")
+    assert body is not None
+    assert "## Run" in body  # structure intact
