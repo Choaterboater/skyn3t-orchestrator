@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from skyn3t.core.event_context import current_event_context, current_event_correlation_id
 from skyn3t.security.secrets import redact_text
@@ -95,9 +95,14 @@ class LLMClient:
                  openrouter_api_key: Optional[str] = None,
                  event_bus: Optional[Any] = None,
                  caller_name: Optional[str] = None,
-                 rag: Optional[Any] = None):
+                 rag: Optional[Any] = None,
+                 skip_backends: Optional[List[str]] = None):
         self.default_model = default_model or os.environ.get("SKYN3T_LLM_MODEL")
         self._backend_name = (backend or os.environ.get("SKYN3T_LLM_BACKEND") or "auto").lower()
+        # Cross-model debate: callers can list backends to skip (e.g. the
+        # retry path passes the backend the prior attempt used). The auto
+        # chain then naturally falls through to a different model.
+        self._skip_backends: set = set(skip_backends or [])
         self._anthropic_key = anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY")
         self._openrouter_key = openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")
         self._impl = None  # lazy
@@ -212,7 +217,16 @@ class LLMClient:
         return {"backend": self._backend_name, "default_model": self.default_model}
 
     async def _try_cli(self, name: str, cls) -> bool:
-        """Instantiate `cls` and check availability; cache and return True on success."""
+        """Instantiate `cls` and check availability; cache and return True on success.
+
+        Honors the per-instance ``_skip_backends`` set so a caller (e.g. the
+        runner's retry path) can route around a backend that just failed —
+        the cross-model debate pattern. The skip list is consulted BEFORE
+        the subprocess probe so we don't pay startup cost on a backend we're
+        going to discard anyway.
+        """
+        if name in getattr(self, "_skip_backends", ()):
+            return False
         try:
             backend = cls()
             if await backend.available():
