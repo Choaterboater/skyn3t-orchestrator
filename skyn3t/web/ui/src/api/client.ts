@@ -87,6 +87,23 @@ export type Skill = {
   source: string;
 };
 
+export type Proposal = {
+  id: string;
+  kind: string;
+  title: string;
+  summary: string;
+  detail: string;
+  payload?: Record<string, any>;
+  source?: string;
+  status: string;
+  created_at: number;
+  decided_at?: number | null;
+  applied_at?: number | null;
+  error?: string | null;
+  requires_approval?: boolean;
+  origin?: string;
+};
+
 export type BuildPatternStats = {
   stack: string;
   shape: string[];
@@ -165,6 +182,30 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
+  proposals: (filter?: { status?: string; origin?: string }) => {
+    const qs = new URLSearchParams();
+    if (filter?.status) qs.set("status", filter.status);
+    if (filter?.origin) qs.set("origin", filter.origin);
+    const q = qs.toString();
+    return fetchJson<{ proposals: Proposal[] }>(
+      `/api/proposals${q ? `?${q}` : ""}`,
+    ).then((d) => d.proposals ?? []);
+  },
+  approveProposal: (id: string) =>
+    fetchJson<{ ok?: boolean; error?: string }>(
+      `/api/proposals/${encodeURIComponent(id)}/approve`,
+      { method: "POST", body: "{}" },
+    ),
+  rejectProposal: (id: string, reason?: string) =>
+    fetchJson<{ ok?: boolean; error?: string }>(
+      `/api/proposals/${encodeURIComponent(id)}/reject`,
+      { method: "POST", body: JSON.stringify({ reason: reason ?? "" }) },
+    ),
+  fileFeatureIdea: (idea: string) =>
+    fetchJson<{ ok?: boolean; proposal_id?: string; error?: string }>(
+      "/api/proposals/feature",
+      { method: "POST", body: JSON.stringify({ idea }) },
+    ),
   skills: (tag?: string) => {
     const q = tag ? `?tag=${encodeURIComponent(tag)}` : "";
     return fetchJson<{ summary?: any; top?: Skill[]; skills?: Skill[] }>(
