@@ -505,6 +505,55 @@ class BaseAgent(ABC):
         scratch.mkdir(parents=True, exist_ok=True)
         return scratch
 
+    def load_skills_for_prompt(
+        self,
+        *,
+        tags: List[str],
+        limit: int = 4,
+        max_chars_per_skill: int = 1200,
+    ) -> str:
+        """Return a system-prompt-ready block of learned skills for the
+        agent. Pulls top-scored skills matching any of ``tags``, dedup
+        by skill name, truncates each to ``max_chars_per_skill``.
+
+        Returns "" if no skills found or the library is unavailable —
+        callers should always be safe to append the result directly.
+        """
+        try:
+            from skyn3t.intelligence.skill_library import get_default_library
+            lib = get_default_library()
+        except Exception:
+            return ""
+        seen: set[str] = set()
+        lines: List[str] = []
+        for tag in tags:
+            if not tag:
+                continue
+            try:
+                hits = lib.find(tag=tag, min_score=0.0, limit=limit)
+            except Exception:
+                continue
+            for s in hits:
+                if s.name in seen:
+                    continue
+                seen.add(s.name)
+                body = (s.body or "").strip()
+                if not body:
+                    continue
+                if len(body) > max_chars_per_skill:
+                    body = body[:max_chars_per_skill] + "\n…[truncated]"
+                lines.append(f"### Skill: {s.name}\n{body}")
+                if len(lines) >= limit:
+                    break
+            if len(lines) >= limit:
+                break
+        if not lines:
+            return ""
+        return (
+            "\n\nLearned skills — apply when relevant:\n\n"
+            + "\n\n".join(lines)
+        )
+
     async def think(self, line: str) -> None:
         """Stream a "thinking" line to the dashboard."""
         self.event_bus.publish(

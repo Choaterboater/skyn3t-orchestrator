@@ -381,6 +381,15 @@ class WriterAgent(BaseAgent):
                 "Produce ONLY the markdown content for the artifact. "
                 "No code fences, no preamble, no commentary."
             )
+            try:
+                skills_block = self.load_skills_for_prompt(
+                    tags=["writer", "readme", "docs"],
+                    limit=2,
+                )
+                if skills_block:
+                    prompt = prompt + skills_block
+            except Exception:
+                pass
             out = await client.complete(prompt, max_tokens=2500, temperature=0.6)
             if out and "[deterministic-stub]" not in out and len(out.strip()) > 80:
                 return out.strip()

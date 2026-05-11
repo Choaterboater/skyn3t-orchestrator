@@ -223,6 +223,15 @@ class ReviewerAgent(BaseAgent):
                 f"{cot_preamble}{role_prompt}\n\nBrief from user:\n{brief}\n\n"
                 "Produce ONLY the markdown (or JSON if asked) - no code fences, no preamble."
             )
+            try:
+                skills_block = self.load_skills_for_prompt(
+                    tags=["reviewer", "critique", "quality"],
+                    limit=2,
+                )
+                if skills_block:
+                    prompt = prompt + skills_block
+            except Exception:
+                pass
             out = await client.complete(prompt, max_tokens=max_tokens, temperature=0.2)
             if out and "[deterministic-stub]" not in out and len(out.strip()) > 80:
                 return out.strip()
