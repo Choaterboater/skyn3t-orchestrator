@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
+import { HttpError } from "./api/client";
 import App from "./App";
 import "./styles/globals.css";
 
@@ -15,7 +16,19 @@ const queryClient = new QueryClient({
     queries: {
       staleTime: 5_000,
       refetchOnWindowFocus: true,
-      retry: 1,
+      // Don't retry 4xx (auth, not found, bad request) — they won't
+      // recover with another attempt. Do retry 5xx once: a transient
+      // backend restart often clears by then.
+      retry: (failureCount, error) => {
+        if (error instanceof HttpError) {
+          if (error.status >= 400 && error.status < 500) return false;
+        }
+        return failureCount < 1;
+      },
+      retryDelay: (attempt) => Math.min(15_000, 1000 * 2 ** attempt),
+    },
+    mutations: {
+      retry: false,
     },
   },
 });
