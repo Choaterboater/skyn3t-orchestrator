@@ -331,6 +331,99 @@ class MetaAgent:
                     },
                 )
 
+        # Rule D: build-pattern shape bias detected. When a particular
+        # scaffold shape has accumulated meaningfully better success
+        # data than another shape for the same stack, surface it as a
+        # Cortex proposal so the operator sees what the system has
+        # learned. Closes the feedback loop user-side.
+        self._check_build_pattern_biases()
+
+    def _check_build_pattern_biases(self) -> None:
+        """Scan BuildPatternScoreboard for clear shape biases per stack.
+
+        For each stack with at least one shape at ≥75% success (min 5
+        samples) AND another shape at ≤40% success (min 3 samples), file
+        a single proposal describing the contrast. Dedup signature is
+        per-stack so repeated runs don't spam the queue.
+        """
+        try:
+            from skyn3t.intelligence.build_patterns import get_default_scoreboard
+            sb = get_default_scoreboard()
+        except Exception:
+            return
+        try:
+            # The scoreboard's _stats is intentionally private; tap it
+            # under the lock to enumerate stacks.
+            with sb._lock:
+                stacks = list(sb._stats.keys())
+        except Exception:
+            return
+        for stack in stacks:
+            try:
+                all_stats = sb.all_stats_for(stack)
+            except Exception:
+                continue
+            if len(all_stats) < 2:
+                continue
+            winners = [
+                s for s in all_stats
+                if (s.success + s.failure) >= 5 and s.success_rate >= 0.75
+            ]
+            losers = [
+                s for s in all_stats
+                if (s.success + s.failure) >= 3 and s.success_rate <= 0.40
+            ]
+            if not winners or not losers:
+                continue
+            # Pick the best winner and the worst loser for the contrast.
+            winners.sort(key=lambda s: s.success_rate, reverse=True)
+            losers.sort(key=lambda s: s.success_rate)
+            best = winners[0]
+            worst = losers[0]
+            # Find files in winner that aren't in loser — those are the
+            # likely-load-bearing additions.
+            winner_set = set(best.shape)
+            loser_set = set(worst.shape)
+            distinguishing = sorted(winner_set - loser_set)
+            self._file_threshold_proposal(
+                signature=f"build_pattern_bias:{stack}",
+                title=f"Build pattern: prefer winning shape for {stack}",
+                summary=(
+                    f"On {stack} scaffolds, one shape is at "
+                    f"{best.success_rate:.0%} success ({best.success}/{best.success + best.failure}); "
+                    f"another is at {worst.success_rate:.0%} ({worst.success}/{worst.success + worst.failure}). "
+                    f"Adopt the winning shape as the template default."
+                ),
+                detail=(
+                    f"_MetaAgent build-pattern scan._\n\n"
+                    f"**Winning shape ({best.success_rate:.0%} success "
+                    f"on {best.success + best.failure} graded builds):**\n"
+                    + "\n".join(f"- `{p}`" for p in best.shape)
+                    + (
+                        f"\n\n**Losing shape ({worst.success_rate:.0%} success "
+                        f"on {worst.success + worst.failure} graded builds):**\n"
+                    )
+                    + "\n".join(f"- `{p}`" for p in worst.shape)
+                    + (
+                        f"\n\n**Distinguishing files in the winner:**\n"
+                        if distinguishing
+                        else "\n\n_(no extra files in the winner — same paths, different content?)_"
+                    )
+                    + ("\n".join(f"- `{p}`" for p in distinguishing) if distinguishing else "")
+                ),
+                payload={
+                    "kind": "build_pattern_bias",
+                    "stack": stack,
+                    "winner_shape": list(best.shape),
+                    "winner_success_rate": best.success_rate,
+                    "winner_samples": best.success + best.failure,
+                    "loser_shape": list(worst.shape),
+                    "loser_success_rate": worst.success_rate,
+                    "loser_samples": worst.success + worst.failure,
+                    "distinguishing_files": distinguishing,
+                },
+            )
+
     def _file_threshold_proposal(
         self,
         *,
