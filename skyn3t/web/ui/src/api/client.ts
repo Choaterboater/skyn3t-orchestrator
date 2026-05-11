@@ -13,6 +13,8 @@ export type AgentRow = {
   name: string;
   agent_type?: string;
   provider?: string;
+  backend?: string | null;
+  model?: string | null;
   status?: string;
   queue_depth?: number;
   recent_errors?: number;
