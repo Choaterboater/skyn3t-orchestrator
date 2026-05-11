@@ -827,6 +827,334 @@ class MSTeamsChannel(MessagingChannel):
             logger.exception("MSTeams send failed")
 
 
+# ── Mattermost (incoming webhook + outgoing webhook) ─────────────────
+
+
+class MattermostChannel(MessagingChannel):
+    """Mattermost channel via the incoming/outgoing webhook pair.
+
+    Mattermost ships its own bot API but the dominant pattern (used by
+    Hermes' adapter) is:
+      - Inbound: Mattermost POSTs an outgoing webhook to our HTTPS
+        endpoint when a user message matches a trigger word or channel.
+      - Outbound: We POST to an incoming webhook URL the operator
+        creates in Mattermost.
+
+    The shape is intentionally Slack-compatible because Mattermost
+    originated as a Slack alternative.
+
+    Env config:
+      MATTERMOST_INCOMING_WEBHOOK_URL  — for outbound replies
+      MATTERMOST_USERNAME              — override sender display name
+    """
+
+    platform = "mattermost"
+
+    def __init__(
+        self,
+        event_bus: EventBus,
+        *,
+        incoming_webhook_url: Optional[str] = None,
+        username: Optional[str] = None,
+    ):
+        super().__init__(event_bus)
+        self.incoming_webhook_url = (
+            incoming_webhook_url or os.getenv("MATTERMOST_INCOMING_WEBHOOK_URL", "")
+        )
+        self.username = username or os.getenv("MATTERMOST_USERNAME", "skyn3t")
+        self._http: Any = None
+
+    async def handle_inbound(self, raw: Dict[str, Any]) -> Optional[InboundMessage]:
+        """Normalize the Mattermost outgoing-webhook form encoding.
+
+        Mattermost outgoing webhooks send application/x-www-form-urlencoded
+        with keys: token, team_id, team_domain, channel_id, channel_name,
+        timestamp, user_id, user_name, text, trigger_word.
+        """
+        text = (raw.get("text") or "").strip()
+        if not text:
+            return None
+        trigger = raw.get("trigger_word") or ""
+        if trigger and text.lower().startswith(trigger.lower()):
+            text = text[len(trigger):].strip()
+        if not text:
+            return None
+        return InboundMessage(
+            platform=self.platform,
+            channel=str(raw.get("channel_id") or ""),
+            sender=str(raw.get("user_id") or raw.get("user_name") or "unknown"),
+            text=text,
+            thread=str(raw.get("post_id") or "") or None,
+            raw=raw,
+        )
+
+    async def send(
+        self, channel: str, text: str, *, thread: Optional[str] = None
+    ) -> None:
+        if not self.incoming_webhook_url:
+            logger.warning("Mattermost send skipped: INCOMING_WEBHOOK_URL unset")
+            return
+        if not text:
+            return
+        if self._http is None:
+            try:
+                import httpx  # type: ignore
+                self._http = httpx.AsyncClient(timeout=15.0)
+            except Exception:
+                logger.exception("Mattermost send: httpx unavailable")
+                return
+        payload: Dict[str, Any] = {"text": text, "username": self.username}
+        if channel:
+            payload["channel"] = channel
+        try:
+            resp = await self._http.post(self.incoming_webhook_url, json=payload)
+            if resp.status_code >= 400:
+                logger.warning("Mattermost send %d: %s", resp.status_code, resp.text[:200])
+        except Exception:
+            logger.exception("Mattermost send failed")
+
+
+# ── Feishu / Lark (Tencent's bot API; same shape as WeCom/Weixin) ────
+
+
+class FeishuChannel(MessagingChannel):
+    """Feishu (Lark) custom-bot channel via the open.feishu.cn API.
+
+    The Tencent / Lark / WeCom family all share the "tenant_access_token
+    auth + JSON message_type=text" wire shape. This implementation
+    targets Feishu specifically; subclassing for WeCom / Weixin is a
+    one-line URL change.
+
+    Env config:
+      FEISHU_APP_ID         — open-platform app id
+      FEISHU_APP_SECRET     — app secret (used to mint tenant_access_token)
+    """
+
+    platform = "feishu"
+
+    def __init__(
+        self,
+        event_bus: EventBus,
+        *,
+        app_id: Optional[str] = None,
+        app_secret: Optional[str] = None,
+    ):
+        super().__init__(event_bus)
+        self.app_id = app_id or os.getenv("FEISHU_APP_ID", "")
+        self.app_secret = app_secret or os.getenv("FEISHU_APP_SECRET", "")
+        self._http: Any = None
+        self._token: Optional[str] = None
+        self._token_expires_at: float = 0.0
+
+    async def handle_inbound(self, raw: Dict[str, Any]) -> Optional[InboundMessage]:
+        """Normalize a Feishu event-subscription payload.
+
+        Shape (a message event under header.event_type='im.message.receive_v1'):
+            {
+              "schema": "2.0",
+              "header": {"event_type": "im.message.receive_v1", ...},
+              "event": {
+                "sender": {"sender_id": {"open_id": "ou_..."}},
+                "message": {
+                  "message_id": "om_...",
+                  "chat_id": "oc_...",
+                  "content": "{\"text\":\"hi\"}",
+                  "message_type": "text"
+                }
+              }
+            }
+        """
+        header = raw.get("header") or {}
+        if header.get("event_type") != "im.message.receive_v1":
+            return None
+        event = raw.get("event") or {}
+        message = event.get("message") or {}
+        if message.get("message_type") != "text":
+            return None
+        # Content is a JSON-encoded string. Decode it defensively.
+        import json as _json
+        try:
+            content = _json.loads(message.get("content") or "{}")
+        except Exception:
+            return None
+        text = (content.get("text") or "").strip()
+        if not text:
+            return None
+        sender = (event.get("sender") or {}).get("sender_id") or {}
+        return InboundMessage(
+            platform=self.platform,
+            channel=str(message.get("chat_id") or ""),
+            sender=str(sender.get("open_id") or sender.get("user_id") or "unknown"),
+            text=text,
+            thread=str(message.get("message_id") or "") or None,
+            raw=raw,
+        )
+
+    async def _get_token(self) -> Optional[str]:
+        """Cache the tenant_access_token; refresh ~60s before expiry."""
+        import time as _time
+        now = _time.time()
+        if self._token and now < self._token_expires_at - 60:
+            return self._token
+        if not self.app_id or not self.app_secret:
+            return None
+        if self._http is None:
+            try:
+                import httpx  # type: ignore
+                self._http = httpx.AsyncClient(timeout=15.0)
+            except Exception:
+                return None
+        url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+        try:
+            resp = await self._http.post(
+                url, json={"app_id": self.app_id, "app_secret": self.app_secret},
+            )
+            if resp.status_code >= 400:
+                logger.warning("Feishu token %d: %s", resp.status_code, resp.text[:200])
+                return None
+            data = resp.json() or {}
+            if data.get("code") != 0:
+                logger.warning("Feishu token error %s: %s", data.get("code"), data.get("msg"))
+                return None
+            self._token = data.get("tenant_access_token")
+            expires_in = int(data.get("expire") or 0)
+            self._token_expires_at = now + expires_in
+            return self._token
+        except Exception:
+            logger.exception("Feishu token fetch failed")
+            return None
+
+    async def send(
+        self, channel: str, text: str, *, thread: Optional[str] = None
+    ) -> None:
+        if not channel or not text:
+            return
+        token = await self._get_token()
+        if not token:
+            logger.warning("Feishu send skipped: no token")
+            return
+        import json as _json
+        url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
+        body = {
+            "receive_id": channel,
+            "msg_type": "text",
+            "content": _json.dumps({"text": text}),
+        }
+        headers = {"Authorization": f"Bearer {token}"}
+        try:
+            resp = await self._http.post(url, json=body, headers=headers)
+            if resp.status_code >= 400:
+                logger.warning("Feishu send %d: %s", resp.status_code, resp.text[:200])
+        except Exception:
+            logger.exception("Feishu send failed")
+
+
+# ── Generic HTTP webhook channel — fills the remaining long-tail ─────
+
+
+class GenericWebhookChannel(MessagingChannel):
+    """Catch-all channel for any "POST text in, POST text out" bridge.
+
+    Operators point this at a service that accepts inbound messages on
+    a known JSON-or-form shape and forwards replies via a webhook URL.
+    Used to wire up SMS gateways (Twilio webhook), Home Assistant
+    notifications, custom internal tools, or any platform we don't
+    have a dedicated subclass for yet.
+
+    Configuration is per-instance, not env-based, so multiple instances
+    can be registered for different bridges in one process.
+
+    Constructor:
+        platform_name      — what the InboundMessage.platform tag is
+        outbound_url       — where to POST replies
+        text_field         — key in inbound payload that carries the
+                             user text (default: "text")
+        channel_field      — key for the destination id (default:
+                             "channel")
+        sender_field       — key for the sender id (default: "sender")
+        outbound_template  — dict template for outbound POST body. Use
+                             "{text}" and "{channel}" placeholders;
+                             they're substituted at send time.
+        auth_header        — optional ("Authorization": "Bearer ...") dict
+    """
+
+    def __init__(
+        self,
+        event_bus: EventBus,
+        *,
+        platform_name: str,
+        outbound_url: str = "",
+        text_field: str = "text",
+        channel_field: str = "channel",
+        sender_field: str = "sender",
+        thread_field: str = "thread",
+        outbound_template: Optional[Dict[str, str]] = None,
+        auth_headers: Optional[Dict[str, str]] = None,
+    ):
+        super().__init__(event_bus)
+        self.platform = platform_name
+        self.outbound_url = outbound_url
+        self.text_field = text_field
+        self.channel_field = channel_field
+        self.sender_field = sender_field
+        self.thread_field = thread_field
+        self.outbound_template = outbound_template or {"channel": "{channel}", "text": "{text}"}
+        self.auth_headers = auth_headers or {}
+        self._http: Any = None
+
+    async def handle_inbound(self, raw: Dict[str, Any]) -> Optional[InboundMessage]:
+        text = str(raw.get(self.text_field) or "").strip()
+        if not text:
+            return None
+        return InboundMessage(
+            platform=self.platform,
+            channel=str(raw.get(self.channel_field) or ""),
+            sender=str(raw.get(self.sender_field) or "unknown"),
+            text=text,
+            thread=str(raw.get(self.thread_field) or "") or None,
+            raw=raw,
+        )
+
+    async def send(
+        self, channel: str, text: str, *, thread: Optional[str] = None
+    ) -> None:
+        if not self.outbound_url:
+            logger.warning("%s send skipped: outbound_url unset", self.platform)
+            return
+        if not text:
+            return
+        if self._http is None:
+            try:
+                import httpx  # type: ignore
+                self._http = httpx.AsyncClient(timeout=15.0)
+            except Exception:
+                logger.exception("%s send: httpx unavailable", self.platform)
+                return
+        # Interpolate the template — supports any nesting that comes in
+        # the template values as long as the strings carry placeholders.
+        rendered: Dict[str, Any] = {}
+        for k, v in self.outbound_template.items():
+            if isinstance(v, str):
+                rendered[k] = (
+                    v.replace("{text}", text)
+                    .replace("{channel}", channel)
+                    .replace("{thread}", thread or "")
+                )
+            else:
+                rendered[k] = v
+        try:
+            resp = await self._http.post(
+                self.outbound_url, json=rendered, headers=self.auth_headers,
+            )
+            if resp.status_code >= 400:
+                logger.warning(
+                    "%s send %d: %s",
+                    self.platform, resp.status_code, resp.text[:200],
+                )
+        except Exception:
+            logger.exception("%s send failed", self.platform)
+
+
 def _strip_case_insensitive(text: str, needle: str) -> str:
     """Remove every case-insensitive occurrence of ``needle`` from ``text``."""
     out: List[str] = []
