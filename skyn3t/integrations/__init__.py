@@ -5,9 +5,12 @@ from skyn3t.integrations.email_agent import EmailAgent
 from skyn3t.integrations.github_webhook import GitHubWebhookAgent
 from skyn3t.integrations.github_webhook import router as github_webhook_router
 from skyn3t.integrations.messaging import (
+    FeishuChannel,
+    GenericWebhookChannel,
     IMessageChannel,
     InboundMessage,
     MatrixChannel,
+    MattermostChannel,
     MessagingChannel,
     MessagingRouter,
     MSTeamsChannel,
@@ -23,10 +26,13 @@ __all__ = [
     "DiscordBot",
     "EmailAgent",
     "GitHubWebhookAgent",
+    "FeishuChannel",
+    "GenericWebhookChannel",
     "IMessageChannel",
     "InboundMessage",
     "MSTeamsChannel",
     "MatrixChannel",
+    "MattermostChannel",
     "MessagingChannel",
     "MessagingRouter",
     "SignalChannel",
