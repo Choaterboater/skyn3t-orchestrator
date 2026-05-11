@@ -15,18 +15,53 @@ export default function AgentsPage() {
     refetchInterval: 15_000,
   });
 
+  // Token rollup per agent — keeps a "how much has each one burned"
+  // column live. Falls back gracefully if the endpoint is unavailable
+  // (older backend without the tracker).
+  const usage = useQuery({
+    queryKey: ["usage_agents"],
+    queryFn: api.usagePerAgent,
+    refetchInterval: 10_000,
+    retry: false,
+  });
+  const totals = useQuery({
+    queryKey: ["usage_totals"],
+    queryFn: api.usageTotals,
+    refetchInterval: 10_000,
+    retry: false,
+  });
+  const usageByName = new Map(
+    (usage.data ?? []).map((u) => [u.agent, u]),
+  );
+
   const invalidate = () => qc.invalidateQueries({ queryKey: ["agents"] });
 
   return (
     <div className="space-y-6">
-      <header>
-        <h1 className="display text-4xl">
-          <span className="text-accent">Agents</span>
-        </h1>
-        <p className="text-text-secondary text-sm mt-1">
-          Every registered agent. Click a row to edit backend, model, prompt,
-          and limits.
-        </p>
+      <header className="flex items-baseline justify-between gap-4">
+        <div>
+          <h1 className="display text-4xl">
+            <span className="text-accent">Agents</span>
+          </h1>
+          <p className="text-text-secondary text-sm mt-1">
+            Every registered agent. Click a row to edit backend, model, prompt,
+            and limits.
+          </p>
+        </div>
+        {totals.data && (
+          <div className="text-right text-xs space-y-0.5">
+            <div className="text-text-secondary uppercase tracking-wider">
+              Total tokens (this session)
+            </div>
+            <div className="text-2xl font-mono text-accent">
+              {fmtTokens(totals.data.total_tokens ?? 0)}
+            </div>
+            <div className="text-text-dim font-mono">
+              {totals.data.total_calls ?? 0} LLM calls ·{" "}
+              {totals.data.agents_tracked ?? 0} agents
+            </div>
+          </div>
+        )}
       </header>
 
       {isLoading && <p className="text-text-secondary">Loading…</p>}
@@ -54,8 +89,9 @@ export default function AgentsPage() {
                   <Th>Type</Th>
                   <Th>Backend</Th>
                   <Th>Model</Th>
+                  <Th align="right">Tokens</Th>
+                  <Th align="right">Calls</Th>
                   <Th align="right">Status</Th>
-                  <Th align="right">Queue</Th>
                   <Th align="right">Errors</Th>
                   <Th align="right">Actions</Th>
                 </tr>
@@ -68,6 +104,7 @@ export default function AgentsPage() {
                     selected={editing === a.name}
                     onSelect={() => setEditing(a.name)}
                     onChanged={invalidate}
+                    usage={usageByName.get(a.name)}
                   />
                 ))}
               </tbody>
@@ -92,11 +129,13 @@ function AgentTableRow({
   selected,
   onSelect,
   onChanged,
+  usage,
 }: {
   a: AgentRow;
   selected: boolean;
   onSelect: () => void;
   onChanged: () => void;
+  usage?: { total_tokens: number; calls: number };
 }) {
   const enable = useMutation({
     mutationFn: () => api.enableAgent(a.name),
@@ -118,11 +157,14 @@ function AgentTableRow({
       <Td>{a.agent_type ?? "—"}</Td>
       <Td mono>{a.backend ?? "default"}</Td>
       <Td mono>{a.model ?? "default"}</Td>
-      <Td align="right">
-        <StatusPill status={a.status ?? "unknown"} />
+      <Td align="right" mono>
+        {usage ? fmtTokens(usage.total_tokens) : "—"}
       </Td>
       <Td align="right" mono>
-        {a.queue_depth ?? 0}
+        {usage ? usage.calls : "—"}
+      </Td>
+      <Td align="right">
+        <StatusPill status={a.status ?? "unknown"} />
       </Td>
       <Td align="right" mono>
         {a.recent_errors ?? 0}
@@ -575,4 +617,14 @@ function StatusPill({ status }: { status: string }) {
       {status}
     </span>
   );
+}
+
+// Token count → compact human format. 1234 → "1.2K", 1234567 → "1.2M".
+// Used in Agents table + Studio project list. Tokens are estimated
+// 4-chars-per-token from LLM_EXCHANGE event payloads.
+function fmtTokens(n: number): string {
+  if (!n || n < 0) return "0";
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}K`;
+  return `${(n / 1_000_000).toFixed(n < 10_000_000 ? 2 : 1)}M`;
 }
