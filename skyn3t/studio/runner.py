@@ -787,6 +787,51 @@ class StudioRunner:
                         if build_result is not None:
                             manifest["build_verification"] = build_result
                             verdict = build_result.get("verdict")
+                            # On failure: try a surgical in-place fix loop
+                            # BEFORE falling back to a full-pipeline retry.
+                            # This is the cheap path — only re-generates
+                            # broken files, keeps the rest of the scaffold.
+                            # Up to FIX_ATTEMPTS rounds; each round re-runs
+                            # BuildVerifier and either declares success or
+                            # collects a fresher failure hint.
+                            FIX_ATTEMPTS = 2
+                            attempt = 0
+                            while verdict == "no" and attempt < FIX_ATTEMPTS:
+                                attempt += 1
+                                try:
+                                    fixed = await self._apply_build_fix_round(
+                                        scaffold_dir, brief, build_result, attempt,
+                                    )
+                                except Exception:
+                                    logger.exception("fix round failed")
+                                    fixed = False
+                                if not fixed:
+                                    break
+                                # Re-verify after the fix attempt.
+                                try:
+                                    build_result = await self._run_build_verifier(
+                                        str(scaffold_dir), brief,
+                                    ) or build_result
+                                except Exception:
+                                    logger.exception("re-verify after fix failed")
+                                    break
+                                manifest["build_verification"] = build_result
+                                verdict = build_result.get("verdict")
+                                manifest.setdefault("build_fix_attempts", []).append({
+                                    "attempt": attempt,
+                                    "verdict": verdict,
+                                    "command": build_result.get("command"),
+                                })
+                                if verdict == "yes":
+                                    self._append_history(
+                                        manifest,
+                                        "BUILD_FIX_SUCCEEDED",
+                                        status="running",
+                                        message=f"In-place fix round {attempt} cleared the build.",
+                                    )
+                                    break
+                            # Still failing after the fix loop → mark failed
+                            # so PR #2's auto-retry can take a different shape.
                             if verdict == "no":
                                 manifest["status"] = "failed"
                                 manifest["error"] = (
@@ -968,6 +1013,113 @@ class StudioRunner:
             if suffix in cls._CODE_LIKE_EXTENSIONS:
                 return False
         return True
+
+    async def _apply_build_fix_round(
+        self,
+        scaffold_dir: Path,
+        brief: str,
+        build_result: Dict[str, Any],
+        attempt: int,
+    ) -> bool:
+        """Surgical fix: ask the LLM to rewrite ONLY the files that look
+        broken given the verifier's stderr. Returns True if at least one
+        file was rewritten (so the caller knows to re-verify).
+
+        This is the cheap retry shape — closer to how Paperclip / OpenCLAw
+        iterate. We don't burn a fresh pipeline; we just edit the scaffold
+        in place and re-run the gate.
+        """
+        from skyn3t.adapters import LLMClient
+        import re as _re
+
+        stderr = (build_result.get("stderr") or "")
+        stdout = (build_result.get("stdout") or "")
+        stack = build_result.get("stack") or "unknown"
+        log_tail = (stderr or stdout).strip()
+        if not log_tail:
+            return False
+
+        # Map current scaffold files → (relpath, content); cap individual
+        # bodies so a giant file doesn't blow the prompt budget.
+        files_on_disk: List[tuple[str, str]] = []
+        for p in sorted(scaffold_dir.rglob("*")):
+            if not p.is_file() or "__pycache__" in p.parts:
+                continue
+            try:
+                rel = p.relative_to(scaffold_dir).as_posix()
+                body = p.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            files_on_disk.append((rel, body[:6000]))
+        if not files_on_disk:
+            return False
+
+        client = LLMClient(event_bus=self.event_bus, caller_name="build_fix")
+        system = (
+            "You are a senior engineer fixing a small project that just "
+            "failed its build/compile check. You are given the brief, the "
+            "stack, the current file tree (with contents), and the build "
+            "log. Reply with a JSON object of the form: "
+            "{\"files\": [{\"path\": \"rel/path\", \"content\": \"FULL "
+            "NEW FILE CONTENT\"}, ...]}. ONLY include files you are "
+            "changing. Each `content` must be the complete new file body "
+            "— not a diff. JSON only, no preamble."
+        )
+        file_block = "\n\n".join(
+            f"### {rel}\n```\n{body}\n```" for rel, body in files_on_disk[:20]
+        )
+        prompt = (
+            f"Brief:\n{brief}\n\n"
+            f"Stack: {stack}\n\n"
+            f"Current scaffold (first {min(len(files_on_disk), 20)} files):\n"
+            f"{file_block}\n\n"
+            f"Build log tail:\n{log_tail[-2000:]}\n\n"
+            f"Fix the broken files. Return JSON: "
+            f"{{\"files\":[{{\"path\":\"…\",\"content\":\"…\"}}]}}."
+        )
+
+        try:
+            out = await client.complete(
+                prompt, system=system, max_tokens=8000, temperature=0.2,
+            )
+        except Exception:
+            logger.exception("LLM call during fix round %d failed", attempt)
+            return False
+        if not out or "[deterministic-stub]" in out:
+            return False
+        m = _re.search(r"\{[\s\S]*\}", out)
+        if not m:
+            return False
+        try:
+            data = json.loads(m.group(0))
+        except Exception:
+            return False
+        files = data.get("files") if isinstance(data, dict) else None
+        if not isinstance(files, list) or not files:
+            return False
+
+        resolved_root = scaffold_dir.resolve()
+        wrote_any = False
+        for spec in files[:25]:
+            if not isinstance(spec, dict):
+                continue
+            rel = (spec.get("path") or "").lstrip("/").strip()
+            content = spec.get("content")
+            if not rel or not isinstance(content, str) or not content.strip():
+                continue
+            target = (scaffold_dir / rel).resolve()
+            try:
+                target.relative_to(resolved_root)
+            except ValueError:
+                continue  # path escape — never write
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+                wrote_any = True
+            except Exception:
+                logger.exception("could not write fix to %s", target)
+                continue
+        return wrote_any
 
     async def _run_build_verifier(self, scaffold_dir: str, brief: str) -> Optional[Dict[str, Any]]:
         """Invoke BuildVerifierAgent in-process and return its output dict.
@@ -1708,18 +1860,38 @@ class StudioRunner:
         # `_retry_hint` (compact tail of build log), prefer that as the
         # lesson — it's much more actionable than a stage name.
         build_hint = manifest.get("_retry_hint") or ""
+        # Cross-model debate: if a build_verification record knows which
+        # backend produced the failing scaffold, suggest a different one to
+        # the retry's brief so the next attempt naturally falls through to
+        # a sibling model. The auto chain (claude_cli → copilot_cli →
+        # openai_cli → kimi_cli) gives a fresh perspective for free.
+        prior_backend = ""
+        bv = manifest.get("build_verification") or {}
+        try:
+            prior_backend = (bv.get("backend") or manifest.get("_used_backend") or "").strip()
+        except Exception:
+            prior_backend = ""
+        debate_note = ""
+        if prior_backend:
+            debate_note = (
+                f"\n\nPrior attempt was generated by '{prior_backend}'. "
+                f"For the retry, prefer a DIFFERENT model so a second "
+                f"perspective gets a shot at the problem."
+            )
         if build_hint:
             lesson_block = (
                 "\n\nPrior attempt failed during build verification. "
                 "Use this as a constraint when picking the next shape:\n"
                 f"{build_hint}\n"
                 "Try a different stack, or fix the specific error above."
+                f"{debate_note}"
             )
         else:
             lesson_block = (
                 f"\n\nPrior attempt ({original_template}) failed at stages "
                 f"{failed_stages or '?'}: {error_summary}\n"
                 f"Try a different shape — pick alternative agents or a simpler stack."
+                f"{debate_note}"
             )
         retry_brief = (brief or "").rstrip() + lesson_block
         retry_slug = f"{slug}-retry"
