@@ -1436,6 +1436,29 @@ async def get_lesson_scores(limit: int = 10):
     }
 
 
+@app.get("/api/memory/skills")
+async def get_skills(tag: Optional[str] = None, limit: int = 20):
+    """First-class skill library — durable learned-skill files in data/skills/.
+
+    With ``tag``: returns matching skills (case-insensitive). Without: returns
+    the aggregate summary plus the top-N highest-scored skills.
+    """
+    from skyn3t.intelligence.skill_library import get_default_library
+    lib = get_default_library()
+    limit = _clamp_limit(limit, default=20, hi=100)
+    if tag:
+        return {
+            "tag": tag,
+            "skills": [s.__dict__ | {"score": s.score} for s in lib.find(tag=tag, min_score=-1.0, limit=limit)],
+        }
+    summary = lib.summary()
+    top = lib.find(min_score=0.1, limit=limit)
+    return {
+        "summary": summary,
+        "top": [s.__dict__ | {"score": s.score} for s in top],
+    }
+
+
 @app.get("/api/memory/build_patterns")
 async def get_build_patterns(stack: Optional[str] = None):
     """Build-pattern scoreboard — (stack, shape) → success/failure counts.

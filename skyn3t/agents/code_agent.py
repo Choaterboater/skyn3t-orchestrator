@@ -278,6 +278,32 @@ class CodeAgent(BaseAgent):
             )
             if stack_hint:
                 build_system = build_system + "\n\n" + stack_hint
+            # Skill injection: pull the top-3 net-helpful skills tagged
+            # with this stack and append them as additional context. This
+            # is how the durable Hermes-style skill library gets read
+            # back at code-generation time — closing the loop from
+            # "system recorded what worked" to "system uses what worked."
+            try:
+                from skyn3t.intelligence.skill_library import get_default_library
+                skill_lines: List[str] = []
+                for s in get_default_library().find(tag=stack, min_score=0.0, limit=3):
+                    snippet = (s.body or "").strip()
+                    if not snippet:
+                        continue
+                    # Keep each skill compact — we don't want the system
+                    # prompt to balloon. 1200 chars per skill is enough
+                    # for a useful pattern + a short example.
+                    if len(snippet) > 1200:
+                        snippet = snippet[:1200] + "\n…[truncated]"
+                    skill_lines.append(f"### Skill: {s.name}\n{snippet}")
+                if skill_lines:
+                    build_system = (
+                        build_system
+                        + "\n\nLearned skills for this stack — apply when relevant:\n\n"
+                        + "\n\n".join(skill_lines)
+                    )
+            except Exception:
+                logger.debug("skill injection failed", exc_info=True)
             from skyn3t.agents.stack_templates import manifest_for, readme_for_stack
             for i, spec in enumerate(file_specs, start=1):
                 if not isinstance(spec, dict):
