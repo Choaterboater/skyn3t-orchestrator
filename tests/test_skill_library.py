@@ -227,3 +227,90 @@ def test_malformed_file_does_not_crash_scan(tmp_path):
     skills = lib.all()
     names = [s.name for s in skills]
     assert "ok" in names
+
+
+# ─── Curator ───────────────────────────────────────────────────────────
+
+
+def test_curate_drops_stale_skills(tmp_path):
+    lib = SkillLibrary(root=tmp_path / "skills")
+    # Old skill — not used in months.
+    old = Skill(name="stale", tags=["x"], last_used_at=time.time() - (60 * 86400))
+    lib.upsert(old)
+    # Fresh one.
+    lib.upsert(Skill(name="fresh", tags=["x"], last_used_at=time.time()))
+    result = lib.curate(max_stale_age_seconds=30 * 86400)
+    assert "stale" in result["archived"]
+    assert "fresh" in result["kept"]
+    names = [s.name for s in lib.all()]
+    assert names == ["fresh"]
+
+
+def test_curate_drops_hurtful_skills_above_min_samples(tmp_path):
+    lib = SkillLibrary(root=tmp_path / "skills")
+    # 3 failures, 0 wins → score=-1, sample count meets threshold → drop.
+    lib.upsert(Skill(name="hurts", tags=["x"], failure_count=3))
+    # 1 failure, 0 wins → score=-1 but only 1 sample → keep (give it a chance).
+    lib.upsert(Skill(name="not-enough-data", tags=["x"], failure_count=1))
+    result = lib.curate(min_samples_before_demote=3)
+    assert "hurts" in result["archived"]
+    assert "not-enough-data" in result["kept"]
+
+
+def test_curate_preserves_pinned_skills(tmp_path):
+    lib = SkillLibrary(root=tmp_path / "skills")
+    # Pinned + stale + hurtful — all reasons to drop, but pin wins.
+    lib.upsert(
+        Skill(
+            name="protected",
+            tags=["x", "pinned"],
+            failure_count=10,
+            last_used_at=time.time() - (90 * 86400),
+        )
+    )
+    result = lib.curate()
+    assert "protected" in result["kept"]
+    assert lib.all()  # still there
+
+
+def test_curate_respects_protect_tags(tmp_path):
+    lib = SkillLibrary(root=tmp_path / "skills")
+    lib.upsert(
+        Skill(
+            name="official",
+            tags=["x", "official"],
+            failure_count=5,
+        )
+    )
+    lib.upsert(Skill(name="ordinary", tags=["x"], failure_count=5))
+    result = lib.curate(protect_tags=["official"])
+    assert "official" in result["kept"]
+    assert "ordinary" in result["archived"]
+
+
+def test_curate_returns_archived_and_kept_lists(tmp_path):
+    lib = SkillLibrary(root=tmp_path / "skills")
+    lib.upsert(Skill(name="a", tags=["x"]))
+    lib.upsert(Skill(name="b", tags=["x"], failure_count=5))
+    result = lib.curate(min_samples_before_demote=3)
+    assert set(result["archived"]) == {"b"}
+    assert set(result["kept"]) == {"a"}
+
+
+def test_auto_cleanup_invokes_skill_curator(tmp_path, monkeypatch):
+    """The AutoCleanup janitor's run_once should call the curator and
+    surface the count in its summary."""
+    from skyn3t.cortex.auto_cleanup import AutoCleanup
+    import skyn3t.intelligence.skill_library as sl
+    monkeypatch.setattr(sl, "_default_library", None)
+    lib = sl.SkillLibrary(root=tmp_path / "skills")
+    monkeypatch.setattr(sl, "get_default_library", lambda: lib)
+    lib.upsert(Skill(name="bad", tags=["x"], failure_count=5))
+    ac = AutoCleanup(
+        event_bus=None,
+        projects_root=tmp_path / "p",
+        proposals_root=tmp_path / "pp",
+        repo_root=tmp_path / "no-git",
+    )
+    summary = ac.run_once()
+    assert summary["skills_archived"] == 1
