@@ -144,10 +144,11 @@ function BackendStatusBanner() {
           isn't responding. Restart it with:
         </p>
         <pre className="text-xs font-mono bg-bg-3 border border-border rounded p-2 mt-2 overflow-x-auto">
-          skyn3t start --host 127.0.0.1 --port 6660
+          bash scripts/restart-backend.sh
         </pre>
         <p className="text-[0.65rem] text-text-dim mt-2">
-          This view auto-recovers once the backend is back. No reload needed.
+          The script kills hung processes, runs <code className="bg-bg-3 px-1 rounded font-mono">pip install -e .</code>,
+          starts the server, and waits for it. This page auto-recovers when it's up — no reload needed.
         </p>
       </div>
     );
