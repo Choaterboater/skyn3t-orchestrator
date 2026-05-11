@@ -757,6 +757,39 @@ class StudioRunner:
                         },
                     )
                     break
+
+                # Inter-agent conversation: cross-model critique +
+                # one bounded revision pass. Returns the original
+                # result if the critic says NO_ISSUES, the revision
+                # fails, or the stage is in the skip list.
+                try:
+                    revised_result = await self._critique_and_revise(
+                        stage=stage,
+                        agent=agent,
+                        result=result,
+                        artifact_dir=artifact_dir,
+                        brief=brief,
+                        task=task,
+                    )
+                    if revised_result is not None and revised_result is not result:
+                        result = revised_result
+                        output = getattr(result, "output", None) or {}
+                        stage_files = self._normalize_stage_files(
+                            output.get("files") if isinstance(output, dict) else None,
+                            artifact_dir=artifact_dir,
+                        )
+                        stage_summary = self._summarize_stage_output(output)
+                        self._publish(
+                            "PROJECT_STAGE_REVISED",
+                            {
+                                "slug": slug,
+                                "stage": stage.name,
+                                "agent": stage.agent,
+                            },
+                        )
+                except Exception:
+                    logger.exception("critique pass crashed; continuing with original result")
+
                 quality_candidate = self._extract_quality_candidate(
                     stage=stage,
                     output=output,
@@ -1307,6 +1340,180 @@ class StudioRunner:
         if not result.success or not isinstance(result.output, dict):
             return None
         return result.output
+
+    # ─────────────────────────────────────────────────────────────────
+    # Inter-agent conversation: critique + revise
+    # ─────────────────────────────────────────────────────────────────
+    # The mission's #1 missing feature is cross-model debate between
+    # agents. A second model reads the first model's output, names
+    # the 1-3 most important issues, and the original agent gets a
+    # chance to revise. Bounded to one critique + one revision per
+    # stage so wall time only goes up ~30%, not unbounded.
+
+    _CRITIQUE_SKIP_STAGES = {
+        # These stages either already ARE the critique step or are
+        # too cheap to be worth critiquing.
+        "brainstorm",     # divergent ideation, no "right answer"
+        "reviewer",       # is itself the critique step
+        "verifier",       # mechanical pass/fail
+        "build_verifier", # mechanical pass/fail
+    }
+
+    async def _critique_and_revise(
+        self,
+        *,
+        stage: Any,
+        agent: Any,
+        result: Any,
+        artifact_dir: Path,
+        brief: str,
+        task: TaskRequest,
+    ) -> Any:
+        """Run a critique pass on the stage output via a cross-model
+        reviewer. If issues are found, ask the original agent to revise
+        once. Returns the (possibly revised) result.
+
+        Cheap escape hatches:
+          - Set SKYN3T_DISABLE_CRITIQUE=1 to turn off entirely
+          - Stages in _CRITIQUE_SKIP_STAGES never get critiqued
+          - If reviewer LLM call fails, return original result unchanged
+            (we never let critique FAIL a stage that was succeeding)
+        """
+        import os as _os
+        if _os.environ.get("SKYN3T_DISABLE_CRITIQUE") == "1":
+            return result
+        if stage.name in self._CRITIQUE_SKIP_STAGES:
+            return result
+
+        output = getattr(result, "output", None) or {}
+        summary = self._summarize_stage_output(output)
+        # Read what the stage actually produced — the .md / .json files
+        # under artifact_dir, capped per-file so the critique prompt
+        # doesn't balloon.
+        produced = self._collect_stage_artifacts(stage, output, artifact_dir)
+        if not produced and not summary:
+            # Nothing concrete to critique. Skip cleanly.
+            return result
+
+        try:
+            from skyn3t.adapters import LLMClient as _LLMClient
+            # Load reviewer's configured backend (cross-family is what
+            # makes this work — see data/agent_overrides.json).
+            try:
+                from skyn3t.config.agent_overrides import get_override_store
+                rev = (get_override_store().get("reviewer") or {})
+            except Exception:
+                rev = {}
+            critic = _LLMClient(
+                default_model=rev.get("model"),
+                backend=rev.get("backend") or None,
+                caller_name="critique",
+            )
+            critique_prompt = (
+                f"Brief:\n{brief[:2000]}\n\n"
+                f"A swarm member just produced output for stage `{stage.name}` "
+                f"(agent: {stage.agent}). Your job is to find the 1-3 MOST "
+                f"IMPORTANT issues — things that would make the next stage's "
+                f"work worse if not fixed. Be specific, name files/sections, "
+                f"and propose concrete fixes. If the output is solid, reply "
+                f"with exactly: NO_ISSUES.\n\n"
+                f"Output to critique:\n\n{produced[:8000]}\n\n"
+                f"List up to 3 critical issues, each as a single line:\n"
+                f"1. <file/section>: <problem> → <fix>\n"
+                f"2. ...\n\n"
+                f"Or reply NO_ISSUES."
+            )
+            critique = await critic.complete(
+                critique_prompt, max_tokens=1500, temperature=0.2,
+            )
+        except Exception as e:
+            logger.warning(f"critique LLM call failed for {stage.name}: {e}")
+            return result
+
+        critique = (critique or "").strip()
+        if not critique or "NO_ISSUES" in critique[:30].upper() or "[deterministic-stub]" in critique:
+            # Reviewer said it's fine, OR the LLM is in stub mode and
+            # we shouldn't pretend a stub critique is meaningful.
+            try:
+                await agent.think(f"critique pass on {stage.name}: clean")
+            except Exception:
+                pass
+            return result
+
+        # Log the critique to project history so the brain map UI can
+        # eventually replay the conversation.
+        try:
+            await agent.think(f"critique on {stage.name}:\n{critique[:400]}")
+        except Exception:
+            pass
+
+        # Send the critique back to the original agent for one revision.
+        # We can't depend on each agent knowing how to read a `_critique`
+        # key from input_data — they all read `brief`. So we APPEND the
+        # critique to the brief itself, marked clearly. Agents that
+        # later add critique-aware paths can still also read `_critique`.
+        revise_input = dict(task.input_data or {})
+        original_brief = str(revise_input.get("brief") or brief or "")
+        revise_input["brief"] = (
+            f"{original_brief}\n\n"
+            f"---\n"
+            f"REVISION NOTES from cross-model reviewer (apply these BEFORE\n"
+            f"writing your output — they identify the most important issues\n"
+            f"with your prior attempt):\n\n{critique}\n\n"
+            f"Your previous output summary: {summary or '(none)'}\n"
+            f"---\n"
+        )
+        revise_input["_critique"] = critique
+        revise_input["_revision_round"] = 1
+        revise_input["_prior_output_summary"] = summary
+        revise_task = TaskRequest(
+            title=f"revise:{stage.name}",
+            description=f"Revise after critique for stage {stage.name}",
+            input_data=revise_input,
+        )
+        try:
+            revised = await asyncio.wait_for(agent.execute(revise_task), timeout=600.0)
+        except asyncio.TimeoutError:
+            logger.warning(f"revision pass timed out for {stage.name}; keeping original")
+            return result
+        except Exception as e:
+            logger.warning(f"revision pass failed for {stage.name}: {e}; keeping original")
+            return result
+
+        if not getattr(revised, "success", False):
+            # Don't let a bad revision break a stage that already succeeded.
+            return result
+        try:
+            await agent.think(f"revised {stage.name} after critique")
+        except Exception:
+            pass
+        return revised
+
+    def _collect_stage_artifacts(
+        self, stage: Any, output: Any, artifact_dir: Path,
+    ) -> str:
+        """Read produced .md/.json/.txt files for the critique prompt.
+
+        Capped so the critique input doesn't balloon — we want the
+        critic to see the SHAPE of what was produced, not every byte.
+        """
+        chunks: list[str] = []
+        files = []
+        if isinstance(output, dict):
+            files = output.get("files") or []
+        for rel in files[:10]:
+            try:
+                p = (artifact_dir / rel) if not Path(rel).is_absolute() else Path(rel)
+                if not p.exists() or not p.is_file():
+                    continue
+                body = p.read_text(encoding="utf-8", errors="ignore")
+                # Limit per-file to keep critique prompt manageable.
+                if len(body) > 1500:
+                    body = body[:1500] + "\n[truncated]"
+                chunks.append(f"### {p.name}\n\n{body}")
+            except Exception:
+                continue
+        return "\n\n---\n\n".join(chunks)
 
     def _scan_artifacts(self, d: Path) -> List[str]:
         """Return relative paths of files under ``d`` (capped at 200)."""
