@@ -27,9 +27,12 @@ _CODE_BUILD_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b(?:build|create|make|ship|launch|scaffold|generate|prototype|develop|implement)\s+"
-        r"(?:an?\s+|the\s+)?"
-        r"(?:small\s+|simple\s+|new\s+|minimal\s+|web\s+|mobile\s+|todo\s+|demo\s+|internal\s+|customer\s+)*"
+        # build/create/etc followed by up to ~6 intervening words (qualifiers,
+        # me, a, an, "tic-tac-toe", etc.) then a software-y noun. The old
+        # version required a fixed adjective vocabulary which made it brittle
+        # for natural briefs like "build me a tic-tac-toe game".
+        r"\b(?:build|create|make|ship|launch|scaffold|generate|prototype|develop|implement)"
+        r"(?:\s+\S+){0,6}\s+"
         r"(?:app|site|website|api|backend|frontend|service|tool|script|cli|bot|dashboard|extension|game)\b",
         re.IGNORECASE,
     ),
@@ -309,13 +312,65 @@ async def _llm_plan(brief: str, llm_client) -> tuple[List[str], List[str], Dict[
     return agents, artifacts, rationale
 
 
+# Verbs that are *only* used about software (you don't "refactor" a campaign
+# or "wire up" an essay). Catching these as standalone signals lets briefs
+# like "fix the dashboard" / "redesign the UI" trigger a code stage without
+# having to mention "app" or "api" explicitly.
+_SOFTWARE_VERB_PATTERN = re.compile(
+    r"\b(?:fix|refactor|debug|wire|hook|patch|migrate|deploy|reindex)\b",
+    re.IGNORECASE,
+)
+# Verbs that mean "software work" only when they're applied to a software-y
+# object. "improve the planner", "add a settings page", "redesign the UI" =
+# code work. "improve the copy" or "redesign the brand" = not code.
+_IMPROVE_VERB_PATTERN = re.compile(
+    r"\b(?:improve|enhance|redesign|add|update)\s+"
+    r"(?:an?\s+|the\s+)?"
+    r"(?:ui|dashboard|app|page|interface|frontend|backend|api|cli|"
+    r"orchestrator|planner|scheduler|service|module|component|widget|"
+    r"settings|config|endpoint|route|webhook|integration|"
+    r"agent|loop|engine|store|cache|queue|worker|"
+    r"layout|form|button|menu)\b",
+    re.IGNORECASE,
+)
+_PURE_DOCS_INTENT_PATTERN = re.compile(
+    r"^\s*(?:write|draft|produce|prepare|compose)\s+(?:an?\s+|the\s+)?"
+    r"(?:readme|spec|specification|brief|plan|proposal|roadmap|analysis|"
+    r"research|blog\s+post|email|summary|report|writeup)\b",
+    re.IGNORECASE,
+)
+
+
 def _should_force_code_agent(brief: str) -> bool:
-    text = brief or ""
+    text = (brief or "").strip()
+    if not text:
+        # Empty brief — let the LLM planner decide; don't force a code stage.
+        return False
     if _TARGET_FILE_PATTERN.search(text):
         return False
-    if _DOCS_ONLY_PATTERN.search(text) and not any(pattern.search(text) for pattern in _CODE_BUILD_PATTERNS):
+    # Hard "I want docs, only docs" signal — short brief leading with
+    # write/draft/produce <docs-noun>. Don't force code in that case.
+    if _PURE_DOCS_INTENT_PATTERN.search(text):
         return False
-    return any(pattern.search(text) for pattern in _CODE_BUILD_PATTERNS)
+    # Strongest signal: explicit code-build phrase ("build an app", "create
+    # an API", etc). Original behavior — preserved.
+    if any(pattern.search(text) for pattern in _CODE_BUILD_PATTERNS):
+        return True
+    # Software-specific verbs that are essentially never used about prose.
+    # "fix the dashboard" / "refactor the planner" / "redesign the UI" all
+    # land here — previously they fell through to a docs-only shape because
+    # they lack an explicit software noun like "app".
+    if _SOFTWARE_VERB_PATTERN.search(text):
+        if _DOCS_ONLY_PATTERN.search(text):
+            return False
+        return True
+    # Ambiguous verbs ("improve", "add", "redesign", "update", "enhance")
+    # paired with a software-y object.
+    if _IMPROVE_VERB_PATTERN.search(text):
+        if _DOCS_ONLY_PATTERN.search(text):
+            return False
+        return True
+    return False
 
 
 def _mentions_any(text: str, keywords: List[str]) -> bool:

@@ -752,6 +752,22 @@ class StudioRunner:
             manifest["current_agent"] = None
             manifest["completed_at"] = time.time()
             manifest["artifacts"] = self._scan_artifacts(artifact_dir)
+            # "Docs-only" failure detection: if the user's brief implied code
+            # work but every artifact produced was markdown/text, the project
+            # ran the wrong shape. Mark it failed so the auto-retry hook
+            # spawns a new attempt with a forced code stage. Skip this check
+            # when the brief was clearly docs-oriented (write/draft/produce
+            # docs-noun) — those projects are expected to produce only docs.
+            if manifest["status"] in {"done", "needs_fixes"}:
+                if self._is_docs_only_for_code_brief(brief, manifest["artifacts"]):
+                    manifest["status"] = "failed"
+                    manifest["error"] = (
+                        "Brief implied software work but every artifact is a "
+                        "doc/markdown file. Auto-retry will force a code stage."
+                    )
+                    manifest["next_action"] = (
+                        "Retrying with a code-producing planner."
+                    )
             completion_message = (
                 manifest["next_action"]
                 if manifest.get("status") in {"done", "needs_fixes"}
@@ -876,6 +892,51 @@ class StudioRunner:
         s = s[:60].rstrip("-")
         suffix = f"{time.time_ns():x}"[-6:]
         return f"{s}-{suffix}"
+
+    # Extensions we treat as "real software output" — running code, markup,
+    # styles, config, schemas. If the project produced any of these, it's
+    # not a docs-only result. Markdown, text, and PDF are NOT in this list.
+    _CODE_LIKE_EXTENSIONS = {
+        ".py", ".pyi",
+        ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+        ".html", ".htm", ".css", ".scss", ".sass",
+        ".vue", ".svelte",
+        ".go", ".rs", ".java", ".kt", ".swift",
+        ".c", ".cc", ".cpp", ".h", ".hpp",
+        ".rb", ".php",
+        ".sql",
+        ".sh", ".bash", ".zsh",
+        ".yml", ".yaml", ".toml", ".ini", ".cfg",
+        ".json", ".jsonc",
+        ".dockerfile",  # users sometimes call it that
+        ".tf", ".tfvars",
+    }
+
+    @classmethod
+    def _is_docs_only_for_code_brief(cls, brief: str, artifacts: List[str]) -> bool:
+        """Return True when the brief implied software but only docs got produced.
+
+        Reuses the planner's own classification so the failure signal and the
+        retry's forced-code-stage logic stay aligned. If the brief is empty,
+        explicitly docs-shaped, or names a target file, we don't flag it.
+        """
+        from skyn3t.studio.planner import _should_force_code_agent
+
+        if not _should_force_code_agent(brief or ""):
+            return False
+        if not artifacts:
+            # Nothing at all was produced — that's a different failure shape
+            # (handled by the per-stage failed-stage path); don't double-flag.
+            return False
+        for rel in artifacts:
+            # Filename like "Dockerfile" with no extension still counts.
+            name = Path(rel).name.lower()
+            if name in {"dockerfile", "makefile", "procfile"}:
+                return False
+            suffix = Path(rel).suffix.lower()
+            if suffix in cls._CODE_LIKE_EXTENSIONS:
+                return False
+        return True
 
     def _scan_artifacts(self, d: Path) -> List[str]:
         """Return relative paths of files under ``d`` (capped at 200)."""
