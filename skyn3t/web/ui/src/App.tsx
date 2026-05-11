@@ -22,7 +22,7 @@ export default function App() {
     <div className="relative z-10 grid grid-cols-[260px_minmax(0,1fr)] min-h-screen bg-atelier">
       <Sidebar />
       <main className="min-w-0 p-6 space-y-4">
-        <AuthBanner />
+        <BackendStatusBanner />
         <Routes>
           <Route path="/" element={<OverviewPage />} />
           <Route path="/agents" element={<AgentsPage />} />
@@ -40,78 +40,120 @@ export default function App() {
   );
 }
 
-// Pings /api/status to learn whether we're authorized. When the backend
-// expects a SKYN3T_WEB_TOKEN and the SPA doesn't have one stashed, the
-// banner offers an input. Hidden once requests succeed.
-function AuthBanner() {
+// Probes /api/status and renders a banner when the backend is in a
+// known-bad state: 401 means we need a token, 5xx/network failure
+// means it's down or restarting. Page contents stay mounted so once
+// the backend recovers everything just resumes.
+function BackendStatusBanner() {
   const token = getAuthToken();
   const [input, setInput] = useState("");
-  const { error } = useQuery({
+  const { error, isFetching } = useQuery({
     queryKey: ["auth_probe"],
     queryFn: api.status,
     retry: false,
     refetchOnWindowFocus: false,
+    refetchInterval: 5_000,
   });
 
-  const needsToken = error instanceof HttpError && error.status === 401;
+  if (!error) return null;
 
-  if (!needsToken) return null;
+  const isAuth = error instanceof HttpError && error.status === 401;
+  const isServerDown =
+    !isAuth &&
+    (error instanceof TypeError || // fetch failed (network)
+      (error instanceof HttpError && error.status >= 500));
 
-  return (
-    <div className="rounded-lg border border-status-yellow/40 bg-status-yellow/10 p-4">
-      <div className="text-sm font-medium text-status-yellow mb-1">
-        <i className="fa-solid fa-lock mr-2" />
-        Backend requires an auth token
-      </div>
-      <p className="text-xs text-text-secondary mb-3">
-        The backend is running with{" "}
-        <code className="bg-bg-3 px-1 rounded font-mono">SKYN3T_WEB_TOKEN</code>{" "}
-        set. Paste it below — it's stored in localStorage and sent as{" "}
-        <code className="bg-bg-3 px-1 rounded font-mono">Authorization: Bearer …</code>{" "}
-        on every request.
-      </p>
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          if (input.trim()) {
-            try {
-              localStorage.setItem("skyn3t_token", input.trim());
-            } catch {
-              /* */
-            }
-            window.location.reload();
-          }
-        }}
-        className="flex gap-2 items-center"
-      >
-        <input
-          type="password"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          placeholder="paste token"
-          className="flex-1 bg-bg-3 border border-border rounded px-2 py-1.5 text-sm font-mono outline-none focus:border-accent"
-        />
-        <button
-          type="submit"
-          className="rounded bg-accent text-bg-0 text-sm font-medium px-3 py-1.5"
-        >
-          Save & reload
-        </button>
-        {token && (
-          <button
-            type="button"
-            onClick={() => {
-              clearAuthToken();
+  if (isAuth) {
+    return (
+      <div className="rounded-lg border border-status-yellow/40 bg-status-yellow/10 p-4">
+        <div className="text-sm font-medium text-status-yellow mb-1">
+          <i className="fa-solid fa-lock mr-2" />
+          Backend requires an auth token
+        </div>
+        <p className="text-xs text-text-secondary mb-3">
+          The backend is running with{" "}
+          <code className="bg-bg-3 px-1 rounded font-mono">
+            SKYN3T_WEB_TOKEN
+          </code>{" "}
+          set. Paste it below — stored in localStorage and sent as{" "}
+          <code className="bg-bg-3 px-1 rounded font-mono">
+            Authorization: Bearer …
+          </code>
+          .
+        </p>
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (input.trim()) {
+              try {
+                localStorage.setItem("skyn3t_token", input.trim());
+              } catch {
+                /* */
+              }
               window.location.reload();
-            }}
-            className="text-xs text-text-dim hover:text-text-primary"
+            }
+          }}
+          className="flex gap-2 items-center"
+        >
+          <input
+            type="password"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder="paste token"
+            className="flex-1 bg-bg-3 border border-border rounded px-2 py-1.5 text-sm font-mono outline-none focus:border-accent"
+          />
+          <button
+            type="submit"
+            className="rounded bg-accent text-bg-0 text-sm font-medium px-3 py-1.5"
           >
-            clear
+            Save & reload
           </button>
-        )}
-      </form>
-    </div>
-  );
+          {token && (
+            <button
+              type="button"
+              onClick={() => {
+                clearAuthToken();
+                window.location.reload();
+              }}
+              className="text-xs text-text-dim hover:text-text-primary"
+            >
+              clear
+            </button>
+          )}
+        </form>
+      </div>
+    );
+  }
+
+  if (isServerDown) {
+    return (
+      <div className="rounded-lg border border-status-red/40 bg-status-red/10 p-4">
+        <div className="flex items-center gap-2 text-sm font-medium text-status-red mb-1">
+          <i className="fa-solid fa-triangle-exclamation" />
+          Backend is unreachable
+          {isFetching && (
+            <span className="text-[0.65rem] text-text-dim font-mono uppercase tracking-wider ml-auto">
+              <i className="fa-solid fa-arrows-rotate animate-spin mr-1" />
+              retrying
+            </span>
+          )}
+        </div>
+        <p className="text-xs text-text-secondary">
+          The orchestrator on{" "}
+          <code className="bg-bg-3 px-1 rounded font-mono">127.0.0.1:6660</code>{" "}
+          isn't responding. Restart it with:
+        </p>
+        <pre className="text-xs font-mono bg-bg-3 border border-border rounded p-2 mt-2 overflow-x-auto">
+          skyn3t start --host 127.0.0.1 --port 6660
+        </pre>
+        <p className="text-[0.65rem] text-text-dim mt-2">
+          This view auto-recovers once the backend is back. No reload needed.
+        </p>
+      </div>
+    );
+  }
+
+  return null;
 }
 
 function Sidebar() {

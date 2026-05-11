@@ -30,30 +30,68 @@ export default function ActivityPage() {
   });
 
   useEffect(() => {
-    const proto = window.location.protocol === "https:" ? "wss" : "ws";
-    const token = getAuthToken();
-    const qs = token ? `?token=${encodeURIComponent(token)}` : "";
-    const url = `${proto}://${window.location.host}/ws/swarm${qs}`;
-    const ws = new WebSocket(url);
-    wsRef.current = ws;
+    // Exponential backoff reconnect. When the backend is restarting,
+    // a tight loop here spams the console with "WebSocket failed" for
+    // every component re-render — back off so the user can read other
+    // diagnostics.
+    let cancelled = false;
+    let retry = 0;
+    let timer: number | null = null;
 
-    ws.onopen = () => setConnected(true);
-    ws.onclose = () => setConnected(false);
-    ws.onerror = () => setConnected(false);
-    ws.onmessage = (e) => {
+    const connect = () => {
+      if (cancelled) return;
+      const proto = window.location.protocol === "https:" ? "wss" : "ws";
+      const token = getAuthToken();
+      const qs = token ? `?token=${encodeURIComponent(token)}` : "";
+      const url = `${proto}://${window.location.host}/ws/swarm${qs}`;
+      let ws: WebSocket;
       try {
-        const msg = JSON.parse(e.data);
-        if (msg?.type === "swarm" && msg.data) {
-          setEvents((prev) => [msg.data, ...prev].slice(0, 500));
-        }
+        ws = new WebSocket(url);
       } catch {
-        /* ignore malformed */
+        scheduleReconnect();
+        return;
       }
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        retry = 0;
+        setConnected(true);
+      };
+      ws.onclose = () => {
+        setConnected(false);
+        scheduleReconnect();
+      };
+      ws.onerror = () => {
+        setConnected(false);
+        // onclose fires after onerror, no need to schedule here.
+      };
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg?.type === "swarm" && msg.data) {
+            setEvents((prev) => [msg.data, ...prev].slice(0, 500));
+          }
+        } catch {
+          /* ignore malformed */
+        }
+      };
     };
 
+    const scheduleReconnect = () => {
+      if (cancelled) return;
+      // 1s, 2s, 4s, 8s, capped at 15s.
+      const delay = Math.min(15000, 1000 * 2 ** retry);
+      retry += 1;
+      timer = window.setTimeout(connect, delay);
+    };
+
+    connect();
+
     return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
       try {
-        ws.close();
+        wsRef.current?.close();
       } catch {
         /* */
       }
