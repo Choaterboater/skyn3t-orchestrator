@@ -5,36 +5,77 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SkyN3t — Multi-Agent Orchestrator</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600;700;800&family=Inter+Tight:wght@300;400;450;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- Typography: Instrument Serif (display, distinctive italic) + Space Grotesk (UI, geometric humanist) + JetBrains Mono (code).
+         Picked per the frontend-design skill: avoid Inter-default convergence; serif display gives the dashboard editorial gravity. -->
+    <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://unpkg.com/cytoscape@3.26.0/dist/cytoscape.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
+        /* ───────────────────────────────────────────────────────────────
+           Aesthetic: "Atelier" — editorial dark with a single warm accent.
+           Built on the frontend-design skill: distinctive serif display
+           typography, restrained palette with one bold accent (warm amber),
+           layered backgrounds with a tactile grain, intentional motion
+           reserved for state transitions. The previous HUD palette has
+           been retained as fallback values where existing CSS references
+           --cyan / --magenta so we don't break the rest of the file.
+           ─────────────────────────────────────────────────────────────── */
         :root {
-            --bg-0: #090b0d;
-            --bg-1: #0e1214;
-            --bg-2: #151a1e;
-            --bg-3: #1d2428;
-            --border: #323b46;
-            --border-hover: #d45b3f;
-            --text-primary: #e1e8ef;
-            --text-secondary: #a8b3bf;
-            --text-dim: #6f7a86;
-            --cyan: #d45b3f;
-            --cyan-glow: rgba(212,91,63,0.35);
-            --magenta: #c45000;
-            --magenta-glow: rgba(196,80,0,0.42);
-            --green: #4e7a4f;
-            --green-glow: rgba(78,122,79,0.28);
-            --yellow: #d4821a;
-            --red: #cc2200;
-            --orange: #c45000;
-            --purple: #6b1a0a;
-            --grid-line: rgba(139,0,0,0.10);
+            /* Surface layers — graphite, not pure black. Warmer than the
+               old HUD so the amber accent reads as light, not warning. */
+            --bg-0: #0f0e0c;       /* page */
+            --bg-1: #16140f;       /* sidebar / chrome */
+            --bg-2: #1d1a13;       /* card */
+            --bg-3: #25211a;       /* card-elev / hover */
+            --border: #2d2920;
+            --border-strong: #3b362a;
+            --border-hover: #c9a96e;
+
+            /* Type — warm whites against the graphite. */
+            --text-primary: #f4ede0;
+            --text-secondary: #b8ad96;
+            --text-dim: #7a705f;
+
+            /* Accent — single warm amber, used sparingly. The frontend-design
+               skill calls out "predictable purple gradients" as the AI-default
+               sin; we commit to one accent and let it carry the brand. */
+            --accent: #c9a96e;         /* warm amber */
+            --accent-strong: #d9b97e;
+            --accent-glow: rgba(201, 169, 110, 0.32);
+            --accent-soft: rgba(201, 169, 110, 0.08);
+            --accent-line: rgba(201, 169, 110, 0.22);
+
+            /* Status semantics — desaturated so they don't fight the accent. */
+            --green: #8aa37a;
+            --green-glow: rgba(138, 163, 122, 0.28);
+            --yellow: #d4a64a;
+            --red: #b65a4a;
+            --orange: #c9824a;
+            --purple: #8a6a8a;
+
+            /* Back-compat aliases so the 11k lines of existing CSS that
+               reference --cyan / --magenta / etc. keep working without an
+               edit-every-rule pass. New code should use --accent. */
+            --cyan: var(--accent);
+            --cyan-glow: var(--accent-glow);
+            --magenta: var(--accent-strong);
+            --magenta-glow: var(--accent-glow);
+
+            /* Background grain — replaces the literal grid lines with a
+               subtle radial wash so it reads as paper, not graph paper. */
+            --grid-line: rgba(201, 169, 110, 0.04);
+
+            /* Geometry — kept identical so existing components still align. */
             --radius-xs: 0.375rem;
             --radius-sm: 0.55rem;
             --radius-md: 0.8rem;
             --radius-lg: 1rem;
-            --focus-ring: rgba(212,91,63,0.24);
+            --focus-ring: rgba(201, 169, 110, 0.30);
+
+            /* Typography stacks */
+            --font-display: 'Instrument Serif', 'Iowan Old Style', Georgia, serif;
+            --font-ui: 'Space Grotesk', system-ui, -apple-system, sans-serif;
+            --font-mono: 'JetBrains Mono', 'SF Mono', Menlo, monospace;
         }
         * { margin:0; padding:0; box-sizing:border-box; }
 
@@ -44,8 +85,16 @@
         .page-header { display: flex; align-items: flex-end; justify-content: space-between;
             padding: 1rem 1.5rem; border-bottom: 1px solid var(--border);
             background: var(--bg-1); position: sticky; top: 0; z-index: 10; gap: 1rem; }
-        .page-header h2.page-title-h { font-size: 1.5rem; line-height: 1.1; margin: 0; font-weight: 700; letter-spacing: -0.02em; }
-        .page-header h2.page-title-h span { color: var(--cyan); }
+        .page-header h2.page-title-h {
+            font-family: var(--font-display);
+            font-style: italic;
+            font-weight: 400;
+            font-size: 2.25rem;
+            line-height: 1.0;
+            margin: 0;
+            letter-spacing: -0.015em;
+        }
+        .page-header h2.page-title-h span { color: var(--accent); font-style: italic; }
         .page-header .subtitle { display: block; color: var(--text-secondary); font-size: .85rem; margin-top: .25rem; }
         .page-actions { display: flex; gap: .5rem; align-items: center; flex-shrink: 0; }
         .page-body { padding: 1rem 1.5rem; flex: 1; min-height: 0; display: grid; gap: 1rem; align-content: start; }
@@ -61,14 +110,37 @@
         @media (max-width: 700px) {
             .col-3, .col-4, .col-6, .col-7, .col-8, .col-9 { grid-column: span 12; }
         }
-        .card-h { display: flex; align-items: center; gap: .5rem; padding: .75rem 1rem;
-            border-bottom: 1px solid var(--border); background: rgba(0,240,255,0.02); }
-        .card-h h3 { font-size: .95rem; margin: 0; font-weight: 600; }
-        .card-h h3 i { color: var(--cyan); margin-right: .35rem; }
+        .card-h {
+            display: flex; align-items: center; gap: .55rem; padding: .85rem 1.1rem;
+            border-bottom: 1px solid var(--border);
+            background: linear-gradient(180deg, rgba(255,255,255,0.012), transparent);
+        }
+        .card-h h3 {
+            font-size: .82rem;
+            margin: 0;
+            font-weight: 500;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            color: var(--text-secondary);
+        }
+        .card-h h3 i { color: var(--accent); margin-right: .45rem; opacity: 0.85; }
         .card-h .right { margin-left: auto; display: flex; gap: .35rem; align-items: center; }
-        .card-b { padding: 1rem; }
-        .ui-card { background: var(--bg-1); border: 1px solid var(--border); border-radius: .65rem; overflow: hidden; display: flex; flex-direction: column; }
-        .ui-card.elev { box-shadow: 0 8px 32px rgba(0,0,0,.35); }
+        .card-b { padding: 1.1rem 1.1rem 1.2rem; }
+        .ui-card {
+            background: var(--bg-2);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            overflow: hidden;
+            display: flex; flex-direction: column;
+            transition: border-color 220ms ease, transform 220ms ease;
+        }
+        .ui-card:hover { border-color: var(--border-strong); }
+        .ui-card.elev {
+            background: linear-gradient(180deg, var(--bg-2), var(--bg-1));
+            box-shadow:
+                0 1px 0 rgba(255,255,255,0.02) inset,
+                0 20px 50px -20px rgba(0,0,0,0.6);
+        }
         .ui-card.fill { height: 100%; }
         .empty-state { padding: 2rem; text-align: center; color: var(--text-secondary); border: 1px solid var(--border); border-radius: .5rem;
             display: flex; flex-direction: column; gap: .5rem; align-items: center; justify-content: center; min-height: 200px; }
@@ -83,20 +155,83 @@
         @keyframes live-blink { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
 
         body {
-            font-family: 'Inter', system-ui, sans-serif;
+            font-family: var(--font-ui);
             background: var(--bg-0);
             color: var(--text-primary);
             min-height: 100vh;
             overflow-x: hidden;
+            font-feature-settings: "ss01" on, "ss02" on, "cv02" on;
+            -webkit-font-smoothing: antialiased;
         }
+        /* Atmospheric background: a slow warm radial bloom from the
+           upper-left, a darker counterweight at the lower-right, and a
+           barely-there noise grain. No literal grid lines — the previous
+           "HUD" graph paper read as low-fi. */
         body::before {
             content: '';
             position: fixed; inset: 0;
-            background-image: linear-gradient(var(--grid-line) 1px, transparent 1px), linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
-            background-size: 40px 40px;
+            background:
+                radial-gradient(ellipse 1200px 800px at 10% -10%,
+                    rgba(201, 169, 110, 0.10), transparent 60%),
+                radial-gradient(ellipse 900px 700px at 100% 110%,
+                    rgba(58, 38, 28, 0.55), transparent 70%);
             pointer-events: none;
             z-index: 0;
         }
+        body::after {
+            content: '';
+            position: fixed; inset: 0;
+            background-image:
+                radial-gradient(circle at 1px 1px, var(--grid-line) 1px, transparent 0);
+            background-size: 22px 22px;
+            opacity: 0.5;
+            mix-blend-mode: overlay;
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        /* Display headings — serif italic for landing/section titles to
+           break the AI-dashboard sans-serif monotony. Apply by adding
+           `.display` to a heading, e.g. <h1 class="display">…</h1>. */
+        .display, .page-title-display {
+            font-family: var(--font-display);
+            font-style: italic;
+            font-weight: 400;
+            letter-spacing: -0.01em;
+            line-height: 1.05;
+        }
+
+        /* Page-load reveal — staggered with the keyframe below. The
+           frontend-design skill recommends "page load reveals over
+           scattered interactions" — we keep micro-interactions quiet and
+           spend the motion budget on the first 600ms. */
+        @keyframes atelier-rise {
+            from { opacity: 0; transform: translateY(8px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+        .page-body, .page-header { animation: atelier-rise 480ms cubic-bezier(.2,.7,.2,1) both; }
+        .page-body > * { animation: atelier-rise 480ms cubic-bezier(.2,.7,.2,1) both; }
+        .page-body > *:nth-child(1) { animation-delay: 60ms; }
+        .page-body > *:nth-child(2) { animation-delay: 120ms; }
+        .page-body > *:nth-child(3) { animation-delay: 180ms; }
+        .page-body > *:nth-child(4) { animation-delay: 240ms; }
+        .page-body > *:nth-child(5) { animation-delay: 300ms; }
+        @media (prefers-reduced-motion: reduce) {
+            .page-body, .page-header, .page-body > * { animation: none; }
+        }
+
+        /* Buttons — quieter, with a single warm-amber active state. */
+        button, .btn {
+            font-family: var(--font-ui);
+            font-weight: 500;
+            letter-spacing: 0.005em;
+        }
+
+        /* Code/mono — JetBrains Mono with slightly tightened tracking. */
+        pre, code, .codeblock, .mono { font-family: var(--font-mono); letter-spacing: -0.005em; }
+
+        /* Selection — the accent, restrained. */
+        ::selection { background: var(--accent-soft); color: var(--accent-strong); }
         .app { position: relative; z-index: 1; display: grid; grid-template-columns: 260px 1fr; min-height: 100vh; }
         .sidebar {
             background: linear-gradient(180deg, var(--bg-1), var(--bg-0));
@@ -106,17 +241,46 @@
         }
         .logo {
             display: flex; align-items: center; gap: 0.75rem;
-            font-size: 1.25rem; font-weight: 800;
-            letter-spacing: -0.02em;
+            font-family: var(--font-display);
+            font-style: italic;
+            font-size: 1.65rem;
+            font-weight: 400;
+            letter-spacing: -0.01em;
         }
-        .logo i { color: var(--cyan); font-size: 1.5rem; animation: pulse-glow 2s infinite; }
-        .logo span { background: linear-gradient(135deg, var(--cyan), var(--magenta)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .logo i { color: var(--accent); font-size: 1.5rem; animation: pulse-glow 2.4s ease-in-out infinite; }
+        .logo span { color: var(--text-primary); }
+        .logo span::first-letter { color: var(--accent); }
         @keyframes pulse-glow { 0%,100%{filter:drop-shadow(0 0 5px var(--cyan-glow));} 50%{filter:drop-shadow(0 0 15px var(--cyan-glow));} }
         .nav-section { display: flex; flex-direction: column; gap: 0.25rem; }
         .nav-section-title { font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-dim); margin-bottom: 0.5rem; }
-        .nav-item { display: flex; align-items: center; gap: 0.75rem; padding: 0.625rem 0.875rem; border-radius: 0.5rem; cursor: pointer; transition: all 0.2s; color: var(--text-secondary); font-size: 0.875rem; font-weight: 500; border: 1px solid transparent; }
-        .nav-item:hover { background: rgba(0,240,255,0.05); color: var(--text-primary); border-color: rgba(0,240,255,0.1); }
-        .nav-item.active { background: linear-gradient(135deg, rgba(0,240,255,0.18), rgba(255,0,160,0.08)); color: var(--cyan); border-color: rgba(0,240,255,0.45); font-weight: 600; box-shadow: 0 0 0 1px rgba(0,240,255,0.15) inset; }
+        .nav-item {
+            display: flex; align-items: center; gap: 0.75rem;
+            padding: 0.55rem 0.85rem;
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            transition: background 180ms ease, color 180ms ease, transform 180ms cubic-bezier(.2,.7,.2,1);
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            font-weight: 500;
+            border: 1px solid transparent;
+            position: relative;
+        }
+        .nav-item:hover { background: var(--accent-soft); color: var(--text-primary); transform: translateX(2px); }
+        .nav-item.active {
+            background: var(--accent-soft);
+            color: var(--accent-strong);
+            border-color: var(--accent-line);
+            font-weight: 600;
+        }
+        .nav-item.active::before {
+            /* Editorial left-rule on the active item. */
+            content: '';
+            position: absolute;
+            left: -1px; top: 0.45rem; bottom: 0.45rem;
+            width: 2px;
+            background: var(--accent);
+            border-radius: 1px;
+        }
         .nav-item i { width: 1.25rem; text-align: center; }
         .system-status { margin-top: auto; padding: 1rem; background: var(--bg-2); border-radius: 0.75rem; border: 1px solid var(--border); }
         .status-row { display: flex; align-items: center; justify-content: space-between; font-size: 0.75rem; margin-bottom: 0.5rem; }
