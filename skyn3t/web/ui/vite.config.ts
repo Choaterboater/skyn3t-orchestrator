@@ -16,10 +16,29 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/api": "http://127.0.0.1:6660",
-      "/ws":  { target: "ws://127.0.0.1:6660", ws: true },
-      "/traces": "http://127.0.0.1:6660",
-      "/webhooks": "http://127.0.0.1:6660",
+      // Backend's _http_origin_allowed compares Origin against the
+      // request's netloc — in dev, the browser sends Origin:
+      // http://localhost:5173 but the request lands on 127.0.0.1:6660,
+      // so non-GETs (POST/PATCH/DELETE) get 401 "Cross-origin browser
+      // access denied." Stripping Origin makes the backend treat it
+      // as a same-origin call, which is correct: dev proxy is a
+      // trusted loopback hop.
+      "/api": {
+        target: "http://127.0.0.1:6660",
+        changeOrigin: true,
+        headers: { origin: "http://127.0.0.1:6660" },
+      },
+      "/ws": { target: "ws://127.0.0.1:6660", ws: true, changeOrigin: true },
+      "/traces": {
+        target: "http://127.0.0.1:6660",
+        changeOrigin: true,
+        headers: { origin: "http://127.0.0.1:6660" },
+      },
+      "/webhooks": {
+        target: "http://127.0.0.1:6660",
+        changeOrigin: true,
+        headers: { origin: "http://127.0.0.1:6660" },
+      },
     },
   },
   build: {
