@@ -1,9 +1,55 @@
 """Shared pytest fixtures."""
 
 import asyncio
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def isolate_runtime_state(tmp_path_factory, monkeypatch):
+    runtime_root = tmp_path_factory.mktemp("runtime-state")
+    data_dir = runtime_root / "data"
+    logs_dir = runtime_root / "logs"
+    vector_dir = data_dir / "vector_db"
+    secrets_path = data_dir / "secrets.json"
+    audit_dir = logs_dir / "audit"
+
+    monkeypatch.setenv("DATA_DIR", str(data_dir))
+    monkeypatch.setenv("LOGS_DIR", str(logs_dir))
+    monkeypatch.setenv("VECTOR_DB_PATH", str(vector_dir))
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{(data_dir / 'skyn3t.db').as_posix()}")
+    monkeypatch.setenv("SECRET_STORAGE_PATH", str(secrets_path))
+    monkeypatch.setenv("AUDIT_LOG_DIR", str(audit_dir))
+
+    import skyn3t.memory.database as memory_database
+    from skyn3t.config.settings import get_settings
+    from skyn3t.core.models import init_db
+    from skyn3t.memory.database import close_engine
+
+    get_settings.cache_clear()
+    asyncio.run(close_engine())
+    memory_database._async_session_maker = None
+    asyncio.run(init_db())
+    try:
+        import skyn3t.cortex.proposals as proposals_module
+
+        proposals_module._store = None
+    except Exception:
+        pass
+
+    yield Path(runtime_root)
+
+    asyncio.run(close_engine())
+    memory_database._async_session_maker = None
+    get_settings.cache_clear()
+    try:
+        import skyn3t.cortex.proposals as proposals_module
+
+        proposals_module._store = None
+    except Exception:
+        pass
 
 
 @pytest.fixture

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 from skyn3t.agents.scheduler_agent import SchedulerAgent
+from skyn3t.core.agent import TaskRequest
 
 
 def test_parse_interval_seconds_minutes():
@@ -61,8 +63,6 @@ def test_anchor_based_skips_missed_ticks():
 def test_schedule_task_creates_anchor_for_intervals():
     """When `every N` is parsed, the job should carry anchor+interval so
     the loop can use the drift-free path."""
-    import asyncio
-    from skyn3t.core.agent import TaskRequest
 
     async def run():
         agent = SchedulerAgent()

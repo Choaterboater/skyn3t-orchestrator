@@ -22,12 +22,15 @@ _TARGET_FILE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _CODE_BUILD_PATTERNS = (
-    re.compile(r"\b(?:code|implement|scaffold|generate|prototype|develop)\b", re.IGNORECASE),
     re.compile(
-        r"\b(?:build|create|make|ship|launch)\s+"
+        r"\b(?:source\s+code|source\s+files?|frontend|backend|api|endpoint|function|class|component|schema|migration|html|css|javascript|typescript|python|fastapi|react|next(?:\.js)?|node(?:\.js)?|cli)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:build|create|make|ship|launch|scaffold|generate|prototype|develop|implement)\s+"
         r"(?:an?\s+|the\s+)?"
         r"(?:small\s+|simple\s+|new\s+|minimal\s+|web\s+|mobile\s+|todo\s+|demo\s+|internal\s+|customer\s+)*"
-        r"(?:app|site|website|api|backend|frontend|service|tool|script|cli|bot|dashboard|extension)\b",
+        r"(?:app|site|website|api|backend|frontend|service|tool|script|cli|bot|dashboard|extension|game)\b",
         re.IGNORECASE,
     ),
 )
@@ -36,6 +39,25 @@ _DOCS_ONLY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _CODE_FOLLOWUP_AGENTS = {"WriterAgent", "MarketerAgent", "ReviewerAgent", "VerifierAgent"}
+_SOFTWARE_ARCHITECTURE_KEYWORDS = [
+    "app",
+    "saas",
+    "platform",
+    "service",
+    "api",
+    "backend",
+    "frontend",
+    "system",
+    "tool",
+    "dashboard",
+    "site",
+    "website",
+    "script",
+    "cli",
+    "bot",
+    "extension",
+    "game",
+]
 
 # Map agent class names to (capability hint, typical artifact). Used both as
 # the menu we show the LLM and as the heuristic-fallback knowledge.
@@ -174,7 +196,7 @@ def _heuristic_plan(brief: str) -> tuple[List[str], List[str], Dict[str, str]]:
 
     needs_arch = _mentions_any(
         b,
-        ["app", "saas", "platform", "service", "api", "backend", "system", "tool", "build", "create", "redesign"],
+        _SOFTWARE_ARCHITECTURE_KEYWORDS,
     )
     if needs_arch:
         chosen.append("ArchitectAgent")
@@ -258,9 +280,9 @@ async def _llm_plan(brief: str, llm_client) -> tuple[List[str], List[str], Dict[
         "ReviewerAgent always runs last (don't include them in your answer). "
         "Pick MINIMAL agents — don't include MarketerAgent for a pure code change, "
         "don't include ArchitectAgent for a brand kit. "
-        "For any app/site/tool/service/software brief that asks SkyN3t to build or create "
-        "the product itself, include CodeAgent unless the user explicitly asks for a "
-        "plan, spec, docs, or copy only. "
+        "Only include CodeAgent when the brief explicitly asks for runnable software "
+        "or source code (for example an app, site, api, script, cli, dashboard, or game), "
+        "unless the user explicitly asks for a plan, spec, docs, or copy only. "
         "ONLY include CodeImproverAgent when the brief mentions a SPECIFIC FILE PATH "
         "(like 'src/app.py' or 'target_file: ...'). For brand kits, "
         "marketing, copy, or strategy work with no code, omit code agents entirely. "

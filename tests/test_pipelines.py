@@ -1,7 +1,9 @@
 """Tests for pipeline system."""
 
 import asyncio
+import json
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -454,13 +456,18 @@ class TestStudioRunner:
                 return None
 
             async def execute(self, task: TaskRequest) -> TaskResult:
+                clarify_path = Path(task.input_data["artifact_dir"]) / "_clarifications.json"
+                clarify_path.write_text(
+                    json.dumps({"questions": ["Who is the audience?"]}),
+                    encoding="utf-8",
+                )
                 return TaskResult(
                     task_id=task.task_id,
                     success=True,
                     output={
                         "needs_clarification": True,
                         "questions": ["Who is the audience?"],
-                        "files": ["draft.md"],
+                        "files": [str(clarify_path)],
                         "summary": "Need audience guidance before writing the draft.",
                     },
                 )
@@ -500,8 +507,10 @@ class TestStudioRunner:
         assert stage["question_count"] == 1
         assert stage["summary"] == "Need audience guidance before writing the draft."
         assert stage["next_action"].startswith("Answer 1 clarification question")
-        assert stage["files"] == ["draft.md"]
+        assert stage["files"] == ["_clarifications.json"]
         assert stage["handoff_to"] == "ReviewerAgent"
+        saved_manifest = json.loads((tmp_path / "demo" / "project.json").read_text())
+        assert saved_manifest["stages"][0]["files"] == ["_clarifications.json"]
 
     async def test_run_pipeline_tags_nested_agent_events_with_project_context(
         self, event_bus, tmp_path, monkeypatch
@@ -983,7 +992,8 @@ class TestStudioRunner:
         runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
         manifest = await runner.start("demo", "Review this project", slug="quality-demo")
 
-        assert manifest["status"] == "done"
+        assert manifest["status"] == "needs_fixes"
+        assert manifest["next_action"] == "Reviewer found a few issues before launch."
         assert manifest["quality_summary"] == {
             "source": "reviewer",
             "verdict": "go-with-fixes",
@@ -1070,7 +1080,9 @@ class TestStudioRunner:
         runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
         manifest = await runner.start("demo", "Ship a launch pack", slug="quality-priority")
 
-        assert manifest["status"] == "done"
+        assert manifest["status"] == "failed"
+        assert manifest["next_action"] == "Reviewer found launch-blocking gaps."
+        assert manifest["error"] == "Reviewer found launch-blocking gaps."
         assert manifest["quality_summary"]["source"] == "reviewer"
         assert manifest["quality_summary"]["verdict"] == "no-go"
         assert manifest["quality_summary"]["score"] == 41
@@ -1234,7 +1246,8 @@ class TestStudioRunner:
         manifest = runner.get_project("orphaned-quality")
 
         assert manifest is not None
-        assert manifest["status"] == "failed"
+        assert manifest["status"] == "interrupted"
+        assert manifest["next_action"] == "Project was interrupted because the server restarted."
         assert manifest["quality_summary"] is None
 
     async def test_mark_project_failed_clears_quality_summary(

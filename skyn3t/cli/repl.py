@@ -412,7 +412,7 @@ HELP_TEXT = """\
 - `/pipeline NAME [PROMPT...]` — run a pipeline by name
 - `/project BRIEF...` — start a Studio run (defaults to the auto planner)
 - `/project --audience builders --autonomy confirm_first BRIEF...` — steer the run before launch
-- `/project --repo-path ../customer-portal --focus-file src/login.tsx BRIEF...` — target another local git repo
+- `/project --repo-path ../customer-portal --focus-file src/login.tsx BRIEF...` — target another local git repo or GitHub URL
 - `/project TEMPLATE :: BRIEF...` — force a specific Studio template
 - `/rag QUERY` — run agentic RAG
 - `/ingest REPO` — kick off a GitHub repo ingestion
@@ -548,7 +548,7 @@ async def _cmd_pipeline(state: ReplState, rest: str) -> None:
 async def _cmd_project(state: ReplState, rest: str) -> None:
     usage = (
         "usage: /project [--audience auto|general|builders|team|leaders|investors] "
-        "[--autonomy balanced|confirm_first|move_fast] [--repo-path PATH] [--focus-file PATH] BRIEF... "
+        "[--autonomy balanced|confirm_first|move_fast] [--repo-path PATH_OR_GITHUB_URL] [--focus-file PATH] BRIEF... "
         "or /project [options] TEMPLATE :: BRIEF..."
     )
     if not rest:

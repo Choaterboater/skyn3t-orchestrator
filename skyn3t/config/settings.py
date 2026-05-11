@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     # Paths
     data_dir: Path = Field(default=Path("./data"), alias="DATA_DIR")
     logs_dir: Path = Field(default=Path("./logs"), alias="LOGS_DIR")
+    projects_dir: Path = Field(default=Path("./projects"), alias="PROJECTS_DIR")
 
     # Database
     database_url: str = Field(
@@ -106,17 +107,26 @@ class Settings(BaseSettings):
             return []
         return [str(v).strip()]
 
-    @field_validator("data_dir", "logs_dir", "secret_storage_path", "audit_log_dir", "policy_file", mode="before")
+    @field_validator(
+        "data_dir",
+        "logs_dir",
+        "projects_dir",
+        "secret_storage_path",
+        "audit_log_dir",
+        "policy_file",
+        mode="before",
+    )
     @classmethod
     def parse_paths(cls, v: Any) -> Any:
         if v is None:
             return None
-        return Path(v)
+        return Path(v).expanduser()
 
     def ensure_directories(self) -> None:
         """Create necessary data directories."""
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.projects_dir.mkdir(parents=True, exist_ok=True)
         self.audit_log_dir.mkdir(parents=True, exist_ok=True)
         Path(self.vector_db_path).mkdir(parents=True, exist_ok=True)
 

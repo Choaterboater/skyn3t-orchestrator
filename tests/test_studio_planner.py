@@ -65,6 +65,22 @@ async def test_plan_pipeline_prefers_code_improver_for_target_files():
 
 
 @pytest.mark.asyncio
+async def test_plan_pipeline_does_not_inject_code_for_nonsoftware_build_language():
+    llm = StubPlannerLLM(
+        '{"agents":["MarketerAgent","WriterAgent"],'
+        '"expected_artifacts":["positioning.md","launch_checklist.md"],'
+        '"rationale":{"MarketerAgent":"Own the campaign.","WriterAgent":"Write the launch copy."}}'
+    )
+
+    stages = await plan_pipeline(
+        brief="Build a launch campaign for a new AI code reviewer",
+        llm_client=llm,
+    )
+
+    assert "CodeAgent" not in [stage.agent for stage in stages]
+
+
+@pytest.mark.asyncio
 async def test_plan_pipeline_heuristics_do_not_treat_build_as_ui():
     stages = await plan_pipeline(brief="Build a small todo app", llm_client=None)
 
@@ -74,3 +90,14 @@ async def test_plan_pipeline_heuristics_do_not_treat_build_as_ui():
         "CodeAgent",
         "ReviewerAgent",
     ]
+
+
+@pytest.mark.asyncio
+async def test_plan_pipeline_heuristics_do_not_treat_generic_build_campaign_as_software():
+    stages = await plan_pipeline(
+        brief="Build a launch campaign for a new AI code reviewer",
+        llm_client=None,
+    )
+
+    assert "ArchitectAgent" not in [stage.agent for stage in stages]
+    assert "CodeAgent" not in [stage.agent for stage in stages]

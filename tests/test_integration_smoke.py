@@ -5,10 +5,8 @@ These tests exercise the full orchestrator + agent + event-bus stack
 wiring between components — things unit tests with mocks can miss.
 """
 
-import asyncio
 import threading
 import time
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 
@@ -20,7 +18,6 @@ from skyn3t.core.agent import BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import Event, EventBus, EventType
 from skyn3t.core.orchestrator import Orchestrator
 from skyn3t.persistence.checkpoint import Checkpoint, CheckpointManager
-
 
 # ---------------------------------------------------------------------------
 # Minimal test agent
@@ -266,9 +263,11 @@ def test_event_bus_thread_safety_under_concurrent_publish():
             errors.append(exc)
 
     def churn_subscriber() -> None:
+        def cb(_ev) -> None:
+            return None
+
         try:
             while not stop_subscriber.is_set():
-                cb = lambda _ev: None
                 bus.subscribe(cb, EventType.SYSTEM_ALERT)
                 bus.unsubscribe(cb, EventType.SYSTEM_ALERT)
         except BaseException as exc:  # noqa: BLE001
