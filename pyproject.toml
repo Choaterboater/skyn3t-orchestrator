@@ -75,6 +75,13 @@ dev = [
     "mypy>=1.5.0",
     "httpx>=0.26.0",
 ]
+# Headless browser smoke test for static-site scaffolds. BuildVerifier
+# treats Playwright as optional — when missing, the static verify gate
+# falls back to the html.parser strict-feed pass. Install with:
+#   pip install -e ".[smoke]" && playwright install chromium
+smoke = [
+    "playwright>=1.40.0",
+]
 
 [project.scripts]
 skyn3t = "skyn3t.cli.main:app"

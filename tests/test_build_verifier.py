@@ -47,7 +47,14 @@ async def test_python_scaffold_with_syntax_error_fails(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_static_html_well_formed_passes(tmp_path):
+async def test_static_html_well_formed_passes(tmp_path, monkeypatch):
+    """Stub the render gate so this test doesn't spin up Chromium on every
+    run — that adds 3-5s to the suite. The render gate has dedicated tests
+    below that exercise both the skip and fail paths."""
+    monkeypatch.setattr(
+        BuildVerifierAgent, "_render_smoke_test",
+        staticmethod(lambda *_a, **_kw: None),
+    )
     scaffold = tmp_path / "scaffold"
     scaffold.mkdir()
     (scaffold / "index.html").write_text(
@@ -119,6 +126,55 @@ async def test_node_project_with_no_lockfile_skipped(tmp_path):
     out = res.output
     assert out["verdict"] == "skipped"
     assert out["stack"] == "node"
+
+
+@pytest.mark.asyncio
+async def test_static_render_gate_returns_skipped_when_playwright_unavailable(tmp_path, monkeypatch):
+    """When Playwright isn't installed, the render gate gracefully reports
+    skipped and the static check passes on parse alone — never penalizes a
+    well-formed HTML scaffold just because the optional browser dep is missing."""
+    scaffold = tmp_path / "scaffold"
+    scaffold.mkdir()
+    (scaffold / "index.html").write_text(
+        "<!doctype html><html><head><title>x</title></head>"
+        "<body><h1>hi</h1></body></html>"
+    )
+    # Force the "playwright not installed" branch by stubbing the helper.
+    monkeypatch.setattr(
+        BuildVerifierAgent, "_render_smoke_test",
+        staticmethod(lambda *_a, **_kw: None),
+    )
+    agent = BuildVerifierAgent()
+    await agent.initialize()
+    res = await agent.execute(TaskRequest(input_data={"scaffold_dir": str(scaffold)}))
+    out = res.output
+    assert out["verdict"] == "yes"
+    assert out["stack"] == "static"
+    assert "render gate skipped" in (out["command"] or "")
+
+
+@pytest.mark.asyncio
+async def test_static_render_gate_fails_when_smoke_returns_errors(tmp_path, monkeypatch):
+    """If Playwright is available AND reports a console.error, the static
+    verifier must flip verdict to 'no' so the in-place fix loop fires."""
+    scaffold = tmp_path / "scaffold"
+    scaffold.mkdir()
+    (scaffold / "index.html").write_text(
+        "<!doctype html><html><head><title>x</title></head>"
+        "<body><h1>hi</h1></body></html>"
+    )
+    monkeypatch.setattr(
+        BuildVerifierAgent, "_render_smoke_test",
+        staticmethod(lambda *_a, **_kw: (False, ["pageerror: ReferenceError: foo is not defined"], "")),
+    )
+    agent = BuildVerifierAgent()
+    await agent.initialize()
+    res = await agent.execute(TaskRequest(input_data={"scaffold_dir": str(scaffold)}))
+    out = res.output
+    assert out["verdict"] == "no"
+    assert out["stack"] == "static"
+    assert "pageerror" in (out["stderr"] or "")
+    assert out["failure_hint"]
 
 
 @pytest.mark.asyncio
