@@ -1720,6 +1720,87 @@ async def proposals_reject(pid: str, payload: dict | None = None):
     return get_store().reject(pid, reason=reason)
 
 
+@app.post("/api/proposals/feature/preview")
+async def proposals_feature_preview(payload: dict, request: Request = None):  # type: ignore[assignment]
+    """Dry-run what filing this idea would do.
+
+    Used by the Cortex UI to show the user — before they file — what
+    file would be patched, which capability area it touches, and what
+    the planned execution would look like on approval. No proposal is
+    created.
+    """
+    if request is not None:
+        rl = _rate_limit_check(request, label="proposals_feature_preview", capacity=30, refill_per_sec=30/60)
+        if rl is not None:
+            return rl
+    idea = (payload or {}).get("idea", "").strip()
+    if not idea:
+        return JSONResponse({"error": "idea required"}, status_code=400)
+    try:
+        from skyn3t.cortex.feature_suggester import (
+            infer_feature_target_file,
+            _idea_keywords,
+            _TARGET_HINTS,
+            REPO_ROOT,
+        )
+
+        target_file = infer_feature_target_file(idea, repo_root=REPO_ROOT)
+        keywords = _idea_keywords(idea)
+
+        # Which capability areas the idea touches (from _TARGET_HINTS).
+        # Each hint pair is (keyword_set, related_paths).
+        kw_set = set(keywords)
+        capability_hits = []
+        for hint_keywords, hint_paths in _TARGET_HINTS:
+            overlap = hint_keywords.intersection(kw_set)
+            if overlap:
+                capability_hits.append({
+                    "keywords": sorted(overlap),
+                    "related_files": list(hint_paths),
+                })
+
+        # Heuristic: estimate what features could land. We can't truly
+        # predict — but we can list adjacent files + the rationale the
+        # code_improver would receive, which is most of the answer.
+        next_action: dict
+        if target_file:
+            next_action = {
+                "kind": "self_patch",
+                "summary": (
+                    f"On approval, the CodeImproverAgent will draft a patch "
+                    f"starting from `{target_file}` based on the rationale you wrote."
+                ),
+                "target_file": target_file,
+                "agent": "code_improver",
+            }
+        else:
+            next_action = {
+                "kind": "blocked",
+                "summary": (
+                    "No starting file could be inferred from this idea. "
+                    "Try mentioning a concrete area (e.g. 'planner', 'cortex', "
+                    "'studio', 'rag') or a file path."
+                ),
+                "agent": None,
+            }
+
+        return {
+            "idea": idea,
+            "target_file": target_file or "",
+            "keywords": keywords,
+            "capability_hits": capability_hits,
+            "next_action": next_action,
+            "would_create": {
+                "kind": "feature",
+                "origin": "user",
+                "status": "pending",
+                "requires_approval": True,
+            },
+        }
+    except Exception as e:
+        return _safe_error_response(e)
+
+
 @app.post("/api/proposals/feature")
 async def proposals_feature(payload: dict, request: Request = None):  # type: ignore[assignment]
     # Rate-limit: 10/min/IP. Free-text idea filing → spam vector.
