@@ -1436,6 +1436,41 @@ async def get_lesson_scores(limit: int = 10):
     }
 
 
+@app.get("/api/memory/build_patterns")
+async def get_build_patterns(stack: Optional[str] = None):
+    """Build-pattern scoreboard — (stack, shape) → success/failure counts.
+
+    Without ``stack``: returns the aggregate summary plus per-stack
+    best+worst shapes. With ``stack``: returns every recorded shape for
+    that stack. Driven by BuildVerifier outcomes recorded in
+    skyn3t/studio/runner.py after every scaffold.
+    """
+    from skyn3t.intelligence.build_patterns import get_default_scoreboard
+    sb = get_default_scoreboard()
+    if stack:
+        return {
+            "stack": stack,
+            "shapes": [s.to_dict() for s in sb.all_stats_for(stack)],
+        }
+    # Aggregate view — for the dashboard tile.
+    summary = sb.summary()
+    per_stack = {}
+    # Touch the private map carefully — we only read keys.
+    try:
+        with sb._lock:
+            stacks = list(sb._stats.keys())
+    except Exception:
+        stacks = []
+    for st in stacks:
+        best = sb.best_shape(st)
+        worst = sb.worst_shape(st)
+        per_stack[st] = {
+            "best": best.to_dict() if best else None,
+            "worst": worst.to_dict() if worst else None,
+        }
+    return {"summary": summary, "per_stack": per_stack}
+
+
 @app.get("/api/meta/status")
 async def meta_agent_status():
     """Get meta-agent status and recent actions."""
