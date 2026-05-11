@@ -2,6 +2,7 @@ import { NavLink, Route, Routes } from "react-router-dom";
 
 import OverviewPage from "./routes/OverviewPage";
 import AgentsPage from "./routes/AgentsPage";
+import StudioPage from "./routes/StudioPage";
 import ChatPage from "./routes/ChatPage";
 import SkillsPage from "./routes/SkillsPage";
 import BuildPatternsPage from "./routes/BuildPatternsPage";
@@ -17,6 +18,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<OverviewPage />} />
           <Route path="/agents" element={<AgentsPage />} />
+          <Route path="/studio" element={<StudioPage />} />
           <Route path="/chat" element={<ChatPage />} />
           <Route path="/skills" element={<SkillsPage />} />
           <Route path="/build-patterns" element={<BuildPatternsPage />} />
@@ -32,6 +34,7 @@ function Sidebar() {
   const items = [
     { to: "/",               label: "Overview",        icon: "fa-solid fa-gauge" },
     { to: "/agents",         label: "Agents",          icon: "fa-solid fa-robot" },
+    { to: "/studio",         label: "Studio",          icon: "fa-solid fa-hammer" },
     { to: "/chat",           label: "Chat",            icon: "fa-solid fa-comments" },
     { to: "/skills",         label: "Skills",          icon: "fa-solid fa-graduation-cap" },
     { to: "/build-patterns", label: "Build Patterns",  icon: "fa-solid fa-route" },
