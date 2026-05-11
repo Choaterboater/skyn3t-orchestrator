@@ -66,10 +66,12 @@ class LLMRequest:
 
 # Subprocess timeouts (seconds)
 _AVAILABLE_TIMEOUT = 3.0
-# 120s used to time out research with multi-product integration specs and
-# code-gen with multi-file prompts. 300s gives subscription-backed CLIs
-# (claude/copilot/kimi) headroom for long thinking + large emissions.
-_COMPLETE_TIMEOUT = 300.0
+# Real-world ceiling: copilot CLI doing MCP web search across 6-7
+# services plus emitting a multi-section spec OR a large per-file
+# scaffold legitimately takes 5-10 minutes. 300s killed real work in
+# v5/v6 of homelab. 600s lets the model finish while still capping
+# the worst case so a stuck call doesn't hang forever.
+_COMPLETE_TIMEOUT = 600.0
 
 
 class LLMClient:
