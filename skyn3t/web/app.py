@@ -340,6 +340,13 @@ async def lifespan(app: FastAPI):
     # Create event bus and orchestrator
     event_bus = EventBus()
     event_bus.subscribe(broadcast_event)
+    # Token tracker: subscribes to LLM_EXCHANGE events and keeps
+    # per-agent / per-project rollups. No-op if subscribe fails.
+    try:
+        from skyn3t.observability.token_tracker import get_default_tracker
+        get_default_tracker().subscribe(event_bus)
+    except Exception:
+        logger.exception("token tracker subscribe failed")
 
     orchestrator = Orchestrator(event_bus)
     orchestrator.enable_memory()
@@ -1487,6 +1494,37 @@ async def get_lesson_scores(limit: int = 10):
         "top_helpful": [s.to_dict() for s in sb.top_helpful(limit=limit)],
         "top_hurtful": [s.to_dict() for s in sb.top_hurtful(limit=limit)],
     }
+
+
+@app.get("/api/usage/totals")
+async def usage_totals():
+    """Aggregate token usage across all agents + all projects."""
+    from skyn3t.observability.token_tracker import get_default_tracker
+    return get_default_tracker().totals()
+
+
+@app.get("/api/usage/agents")
+async def usage_per_agent():
+    """Per-agent token rollup. Sorted desc by total_tokens."""
+    from skyn3t.observability.token_tracker import get_default_tracker
+    return {"agents": get_default_tracker().per_agent()}
+
+
+@app.get("/api/usage/projects")
+async def usage_per_project():
+    """Per-project token rollup with stage breakdown."""
+    from skyn3t.observability.token_tracker import get_default_tracker
+    return {"projects": get_default_tracker().per_project()}
+
+
+@app.get("/api/usage/projects/{slug}")
+async def usage_for_project(slug: str):
+    """Per-project rollup for a single slug."""
+    from skyn3t.observability.token_tracker import get_default_tracker
+    data = get_default_tracker().for_project(slug)
+    if not data:
+        return JSONResponse({"error": "no usage data for this slug yet"}, status_code=404)
+    return data
 
 
 @app.get("/api/memory/skills")

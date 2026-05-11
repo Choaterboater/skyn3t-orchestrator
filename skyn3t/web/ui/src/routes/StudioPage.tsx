@@ -24,6 +24,18 @@ export default function StudioPage() {
     refetchOnWindowFocus: true,
   });
 
+  // Per-project token usage rollup. Falls back gracefully if the
+  // tracker endpoint isn't available (older backend).
+  const usage = useQuery({
+    queryKey: ["usage_projects"],
+    queryFn: api.usagePerProject,
+    refetchInterval: 8_000,
+    retry: false,
+  });
+  const usageBySlug = new Map(
+    (usage.data ?? []).map((u: any) => [u.slug, u]),
+  );
+
   const detail = useQuery({
     queryKey: ["studio_project", selected],
     queryFn: () => api.project(selected as string),
@@ -91,6 +103,7 @@ export default function StudioPage() {
           error={projects.error}
           selected={selected}
           onPick={pickProject}
+          usageBySlug={usageBySlug}
         />
         <div className="min-w-0">
           {mode === "new" && <NewProjectForm onStarted={onStarted} />}
@@ -119,12 +132,14 @@ function ProjectList({
   error,
   selected,
   onPick,
+  usageBySlug,
 }: {
   projects: ProjectRow[];
   isLoading: boolean;
   error: unknown;
   selected: string | null;
   onPick: (slug: string) => void;
+  usageBySlug: Map<string, { total_tokens: number; calls: number }>;
 }) {
   const sorted = useMemo(
     () =>
@@ -176,8 +191,16 @@ function ProjectList({
                   </span>
                   <StatusPill status={p.status} />
                 </div>
-                <div className="text-[0.65rem] text-text-dim font-mono mt-1 truncate">
-                  {p.template ?? "—"} · {p.slug}
+                <div className="text-[0.65rem] text-text-dim font-mono mt-1 truncate flex items-center gap-2">
+                  <span className="truncate">{p.template ?? "—"} · {p.slug}</span>
+                  {usageBySlug.get(p.slug) && (
+                    <span
+                      className="shrink-0 text-accent"
+                      title={`${usageBySlug.get(p.slug)!.calls} LLM calls`}
+                    >
+                      {fmtTokensCompact(usageBySlug.get(p.slug)!.total_tokens)}
+                    </span>
+                  )}
                 </div>
                 {p.brief && (
                   <div
@@ -629,4 +652,13 @@ function StatusPill({ status }: { status: string }) {
       {s}
     </span>
   );
+}
+
+// Compact token formatter. 1234 → "1.2K tok", 1234567 → "1.2M tok".
+// Estimated 4-chars-per-token from LLM_EXCHANGE event payloads.
+function fmtTokensCompact(n: number): string {
+  if (!n || n < 0) return "0 tok";
+  if (n < 1000) return `${n} tok`;
+  if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}K tok`;
+  return `${(n / 1_000_000).toFixed(n < 10_000_000 ? 2 : 1)}M tok`;
 }

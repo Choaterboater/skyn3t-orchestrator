@@ -205,6 +205,45 @@ export type SystemStatus = {
 export const api = {
   status: () => fetchJson<SystemStatus>("/api/status"),
   swarmSnapshot: () => fetchJson<any>("/api/swarm/snapshot"),
+  usageTotals: () =>
+    fetchJson<{
+      total_tokens: number;
+      total_calls: number;
+      agents_tracked: number;
+      projects_tracked: number;
+    }>("/api/usage/totals"),
+  usagePerAgent: () =>
+    fetchJson<{
+      agents: Array<{
+        agent: string;
+        prompt_tokens: number;
+        response_tokens: number;
+        total_tokens: number;
+        calls: number;
+        last_used_at: number;
+        backend?: string;
+        model?: string;
+      }>;
+    }>("/api/usage/agents").then((d) => d.agents ?? []),
+  usagePerProject: () =>
+    fetchJson<{
+      projects: Array<{
+        slug: string;
+        total_tokens: number;
+        prompt_tokens: number;
+        response_tokens: number;
+        calls: number;
+        last_used_at: number;
+        stages: Array<{
+          stage: string;
+          total_tokens: number;
+          calls: number;
+          by_agent: Record<string, number>;
+        }>;
+      }>;
+    }>("/api/usage/projects").then((d) => d.projects ?? []),
+  usageForProject: (slug: string) =>
+    fetchJson<any>(`/api/usage/projects/${encodeURIComponent(slug)}`),
   agents: () =>
     fetchJson<{ agents: AgentRow[] }>("/api/agents").then((d) => d.agents ?? []),
   execAgent: (name: string, message: string) =>
