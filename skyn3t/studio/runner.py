@@ -505,15 +505,20 @@ class StudioRunner:
                     except Exception:
                         _stage_to = None
                     if _stage_to is None:
-                        # Per-stage defaults. Code and research are the
-                        # heavy-LLM stages — code does N per-file calls
-                        # with the full prior-artifact context (research +
-                        # arch + design = ~30KB per call) and 5+ files,
-                        # research can do real web search via MCP. Both
-                        # routinely exceed the old flat 300s cap. Other
-                        # stages stay at 300s; nothing else should need
-                        # more than a single big LLM call.
-                        heavy_stages = {"code", "research"}
+                        # Per-stage defaults. Heavy stages routinely exceed
+                        # the old 300s cap because they consume the full
+                        # prior-artifact context (research 32KB + arch 6KB
+                        # + design 7 files + code 7 files + brief) AND
+                        # produce their own multi-section output:
+                        #   - code: N per-file LLM calls with that whole
+                        #     context per call
+                        #   - research: real MCP web search across
+                        #     multiple services
+                        #   - reviewer: reads all upstream artifacts to
+                        #     grade the swarm's work — added after v8
+                        #     timed out reviewing a 23KB App.jsx + 32KB
+                        #     research.md
+                        heavy_stages = {"code", "research", "reviewer"}
                         _stage_to = 1800.0 if stage.name in heavy_stages else 300.0
                     with push_event_context(
                         project_slug=slug,
