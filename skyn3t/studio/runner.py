@@ -844,6 +844,24 @@ class StudioRunner:
                                 manifest["_retry_hint"] = (
                                     build_result.get("failure_hint") or ""
                                 )
+                            # Record the (stack, shape, verdict) outcome in
+                            # the build-pattern scoreboard regardless of
+                            # success/fail — the meta-agent reads this to
+                            # spot which shapes correlate with success so
+                            # future scaffolds can be biased toward them.
+                            try:
+                                from skyn3t.intelligence.build_patterns import (
+                                    get_default_scoreboard,
+                                )
+                                stack = (build_result or {}).get("stack") or "unknown"
+                                shape = sorted(
+                                    p.relative_to(scaffold_dir).as_posix()
+                                    for p in scaffold_dir.rglob("*")
+                                    if p.is_file() and "__pycache__" not in p.parts
+                                )
+                                get_default_scoreboard().record(stack, shape, verdict)
+                            except Exception:
+                                logger.exception("build_pattern record failed")
             completion_message = (
                 manifest["next_action"]
                 if manifest.get("status") in {"done", "needs_fixes"}
