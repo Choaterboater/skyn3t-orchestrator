@@ -205,3 +205,161 @@ def hint_for_stack(stack: Optional[str]) -> str:
     if not stack:
         return ""
     return STACK_BUILD_HINTS.get(stack, "")
+
+
+# ── Per-stack README starters ──────────────────────────────────────────
+#
+# Every scaffold's README has the same shape (Install / Run / How it
+# works / License). Content differs per stack but the LLM writes nearly
+# the same boilerplate every time — wasted tokens. Generate it locally.
+# CodeAgent can use these as the README body directly, or pass them to
+# the LLM as a starting point for a brief-specific README.
+
+def _readme_static(brief: str) -> str:
+    return (
+        f"# Project\n\n"
+        f"{brief.strip()}\n\n"
+        "## Run\n\n"
+        "Open `index.html` in any modern browser. No build step.\n\n"
+        "```bash\n"
+        "open index.html   # macOS\n"
+        "xdg-open index.html  # Linux\n"
+        "```\n\n"
+        "## Files\n\n"
+        "- `index.html` — entry markup\n"
+        "- `style.css` — styles\n"
+        "- `script.js` — interactive behavior (loaded with `defer`)\n"
+    )
+
+
+def _readme_python_cli(brief: str) -> str:
+    return (
+        f"# Project\n\n"
+        f"{brief.strip()}\n\n"
+        "## Install\n\n"
+        "```bash\n"
+        "python3 -m venv .venv && source .venv/bin/activate\n"
+        "pip install -r requirements.txt\n"
+        "```\n\n"
+        "## Run\n\n"
+        "```bash\n"
+        "python main.py --help\n"
+        "```\n"
+    )
+
+
+def _readme_fastapi(brief: str) -> str:
+    return (
+        f"# Project\n\n"
+        f"{brief.strip()}\n\n"
+        "## Install\n\n"
+        "```bash\n"
+        "python3 -m venv .venv && source .venv/bin/activate\n"
+        "pip install -r requirements.txt\n"
+        "cp .env.example .env  # then edit\n"
+        "```\n\n"
+        "## Run\n\n"
+        "```bash\n"
+        "uvicorn src.main:app --reload\n"
+        "```\n\n"
+        "Smoke: `curl http://127.0.0.1:8000/health` should return "
+        "`{\"status\":\"ok\"}`.\n\n"
+        "## Test\n\n"
+        "```bash\n"
+        "pytest tests/\n"
+        "```\n"
+    )
+
+
+def _readme_flask(brief: str) -> str:
+    return (
+        f"# Project\n\n"
+        f"{brief.strip()}\n\n"
+        "## Install\n\n"
+        "```bash\n"
+        "python3 -m venv .venv && source .venv/bin/activate\n"
+        "pip install -r requirements.txt\n"
+        "```\n\n"
+        "## Run\n\n"
+        "```bash\n"
+        "flask --app app run\n"
+        "```\n\n"
+        "Then open http://127.0.0.1:5000.\n"
+    )
+
+
+def _readme_node_cli(brief: str) -> str:
+    return (
+        f"# Project\n\n"
+        f"{brief.strip()}\n\n"
+        "## Install\n\n"
+        "```bash\n"
+        "npm install\n"
+        "```\n\n"
+        "## Run\n\n"
+        "```bash\n"
+        "node index.js --help\n"
+        "```\n"
+    )
+
+
+def _readme_react_vite(brief: str) -> str:
+    return (
+        f"# Project\n\n"
+        f"{brief.strip()}\n\n"
+        "## Install\n\n"
+        "```bash\n"
+        "npm install\n"
+        "```\n\n"
+        "## Run\n\n"
+        "```bash\n"
+        "npm run dev\n"
+        "```\n\n"
+        "Then open http://127.0.0.1:5173.\n\n"
+        "## Build\n\n"
+        "```bash\n"
+        "npm run build && npm run preview\n"
+        "```\n"
+    )
+
+
+def _readme_next(brief: str) -> str:
+    return (
+        f"# Project\n\n"
+        f"{brief.strip()}\n\n"
+        "## Install\n\n"
+        "```bash\n"
+        "npm install\n"
+        "```\n\n"
+        "## Run\n\n"
+        "```bash\n"
+        "npm run dev\n"
+        "```\n\n"
+        "Then open http://127.0.0.1:3000.\n\n"
+        "## Build\n\n"
+        "```bash\n"
+        "npm run build && npm start\n"
+        "```\n"
+    )
+
+
+_README_GENERATORS = {
+    "static_site": _readme_static,
+    "python_cli": _readme_python_cli,
+    "fastapi": _readme_fastapi,
+    "flask": _readme_flask,
+    "node_cli": _readme_node_cli,
+    "react_vite": _readme_react_vite,
+    "next": _readme_next,
+}
+
+
+def readme_for_stack(stack: Optional[str], brief: str) -> Optional[str]:
+    """Return a deterministic README.md body for the given stack, or None
+    when the stack isn't recognized. ``brief`` is interpolated as the
+    project description in the first paragraph.
+    """
+    if not stack:
+        return None
+    gen = _README_GENERATORS.get(stack)
+    return gen(brief or "") if gen else None

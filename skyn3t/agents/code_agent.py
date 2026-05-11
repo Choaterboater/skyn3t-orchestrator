@@ -237,6 +237,7 @@ class CodeAgent(BaseAgent):
             )
             if stack_hint:
                 build_system = build_system + "\n\n" + stack_hint
+            from skyn3t.agents.stack_templates import readme_for_stack
             for i, spec in enumerate(file_specs, start=1):
                 if not isinstance(spec, dict):
                     continue
@@ -250,6 +251,22 @@ class CodeAgent(BaseAgent):
                 except ValueError:
                     continue
                 target.parent.mkdir(parents=True, exist_ok=True)
+
+                # README shortcut: when a known stack is in play, generate
+                # the README deterministically instead of burning an LLM
+                # call on boilerplate the model writes the same way every
+                # time. Saves ~1 call per project (~8k tokens of room).
+                if rel.lower() in ("readme.md", "readme") and stack != "minimal":
+                    body_static = readme_for_stack(stack, brief)
+                    if body_static:
+                        try:
+                            target.write_text(body_static, encoding="utf-8")
+                            files_written.append(str(target))
+                            await self.think(f"wrote {rel} (deterministic readme for {stack})")
+                            continue
+                        except Exception:
+                            pass  # fall through to LLM path
+
                 await self.think(f"building file {i}/{len(file_specs)}: {rel}")
                 file_prompt = (
                     f"Brief:\n{brief}\n\nStack: {stack}\n\n"
@@ -280,7 +297,26 @@ class CodeAgent(BaseAgent):
         except Exception:
             logger.exception("scaffold-from-brief failed; falling back to deterministic stub")
 
-        if not files_written:
+        # Fallback path: if the LLM didn't produce real code files, hand-
+        # roll the scaffold. Two trigger cases:
+        #   (a) Nothing got written at all (LLM offline or every call
+        #       returned deterministic-stub).
+        #   (b) Only the deterministic README was written but no code —
+        #       happens when a stack template fires but the LLM portion
+        #       fails. Without this check we'd ship a README and zero
+        #       code, which is worse than the hand-rolled scaffold.
+        non_readme = [
+            f for f in files_written
+            if _Path(f).name.lower() not in ("readme.md", "readme")
+        ]
+        if not non_readme:
+            # Wipe any README we wrote — the fallback will produce its
+            # own coherent set including a brief-relevant README.
+            for f in files_written:
+                try:
+                    _Path(f).unlink()
+                except Exception:
+                    pass
             files_written = self._write_fallback_scaffold(out_dir, brief)
 
         try:
