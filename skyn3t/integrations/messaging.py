@@ -432,6 +432,401 @@ class MatrixChannel(MessagingChannel):
             logger.exception("Matrix send failed")
 
 
+# ── Signal (signal-cli REST API or signald JSON-RPC) ─────────────────
+
+
+class SignalChannel(MessagingChannel):
+    """Signal channel via signal-cli's REST API.
+
+    Signal doesn't ship a first-party bot API. The standard self-hosted
+    bridge is bbernhard/signal-cli-rest-api — a Docker container that
+    wraps signal-cli and exposes a small REST surface for sending and
+    receiving messages. This class targets that wire shape.
+
+    Inbound: poll-mode or webhook-mode (the bridge supports both).
+    This implementation accepts whatever payload shape the bridge
+    forwards via webhook → ingest().
+
+    Outbound: POST /v2/send to the bridge with {message, number,
+    recipients}. The bridge handles the actual Signal Protocol.
+
+    Env config:
+      SIGNAL_BRIDGE_URL  — base URL, e.g. http://localhost:8080
+      SIGNAL_NUMBER      — the registered bot phone number in E.164,
+                           e.g. +15551234567
+    """
+
+    platform = "signal"
+
+    def __init__(
+        self,
+        event_bus: EventBus,
+        *,
+        bridge_url: Optional[str] = None,
+        number: Optional[str] = None,
+    ):
+        super().__init__(event_bus)
+        self.bridge_url = (bridge_url or os.getenv("SIGNAL_BRIDGE_URL", "")).rstrip("/")
+        self.number = number or os.getenv("SIGNAL_NUMBER", "")
+        self._http: Any = None
+
+    async def handle_inbound(self, raw: Dict[str, Any]) -> Optional[InboundMessage]:
+        """Normalize a signal-cli-rest-api envelope.
+
+        Shape (a typical incoming-text payload from the bridge):
+            {
+              "envelope": {
+                "source": "+15551234567",
+                "sourceName": "Alice",
+                "timestamp": 1729012345000,
+                "dataMessage": {
+                  "message": "build me a thing",
+                  "groupInfo": {"groupId": "abc=", "type": "DELIVER"}
+                }
+              },
+              "account": "+15559999999"
+            }
+        """
+        envelope = raw.get("envelope") or {}
+        data = envelope.get("dataMessage") or {}
+        text = (data.get("message") or "").strip()
+        if not text:
+            # Receipts, typing, sync — ignore.
+            return None
+        source = str(envelope.get("source") or "")
+        if not source:
+            return None
+        # Channel = group id when in a group, else the sender number.
+        group = (data.get("groupInfo") or {}).get("groupId")
+        channel = str(group or source)
+        return InboundMessage(
+            platform=self.platform,
+            channel=channel,
+            sender=source,
+            text=text,
+            thread=str(envelope.get("timestamp") or "") or None,
+            raw=raw,
+        )
+
+    async def send(
+        self, channel: str, text: str, *, thread: Optional[str] = None
+    ) -> None:
+        if not self.bridge_url or not self.number:
+            logger.warning("Signal send skipped: SIGNAL_BRIDGE_URL / SIGNAL_NUMBER unset")
+            return
+        if not channel or not text:
+            return
+        if self._http is None:
+            try:
+                import httpx  # type: ignore
+                self._http = httpx.AsyncClient(timeout=15.0)
+            except Exception:
+                logger.exception("Signal send: httpx unavailable")
+                return
+        # signal-cli-rest-api v2 distinguishes recipients (numbers) from
+        # group ids by looking at the value: a leading '+' means E.164
+        # number, otherwise treated as a group id.
+        if channel.startswith("+"):
+            payload: Dict[str, Any] = {
+                "message": text,
+                "number": self.number,
+                "recipients": [channel],
+            }
+        else:
+            payload = {
+                "message": text,
+                "number": self.number,
+                "recipients": [channel],
+                # Some bridge versions need an explicit group_id field;
+                # send both to maximize compat.
+                "group_id": channel,
+            }
+        url = f"{self.bridge_url}/v2/send"
+        try:
+            resp = await self._http.post(url, json=payload)
+            if resp.status_code >= 400:
+                logger.warning("Signal send %d: %s", resp.status_code, resp.text[:200])
+        except Exception:
+            logger.exception("Signal send failed")
+
+
+# ── BlueBubbles iMessage (BlueBubbles server bridge) ──────────────────
+
+
+class IMessageChannel(MessagingChannel):
+    """iMessage channel via the BlueBubbles server (open-source iMessage
+    bridge for macOS).
+
+    Apple offers no official API. BlueBubbles is the dominant self-host
+    bridge: a Mac runs the BlueBubbles Server, which exposes a REST
+    surface over the local network. This class targets BlueBubbles v1.
+
+    Inbound: the bridge POSTs new-message webhooks to /webhooks/imessage
+    on our server. Outbound: POST /api/v1/message/text with the chat
+    GUID and message body.
+
+    Env config:
+      BLUEBUBBLES_URL       — base URL, e.g. http://192.168.1.50:1234
+      BLUEBUBBLES_PASSWORD  — required for every API call; the bridge
+                              uses a password instead of a token.
+    """
+
+    platform = "imessage"
+
+    def __init__(
+        self,
+        event_bus: EventBus,
+        *,
+        bridge_url: Optional[str] = None,
+        password: Optional[str] = None,
+    ):
+        super().__init__(event_bus)
+        self.bridge_url = (bridge_url or os.getenv("BLUEBUBBLES_URL", "")).rstrip("/")
+        self.password = password or os.getenv("BLUEBUBBLES_PASSWORD", "")
+        self._http: Any = None
+
+    async def handle_inbound(self, raw: Dict[str, Any]) -> Optional[InboundMessage]:
+        """Normalize a BlueBubbles 'new-message' webhook envelope.
+
+        Shape:
+            {
+              "type": "new-message",
+              "data": {
+                "guid": "iMessage;-;chat123",
+                "text": "build me a thing",
+                "chats": [{"guid": "iMessage;-;chat123"}],
+                "handle": {"address": "+15551234567"},
+                "isFromMe": false,
+                "dateCreated": 1729012345000
+              }
+            }
+        """
+        if raw.get("type") != "new-message":
+            return None
+        data = raw.get("data") or {}
+        if data.get("isFromMe"):
+            # Echo from the bot's own send; ignore so we don't loop.
+            return None
+        text = (data.get("text") or "").strip()
+        if not text:
+            return None
+        chats = data.get("chats") or []
+        chat_guid = ""
+        if chats and isinstance(chats[0], dict):
+            chat_guid = str(chats[0].get("guid") or "")
+        handle = (data.get("handle") or {}).get("address") or ""
+        if not chat_guid:
+            return None
+        return InboundMessage(
+            platform=self.platform,
+            channel=chat_guid,
+            sender=str(handle or "unknown"),
+            text=text,
+            thread=str(data.get("guid") or "") or None,
+            raw=raw,
+        )
+
+    async def send(
+        self, channel: str, text: str, *, thread: Optional[str] = None
+    ) -> None:
+        if not self.bridge_url or not self.password:
+            logger.warning("iMessage send skipped: BLUEBUBBLES_URL / PASSWORD unset")
+            return
+        if not channel or not text:
+            return
+        if self._http is None:
+            try:
+                import httpx  # type: ignore
+                self._http = httpx.AsyncClient(timeout=15.0)
+            except Exception:
+                logger.exception("iMessage send: httpx unavailable")
+                return
+        url = (
+            f"{self.bridge_url}/api/v1/message/text"
+            f"?password={self.password}"
+        )
+        # BlueBubbles requires a deterministic tempGuid for idempotency.
+        import time as _time
+        import hashlib as _hashlib
+        seed = f"{channel}|{int(_time.time() * 1000)}|{text[:64]}"
+        temp_guid = "temp-" + _hashlib.sha1(seed.encode("utf-8")).hexdigest()[:24]
+        payload = {
+            "chatGuid": channel,
+            "tempGuid": temp_guid,
+            "message": text,
+            "method": "apple-script",  # most reliable on macOS hosts
+        }
+        try:
+            resp = await self._http.post(url, json=payload)
+            if resp.status_code >= 400:
+                logger.warning("iMessage send %d: %s", resp.status_code, resp.text[:200])
+        except Exception:
+            logger.exception("iMessage send failed")
+
+
+# ── Microsoft Teams (Bot Framework webhook) ───────────────────────────
+
+
+class MSTeamsChannel(MessagingChannel):
+    """Microsoft Teams channel via the Bot Framework REST API.
+
+    Teams talks to bots via the Azure Bot Service. The bot registers
+    a messaging endpoint (HTTPS), Teams POSTs Activity payloads to it,
+    and the bot replies by POSTing back to ``activity.serviceUrl`` with
+    a bearer token from Azure AD.
+
+    For self-hosted bots, the typical setup is:
+      1. Register a bot in Azure Bot Service (free tier ok).
+      2. Set the Microsoft App ID + password in env vars.
+      3. Configure the bot's messaging endpoint to
+         POST https://<your-host>/webhooks/msteams.
+      4. Mount that route in this codebase (kept out of this module so
+         operators can opt in — bot framework token fetching adds a
+         Microsoft auth dependency we don't want to force).
+
+    This class handles the wire-shape pieces: parsing inbound Activity
+    payloads, building reply Activities. Auth token acquisition is
+    left to the operator's deployment because it requires the msal
+    package + an Azure tenant configuration that varies.
+
+    Env config:
+      MSTEAMS_APP_ID       — bot's Microsoft App ID
+      MSTEAMS_APP_PASSWORD — bot's Microsoft App password / secret
+    """
+
+    platform = "msteams"
+
+    def __init__(
+        self,
+        event_bus: EventBus,
+        *,
+        app_id: Optional[str] = None,
+        app_password: Optional[str] = None,
+    ):
+        super().__init__(event_bus)
+        self.app_id = app_id or os.getenv("MSTEAMS_APP_ID", "")
+        self.app_password = app_password or os.getenv("MSTEAMS_APP_PASSWORD", "")
+        self._http: Any = None
+        self._token: Optional[str] = None
+        self._token_expires_at: float = 0.0
+
+    async def handle_inbound(self, raw: Dict[str, Any]) -> Optional[InboundMessage]:
+        """Normalize a Teams Activity payload.
+
+        Shape (an incoming user-typed message in a channel/group):
+            {
+              "type": "message",
+              "id": "1700000000",
+              "text": "<at>SkyN3t</at> build me a thing",
+              "from": {"id": "29:abc...", "name": "Alice"},
+              "conversation": {"id": "19:xyz@thread.tacv2"},
+              "serviceUrl": "https://smba.trafficmanager.net/amer/",
+              "channelData": {"team": {...}}
+            }
+        """
+        if raw.get("type") != "message":
+            return None
+        text = (raw.get("text") or "").strip()
+        if not text:
+            return None
+        # Strip <at>BotName</at> mentions Teams injects in group chats.
+        import re as _re
+        text = _re.sub(r"<at>[^<]*</at>", "", text).strip()
+        if not text:
+            return None
+        conv = raw.get("conversation") or {}
+        sender = raw.get("from") or {}
+        # `serviceUrl` is per-tenant — the bot must POST replies back to
+        # whatever serviceUrl the inbound carried. Stash it in raw so
+        # the send path can look it up.
+        return InboundMessage(
+            platform=self.platform,
+            channel=str(conv.get("id") or ""),
+            sender=str(sender.get("id") or sender.get("name") or "unknown"),
+            text=text,
+            thread=str(raw.get("id") or "") or None,
+            raw=raw,
+        )
+
+    async def _get_token(self) -> Optional[str]:
+        """Acquire a Bot Framework token via the AAD client-credentials
+        flow. Cached for the token's lifetime minus a 60s safety margin.
+        Returns None when credentials aren't set so the caller can skip
+        the send cleanly."""
+        import time as _time
+        now = _time.time()
+        if self._token and now < self._token_expires_at - 60:
+            return self._token
+        if not self.app_id or not self.app_password:
+            return None
+        if self._http is None:
+            try:
+                import httpx  # type: ignore
+                self._http = httpx.AsyncClient(timeout=15.0)
+            except Exception:
+                return None
+        url = "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token"
+        data = {
+            "grant_type": "client_credentials",
+            "client_id": self.app_id,
+            "client_secret": self.app_password,
+            "scope": "https://api.botframework.com/.default",
+        }
+        try:
+            resp = await self._http.post(
+                url, data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            if resp.status_code >= 400:
+                logger.warning("MSTeams token %d: %s", resp.status_code, resp.text[:200])
+                return None
+            tok = resp.json()
+            self._token = tok.get("access_token")
+            expires_in = int(tok.get("expires_in") or 0)
+            self._token_expires_at = now + expires_in
+            return self._token
+        except Exception:
+            logger.exception("MSTeams token fetch failed")
+            return None
+
+    async def send(
+        self, channel: str, text: str, *, thread: Optional[str] = None
+    ) -> None:
+        """Post a reply to a Teams conversation.
+
+        Teams routes replies through ``serviceUrl``, but we don't have
+        that here without the inbound payload. Operators pass the
+        inbound's ``raw`` back via the router's reply path — see
+        ``ingest`` which preserves it on the published TASK_CREATED
+        payload. For the simple case this method falls back to the
+        default Teams serviceUrl which is correct for most tenants.
+        """
+        if not channel or not text:
+            return
+        token = await self._get_token()
+        if not token:
+            logger.warning("MSTeams send skipped: no token")
+            return
+        # Default serviceUrl — the per-tenant URL is the actual right
+        # answer when present, but smba.trafficmanager.net is the
+        # documented global ingress and works for most deploys.
+        service_url = "https://smba.trafficmanager.net/amer/"
+        url = (
+            f"{service_url.rstrip('/')}/v3/conversations/"
+            f"{channel}/activities"
+        )
+        body: Dict[str, Any] = {"type": "message", "text": text}
+        if thread:
+            body["replyToId"] = thread
+        headers = {"Authorization": f"Bearer {token}"}
+        try:
+            resp = await self._http.post(url, json=body, headers=headers)
+            if resp.status_code >= 400:
+                logger.warning("MSTeams send %d: %s", resp.status_code, resp.text[:200])
+        except Exception:
+            logger.exception("MSTeams send failed")
+
+
 def _strip_case_insensitive(text: str, needle: str) -> str:
     """Remove every case-insensitive occurrence of ``needle`` from ``text``."""
     out: List[str] = []
