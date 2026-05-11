@@ -30,10 +30,12 @@ export default function ActivityPage() {
   });
 
   useEffect(() => {
-    // Exponential backoff reconnect. When the backend is restarting,
-    // a tight loop here spams the console with "WebSocket failed" for
-    // every component re-render — back off so the user can read other
-    // diagnostics.
+    // Reconnecting WebSocket with backoff. The trick is StrictMode in
+    // dev: it mounts → unmounts → re-mounts to flush effects. The
+    // first WS's `onclose` was firing AFTER cleanup ran and was
+    // scheduling reconnects past unmount. Solution: detach handlers
+    // explicitly on cleanup and check `cancelled` inside every
+    // callback.
     let cancelled = false;
     let retry = 0;
     let timer: number | null = null;
@@ -54,18 +56,24 @@ export default function ActivityPage() {
       wsRef.current = ws;
 
       ws.onopen = () => {
+        if (cancelled) {
+          ws.close();
+          return;
+        }
         retry = 0;
         setConnected(true);
       };
       ws.onclose = () => {
+        if (cancelled) return;
         setConnected(false);
         scheduleReconnect();
       };
       ws.onerror = () => {
+        if (cancelled) return;
         setConnected(false);
-        // onclose fires after onerror, no need to schedule here.
       };
       ws.onmessage = (e) => {
+        if (cancelled) return;
         try {
           const msg = JSON.parse(e.data);
           if (msg?.type === "swarm" && msg.data) {
@@ -79,8 +87,9 @@ export default function ActivityPage() {
 
     const scheduleReconnect = () => {
       if (cancelled) return;
-      // 1s, 2s, 4s, 8s, capped at 15s.
-      const delay = Math.min(15000, 1000 * 2 ** retry);
+      // 2s, 4s, 8s, capped at 30s. Starts higher than 1s so StrictMode
+      // double-mounts don't trigger an immediate second connect.
+      const delay = Math.min(30000, 2000 * 2 ** retry);
       retry += 1;
       timer = window.setTimeout(connect, delay);
     };
@@ -89,11 +98,24 @@ export default function ActivityPage() {
 
     return () => {
       cancelled = true;
-      if (timer) window.clearTimeout(timer);
-      try {
-        wsRef.current?.close();
-      } catch {
-        /* */
+      if (timer !== null) {
+        window.clearTimeout(timer);
+        timer = null;
+      }
+      const ws = wsRef.current;
+      if (ws) {
+        // Detach handlers before close so the dying socket doesn't
+        // fire onclose → scheduleReconnect after we've unmounted.
+        ws.onopen = null;
+        ws.onclose = null;
+        ws.onerror = null;
+        ws.onmessage = null;
+        try {
+          ws.close();
+        } catch {
+          /* */
+        }
+        wsRef.current = null;
       }
     };
   }, []);

@@ -172,6 +172,13 @@ function AgentEditDrawer({
     queryKey: ["agent_config", name],
     queryFn: () => api.agentConfig(name),
   });
+  // Backend catalog for the dropdowns. Cached aggressively — backends
+  // and their model lists don't change at runtime.
+  const catalog = useQuery({
+    queryKey: ["agent_models"],
+    queryFn: api.agentModels,
+    staleTime: 5 * 60_000,
+  });
   const [form, setForm] = useState<AgentConfigView["config"]>({});
   const [enabled, setEnabled] = useState<boolean>(true);
 
@@ -241,27 +248,12 @@ function AgentEditDrawer({
             Enabled
           </label>
 
-          <Field label="Backend">
-            <input
-              value={form?.backend ?? ""}
-              onChange={(e) =>
-                setForm((f) => ({ ...f, backend: e.target.value }))
-              }
-              placeholder="e.g. claude_cli, openrouter, anthropic"
-              className="w-full bg-bg-3 border border-border rounded px-2 py-1.5 text-sm font-mono outline-none focus:border-accent"
-            />
-          </Field>
-
-          <Field label="Model">
-            <input
-              value={form?.model ?? ""}
-              onChange={(e) =>
-                setForm((f) => ({ ...f, model: e.target.value }))
-              }
-              placeholder="e.g. claude-sonnet-4-6"
-              className="w-full bg-bg-3 border border-border rounded px-2 py-1.5 text-sm font-mono outline-none focus:border-accent"
-            />
-          </Field>
+          <BackendModelDropdowns
+            backend={form?.backend ?? ""}
+            model={form?.model ?? ""}
+            catalog={catalog.data?.backends ?? []}
+            onChange={(patch) => setForm((f) => ({ ...f, ...patch }))}
+          />
 
           <Field label="System prompt">
             <textarea
@@ -362,6 +354,143 @@ function AgentEditDrawer({
         </form>
       )}
     </aside>
+  );
+}
+
+// Backend + Model dropdowns. Selecting a backend filters the model
+// list. Picking "Custom..." in either flips back to a free-text input
+// — useful for one-off models that aren't in the static catalog.
+function BackendModelDropdowns({
+  backend,
+  model,
+  catalog,
+  onChange,
+}: {
+  backend: string;
+  model: string;
+  catalog: Array<{
+    backend: string;
+    models: Array<{ id: string; label: string }>;
+  }>;
+  onChange: (patch: { backend?: string; model?: string }) => void;
+}) {
+  const knownBackends = catalog.map((b) => b.backend);
+  const backendInCatalog = backend === "" || knownBackends.includes(backend);
+  const [backendCustom, setBackendCustom] = useState(!backendInCatalog);
+
+  const currentBackendEntry = catalog.find((b) => b.backend === backend);
+  const knownModels = currentBackendEntry?.models ?? [];
+  const knownModelIds = knownModels.map((m) => m.id);
+  const modelInCatalog = model === "" || knownModelIds.includes(model);
+  const [modelCustom, setModelCustom] = useState(!modelInCatalog);
+
+  // Keep "custom" toggles in sync if the form value is changed externally
+  // (e.g. when a different agent is loaded).
+  useEffect(() => {
+    setBackendCustom(!backendInCatalog);
+  }, [backendInCatalog]);
+  useEffect(() => {
+    setModelCustom(!modelInCatalog);
+  }, [modelInCatalog]);
+
+  return (
+    <>
+      <Field label="Backend">
+        {backendCustom ? (
+          <div className="flex gap-2">
+            <input
+              value={backend}
+              onChange={(e) => onChange({ backend: e.target.value })}
+              placeholder="custom backend name"
+              className="flex-1 bg-bg-3 border border-border rounded px-2 py-1.5 text-sm font-mono outline-none focus:border-accent"
+            />
+            <button
+              type="button"
+              onClick={() => setBackendCustom(false)}
+              className="text-[0.65rem] text-text-dim hover:text-text-primary px-2"
+            >
+              pick
+            </button>
+          </div>
+        ) : (
+          <select
+            value={backend}
+            onChange={(e) => {
+              const v = e.target.value;
+              if (v === "__custom__") {
+                setBackendCustom(true);
+              } else {
+                // When backend changes, clear the model so the user re-picks
+                // from the new backend's list.
+                onChange({ backend: v, model: "" });
+              }
+            }}
+            className="w-full bg-bg-3 border border-border rounded px-2 py-1.5 text-sm font-mono outline-none focus:border-accent"
+          >
+            <option value="">(default)</option>
+            {catalog.map((b) => (
+              <option key={b.backend} value={b.backend}>
+                {b.backend}
+              </option>
+            ))}
+            <option value="__custom__">Custom...</option>
+          </select>
+        )}
+      </Field>
+
+      <Field label="Model">
+        {modelCustom ? (
+          <div className="flex gap-2">
+            <input
+              value={model}
+              onChange={(e) => onChange({ model: e.target.value })}
+              placeholder="custom model id"
+              className="flex-1 bg-bg-3 border border-border rounded px-2 py-1.5 text-sm font-mono outline-none focus:border-accent"
+            />
+            <button
+              type="button"
+              onClick={() => setModelCustom(false)}
+              className="text-[0.65rem] text-text-dim hover:text-text-primary px-2"
+              disabled={knownModels.length === 0}
+              title={
+                knownModels.length === 0
+                  ? "Pick a backend first"
+                  : "Show dropdown"
+              }
+            >
+              pick
+            </button>
+          </div>
+        ) : (
+          <select
+            value={model}
+            onChange={(e) => {
+              const v = e.target.value;
+              if (v === "__custom__") {
+                setModelCustom(true);
+              } else {
+                onChange({ model: v });
+              }
+            }}
+            disabled={knownModels.length === 0}
+            className="w-full bg-bg-3 border border-border rounded px-2 py-1.5 text-sm font-mono outline-none focus:border-accent disabled:opacity-50"
+          >
+            <option value="">(default)</option>
+            {knownModels.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.label}
+              </option>
+            ))}
+            <option value="__custom__">Custom...</option>
+          </select>
+        )}
+        {knownModels.length === 0 && !modelCustom && (
+          <p className="text-[0.6rem] text-text-dim mt-1">
+            Pick a backend above to see its models.
+          </p>
+        )}
+      </Field>
+    </>
   );
 }
 
