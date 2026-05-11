@@ -119,3 +119,34 @@ def test_distinguishing_files_lists_extras_in_winner(fresh_meta):
     meta._check_build_pattern_biases()
     assert len(store.proposals) == 1
     assert "tsconfig.json" in store.proposals[0]["payload"]["distinguishing_files"]
+
+
+def test_winning_shape_persists_as_skill_file(fresh_meta, monkeypatch, tmp_path):
+    """End-to-end: MetaAgent's pattern scan should persist the winning
+    shape as a first-class Skill file the next scaffold can read."""
+    import skyn3t.intelligence.skill_library as sl
+    skill_root = tmp_path / "skills"
+    monkeypatch.setattr(sl, "_default_library", None)
+    monkeypatch.setattr(
+        sl, "get_default_library",
+        lambda: sl.SkillLibrary(root=skill_root),
+    )
+
+    meta, sb, store = fresh_meta
+    # Same fastapi setup as the headline pass-fail test.
+    for _ in range(6):
+        sb.record("fastapi", ["src/main.py", "tests/test_health.py", "requirements.txt"], "yes")
+    sb.record("fastapi", ["src/main.py", "tests/test_health.py", "requirements.txt"], "no")
+    sb.record("fastapi", ["src/main.py", "requirements.txt"], "yes")
+    for _ in range(5):
+        sb.record("fastapi", ["src/main.py", "requirements.txt"], "no")
+    meta._check_build_pattern_biases()
+
+    lib = sl.get_default_library()
+    skills = lib.find(tag="fastapi", min_score=-1.0, limit=5)
+    names = [s.name for s in skills]
+    assert "fastapi-winning-shape" in names
+    target = next(s for s in skills if s.name == "fastapi-winning-shape")
+    assert "tests/test_health.py" in target.body
+    assert "scaffold-shape" in target.tags
+    assert "build-success" in target.tags
