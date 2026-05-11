@@ -768,6 +768,37 @@ class StudioRunner:
                     manifest["next_action"] = (
                         "Retrying with a code-producing planner."
                     )
+                else:
+                    # If a scaffold dir was produced, run BuildVerifier as a
+                    # post-stage gate. A scaffold that doesn't compile / parse
+                    # is a failure even if every stage reported success — the
+                    # user wants programs that RUN, not just files that exist.
+                    # Verifier failure surfaces a `failure_hint` we attach to
+                    # the manifest so the auto-retry can inject it as a lesson.
+                    scaffold_dir = artifact_dir / "scaffold"
+                    if scaffold_dir.exists() and scaffold_dir.is_dir():
+                        try:
+                            build_result = await self._run_build_verifier(
+                                str(scaffold_dir), brief,
+                            )
+                        except Exception:
+                            logger.exception("build_verifier invocation failed")
+                            build_result = None
+                        if build_result is not None:
+                            manifest["build_verification"] = build_result
+                            verdict = build_result.get("verdict")
+                            if verdict == "no":
+                                manifest["status"] = "failed"
+                                manifest["error"] = (
+                                    build_result.get("summary")
+                                    or "Build verifier rejected the scaffold."
+                                )
+                                manifest["next_action"] = (
+                                    "Retrying with the build failure as a hint."
+                                )
+                                manifest["_retry_hint"] = (
+                                    build_result.get("failure_hint") or ""
+                                )
             completion_message = (
                 manifest["next_action"]
                 if manifest.get("status") in {"done", "needs_fixes"}
@@ -937,6 +968,35 @@ class StudioRunner:
             if suffix in cls._CODE_LIKE_EXTENSIONS:
                 return False
         return True
+
+    async def _run_build_verifier(self, scaffold_dir: str, brief: str) -> Optional[Dict[str, Any]]:
+        """Invoke BuildVerifierAgent in-process and return its output dict.
+
+        Constructed fresh per project rather than fetched from the orchestrator
+        — that way the verifier doesn't require any registered-agent plumbing,
+        and tests can run it without booting the full stack.
+        """
+        try:
+            from skyn3t.agents.build_verifier import BuildVerifierAgent
+        except Exception:
+            return None
+        from skyn3t.core.agent import TaskRequest
+        try:
+            agent = BuildVerifierAgent(event_bus=self.event_bus)
+            await agent.initialize()
+            result = await agent.execute(
+                TaskRequest(
+                    title="build-verify",
+                    description=f"verify scaffold for: {brief[:120]}",
+                    input_data={"scaffold_dir": scaffold_dir, "brief": brief},
+                )
+            )
+        except Exception:
+            logger.exception("build_verifier execute failed")
+            return None
+        if not result.success or not isinstance(result.output, dict):
+            return None
+        return result.output
 
     def _scan_artifacts(self, d: Path) -> List[str]:
         """Return relative paths of files under ``d`` (capped at 200)."""
@@ -1644,12 +1704,23 @@ class StudioRunner:
         ]
         # Build the augmented brief — the original brief plus a "previous
         # attempt failed because X" hint that the planner will treat as a
-        # constraint when picking a new shape.
-        lesson_block = (
-            f"\n\nPrior attempt ({original_template}) failed at stages "
-            f"{failed_stages or '?'}: {error_summary}\n"
-            f"Try a different shape — pick alternative agents or a simpler stack."
-        )
+        # constraint when picking a new shape. If BuildVerifier left a
+        # `_retry_hint` (compact tail of build log), prefer that as the
+        # lesson — it's much more actionable than a stage name.
+        build_hint = manifest.get("_retry_hint") or ""
+        if build_hint:
+            lesson_block = (
+                "\n\nPrior attempt failed during build verification. "
+                "Use this as a constraint when picking the next shape:\n"
+                f"{build_hint}\n"
+                "Try a different stack, or fix the specific error above."
+            )
+        else:
+            lesson_block = (
+                f"\n\nPrior attempt ({original_template}) failed at stages "
+                f"{failed_stages or '?'}: {error_summary}\n"
+                f"Try a different shape — pick alternative agents or a simpler stack."
+            )
         retry_brief = (brief or "").rstrip() + lesson_block
         retry_slug = f"{slug}-retry"
         try:

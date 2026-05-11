@@ -52,6 +52,7 @@ DEFAULT_ROSTER: List[Tuple[str, Callable[[Any], Dict[str, Any]]]] = [
     ("ProjectMemoryAgent", _kw_rag),
     ("DocsIngestorAgent", _kw_rag),
     ("VerifierAgent", _kw_eb),
+    ("BuildVerifierAgent", _kw_eb),
 ]
 
 
