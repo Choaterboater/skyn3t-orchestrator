@@ -1,7 +1,8 @@
 # Issue: Code-generation reliability on integration-heavy briefs
 
 **Date:** 2026-05-14
-**Status:** Open
+**Last updated:** 2026-05-15
+**Status:** Partially mitigated — see "Resolution status" at the bottom.
 **Severity:** High — current bottleneck on success rate
 **Affects:** v37, v38, v45, v45-retry, v46 (all homelab dashboard runs since infra fixes landed)
 
@@ -178,3 +179,17 @@ double-check `server/index.js` includes all `routes/*.js` imports."
   below the 75 threshold for `done`)
 - Sandbox dir for current backend (PID 75020): `/var/folders/yj/.../skyn3t-llm-cwd-567hfihu/`
 - Latest scaffold under inspection: `~/Documents/skyn3t/Projects/homelab-dashboard-v46/scaffold/`
+
+## Resolution status (2026-05-15)
+
+| Proposal | Status | Where |
+|---|---|---|
+| #1 Mount checker in consistency engine | **Landed** | `skyn3t/agents/consistency_engine.py:118` `_find_missing_router_mounts()`, wired in `check_consistency` at `:555`; covered by `tests/test_consistency_engine.py::test_consistency_flags_unmounted_router` + `::test_consistency_accepts_mounted_router`. Suggestion text and mount-prefix synthesis match this issue's spec. Tag on `BuildPatternScoreboard` (proposal #4) not yet implemented. |
+| #2 Sandbox-content harvesting in `_run_capture` | **Landed (partial)** | `skyn3t/adapters/llm_client.py:425` `_collect_sandbox_artifacts()` + `:454` `_append_sandbox_artifacts()`. Harvest filters by mtime; appends via `// === <relpath> ===` markers. Sandbox cwd is now per-call with cleanup (BR-012 fix on 2026-05-15) — previously a process singleton. Residual: marker syntax is JS-comment-shaped and confuses downstream parsers when content is Python/HTML. |
+| #3 Frontend `vite build` dry-run inside critique loop | **Open** | Not implemented. Would shift Class-2 failures (v46) from end-of-run to inside critique. |
+| #4 Per-class build-pattern scoreboard rule (`missing_mount` tag) | **Open** | The mount checker exists, but the build-patterns scoreboard doesn't tag `(stack, shape, "missing_mount")` yet, so the planner can't pre-warn. |
+
+Class-1 (missing mount) and Class-3 (sandbox content lost) are now caught
+by the consistency engine before reaching the integration verifier, and
+by the harvest step before stdout is read. Class-2 (frontend build
+failure inside critique) is still the remaining open work.
