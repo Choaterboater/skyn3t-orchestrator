@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 import traceback
@@ -594,6 +595,14 @@ class StudioRunner:
                     **(extra or {}),
                     **stage.input_extra,
                 }
+                # Inject scoreboard-derived pre-warnings into the code
+                # stage. If this (stack, planned-shape) has lost the
+                # router mount in past runs, tell the CodeAgent to
+                # double-check the mount lines before handoff.
+                if stage.name == "code":
+                    pre_warnings = self._scoreboard_prewarnings(brief)
+                    if pre_warnings:
+                        input_data["scoreboard_prewarnings"] = pre_warnings
                 task = TaskRequest(
                     title=f"{template_key}:{stage.name}",
                     input_data=input_data,
@@ -2664,6 +2673,46 @@ class StudioRunner:
         all_files = self._scaffold_shape(scaffold_dir)
         return validate_stack_shape(detected, all_files)
 
+    @staticmethod
+    def _scoreboard_prewarnings(brief: str) -> List[str]:
+        """Return pre-warning strings derived from BuildPatternScoreboard.
+
+        Looks up the planner-time shape for ``brief`` against the
+        per-shape tag counts (e.g. ``missing_mount``). If a shape has
+        accumulated enough failures of a known class, surface a one-
+        line warning the CodeAgent can read.
+        """
+        warnings: List[str] = []
+        try:
+            from skyn3t.agents.stack_templates import detect_stack, plan_for_stack
+            from skyn3t.intelligence.build_patterns import get_default_scoreboard
+
+            stack = detect_stack(brief)
+            if not stack:
+                return warnings
+            shape_files = plan_for_stack(stack, brief)
+            if not shape_files:
+                return warnings
+            shape = [str(p) for p in shape_files]
+            sb = get_default_scoreboard()
+
+            # Threshold: 3+ occurrences of a tag for this (stack, shape)
+            # combo earns a warning. Tunable; we picked 3 to match the
+            # meta-agent's ``min_samples`` for shape-level decisions.
+            mount_misses = sb.tag_count_for_shape(stack, shape, "missing_mount")
+            if mount_misses >= 3:
+                warnings.append(
+                    f"⚠️ Past failure pattern for this {stack} shape: the "
+                    f"server/routes/*.js routers got exported but never "
+                    f"`app.use(...)`-mounted in server/index.js "
+                    f"({mount_misses} prior occurrences). Double-check that "
+                    f"every routes/*.js file is imported AND mounted in "
+                    f"server/index.js before handoff."
+                )
+        except Exception:
+            logger.debug("scoreboard pre-warning lookup failed", exc_info=True)
+        return warnings
+
     async def _run_post_code_checks(
         self,
         *,
@@ -2690,6 +2739,27 @@ class StudioRunner:
             "ok": bool(report.ok),
             "issue_count": len(report.issues),
         }
+
+        # Record per-category tags on the build-pattern scoreboard so the
+        # planner can pre-warn future runs about shapes that historically
+        # fail a specific way (e.g. lose the router mount).
+        missing_mount_count = sum(
+            1 for i in report.issues if i.category == "missing_mount"
+        )
+        if missing_mount_count:
+            try:
+                from skyn3t.agents.stack_templates import detect_stack
+                from skyn3t.intelligence.build_patterns import (
+                    get_default_scoreboard,
+                )
+                stack = detect_stack(brief) or "unknown"
+                shape = self._scaffold_shape(scaffold_dir)
+                if stack != "unknown" and shape:
+                    get_default_scoreboard().record_tag(
+                        stack, shape, "missing_mount",
+                    )
+            except Exception:
+                logger.exception("missing_mount scoreboard tag failed")
 
         # Fail fast on stack mismatch before mutating files with targeted fix.
         if mismatches:
@@ -2755,6 +2825,216 @@ class StudioRunner:
                 status="running",
                 message=f"{len(report.issues)} consistency issues found after code stage.",
             )
+
+        # ── Frontend build dry-run (proposal #3) ───────────────────────────
+        # Shift Class-2 failures (vite build fails inside the final
+        # BuildVerifier) from end-of-run into the critique window. We
+        # run `vite build` against the frontend dir; if it fails, we
+        # feed the error log through apply_targeted_fix so the LLM
+        # repairs it now instead of after another reviewer pass.
+        await self._run_frontend_build_dryrun(
+            manifest=manifest,
+            artifact_dir=artifact_dir,
+            scaffold_dir=scaffold_dir,
+            brief=brief,
+        )
+
+    async def _run_frontend_build_dryrun(
+        self,
+        *,
+        manifest: Dict[str, Any],
+        artifact_dir: Path,
+        scaffold_dir: Path,
+        brief: str,
+    ) -> None:
+        """Run `vite build` to catch frontend errors before BuildVerifier.
+
+        Skipped when:
+          * No frontend exists in this scaffold (server-only / python_cli).
+          * No package.json declares vite as a script or devDep (would
+            run for ~20s discovering nothing).
+          * `npm`/`node` aren't on PATH.
+        """
+        import shutil as _sh
+        if not scaffold_dir.exists():
+            return
+        # Cheap front-end detection — anchored to the files we'd be
+        # building. If there's no index.html plus no JSX/TSX/JS/TS
+        # files under src/, there's nothing for vite to build.
+        has_index = (scaffold_dir / "index.html").is_file()
+        has_src_entry = False
+        src_dir = scaffold_dir / "src"
+        if src_dir.is_dir():
+            for ext in ("*.jsx", "*.tsx", "*.js", "*.ts"):
+                if next(src_dir.rglob(ext), None) is not None:
+                    has_src_entry = True
+                    break
+        if not (has_index and has_src_entry):
+            return
+
+        pkg_path = scaffold_dir / "package.json"
+        if not pkg_path.is_file():
+            return
+        try:
+            pkg_text = pkg_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return
+        if "vite" not in pkg_text:
+            return
+
+        npm_bin = _sh.which("npm")
+        node_bin = _sh.which("node")
+        if not npm_bin or not node_bin:
+            return
+
+        # We need node_modules to run vite — but vite is heavy, so cap
+        # the install + build at the same total budget as the eventual
+        # BuildVerifier so we don't blow the stage timeout here.
+        cmd_install = [
+            npm_bin, "install", "--no-audit", "--no-fund",
+            "--silent", "--prefer-offline",
+        ]
+        cmd_build = [npm_bin, "run", "build", "--silent"]
+        env = os.environ.copy()
+        env["CI"] = "1"  # vite/npm: non-interactive
+
+        try:
+            install_proc = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    *cmd_install,
+                    cwd=str(scaffold_dir),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                ),
+                timeout=180.0,
+            )
+            install_stdout, install_stderr = await asyncio.wait_for(
+                install_proc.communicate(), timeout=180.0
+            )
+        except asyncio.TimeoutError:
+            logger.info("frontend build dry-run: npm install timed out — skipping")
+            return
+        except (OSError, FileNotFoundError):
+            return
+
+        if install_proc.returncode != 0:
+            stderr_text = install_stderr.decode(errors="replace") if install_stderr else ""
+            # Network failure is not a code defect — skip the build phase
+            # rather than spuriously failing the run.
+            if any(
+                phrase in stderr_text
+                for phrase in ("ECONNREFUSED", "ENOTFOUND", "network", "unable to connect")
+            ):
+                logger.info("frontend build dry-run: npm install network error — skipping")
+                return
+            # Unknown install failure: still skip the build verifier
+            # would catch it later anyway.
+            logger.info("frontend build dry-run: npm install failed — leaving for BuildVerifier")
+            return
+
+        try:
+            build_proc = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    *cmd_build,
+                    cwd=str(scaffold_dir),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                ),
+                timeout=120.0,
+            )
+            build_stdout, build_stderr = await asyncio.wait_for(
+                build_proc.communicate(), timeout=120.0
+            )
+        except asyncio.TimeoutError:
+            logger.info("frontend build dry-run: vite build timed out — skipping")
+            return
+        except (OSError, FileNotFoundError):
+            return
+
+        if build_proc.returncode == 0:
+            manifest["frontend_build_dryrun"] = {"ok": True}
+            return
+
+        # Build failed. Capture the tail of stderr (most informative
+        # part of a vite/rollup error) and feed it through targeted_fix.
+        build_stderr_text = build_stderr.decode(errors="replace") if build_stderr else ""
+        build_stdout_text = build_stdout.decode(errors="replace") if build_stdout else ""
+        error_blob = (build_stderr_text or build_stdout_text or "").strip()
+        error_tail = error_blob[-3500:]  # vite error tail is usually self-contained
+
+        manifest["frontend_build_dryrun"] = {
+            "ok": False,
+            "error_tail": error_tail,
+        }
+        self._save_manifest(artifact_dir, manifest)
+        self._append_history(
+            manifest,
+            "FRONTEND_BUILD_DRYRUN_FAILED",
+            status="running",
+            message=(
+                error_tail.splitlines()[0]
+                if error_tail
+                else "vite build failed (no output)"
+            ),
+        )
+
+        # Hand the build error to targeted_fix so the LLM can repair.
+        # We don't know which file is at fault — vite/rollup error
+        # text usually names it. Let the LLM parse it.
+        from skyn3t.adapters import LLMClient
+        from skyn3t.agents.targeted_fix import FileIssue, apply_targeted_fix
+
+        # Try to extract the offending file path from the error tail.
+        # Common vite/rollup shapes: "src/foo.jsx:12:5", "error during
+        # build: file: src/foo.jsx".
+        target_file = self._guess_failed_file(error_tail, scaffold_dir)
+        client = LLMClient(event_bus=self.event_bus, caller_name="vite_dryrun_fix")
+        issues = [
+            FileIssue(
+                path=target_file or "src/main.jsx",
+                error_message=(
+                    "vite build failed during code-stage dry-run. "
+                    "Tail of build output:\n\n" + error_tail
+                ),
+                suggested_action="regenerate",
+            )
+        ]
+        try:
+            fix_result = await apply_targeted_fix(
+                scaffold_dir=scaffold_dir,
+                issues=issues,
+                llm_client=client,
+                brief=brief,
+            )
+            manifest["frontend_build_dryrun"]["fix"] = {
+                "changed": fix_result.files_changed,
+                "created": fix_result.files_created,
+                "errors": fix_result.errors,
+            }
+            self._save_manifest(artifact_dir, manifest)
+        except Exception:
+            logger.exception("frontend build dry-run targeted fix crashed")
+
+    @staticmethod
+    def _guess_failed_file(error_text: str, scaffold_dir: Path) -> Optional[str]:
+        """Pull a scaffold-relative file path out of a vite/rollup error tail."""
+        if not error_text:
+            return None
+        # Match common shapes: "src/foo.jsx:12:5" or "/abs/.../scaffold/src/foo.jsx".
+        scaffold_str = str(scaffold_dir.resolve())
+        for line in error_text.splitlines():
+            m = re.search(r"([A-Za-z0-9_\-./]+\.(?:jsx|tsx|js|ts|css|html))(?::\d+)?", line)
+            if not m:
+                continue
+            candidate = m.group(1)
+            if candidate.startswith(scaffold_str):
+                candidate = candidate[len(scaffold_str):].lstrip("/")
+            # Sanity-check that file exists in scaffold
+            if (scaffold_dir / candidate).is_file():
+                return candidate
+        return None
 
     def _scan_artifacts(self, d: Path) -> List[str]:
         """Return relative paths of files under ``d`` (capped at 200)."""
