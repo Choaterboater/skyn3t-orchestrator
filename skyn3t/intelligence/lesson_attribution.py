@@ -156,8 +156,22 @@ class LessonScoreboard:
                     self._stats[lid] = stats
                 stats.last_seen_at = time.time()
 
-    def record_outcome(self, task_id: str, *, success: bool) -> None:
-        """Credit/debit injected lessons based on the task outcome."""
+    def record_outcome(
+        self,
+        task_id: str,
+        *,
+        success: Optional[bool] = None,
+        neutral: bool = False,
+    ) -> None:
+        """Credit/debit injected lessons based on the task outcome.
+
+        ``neutral=True`` counts the outcome without nudging the
+        helpful/hurt ratio — useful for tasks that completed but
+        didn't exercise the lesson (skipped, no-op, etc). Without
+        this path the ``LessonStats.neutral`` field is write-only.
+        """
+        if not neutral and success is None:
+            raise ValueError("record_outcome: pass success= or neutral=True")
         with self._lock:
             ids = self._inflight.pop(task_id, [])
             if not ids:
@@ -167,7 +181,9 @@ class LessonScoreboard:
                 if stats is None:
                     stats = LessonStats(lesson_id=lid)
                     self._stats[lid] = stats
-                if success:
+                if neutral:
+                    stats.neutral += 1
+                elif success:
                     stats.helpful += 1
                 else:
                     stats.hurt += 1

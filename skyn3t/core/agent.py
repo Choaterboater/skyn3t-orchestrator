@@ -548,11 +548,35 @@ class BaseAgent(ABC):
         import time as _t
         from pathlib import Path as _PP
 
+        # Whitelist: if a `projects_dir` is configured, paths inside
+        # that tree are always allowed even if the tree happens to
+        # live inside the SkyN3t repo (common dev setup). Without this
+        # whitelist, a developer running `projects_dir=./data/projects`
+        # sees every caller-supplied path silently fall back to the
+        # scratch dir.
+        projects_root: Optional["Path"] = None
+        try:
+            from skyn3t.config import get_settings as _get_settings
+            cfg = _get_settings()
+            pd = getattr(cfg, "projects_dir", None)
+            if pd:
+                projects_root = _PP(str(pd)).expanduser().resolve()
+        except Exception:
+            projects_root = None
+
         def _is_dangerous(path: "Path") -> bool:
             """Reject paths that look like the repo root, CWD, or system dirs."""
             try:
                 resolved = path.resolve()
-                cwd = _PP().resolve()
+                # Configured projects root is always safe, even if it's
+                # inside the repo.
+                if projects_root is not None:
+                    try:
+                        resolved.relative_to(projects_root)
+                        return False
+                    except ValueError:
+                        pass
+                cwd = _PP.cwd().resolve()
                 # Never write to CWD if CWD is the SkyN3t repo root
                 if resolved == cwd:
                     return True

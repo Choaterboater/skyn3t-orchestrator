@@ -392,11 +392,8 @@ async def _probe_version(binary: str) -> bool:
     return proc.returncode == 0
 
 
-_LLM_CLI_SANDBOX_CWD: Optional[str] = None
-
-
-def _llm_cli_sandbox_cwd() -> str:
-    """Return a per-process sandbox directory for LLM CLI subprocesses.
+def _make_llm_cli_sandbox_cwd() -> str:
+    """Return a fresh sandbox directory for one LLM CLI subprocess call.
 
     Without an explicit cwd, ``claude``/``kimi``/``copilot``/``openai`` CLIs
     inherit the backend's CWD — which is the SkyN3t repo root in
@@ -404,12 +401,13 @@ def _llm_cli_sandbox_cwd() -> str:
     that operate relative to CWD, leaking generated files (web/, server/,
     src/) into the repo. Pin every CLI subprocess to a sandbox dir so the
     blast radius is /tmp, not the source tree.
+
+    A fresh dir per call (vs. a process-wide singleton) means concurrent
+    calls can't double-harvest each other's artifacts, and the dir gets
+    cleaned up in a finally block once we're done.
     """
-    global _LLM_CLI_SANDBOX_CWD
-    if _LLM_CLI_SANDBOX_CWD is None:
-        import tempfile
-        _LLM_CLI_SANDBOX_CWD = tempfile.mkdtemp(prefix="skyn3t-llm-cwd-")
-    return _LLM_CLI_SANDBOX_CWD
+    import tempfile
+    return tempfile.mkdtemp(prefix="skyn3t-llm-cwd-")
 
 
 def _normalize_sandbox_relpath(sandbox_root: Path, file_path: Path) -> str:
@@ -482,88 +480,95 @@ async def _run_capture(args: list[str]) -> str:
     8–15min on a single large file but never stops emitting for more
     than ~30s while it's actually working. A flat 600s cap killed v34.
     """
+    import shutil as _sh
     start_wall = time.time()
-    sandbox_cwd = _llm_cli_sandbox_cwd()
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=sandbox_cwd,
-    )
-
-    stdout_buf: list[bytes] = []
-    stderr_buf: list[bytes] = []
-    start = asyncio.get_event_loop().time()
-
-    async def _drain(stream, sink):
-        while True:
-            chunk = await stream.read(4096)
-            if not chunk:
-                return
-            sink.append(chunk)
-
-    stdout_task = asyncio.create_task(_drain(proc.stdout, stdout_buf))
-    stderr_task = asyncio.create_task(_drain(proc.stderr, stderr_buf))
-
+    sandbox_cwd = _make_llm_cli_sandbox_cwd()
     try:
-        while True:
-            elapsed = asyncio.get_event_loop().time() - start
-            if elapsed >= _COMPLETE_TIMEOUT:
-                raise asyncio.TimeoutError(
-                    f"hard timeout after {int(elapsed)}s"
-                )
-            prev_len = sum(len(c) for c in stdout_buf)
-            try:
-                # Wait either for proc to exit or for the idle window
-                # to elapse. We re-check progress each cycle.
-                await asyncio.wait_for(
-                    proc.wait(),
-                    timeout=min(_IDLE_TIMEOUT, _COMPLETE_TIMEOUT - elapsed),
-                )
-                break  # process exited
-            except asyncio.TimeoutError:
-                new_len = sum(len(c) for c in stdout_buf)
-                if new_len == prev_len:
-                    # No new bytes in the idle window → hung.
-                    raise asyncio.TimeoutError(
-                        f"idle timeout ({int(_IDLE_TIMEOUT)}s no output)"
-                    )
-                # Made progress; reset and keep waiting.
-                continue
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        # Cancel drain tasks so we don't leak them.
-        for t in (stdout_task, stderr_task):
-            t.cancel()
-        raise
-    finally:
-        # Make sure drains finish flushing whatever's left in the pipes.
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(stdout_task, stderr_task, return_exceptions=True),
-                timeout=2.0,
-            )
-        except asyncio.TimeoutError:
-            pass
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=sandbox_cwd,
+        )
 
-    stdout = b"".join(stdout_buf)
-    stderr = b"".join(stderr_buf)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"{args[0]} cli failed: {stderr.decode(errors='replace')[:300]}"
-        )
-    stdout_text = stdout.decode(errors="replace")
-    artifacts = _collect_sandbox_artifacts(sandbox_cwd, started_at=start_wall)
-    if artifacts:
-        logger.info(
-            "harvested %d sandbox artifact(s) from %s",
-            len(artifacts),
-            args[0],
-        )
-    return _append_sandbox_artifacts(stdout_text, artifacts)
+        stdout_buf: list[bytes] = []
+        stderr_buf: list[bytes] = []
+        start = asyncio.get_event_loop().time()
+
+        async def _drain(stream, sink):
+            while True:
+                chunk = await stream.read(4096)
+                if not chunk:
+                    return
+                sink.append(chunk)
+
+        stdout_task = asyncio.create_task(_drain(proc.stdout, stdout_buf))
+        stderr_task = asyncio.create_task(_drain(proc.stderr, stderr_buf))
+
+        try:
+            while True:
+                elapsed = asyncio.get_event_loop().time() - start
+                if elapsed >= _COMPLETE_TIMEOUT:
+                    raise asyncio.TimeoutError(
+                        f"hard timeout after {int(elapsed)}s"
+                    )
+                prev_len = sum(len(c) for c in stdout_buf)
+                try:
+                    # Wait either for proc to exit or for the idle window
+                    # to elapse. We re-check progress each cycle.
+                    await asyncio.wait_for(
+                        proc.wait(),
+                        timeout=min(_IDLE_TIMEOUT, _COMPLETE_TIMEOUT - elapsed),
+                    )
+                    break  # process exited
+                except asyncio.TimeoutError:
+                    new_len = sum(len(c) for c in stdout_buf)
+                    if new_len == prev_len:
+                        # No new bytes in the idle window → hung.
+                        raise asyncio.TimeoutError(
+                            f"idle timeout ({int(_IDLE_TIMEOUT)}s no output)"
+                        )
+                    # Made progress; reset and keep waiting.
+                    continue
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            # Cancel drain tasks so we don't leak them.
+            for t in (stdout_task, stderr_task):
+                t.cancel()
+            raise
+        finally:
+            # Make sure drains finish flushing whatever's left in the pipes.
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(stdout_task, stderr_task, return_exceptions=True),
+                    timeout=2.0,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+        stdout = b"".join(stdout_buf)
+        stderr = b"".join(stderr_buf)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"{args[0]} cli failed: {stderr.decode(errors='replace')[:300]}"
+            )
+        stdout_text = stdout.decode(errors="replace")
+        artifacts = _collect_sandbox_artifacts(sandbox_cwd, started_at=start_wall)
+        if artifacts:
+            logger.info(
+                "harvested %d sandbox artifact(s) from %s",
+                len(artifacts),
+                args[0],
+            )
+        return _append_sandbox_artifacts(stdout_text, artifacts)
+    finally:
+        # Clean up the per-call sandbox dir on success, failure, OR
+        # cancellation. ignore_errors=True so a busy file (Windows) or
+        # vanished tree doesn't mask the real result/exception.
+        _sh.rmtree(sandbox_cwd, ignore_errors=True)
 
 
 class _ClaudeCLIBackend:

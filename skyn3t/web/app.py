@@ -601,7 +601,33 @@ async def enforce_request_size(request: Request, call_next):
                 {"error": f"request body too large (>{MAX_REQUEST_BODY_BYTES} bytes)"},
                 status_code=413,
             )
-    return await call_next(request)
+        return await call_next(request)
+
+    # Chunked / no-Content-Length uploads still need a hard cap.
+    # Wrap the ASGI receive callable to count bytes as they stream in
+    # and bail with 413 once the cap is exceeded. Without this, a
+    # malicious chunked POST can stream unlimited bytes through the
+    # middleware.
+    original_receive = request.receive
+    counter = {"bytes": 0, "exceeded": False}
+
+    async def _counting_receive():
+        message = await original_receive()
+        if message.get("type") == "http.request":
+            body = message.get("body") or b""
+            counter["bytes"] += len(body)
+            if counter["bytes"] > MAX_REQUEST_BODY_BYTES:
+                counter["exceeded"] = True
+        return message
+
+    request._receive = _counting_receive  # type: ignore[attr-defined]
+    response = await call_next(request)
+    if counter["exceeded"]:
+        return JSONResponse(
+            {"error": f"request body too large (>{MAX_REQUEST_BODY_BYTES} bytes)"},
+            status_code=413,
+        )
+    return response
 
 
 @app.middleware("http")

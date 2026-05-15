@@ -456,7 +456,7 @@ class MetaAgent:
             name=f"{stack}-winning-shape",
             tags=[stack, "build-success", "scaffold-shape"],
             success_count=best.success,
-            failure_count=worst.failure,
+            failure_count=best.failure,
             source="meta_agent:build_pattern_scan",
             body="\n".join(body_lines),
         )

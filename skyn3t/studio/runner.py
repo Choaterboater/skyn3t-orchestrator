@@ -37,6 +37,15 @@ from skyn3t.studio.templates import get_template
 logger = logging.getLogger("skyn3t.studio")
 
 
+class StackShapeMismatchError(RuntimeError):
+    """Raised when post-code stack validation finds inconsistent files.
+
+    The runner uses this to bail intentionally rather than crash; the
+    outer exception handler distinguishes it from a real crash so the
+    user sees an accurate ``next_action`` instead of "runner crashed."
+    """
+
+
 class StudioRunner:
     """Run project templates end-to-end against a pool of specialist agents."""
 
@@ -1420,7 +1429,13 @@ class StudioRunner:
             # The runner itself crashed (agent init blew up, get_agent raised, etc).
             # Without this guard the manifest stays at {stages: [], completed_at: None}
             # and the user sees a project that ran 0 stages with no error.
-            logger.exception("studio runner failed for slug=%s", slug)
+            is_intentional_bail = isinstance(exc, StackShapeMismatchError)
+            if is_intentional_bail:
+                logger.info(
+                    "studio runner bailed for slug=%s (intentional): %s", slug, exc
+                )
+            else:
+                logger.exception("studio runner failed for slug=%s", slug)
             manifest["status"] = "failed"
             manifest["error"] = (
                 f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-2000:]}"
@@ -1429,7 +1444,12 @@ class StudioRunner:
             manifest["current_stage"] = None
             manifest["current_agent"] = None
             self._clear_quality_summary(manifest)
-            manifest["next_action"] = "Project stopped because the runner crashed."
+            manifest["next_action"] = (
+                "Project stopped: stack shape validation flagged files inconsistent "
+                "with the chosen stack. Review manifest['stack_shape_mismatches']."
+                if is_intentional_bail
+                else "Project stopped because the runner crashed."
+            )
             self._finalize_benchmark(manifest)
             self._append_history(
                 manifest,
@@ -2151,8 +2171,9 @@ class StudioRunner:
         slate before rebooting.
         """
         try:
-            import psutil
             import socket
+
+            import psutil
 
             # Try to find and kill processes listening on common server ports
             # Look for Node or Python processes in the scaffold directory
@@ -2681,7 +2702,7 @@ class StudioRunner:
                 message="; ".join(mismatches),
             )
             self._save_manifest(artifact_dir, manifest)
-            raise RuntimeError(
+            raise StackShapeMismatchError(
                 f"Stack shape mismatch found {len(mismatches)} inconsistent file(s): "
                 + "; ".join(mismatches)
             )
@@ -2723,6 +2744,10 @@ class StudioRunner:
             }
             report = await asyncio.to_thread(check_consistency, scaffold_dir, brief)
             manifest["consistency_check"]["post_fix_ok"] = bool(report.ok)
+            # Persist now so consistency_fix diagnostics survive a
+            # crash in the next stage (otherwise the post-fix state
+            # only saves later, and is lost if the run dies first).
+            self._save_manifest(artifact_dir, manifest)
         if not report.ok:
             self._append_history(
                 manifest,
@@ -3095,7 +3120,10 @@ class StudioRunner:
         if explicit_timeout is not None:
             return float(explicit_timeout)
         heavy_stages = {"code", "research", "reviewer", "codeimprover"}
-        medium_stages = {"designer", "architect"}
+        # consistency_reviewer ran 8 minutes (480s) in observed
+        # multi-blocker reviews on the deep profile. 300s base * 1.4 =
+        # 420s wasn't enough. Treat it as medium.
+        medium_stages = {"designer", "architect", "consistency_reviewer"}
         if stage_name in heavy_stages:
             base = 1800.0
         elif stage_name in medium_stages:

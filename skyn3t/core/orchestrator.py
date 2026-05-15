@@ -12,6 +12,7 @@ from uuid import uuid4
 from skyn3t.core.agent import BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import Event, EventBus, EventType
 from skyn3t.core.fallback import FallbackManager
+from skyn3t.core.models import AgentStatus
 from skyn3t.core.pipeline import Pipeline, create_pipeline
 from skyn3t.core.self_healing import SelfHealingManager
 from skyn3t.intelligence.agent_selector import AgentSelector
@@ -548,8 +549,14 @@ class Orchestrator:
         logger.info("spawn_subordinate: %s (%s) reporting to %s", name, agent_type, manager_name)
         return agent
 
-    def _terminate_idle_auto_agents(self) -> None:
-        """Shut down auto-spawned agents that have been idle too long."""
+    async def _terminate_idle_auto_agents(self) -> None:
+        """Shut down auto-spawned agents that have been idle too long.
+
+        We must AWAIT each agent's ``shutdown()`` before
+        ``unregister_agent`` removes it from ``self.agents`` —
+        otherwise the agent gets yanked from the registry while
+        in-flight work is still running, orphaning the task.
+        """
         now = datetime.now(timezone.utc)
         ttl = self._auto_agent_ttl_seconds
         to_terminate: List[BaseAgent] = []
@@ -575,7 +582,7 @@ class Orchestrator:
                 if hasattr(agent, "shutdown"):
                     shutdown_coro = agent.shutdown()
                     if inspect.iscoroutine(shutdown_coro):
-                        asyncio.create_task(shutdown_coro)
+                        await shutdown_coro
             except Exception:
                 logger.exception("_terminate_idle_auto_agents: shutdown failed for %s", agent.name)
             self.unregister_agent(agent.name)
@@ -634,6 +641,7 @@ class Orchestrator:
         auto_decompose: bool = False,
         auto_spawn: bool = False,
         max_parallel: int = 5,
+        subtask_timeout_seconds: float = 1800.0,
     ) -> Dict[str, Any]:
         """Decompose a task and delegate subtasks to subordinates in parallel.
 
@@ -697,15 +705,22 @@ class Orchestrator:
                     )
                 # Wait for the subordinate to complete the task.
                 # The orchestrator already tracks task_results, so poll
-                # with a short sleep until the result appears.
-                for _ in range(600):  # 60s max @ 0.1s sleep
+                # with a short sleep until the result appears. Default
+                # cap matches the heavy LLM stages (30 min); callers
+                # can tune via ``subtask_timeout_seconds``.
+                poll_interval = 0.1
+                max_polls = int(max(1.0, subtask_timeout_seconds / poll_interval))
+                for _ in range(max_polls):
                     if subtask.task_id in self.task_results:
                         return self.task_results[subtask.task_id]
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(poll_interval)
                 return TaskResult(
                     task_id=subtask.task_id,
                     success=False,
-                    error="Subtask timed out waiting for result",
+                    error=(
+                        f"Subtask timed out after "
+                        f"{subtask_timeout_seconds:.0f}s waiting for result"
+                    ),
                 )
 
         if specs:
@@ -1596,10 +1611,17 @@ class Orchestrator:
         # for the policy module: the failure that just occurred IS
         # attempt N). task.max_retries is the count of RETRIES allowed
         # beyond the first attempt, so total attempts = max_retries + 1.
+        # The policy module already enforces a per-class budget.
+        # Don't pass a default-derived override (task.max_retries + 1)
+        # because `decide()` does `min(class_budget, override)` and
+        # that silently shortens classes with smaller budgets
+        # (TIMEOUT=3 → caps at 3 instead of 4; SYNTAX=2 → 2 instead
+        # of 4). The pre-check above (`retry_count >= max_retries`)
+        # already handles the global upper bound for the rare case
+        # where a caller explicitly set a small task.max_retries.
         decision = _retry_decide(
             error,
             attempt=task.retry_count + 1,
-            max_attempts_override=task.max_retries + 1,
         )
         # Fast-fail classes (AUTH, QUOTA, CAPACITY, NOT_FOUND) cap at
         # 1 attempt — the policy will return should_retry=False here
@@ -1894,7 +1916,7 @@ class Orchestrator:
                 for agent in list(self.agents.values()):
                     # Skip monitoring + self-healing for explicitly-disabled agents
                     if not getattr(agent, "enabled", True):
-                        agent.status = "disabled"
+                        agent.status = AgentStatus.DISABLED.value
                         continue
 
                     # Check for stuck tasks: if a task has been running longer than
@@ -1954,7 +1976,7 @@ class Orchestrator:
                 # grow unbounded for the lifetime of the process.
                 self._compact_terminal_state()
                 self._compact_idempotency_keys()
-                self._terminate_idle_auto_agents()
+                await self._terminate_idle_auto_agents()
 
                 await asyncio.sleep(30)
             except asyncio.CancelledError:

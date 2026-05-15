@@ -647,7 +647,7 @@ class TestAutoSpawn:
         # Simulate idle state
         sub.status = "idle"
         sub.last_active_at = datetime.now(timezone.utc) - timedelta(seconds=1)
-        orch._terminate_idle_auto_agents()
+        await orch._terminate_idle_auto_agents()
         assert sub.name not in orch.agents
 
     async def test_terminate_idle_skips_manual_agents(self, event_bus):
@@ -658,7 +658,7 @@ class TestAutoSpawn:
         agent.status = "idle"
         agent.last_active_at = datetime.now(timezone.utc)
         orch.register_agent(agent)
-        orch._terminate_idle_auto_agents()
+        await orch._terminate_idle_auto_agents()
         assert "keeper" in orch.agents
 
     async def test_terminate_idle_skips_busy_auto_agents(self, event_bus):
@@ -669,7 +669,7 @@ class TestAutoSpawn:
         sub = await orch.spawn_subordinate("mgr", "BrainstormAgent", role="eng")
         sub.status = "busy"
         sub.last_active_at = datetime.now(timezone.utc)
-        orch._terminate_idle_auto_agents()
+        await orch._terminate_idle_auto_agents()
         assert sub.name in orch.agents
 
 

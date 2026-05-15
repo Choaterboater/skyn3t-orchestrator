@@ -35,6 +35,24 @@ export type AgentConfigView = {
   };
 };
 
+// Mutation responses from /api/agents/* endpoints. Backend signals
+// partial failure by leaving `ok` true but populating `persisted=false`
+// and/or `persist_error`. UI callers should surface these so partial
+// outcomes aren't reported as full success.
+export type AgentMutateResponse = {
+  ok?: boolean;
+  persisted?: boolean;
+  persist_error?: string;
+  [key: string]: unknown;
+};
+
+export type AgentDeleteResponse = {
+  ok?: boolean;
+  cleanup?: Record<string, boolean>;
+  errors?: string[];
+  persist_error?: string;
+};
+
 export type ProjectRow = {
   slug: string;
   title?: string;
@@ -263,22 +281,22 @@ export const api = {
       }>;
     }>("/api/agents/models"),
   patchAgentConfig: (name: string, patch: Record<string, unknown>) =>
-    fetchJson<any>(`/api/agents/${encodeURIComponent(name)}/config`, {
-      method: "PATCH",
-      body: JSON.stringify(patch),
-    }),
+    fetchJson<AgentMutateResponse>(
+      `/api/agents/${encodeURIComponent(name)}/config`,
+      { method: "PATCH", body: JSON.stringify(patch) },
+    ),
   enableAgent: (name: string) =>
-    fetchJson<{ ok?: boolean }>(
+    fetchJson<AgentMutateResponse>(
       `/api/agents/${encodeURIComponent(name)}/enable`,
       { method: "POST", body: "{}" },
     ),
   disableAgent: (name: string) =>
-    fetchJson<{ ok?: boolean }>(
+    fetchJson<AgentMutateResponse>(
       `/api/agents/${encodeURIComponent(name)}/disable`,
       { method: "POST", body: "{}" },
     ),
   deleteAgent: (name: string) =>
-    fetchJson<{ ok?: boolean }>(
+    fetchJson<AgentDeleteResponse>(
       `/api/agents/${encodeURIComponent(name)}`,
       { method: "DELETE" },
     ),

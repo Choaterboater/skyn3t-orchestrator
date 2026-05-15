@@ -145,7 +145,7 @@ class ConsistencyReviewerAgent(BaseAgent):
         # Check 1: If brief asks for TypeScript, do .tsx/.ts files exist?
         ts_requested = any(
             phrase in brief_lower
-            for phrase in ("typescript", "typeScript", ".ts", ".tsx", "tsconfig")
+            for phrase in ("typescript", ".ts", ".tsx", "tsconfig")
         )
         if ts_requested:
             ts_files = list(scaffold_dir.rglob("*.ts")) + list(scaffold_dir.rglob("*.tsx"))
@@ -188,20 +188,25 @@ class ConsistencyReviewerAgent(BaseAgent):
                 ))
 
         # Check 3: Does README mention services that aren't in the code?
+        # _detect_services returns slug tokens ("home_assistant"), but
+        # READMEs are written in display form ("Home Assistant"). We
+        # accept slug, space-separated, and hyphen-separated variants.
         readme = scaffold_dir / "README.md"
         if readme.exists():
             readme_text = readme.read_text(encoding="utf-8").lower()
             from skyn3t.agents.stack_templates import _detect_services
             detected = set(_detect_services(brief))
             for svc in detected:
-                if svc not in readme_text:
-                    findings.append(ConsistencyFinding(
-                        severity="warning",
-                        category="readme_drift",
-                        file="README.md",
-                        message=f"README does not mention '{svc}' which is in the brief.",
-                        suggestion=f"Add a section documenting the {svc} integration.",
-                    ))
+                variants = {svc, svc.replace("_", " "), svc.replace("_", "-")}
+                if any(v in readme_text for v in variants):
+                    continue
+                findings.append(ConsistencyFinding(
+                    severity="warning",
+                    category="readme_drift",
+                    file="README.md",
+                    message=f"README does not mention '{svc}' which is in the brief.",
+                    suggestion=f"Add a section documenting the {svc} integration.",
+                ))
 
         return findings
 

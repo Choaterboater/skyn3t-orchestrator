@@ -958,7 +958,12 @@ class CodeAgent(BaseAgent):
                 retrieval = await asyncio.wait_for(
                     rag.query(
                         query_text, n_results=3,
-                        filter_dict={"doc_type": "experience", "success": False},
+                        filter_dict={
+                            "$and": [
+                                {"doc_type": "experience"},
+                                {"success": False},
+                            ]
+                        },
                     ),
                     timeout=3.0,
                 )

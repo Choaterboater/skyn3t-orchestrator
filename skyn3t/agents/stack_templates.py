@@ -1740,10 +1740,6 @@ def validate_stack_shape(stack: Optional[str], written_files: List[str]) -> List
     elif stack == "python_cli":
         foreign = {
             "package.json", "vite.config.js", "next.config.js",
-            "requirements.txt",  # actually fine, but we list it to be explicit
-            # python_cli shouldn't have requirements.txt mixed in unless
-            # it's a real Python project; this branch is intentionally
-            # narrow because python_cli is the fallback for many shapes.
         }
         for sig in foreign:
             if sig in rels:

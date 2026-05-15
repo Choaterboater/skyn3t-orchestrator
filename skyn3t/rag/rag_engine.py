@@ -56,6 +56,15 @@ class RAGEngine:
             documents=documents,
             metadatas=metadatas,
         )
+        # Hybrid (BM25) index caches a corpus snapshot in self._hybrid.
+        # Dropping the attribute forces the next query_hybrid() call to
+        # rebuild against the fresh corpus instead of returning stale
+        # ordering for newly-added documents.
+        if hasattr(self, "_hybrid"):
+            try:
+                delattr(self, "_hybrid")
+            except AttributeError:
+                pass
         return document_ids
 
     async def add_knowledge_one(

@@ -182,10 +182,21 @@ async def plan_pipeline(*, brief: str, llm_client=None) -> List[PlannedStage]:
     # Build PlannedStages
     stages: List[PlannedStage] = []
     by_agent = {e["agent"]: e for e in AGENT_CATALOG}
+    # Map agent_name -> planner-provided artifact. The planner output
+    # (LLM or heuristic) gives us a *positional* list aligned with the
+    # pre-dedupe chosen_agents; after dedupe we look back by agent
+    # name. If the planner specified an artifact for an agent, prefer
+    # it over the catalog default — otherwise BR-001: artifact-specific
+    # outputs like Dockerfile/Makefile get silently dropped.
+    artifact_overrides: Dict[str, str] = {}
+    if expected_artifacts:
+        for agent_name, override in zip(chosen_agents, expected_artifacts):
+            if override and agent_name not in artifact_overrides:
+                artifact_overrides[agent_name] = override
     for i, agent_name in enumerate(chosen_agents):
         catalog_entry = by_agent.get(agent_name, {})
         cap = (catalog_entry.get("capabilities") or ["general"])[0]
-        expected = catalog_entry.get("artifact", "")
+        expected = artifact_overrides.get(agent_name) or catalog_entry.get("artifact", "")
         expected_artifact = (
             expected
             if isinstance(expected, str)
