@@ -190,7 +190,14 @@ class ConsistencyReviewerAgent(BaseAgent):
         # Check 3: Does README mention services that aren't in the code?
         # _detect_services returns slug tokens ("home_assistant"), but
         # READMEs are written in display form ("Home Assistant"). We
-        # accept slug, space-separated, and hyphen-separated variants.
+        # accept slug, space-separated, hyphen-separated, and a small
+        # set of irregular aliases (pihole↔pi-hole, qbittorrent↔qBittorrent).
+        _IRREGULAR_ALIASES: Dict[str, set] = {
+            "pihole": {"pi-hole", "pi hole"},
+            "qbittorrent": {"qbittorrent", "qbit"},
+            "sabnzbd": {"sab"},
+            "homeassistant": {"home assistant", "home-assistant"},
+        }
         readme = scaffold_dir / "README.md"
         if readme.exists():
             readme_text = readme.read_text(encoding="utf-8").lower()
@@ -198,6 +205,7 @@ class ConsistencyReviewerAgent(BaseAgent):
             detected = set(_detect_services(brief))
             for svc in detected:
                 variants = {svc, svc.replace("_", " "), svc.replace("_", "-")}
+                variants.update(_IRREGULAR_ALIASES.get(svc, set()))
                 if any(v in readme_text for v in variants):
                     continue
                 findings.append(ConsistencyFinding(

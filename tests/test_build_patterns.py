@@ -228,3 +228,62 @@ async def test_code_agent_uses_learned_shape_when_data_supports_it(
     # The learned shape differs from the default → CodeAgent's bias would
     # fire.
     assert sorted(best.shape) != default_paths
+
+
+# ─── Per-shape tag counters (proposal #4) ──────────────────────────────
+
+
+def test_record_tag_creates_bucket_and_increments(tmp_path):
+    """record_tag() should create a bucket for an unseen shape and tally
+    the tag count; subsequent calls increment."""
+    sb = BuildPatternScoreboard(store_path=tmp_path / "patterns.json")
+    shape = ["server/index.js", "server/routes/config.js"]
+    sb.record_tag("node-express", shape, "missing_mount")
+    sb.record_tag("node-express", shape, "missing_mount")
+    sb.record_tag("node-express", shape, "missing_mount")
+    assert sb.tag_count_for_shape("node-express", shape, "missing_mount") == 3
+
+
+def test_record_tag_is_independent_of_success_failure(tmp_path):
+    """A tag can coexist with success/failure counts on the same shape."""
+    sb = BuildPatternScoreboard(store_path=tmp_path / "patterns.json")
+    shape = ["a.js", "b.js"]
+    sb.record("node-express", shape, "yes")
+    sb.record_tag("node-express", shape, "missing_mount")
+    sb.record("node-express", shape, "no")
+    assert sb.tag_count_for_shape("node-express", shape, "missing_mount") == 1
+    stats = sb.all_stats_for("node-express")[0]
+    assert stats.success == 1
+    assert stats.failure == 1
+
+
+def test_tag_count_returns_zero_for_unknown_shape(tmp_path):
+    sb = BuildPatternScoreboard(store_path=tmp_path / "patterns.json")
+    assert sb.tag_count_for_shape("node-express", ["a.js"], "missing_mount") == 0
+
+
+def test_tag_count_returns_zero_for_known_shape_no_tag(tmp_path):
+    sb = BuildPatternScoreboard(store_path=tmp_path / "patterns.json")
+    sb.record("node-express", ["a.js"], "yes")
+    assert sb.tag_count_for_shape("node-express", ["a.js"], "missing_mount") == 0
+
+
+def test_record_tag_empty_inputs_are_no_ops(tmp_path):
+    sb = BuildPatternScoreboard(store_path=tmp_path / "patterns.json")
+    sb.record_tag("", ["a.js"], "missing_mount")
+    sb.record_tag("node-express", [], "missing_mount")
+    sb.record_tag("node-express", ["a.js"], "")
+    # No bucket should have been created
+    assert sb.all_stats_for("node-express") == []
+
+
+def test_tag_count_persists_across_reload(tmp_path):
+    """Tag counts must survive a reload — the planner reads them at the
+    start of the next project run."""
+    store = tmp_path / "patterns.json"
+    sb1 = BuildPatternScoreboard(store_path=store, flush_every=1)
+    shape = ["server/index.js"]
+    sb1.record_tag("node-express", shape, "missing_mount")
+    sb1.record_tag("node-express", shape, "missing_mount")
+    sb2 = BuildPatternScoreboard(store_path=store)
+    assert sb2.tag_count_for_shape("node-express", shape, "missing_mount") == 2

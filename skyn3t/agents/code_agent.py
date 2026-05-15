@@ -876,6 +876,18 @@ class CodeAgent(BaseAgent):
             )
             if stack_hint:
                 build_system = build_system + "\n\n" + stack_hint
+            # Scoreboard pre-warnings: the runner injects strings derived
+            # from BuildPatternScoreboard for shapes that have failed a
+            # known pattern (e.g. lost the router mount). Lift them into
+            # the system prompt so the model sees the warning before it
+            # writes the affected files.
+            pre_warnings = d.get("scoreboard_prewarnings") or []
+            if pre_warnings:
+                build_system = (
+                    build_system
+                    + "\n\nPRIOR-FAILURE PATTERNS for this scaffold shape:\n"
+                    + "\n".join(f"- {w}" for w in pre_warnings)
+                )
             # Skill injection: pull the top-3 net-helpful skills tagged
             # with this stack and append them as additional context. This
             # is how the durable Hermes-style skill library gets read

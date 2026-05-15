@@ -54,13 +54,20 @@ logger = logging.getLogger("skyn3t.intelligence.build_patterns")
 
 @dataclass
 class BuildPatternStats:
-    """Running tally for one (stack, shape) combo."""
+    """Running tally for one (stack, shape) combo.
+
+    ``tags`` records per-tag occurrence counts (e.g. ``{"missing_mount":
+    4}`` means this shape lost the router mount four times). The planner
+    reads tags to pre-warn the CodeAgent on shapes that historically fail
+    a specific way.
+    """
 
     stack: str
     shape: List[str] = field(default_factory=list)
     success: int = 0
     failure: int = 0
     skipped: int = 0
+    tags: Dict[str, int] = field(default_factory=dict)
     last_seen_at: float = field(default_factory=time.time)
 
     @property
@@ -82,17 +89,27 @@ class BuildPatternStats:
             "success": self.success,
             "failure": self.failure,
             "skipped": self.skipped,
+            "tags": dict(self.tags),
             "last_seen_at": self.last_seen_at,
         }
 
     @classmethod
     def from_dict(cls, data: Dict) -> "BuildPatternStats":
+        raw_tags = data.get("tags") or {}
+        tags: Dict[str, int] = {}
+        if isinstance(raw_tags, dict):
+            for k, v in raw_tags.items():
+                try:
+                    tags[str(k)] = int(v)
+                except (TypeError, ValueError):
+                    continue
         return cls(
             stack=str(data.get("stack", "")),
             shape=[str(p) for p in (data.get("shape") or [])],
             success=int(data.get("success", 0)),
             failure=int(data.get("failure", 0)),
             skipped=int(data.get("skipped", 0)),
+            tags=tags,
             last_seen_at=float(data.get("last_seen_at", time.time())),
         )
 
@@ -208,9 +225,60 @@ class BuildPatternScoreboard:
             if self._unflushed >= self._flush_every:
                 self._flush_locked()
 
+    def record_tag(self, stack: str, shape: Iterable[str], tag: str) -> None:
+        """Increment a named occurrence tag on a (stack, shape) bucket.
+
+        Used for per-class failure attribution — e.g. when the
+        consistency engine emits a ``missing_mount`` blocker, the
+        runner records ``("node-express", shape, "missing_mount")``
+        so the planner can later pre-warn the CodeAgent that this
+        scaffold shape has historically lost the router mount.
+
+        Tags are independent of the success/failure counters: a build
+        can succeed AND have a tag recorded earlier in its lifecycle.
+        """
+        if not stack or not tag:
+            return
+        shape_list = sorted({str(p).strip() for p in shape if str(p).strip()})
+        if not shape_list:
+            return
+        h = self._shape_hash(shape_list)
+        with self._lock:
+            bucket = self._stats.setdefault(stack, {})
+            stats = bucket.get(h)
+            if stats is None:
+                stats = BuildPatternStats(stack=stack, shape=shape_list)
+                bucket[h] = stats
+            stats.tags[tag] = stats.tags.get(tag, 0) + 1
+            stats.last_seen_at = time.time()
+            self._unflushed += 1
+            if self._unflushed >= self._flush_every:
+                self._flush_locked()
+
     # ------------------------------------------------------------------
     # Querying
     # ------------------------------------------------------------------
+
+    def tag_count_for_shape(
+        self, stack: str, shape: Iterable[str], tag: str,
+    ) -> int:
+        """How many times ``tag`` has been recorded for this exact shape.
+
+        Returns 0 when the bucket is unknown. Planner uses this to
+        decide whether to inject a pre-warning into CodeAgent.
+        """
+        if not stack or not tag:
+            return 0
+        shape_list = sorted({str(p).strip() for p in shape if str(p).strip()})
+        if not shape_list:
+            return 0
+        h = self._shape_hash(shape_list)
+        with self._lock:
+            bucket = self._stats.get(stack, {})
+            stats = bucket.get(h)
+            if stats is None:
+                return 0
+            return int(stats.tags.get(tag, 0))
 
     def best_shape(self, stack: str, *, min_samples: int = 3) -> Optional[BuildPatternStats]:
         """Return the highest-success-rate shape for the stack with at
