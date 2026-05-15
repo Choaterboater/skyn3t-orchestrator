@@ -482,7 +482,14 @@ class GitHubIngestorAgent(BaseAgent):
             tmp.write_text(json.dumps(self._sha_cache, indent=2, sort_keys=True))
             os.replace(tmp, self._sha_cache_path)
         except Exception:
-            pass
+            # Losing the SHA cache means next ingest re-fetches every
+            # file we've already seen — slow but not incorrect. Worth
+            # warning so a permanently-broken disk surfaces.
+            logger.warning(
+                "github_ingestor: failed to persist SHA cache to %s — "
+                "next ingest will re-fetch everything",
+                self._sha_cache_path, exc_info=True,
+            )
 
     async def _fetch_file_content(
         self, repo_full_name: str, path: str, max_bytes: int

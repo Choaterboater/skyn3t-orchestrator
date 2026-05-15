@@ -15,7 +15,6 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, WebSocketException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -23,6 +22,7 @@ from fastapi.responses import (
     PlainTextResponse,
     RedirectResponse,
 )
+from fastapi.staticfiles import StaticFiles
 from starlette import status as starlette_status
 
 from skyn3t.config.settings import get_settings
@@ -937,12 +937,43 @@ async def agent_config_patch(name: str, payload: Dict[str, Any]):
     if not a:
         return JSONResponse({"error": "not found"}, status_code=404)
     res = a.apply_override(payload or {})
+    # Persist to disk. Used to swallow errors silently — the in-memory
+    # override would apply but a restart would lose it with no warning.
+    # Now we log AND surface "persisted: false" so the caller (and the
+    # UI / operator) can see when the disk write fails.
+    persisted = True
+    persist_error: Optional[str] = None
     try:
         from skyn3t.config.agent_overrides import get_override_store
         get_override_store().set(name, payload or {})
-    except Exception:
-        pass
-    return res
+    except Exception as exc:
+        persisted = False
+        persist_error = f"{type(exc).__name__}: {exc}"
+        logger.warning(
+            "agent override persistence failed for %s: %s",
+            name, exc, exc_info=True,
+        )
+    out = dict(res) if isinstance(res, dict) else {"applied": res}
+    out["persisted"] = persisted
+    if persist_error:
+        out["persist_error"] = persist_error
+    return out
+
+
+def _persist_override_or_log(name: str, patch: dict) -> tuple[bool, Optional[str]]:
+    """Shared helper for the enable/disable endpoints. Returns
+    (persisted, error_msg). On failure, logs at WARNING with the
+    full exception."""
+    try:
+        from skyn3t.config.agent_overrides import get_override_store
+        get_override_store().set(name, patch)
+        return True, None
+    except Exception as exc:
+        logger.warning(
+            "agent override persistence failed for %s (patch=%s): %s",
+            name, patch, exc, exc_info=True,
+        )
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 @app.post("/api/agents/{name}/enable")
@@ -953,12 +984,11 @@ async def agent_enable(name: str):
     if not a:
         return JSONResponse({"error": "not found"}, status_code=404)
     a.apply_override({"enabled": True})
-    try:
-        from skyn3t.config.agent_overrides import get_override_store
-        get_override_store().set(name, {"enabled": True})
-    except Exception:
-        pass
-    return {"ok": True}
+    persisted, err = _persist_override_or_log(name, {"enabled": True})
+    out: Dict[str, Any] = {"ok": True, "persisted": persisted}
+    if err:
+        out["persist_error"] = err
+    return out
 
 
 @app.post("/api/agents/{name}/disable")
@@ -969,12 +999,11 @@ async def agent_disable(name: str):
     if not a:
         return JSONResponse({"error": "not found"}, status_code=404)
     a.apply_override({"enabled": False})
-    try:
-        from skyn3t.config.agent_overrides import get_override_store
-        get_override_store().set(name, {"enabled": False})
-    except Exception:
-        pass
-    return {"ok": True}
+    persisted, err = _persist_override_or_log(name, {"enabled": False})
+    out: Dict[str, Any] = {"ok": True, "persisted": persisted}
+    if err:
+        out["persist_error"] = err
+    return out
 
 
 @app.get("/api/agents/models")
@@ -1075,22 +1104,83 @@ async def agent_delete(name: str):
         return JSONResponse({"error": "Orchestrator not initialized"}, status_code=503)
     if name not in orchestrator.agents:
         return JSONResponse({"error": "not found"}, status_code=404)
+    # Shut down the agent's task processor BEFORE removing it from the
+    # registry — otherwise the background loop keeps running orphaned
+    # against a no-longer-tracked agent. Best effort; if shutdown
+    # raises we still drop the registry entry so the user isn't stuck
+    # with a half-deleted record.
+    agent = orchestrator.agents.get(name)
+    # Three stages of cleanup, each can fail independently. We collect
+    # the outcomes so the caller knows EXACTLY what landed and what
+    # didn't — silent failure used to make a partially-deleted agent
+    # look fully removed in the UI while its custom-spec / override
+    # files remained on disk.
+    cleanup: Dict[str, Any] = {
+        "shutdown": "ok",
+        "registry_removed": False,
+        "custom_spec_deleted": "ok",
+        "overrides_deleted": "ok",
+    }
+    errors: List[str] = []
+
+    if agent is not None:
+        try:
+            shutdown = getattr(agent, "shutdown", None)
+            if callable(shutdown):
+                import asyncio as _asyncio
+                ret = shutdown()
+                if _asyncio.iscoroutine(ret):
+                    await ret
+        except Exception as exc:
+            cleanup["shutdown"] = f"failed: {type(exc).__name__}"
+            errors.append(f"shutdown: {exc}")
+            logger.warning(
+                "agent shutdown failed during delete name=%s: %s",
+                name, exc, exc_info=True,
+            )
+
     try:
         orchestrator.agents.pop(name, None)
         orchestrator.agent_registry.pop(name, None)
-    except Exception:
-        pass
+        cleanup["registry_removed"] = True
+    except Exception as exc:
+        errors.append(f"registry pop: {exc}")
+        logger.warning(
+            "registry removal failed name=%s: %s",
+            name, exc, exc_info=True,
+        )
+
     try:
         from skyn3t.config.custom_agents import get_custom_store
         get_custom_store().delete(name)
-    except Exception:
-        pass
+    except Exception as exc:
+        cleanup["custom_spec_deleted"] = f"failed: {type(exc).__name__}"
+        errors.append(f"custom spec delete: {exc}")
+        logger.warning(
+            "custom_agents.delete failed name=%s: %s",
+            name, exc, exc_info=True,
+        )
+
     try:
         from skyn3t.config.agent_overrides import get_override_store
         get_override_store().delete(name)
-    except Exception:
-        pass
-    return {"ok": True}
+    except Exception as exc:
+        cleanup["overrides_deleted"] = f"failed: {type(exc).__name__}"
+        errors.append(f"overrides delete: {exc}")
+        logger.warning(
+            "agent_overrides.delete failed name=%s: %s",
+            name, exc, exc_info=True,
+        )
+
+    # "ok" only when EVERY cleanup step succeeded. UI can colour-code
+    # off this field instead of guessing from a bare {"ok": true}.
+    response: Dict[str, Any] = {
+        "ok": not errors,
+        "cleanup": cleanup,
+    }
+    if errors:
+        response["errors"] = errors
+    return response
 
 
 @app.get("/api/llm/backends")
@@ -1808,10 +1898,10 @@ async def proposals_feature_preview(payload: dict, request: Request = None):  # 
         return JSONResponse({"error": "idea required"}, status_code=400)
     try:
         from skyn3t.cortex.feature_suggester import (
-            infer_feature_target_file,
-            _idea_keywords,
             _TARGET_HINTS,
             REPO_ROOT,
+            _idea_keywords,
+            infer_feature_target_file,
         )
 
         target_file = infer_feature_target_file(idea, repo_root=REPO_ROOT)

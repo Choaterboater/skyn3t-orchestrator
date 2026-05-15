@@ -7,7 +7,6 @@ adjective bank) when the LLM is unavailable or returns a stub.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult

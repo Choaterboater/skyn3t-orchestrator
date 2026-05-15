@@ -5,7 +5,6 @@ files. Closes the gap to Hermes' first-class skill abstraction.
 from __future__ import annotations
 
 import time
-from pathlib import Path
 
 import pytest
 
@@ -13,9 +12,7 @@ from skyn3t.intelligence.skill_library import (
     Skill,
     SkillLibrary,
     _slugify,
-    get_default_library,
 )
-
 
 # ─── Slugify ───────────────────────────────────────────────────────────
 
@@ -300,8 +297,8 @@ def test_curate_returns_archived_and_kept_lists(tmp_path):
 def test_auto_cleanup_invokes_skill_curator(tmp_path, monkeypatch):
     """The AutoCleanup janitor's run_once should call the curator and
     surface the count in its summary."""
-    from skyn3t.cortex.auto_cleanup import AutoCleanup
     import skyn3t.intelligence.skill_library as sl
+    from skyn3t.cortex.auto_cleanup import AutoCleanup
     monkeypatch.setattr(sl, "_default_library", None)
     lib = sl.SkillLibrary(root=tmp_path / "skills")
     monkeypatch.setattr(sl, "get_default_library", lambda: lib)

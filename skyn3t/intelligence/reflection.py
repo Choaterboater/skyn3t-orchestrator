@@ -516,6 +516,26 @@ class ReflectionEngine:
         if not task_id:
             logger.warning("Skipping task_failed event missing task_id")
             return
+        # Only learn from TERMINAL failures. Intermediate failures
+        # (retries are still available, fallback agent is about to be
+        # tried, etc) shouldn't be treated as ground-truth "this agent
+        # failed" — they pollute the lessons store with noise that a
+        # successful retry would have erased. We treat an event as
+        # terminal when retry_count >= max_retries, OR when neither
+        # field is present (older publishers we shouldn't assume are
+        # retryable). When `terminal: True` is explicitly set, honor it.
+        retry_count = payload.get("retry_count")
+        max_retries = payload.get("max_retries")
+        is_terminal = payload.get("terminal")
+        if is_terminal is None and retry_count is not None and max_retries is not None:
+            try:
+                is_terminal = int(retry_count) >= int(max_retries)
+            except (TypeError, ValueError):
+                is_terminal = True  # malformed → assume terminal
+        if is_terminal is False:
+            # Mid-retry — skip. The next attempt may succeed and the
+            # reflection store should reflect outcome, not transient state.
+            return
         result = TaskResult(
             task_id=task_id,
             success=False,

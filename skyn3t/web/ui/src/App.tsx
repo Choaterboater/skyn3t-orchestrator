@@ -174,8 +174,8 @@ function Sidebar() {
   ];
   return (
     <aside className="flex flex-col gap-6 border-r border-border bg-bg-1 px-5 py-6">
-      <div className="display text-2xl">
-        <span className="text-accent">S</span>kyN3t
+      <div className="display text-xl tracking-wider">
+        <span className="text-accent">S</span>KYN3T
       </div>
       <nav className="flex flex-col gap-1 text-sm">
         {items.map((it) => (
@@ -187,7 +187,7 @@ function Sidebar() {
               [
                 "relative flex items-center gap-3 rounded-md px-3 py-2 transition",
                 isActive
-                  ? "bg-accent-soft text-accent-strong font-semibold border border-accent-line"
+                  ? "bg-accent-soft text-accent-strong font-medium border border-accent-line"
                   : "text-text-secondary hover:bg-accent-soft hover:text-text-primary",
               ].join(" ")
             }

@@ -1,44 +1,44 @@
 /** @type {import('tailwindcss').Config} */
-// Tailwind config aligned with the atelier palette already in the
-// backend's :root tokens. The SPA reuses the same warm-amber accent
-// + graphite surfaces so the new UI looks like the same product, just
-// not fighting itself.
+// Tailwind config aligned with the Tactical Ops (warm) machine-room palette.
+// Deep graphite browns + ember-orange accent. Fonts: Orbitron (display),
+// Rajdhani (body), JetBrains Mono (data). This is the "warm atelier"
+// aesthetic — a server closet that has been humming in the dark for years.
 export default {
   content: ["./index.html", "./src/**/*.{ts,tsx,js,jsx}"],
   theme: {
     extend: {
       colors: {
         bg: {
-          0: "#0f0e0c",
-          1: "#16140f",
-          2: "#1d1a13",
-          3: "#25211a",
+          0: "#0F0D0A",
+          1: "#1A1714",
+          2: "#24201A",
+          3: "#2E2920",
         },
         border: {
-          DEFAULT: "#2d2920",
-          strong: "#3b362a",
+          DEFAULT: "#3B3429",
+          strong: "#4A4337",
         },
         text: {
-          primary: "#f4ede0",
-          secondary: "#b8ad96",
-          dim: "#7a705f",
+          primary: "#E8DDCB",
+          secondary: "#8C8270",
+          dim: "#5C5448",
         },
         accent: {
-          DEFAULT: "#c9a96e",
-          strong: "#d9b97e",
-          soft:   "rgba(201, 169, 110, 0.08)",
-          line:   "rgba(201, 169, 110, 0.22)",
+          DEFAULT: "#E05C1A",
+          strong: "#F06E2E",
+          soft: "rgba(224, 92, 26, 0.08)",
+          line: "rgba(224, 92, 26, 0.22)",
         },
         status: {
-          green:  "#8aa37a",
-          yellow: "#d4a64a",
-          red:    "#b65a4a",
+          green: "#7A9E6A",
+          yellow: "#C49A3A",
+          red: "#B05040",
         },
       },
       fontFamily: {
-        display: ['"Instrument Serif"', "Georgia", "serif"],
-        sans:    ['"Space Grotesk"', "system-ui", "sans-serif"],
-        mono:    ['"JetBrains Mono"', "ui-monospace", "monospace"],
+        display: ['"Orbitron"', "system-ui", "sans-serif"],
+        sans: ['"Rajdhani"', "system-ui", "sans-serif"],
+        mono: ['"JetBrains Mono"', "ui-monospace", "monospace"],
       },
     },
   },

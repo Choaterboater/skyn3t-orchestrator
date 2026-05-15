@@ -190,6 +190,86 @@ class TestCodeAgent:
         assert not (tmp_path / "scaffold_log.txt").exists()
 
 
+    @pytest.mark.slow
+    @pytest.mark.asyncio
+    async def test_scaffold_rag_recall_injects_past_failures(self, tmp_path, monkeypatch):
+        """RAG recall should query past experiences and inject failure
+        lessons into the build system prompt without crashing."""
+        from skyn3t.agents.code_agent import CodeAgent
+
+        class StubLLM:
+            async def complete(self, *args, **kwargs):
+                return "[deterministic-stub]"
+
+        agent = CodeAgent("code", EventBus())
+        await agent.initialize()
+        monkeypatch.setattr(agent, "get_llm", lambda: StubLLM())
+
+        # Mock RAG to return a fake failure experience.
+        fake_doc = {
+            "content": "Previous react_vite build failed because vite.config.js "
+                       "missed the server.proxy entry for /api. Always add it.",
+            "metadata": {"doc_type": "experience", "success": False},
+        }
+
+        async def mock_rag_query(*args, **kwargs):
+            return {"documents": [fake_doc], "context": fake_doc["content"]}
+
+        monkeypatch.setattr(
+            "skyn3t.rag.rag_engine.RAGEngine.query", mock_rag_query
+        )
+        async def mock_init(self): pass
+        monkeypatch.setattr(
+            "skyn3t.rag.rag_engine.RAGEngine.initialize", mock_init
+        )
+
+        task = TaskRequest(
+            title="Scaffold app",
+            input_data={
+                "task_type": "scaffold",
+                "brief": "Build a React Vite dashboard",
+                "artifact_dir": str(tmp_path),
+            },
+        )
+        result = await agent.execute(task)
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_scaffold_rag_recall_graceful_when_empty(self, tmp_path, monkeypatch):
+        """RAG recall should not fail when the vector store is empty."""
+        from skyn3t.agents.code_agent import CodeAgent
+
+        class StubLLM:
+            async def complete(self, *args, **kwargs):
+                return "[deterministic-stub]"
+
+        agent = CodeAgent("code", EventBus())
+        await agent.initialize()
+        monkeypatch.setattr(agent, "get_llm", lambda: StubLLM())
+
+        async def mock_rag_query(*args, **kwargs):
+            return {"documents": [], "context": ""}
+
+        monkeypatch.setattr(
+            "skyn3t.rag.rag_engine.RAGEngine.query", mock_rag_query
+        )
+        async def mock_init(self): pass
+        monkeypatch.setattr(
+            "skyn3t.rag.rag_engine.RAGEngine.initialize", mock_init
+        )
+
+        task = TaskRequest(
+            title="Scaffold app",
+            input_data={
+                "task_type": "scaffold",
+                "brief": "Build a tiny hello world app",
+                "artifact_dir": str(tmp_path),
+            },
+        )
+        result = await agent.execute(task)
+        assert result.success is True
+
+
 class TestBrainstormAgent:
     @pytest.mark.asyncio
     async def test_require_clarification_forces_kickoff_questions(self, tmp_path, monkeypatch):

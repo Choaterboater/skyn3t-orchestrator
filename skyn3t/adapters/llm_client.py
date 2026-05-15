@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, List, Optional
 
 from skyn3t.core.event_context import current_event_context, current_event_correlation_id
@@ -66,12 +67,17 @@ class LLMRequest:
 
 # Subprocess timeouts (seconds)
 _AVAILABLE_TIMEOUT = 3.0
-# Real-world ceiling: copilot CLI doing MCP web search across 6-7
-# services plus emitting a multi-section spec OR a large per-file
-# scaffold legitimately takes 5-10 minutes. 300s killed real work in
-# v5/v6 of homelab. 600s lets the model finish while still capping
-# the worst case so a stuck call doesn't hang forever.
-_COMPLETE_TIMEOUT = 600.0
+# Hard ceiling on total CLI wall time. Kimi streaming a 15k-token
+# .jsx file legitimately approaches 10min; 600s tripped on v34 with
+# zero recovery. 1200s gives slow streamers headroom; idle-timeout
+# below catches truly-hung calls without waiting for the hard cap.
+_COMPLETE_TIMEOUT = 1200.0
+# Idle timeout: if the CLI hasn't emitted ANY output for this long,
+# treat it as hung and kill it. Real generation emits tokens
+# continuously, so 180s of silence ≈ stuck. This catches hangs much
+# faster than _COMPLETE_TIMEOUT alone, while still letting a slow
+# streamer make progress on a long file.
+_IDLE_TIMEOUT = 180.0
 
 
 class LLMClient:
@@ -185,9 +191,20 @@ class LLMClient:
                 et = getattr(EventType, "LLM_EXCHANGE", None)
                 if et is not None:
                     context = current_event_context()
+                    # Preview fields (truncated, redacted) for the
+                    # dashboard's LLM-exchange log — humans skim these,
+                    # they don't need full 30KB payloads.
                     prompt_trunc = redact_text((req.prompt or "")[:2000])
                     response_trunc = redact_text((out or "")[:2000])
                     system_trunc = redact_text((req.system or "")[:500]) if req.system else ""
+                    # Accurate length fields for the token tracker —
+                    # the truncated preview field made the dashboard
+                    # report cap-times-bump constants instead of real
+                    # token counts. These are pre-truncation lengths
+                    # in characters (no redaction effect on length).
+                    prompt_chars_full = len(req.prompt or "")
+                    response_chars_full = len(out or "")
+                    system_chars_full = len(req.system or "")
                     self._event_bus.publish(Event(
                         event_type=et,
                         source=self._caller_name or "llm",
@@ -198,6 +215,9 @@ class LLMClient:
                             "prompt": prompt_trunc,
                             "response": response_trunc,
                             "system": system_trunc,
+                            "prompt_chars": prompt_chars_full,
+                            "response_chars": response_chars_full,
+                            "system_chars": system_chars_full,
                             "duration_ms": int(elapsed * 1000),
                             **{
                                 key: value
@@ -372,22 +392,178 @@ async def _probe_version(binary: str) -> bool:
     return proc.returncode == 0
 
 
+_LLM_CLI_SANDBOX_CWD: Optional[str] = None
+
+
+def _llm_cli_sandbox_cwd() -> str:
+    """Return a per-process sandbox directory for LLM CLI subprocesses.
+
+    Without an explicit cwd, ``claude``/``kimi``/``copilot``/``openai`` CLIs
+    inherit the backend's CWD — which is the SkyN3t repo root in
+    production. Some CLIs (notably ``claude -p``) can use Edit/Write tools
+    that operate relative to CWD, leaking generated files (web/, server/,
+    src/) into the repo. Pin every CLI subprocess to a sandbox dir so the
+    blast radius is /tmp, not the source tree.
+    """
+    global _LLM_CLI_SANDBOX_CWD
+    if _LLM_CLI_SANDBOX_CWD is None:
+        import tempfile
+        _LLM_CLI_SANDBOX_CWD = tempfile.mkdtemp(prefix="skyn3t-llm-cwd-")
+    return _LLM_CLI_SANDBOX_CWD
+
+
+def _normalize_sandbox_relpath(sandbox_root: Path, file_path: Path) -> str:
+    """Normalize a harvested sandbox file path to a scaffold-relative path."""
+    rel = file_path.relative_to(sandbox_root).as_posix().lstrip("/")
+    # Some CLIs create files under a top-level "sandbox/" folder. Strip it
+    # so route/file matching can align with scaffold-relative plan paths.
+    if rel.startswith("sandbox/"):
+        rel = rel[len("sandbox/") :]
+    return rel
+
+
+def _collect_sandbox_artifacts(sandbox_cwd: str, started_at: float) -> list[tuple[str, str]]:
+    """Harvest text files created/updated during the current CLI call."""
+    root = Path(sandbox_cwd)
+    artifacts: list[tuple[str, str]] = []
+    if not root.exists():
+        return artifacts
+
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if stat.st_mtime < started_at:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        rel = _normalize_sandbox_relpath(root, path)
+        if not rel:
+            continue
+        artifacts.append((rel, text))
+
+    artifacts.sort(key=lambda it: it[0])
+    return artifacts
+
+
+def _append_sandbox_artifacts(stdout_text: str, artifacts: list[tuple[str, str]]) -> str:
+    """Attach harvested artifacts to stdout in a parser-friendly marker format."""
+    text = stdout_text.strip()
+    if not artifacts:
+        return text
+    if not text and len(artifacts) == 1:
+        # Per-file generation path: if a single file was generated via
+        # sandbox write and stdout is empty, return the raw file body.
+        return artifacts[0][1].strip()
+
+    sections: list[str] = []
+    for rel, body in artifacts:
+        sections.append(f"// === {rel} ===\n{body.strip()}")
+    merged = "\n\n".join(sections).strip()
+    if not text:
+        return merged
+    return f"{text}\n\n{merged}"
+
+
 async def _run_capture(args: list[str]) -> str:
-    """Run a subprocess and return its stdout (raises on non-zero)."""
+    """Run a subprocess and return its stdout (raises on non-zero).
+
+    Uses two-tier timeout:
+      * IDLE: if no bytes arrive on stdout for _IDLE_TIMEOUT, kill.
+        Real generation emits tokens continuously; long silence ≈ hang.
+      * HARD: total wall time can't exceed _COMPLETE_TIMEOUT.
+
+    The stream-then-idle pattern matters for Kimi, which can take
+    8–15min on a single large file but never stops emitting for more
+    than ~30s while it's actually working. A flat 600s cap killed v34.
+    """
+    start_wall = time.time()
+    sandbox_cwd = _llm_cli_sandbox_cwd()
     proc = await asyncio.create_subprocess_exec(
-        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=sandbox_cwd,
     )
+
+    stdout_buf: list[bytes] = []
+    stderr_buf: list[bytes] = []
+    start = asyncio.get_event_loop().time()
+
+    async def _drain(stream, sink):
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                return
+            sink.append(chunk)
+
+    stdout_task = asyncio.create_task(_drain(proc.stdout, stdout_buf))
+    stderr_task = asyncio.create_task(_drain(proc.stderr, stderr_buf))
+
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_COMPLETE_TIMEOUT)
+        while True:
+            elapsed = asyncio.get_event_loop().time() - start
+            if elapsed >= _COMPLETE_TIMEOUT:
+                raise asyncio.TimeoutError(
+                    f"hard timeout after {int(elapsed)}s"
+                )
+            prev_len = sum(len(c) for c in stdout_buf)
+            try:
+                # Wait either for proc to exit or for the idle window
+                # to elapse. We re-check progress each cycle.
+                await asyncio.wait_for(
+                    proc.wait(),
+                    timeout=min(_IDLE_TIMEOUT, _COMPLETE_TIMEOUT - elapsed),
+                )
+                break  # process exited
+            except asyncio.TimeoutError:
+                new_len = sum(len(c) for c in stdout_buf)
+                if new_len == prev_len:
+                    # No new bytes in the idle window → hung.
+                    raise asyncio.TimeoutError(
+                        f"idle timeout ({int(_IDLE_TIMEOUT)}s no output)"
+                    )
+                # Made progress; reset and keep waiting.
+                continue
     except asyncio.TimeoutError:
         try:
             proc.kill()
         except ProcessLookupError:
             pass
+        # Cancel drain tasks so we don't leak them.
+        for t in (stdout_task, stderr_task):
+            t.cancel()
         raise
+    finally:
+        # Make sure drains finish flushing whatever's left in the pipes.
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(stdout_task, stderr_task, return_exceptions=True),
+                timeout=2.0,
+            )
+        except asyncio.TimeoutError:
+            pass
+
+    stdout = b"".join(stdout_buf)
+    stderr = b"".join(stderr_buf)
     if proc.returncode != 0:
-        raise RuntimeError(f"{args[0]} cli failed: {stderr.decode(errors='replace')[:300]}")
-    return stdout.decode(errors="replace").strip()
+        raise RuntimeError(
+            f"{args[0]} cli failed: {stderr.decode(errors='replace')[:300]}"
+        )
+    stdout_text = stdout.decode(errors="replace")
+    artifacts = _collect_sandbox_artifacts(sandbox_cwd, started_at=start_wall)
+    if artifacts:
+        logger.info(
+            "harvested %d sandbox artifact(s) from %s",
+            len(artifacts),
+            args[0],
+        )
+    return _append_sandbox_artifacts(stdout_text, artifacts)
 
 
 class _ClaudeCLIBackend:

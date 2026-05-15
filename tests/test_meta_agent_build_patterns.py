@@ -38,8 +38,8 @@ def fresh_meta(monkeypatch, tmp_path):
     monkeypatch.setattr(cortex, "get_store", lambda: store)
 
     # Build a minimal MetaAgent without a real orchestrator.
-    from skyn3t.memory.meta_agent import MetaAgent
     from skyn3t.core.events import EventBus
+    from skyn3t.memory.meta_agent import MetaAgent
     meta = MetaAgent(event_bus=EventBus())
     return meta, sb, store
 

@@ -48,7 +48,7 @@ class LessonStats:
         denom = max(1, self.helpful + self.hurt)
         return (self.helpful - self.hurt) / denom
 
-    def to_dict(self) -> Dict[str, float]:
+    def to_dict(self) -> Dict[str, object]:
         return {
             "lesson_id": self.lesson_id,
             "helpful": self.helpful,

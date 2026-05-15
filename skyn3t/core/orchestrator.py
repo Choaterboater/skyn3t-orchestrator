@@ -1,10 +1,12 @@
 """Main orchestrator that manages all agents and tasks."""
 
 import asyncio
+import importlib
+import inspect
 import logging
 import threading
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, cast
 from uuid import uuid4
 
 from skyn3t.core.agent import BaseAgent, TaskRequest, TaskResult
@@ -62,6 +64,8 @@ class Orchestrator:
         self._self_healing = SelfHealingManager(self.event_bus)
         self._task_semaphore: Optional[asyncio.Semaphore] = None
         self._max_concurrent = 10
+        # Auto-spawned agents idle longer than this are terminated.
+        self._auto_agent_ttl_seconds: float = 600.0  # 10 min
 
         # Fallback / resilience layer
         self._fallback = FallbackManager(self.event_bus)
@@ -409,6 +413,9 @@ class Orchestrator:
             "name": agent.name,
             "type": agent.agent_type,
             "provider": agent.provider,
+            "role": agent.role,
+            "reports_to": agent.reports_to,
+            "lifecycle": agent.lifecycle,
             "capabilities": [c.name for c in agent.capabilities],
             "registered_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -429,6 +436,9 @@ class Orchestrator:
                     capabilities=[c.name for c in agent.capabilities],
                     config=agent.config,
                     meta=agent.metadata,
+                    role=agent.role,
+                    reports_to=agent.reports_to,
+                    lifecycle=agent.lifecycle,
                 )
             )
 
@@ -442,6 +452,275 @@ class Orchestrator:
     def get_agent(self, name: str) -> Optional[BaseAgent]:
         """Get an agent by name."""
         return self.agents.get(name)
+
+    def get_subordinates(self, name: str) -> List[BaseAgent]:
+        """Return agents that report to the given manager."""
+        return [a for a in self.agents.values() if a.reports_to == name]
+
+    def get_manager(self, name: str) -> Optional[BaseAgent]:
+        """Return the agent that the named agent reports to."""
+        agent = self.agents.get(name)
+        if agent and agent.reports_to:
+            return self.agents.get(agent.reports_to)
+        return None
+
+    def get_reporting_chain(self, name: str) -> List[str]:
+        """Return the chain of manager names from this agent up to the root.
+        The first element is the agent's direct manager; the last is the root.
+        """
+        chain: List[str] = []
+        current = name
+        visited: Set[str] = set()
+        while True:
+            agent = self.agents.get(current)
+            if not agent or not agent.reports_to:
+                break
+            if agent.reports_to in visited:
+                # Cycle detected — stop to avoid infinite loop
+                break
+            visited.add(agent.reports_to)
+            chain.append(agent.reports_to)
+            current = agent.reports_to
+        return chain
+
+    async def spawn_subordinate(
+        self,
+        manager_name: str,
+        agent_type: str,
+        role: Optional[str] = None,
+        capabilities: Optional[List[str]] = None,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> Optional[BaseAgent]:
+        """Dynamically create a subordinate agent reporting to ``manager_name``.
+
+        Looks up the agent class by ``agent_type`` in ``skyn3t.agents``,
+        instantiates it with the orchestrator's event bus, sets its
+        ``reports_to`` and ``lifecycle="auto"``, and registers it.
+        Returns the new agent or None if the type is unknown or spawn fails.
+        """
+        mod = importlib.import_module("skyn3t.agents")
+        cls = getattr(mod, agent_type, None)
+        if cls is None:
+            logger.warning("spawn_subordinate: unknown agent_type %s", agent_type)
+            return None
+
+        # Build a unique name that won't collide.
+        base_name = f"{manager_name}-{role or agent_type}"
+        name = base_name
+        counter = 1
+        while name in self.agents:
+            name = f"{base_name}-{counter}"
+            counter += 1
+
+        kwargs: Dict[str, Any] = {"event_bus": self.event_bus}
+        sig = inspect.signature(cls)
+        if "name" in sig.parameters:
+            kwargs["name"] = name
+        if "config" in sig.parameters:
+            kwargs["config"] = config or {}
+        # Filter to what the constructor actually accepts
+        kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+
+        try:
+            agent = cast(BaseAgent, cls(**kwargs))
+        except Exception:
+            logger.exception("spawn_subordinate: failed to instantiate %s", agent_type)
+            return None
+
+        agent.role = role
+        agent.reports_to = manager_name
+        agent.lifecycle = "auto"
+        if capabilities:
+            from skyn3t.core.agent import AgentCapability
+            for cap_name in capabilities:
+                agent.add_capability(AgentCapability(name=cap_name, description=cap_name))
+
+        if hasattr(agent, "initialize"):
+            try:
+                init = agent.initialize()
+                if inspect.iscoroutine(init):
+                    await init
+            except Exception:
+                logger.exception("spawn_subordinate: initialize failed for %s", name)
+                return None
+
+        self.register_agent(agent)
+        logger.info("spawn_subordinate: %s (%s) reporting to %s", name, agent_type, manager_name)
+        return agent
+
+    def _terminate_idle_auto_agents(self) -> None:
+        """Shut down auto-spawned agents that have been idle too long."""
+        now = datetime.now(timezone.utc)
+        ttl = self._auto_agent_ttl_seconds
+        to_terminate: List[BaseAgent] = []
+        for agent in list(self.agents.values()):
+            if agent.lifecycle != "auto":
+                continue
+            last_active = getattr(agent, "last_active_at", None)
+            if last_active is None:
+                # Never activated — use creation time approximation via registry
+                reg = self.agent_registry.get(agent.name, {})
+                try:
+                    from datetime import datetime as _dt
+                    created = _dt.fromisoformat(reg.get("registered_at", ""))
+                    last_active = created.replace(tzinfo=timezone.utc)
+                except Exception:
+                    last_active = now
+            if last_active and (now - last_active).total_seconds() > ttl:
+                if getattr(agent, "_current_task", None) is None and agent.status in ("idle", "offline"):
+                    to_terminate.append(agent)
+        for agent in to_terminate:
+            logger.info("_terminate_idle_auto_agents: terminating %s (idle > %.0fs)", agent.name, ttl)
+            try:
+                if hasattr(agent, "shutdown"):
+                    shutdown_coro = agent.shutdown()
+                    if inspect.iscoroutine(shutdown_coro):
+                        asyncio.create_task(shutdown_coro)
+            except Exception:
+                logger.exception("_terminate_idle_auto_agents: shutdown failed for %s", agent.name)
+            self.unregister_agent(agent.name)
+
+    async def delegate_task(
+        self,
+        task: TaskRequest,
+        manager_name: str,
+        capability: Optional[str] = None,
+        auto_spawn: bool = False,
+        spawn_agent_type: Optional[str] = None,
+        spawn_role: Optional[str] = None,
+    ) -> Optional[str]:
+        """Delegate a task from a manager to one of its subordinates.
+
+        If ``capability`` is provided, picks the first subordinate that
+        has it. Otherwise picks the first available subordinate. Returns
+        the task_id if successfully submitted, None if no suitable
+        subordinate exists.
+
+        When ``auto_spawn`` is True and no matching subordinate exists,
+        attempts to ``spawn_subordinate()`` using ``spawn_agent_type``
+        (defaults to the capability name) before giving up.
+        """
+        subs = self.get_subordinates(manager_name)
+        candidates = subs
+        if capability:
+            candidates = [a for a in subs if any(c.name == capability for c in a.capabilities)]
+        if candidates:
+            target = candidates[0]
+            target.last_active_at = datetime.now(timezone.utc)
+            await target.submit_task(task)
+            return task.task_id
+
+        if auto_spawn:
+            agent_type = spawn_agent_type or capability or "BaseAgent"
+            role = spawn_role or capability or agent_type
+            spawned = await self.spawn_subordinate(
+                manager_name=manager_name,
+                agent_type=agent_type,
+                role=role,
+                capabilities=[capability] if capability else None,
+            )
+            if spawned:
+                spawned.last_active_at = datetime.now(timezone.utc)
+                await spawned.submit_task(task)
+                return task.task_id
+
+        return None
+
+    async def fan_out(
+        self,
+        manager_name: str,
+        task: TaskRequest,
+        subtasks: Optional[List[Dict[str, Any]]] = None,
+        auto_decompose: bool = False,
+        auto_spawn: bool = False,
+        max_parallel: int = 5,
+    ) -> Dict[str, Any]:
+        """Decompose a task and delegate subtasks to subordinates in parallel.
+
+        Args:
+            manager_name: The manager whose subordinates will execute.
+            task: The parent task to fan out.
+            subtasks: Optional explicit list of subtask specs. Each spec
+                should have at least ``capability`` and optionally
+                ``title``, ``description``, ``input_data``.
+            auto_decompose: If True and ``subtasks`` is None, uses the
+                TaskDecomposer to break the task into subtasks.
+            auto_spawn: If True, spawns subordinates when no match exists.
+            max_parallel: Maximum concurrent subtasks.
+
+        Returns:
+            Dict with ``success`` (all passed), ``results`` (list of
+            TaskResult), ``completed``, ``failed``, and ``parent_task_id``.
+        """
+        specs: List[Dict[str, Any]] = []
+        if subtasks:
+            specs = subtasks
+        elif auto_decompose and self._task_decomposer:
+            decomposed = self._task_decomposer.decompose(task)
+            for st in decomposed:
+                specs.append({
+                    "capability": st.capability,
+                    "title": st.title,
+                    "description": st.description,
+                    "input_data": st.input_data,
+                })
+        else:
+            # No decomposition — just delegate the whole task as one subtask
+            specs = [{"capability": None, "title": task.title, "input_data": task.input_data}]
+
+        semaphore = asyncio.Semaphore(max_parallel)
+        results: List[TaskResult] = []
+
+        async def run_one(spec: Dict[str, Any]) -> TaskResult:
+            cap = spec.get("capability")
+            input_data = {**task.input_data, **spec.get("input_data", {})}
+            input_data["parent_task_id"] = task.task_id
+            subtask = TaskRequest(
+                title=spec.get("title", task.title),
+                description=spec.get("description", task.description),
+                input_data=input_data,
+            )
+            async with semaphore:
+                delegated_id = await self.delegate_task(
+                    subtask,
+                    manager_name=manager_name,
+                    capability=cap,
+                    auto_spawn=auto_spawn,
+                    spawn_agent_type=spec.get("agent_type") or cap,
+                    spawn_role=cap,
+                )
+                if delegated_id is None:
+                    return TaskResult(
+                        task_id=subtask.task_id,
+                        success=False,
+                        error=f"No subordinate found for capability '{cap}'",
+                    )
+                # Wait for the subordinate to complete the task.
+                # The orchestrator already tracks task_results, so poll
+                # with a short sleep until the result appears.
+                for _ in range(600):  # 60s max @ 0.1s sleep
+                    if subtask.task_id in self.task_results:
+                        return self.task_results[subtask.task_id]
+                    await asyncio.sleep(0.1)
+                return TaskResult(
+                    task_id=subtask.task_id,
+                    success=False,
+                    error="Subtask timed out waiting for result",
+                )
+
+        if specs:
+            results = await asyncio.gather(*[run_one(s) for s in specs])
+
+        completed = [r for r in results if r.success]
+        failed = [r for r in results if not r.success]
+        return {
+            "success": len(failed) == 0 and len(completed) == len(specs),
+            "parent_task_id": task.task_id,
+            "results": results,
+            "completed": len(completed),
+            "failed": len(failed),
+            "outputs": {r.task_id: r.output for r in results},
+        }
 
     def find_agents_by_capability(self, capability: str) -> List[BaseAgent]:
         """Find agents that have a specific capability."""
@@ -1304,6 +1583,48 @@ class Orchestrator:
             self._finalize_task_failure(task, failed_agent_name, error)
             return
 
+        # Per-failure-class retry policy. Old behavior was uniform
+        # exponential backoff regardless of error type, which burned
+        # cycles on AUTH-class failures (never going to succeed) and
+        # under-waited on RATE_LIMIT errors (succeed on retry but
+        # needed a longer wait). The policy module classifies the
+        # error string and returns a decision tuned to that class.
+        from skyn3t.core.retry_policy import classify as _classify
+        from skyn3t.core.retry_policy import decide as _retry_decide
+        failure_class = _classify(error)
+        # attempt = how many attempts have already happened (1-indexed
+        # for the policy module: the failure that just occurred IS
+        # attempt N). task.max_retries is the count of RETRIES allowed
+        # beyond the first attempt, so total attempts = max_retries + 1.
+        decision = _retry_decide(
+            error,
+            attempt=task.retry_count + 1,
+            max_attempts_override=task.max_retries + 1,
+        )
+        # Fast-fail classes (AUTH, QUOTA, CAPACITY, NOT_FOUND) cap at
+        # 1 attempt — the policy will return should_retry=False here
+        # and skip ahead to terminal failure handling.
+        if not decision.should_retry:
+            logger.info(
+                "task %s fail-fast (%s): %s",
+                task_id, failure_class.value, decision.reason,
+            )
+            self.event_bus.publish(
+                Event(
+                    event_type=EventType.SYSTEM_ALERT,
+                    source="orchestrator",
+                    payload={
+                        "kind": "TASK_FAIL_FAST",
+                        "task_id": task_id,
+                        "failure_class": failure_class.value,
+                        "reason": decision.reason,
+                    },
+                    correlation_id=task_id,
+                )
+            )
+            self._finalize_task_failure(task, failed_agent_name, error)
+            return
+
         # Prefer a new fallback agent when one is still available.
         fallback_agent = self._get_fallback_agent(
             failed_agent_name,
@@ -1326,6 +1647,7 @@ class Orchestrator:
                             "failed_agent": failed_agent_name,
                             "fallback_agent": fallback_agent,
                             "retry_count": task.retry_count,
+                            "failure_class": failure_class.value,
                         },
                         correlation_id=task_id,
                     )
@@ -1334,7 +1656,9 @@ class Orchestrator:
                 return
 
         task.retry_count += 1
-        await asyncio.sleep(2 ** task.retry_count)
+        # Backoff comes from the policy (used to be a hardcoded
+        # 2**retry_count regardless of class).
+        await asyncio.sleep(decision.backoff_seconds)
         queued = await self._retry_task(task, exclude_agents=attempted_agents)
         if queued:
             return
@@ -1347,7 +1671,40 @@ class Orchestrator:
         failed_agent_name: str,
         error: str,
     ) -> None:
-        """Persist and publish terminal task failure state."""
+        """Persist and publish terminal task failure state.
+
+        Re-persists to memory with the FINAL retry_count so the
+        durable record matches the emitted TASK_FAILED_FINAL event.
+        Earlier code only persisted at the start of the failure-
+        handling path (with retry_count=N-1), so the DB-stored
+        attempts undercounted relative to what the dashboard saw.
+        """
+        if self._memory:
+            agent = self.agents.get(failed_agent_name)
+            asyncio.create_task(
+                self._memory.save_task(
+                    task_id=task.task_id,
+                    title=task.title,
+                    description=task.description,
+                    status="failed",
+                    priority=task.priority,
+                    agent_id=agent.id if agent else None,
+                    agent_name=failed_agent_name,
+                    parent_task_id=None,
+                    input_data=task.input_data,
+                    output_data={"_meta": {
+                        "agent_name": failed_agent_name,
+                        "error": error,
+                        "terminal": True,
+                    }},
+                    error_message=error,
+                    retry_count=task.retry_count,
+                    max_retries=task.max_retries,
+                    started_at=None,
+                    completed_at=datetime.now(timezone.utc),
+                    session_id=task.session_id,
+                )
+            )
         self.event_bus.publish(
             Event(
                 event_type=EventType.TASK_FAILED_FINAL,
@@ -1357,6 +1714,8 @@ class Orchestrator:
                     "agent": failed_agent_name,
                     "error": error,
                     "retry_count": task.retry_count,
+                    "max_retries": task.max_retries,
+                    "terminal": True,
                 },
                 correlation_id=task.task_id,
             )
@@ -1578,7 +1937,14 @@ class Orchestrator:
                             agent.status = "error"
                             self._self_healing.request_healing(agent.name)
                         else:
-                            agent.status = "idle"
+                            # Don't clobber an active task. The health
+                            # monitor used to flip every healthy agent
+                            # to "idle" even mid-execution, which made
+                            # the dashboard misreport busy agents as
+                            # idle. Only revert to idle if the agent
+                            # is genuinely not running anything.
+                            if getattr(agent, "_current_task", None) is None:
+                                agent.status = "idle"
                     except asyncio.TimeoutError:
                         agent.status = "error"
                         self._self_healing.request_healing(agent.name)
@@ -1588,6 +1954,7 @@ class Orchestrator:
                 # grow unbounded for the lifetime of the process.
                 self._compact_terminal_state()
                 self._compact_idempotency_keys()
+                self._terminate_idle_auto_agents()
 
                 await asyncio.sleep(30)
             except asyncio.CancelledError:

@@ -15,10 +15,10 @@ import re
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from skyn3t.config.settings import get_settings
-from skyn3t.core.agent import AgentCapability, TaskRequest
+from skyn3t.core.agent import AgentCapability, TaskRequest, TaskResult
 from skyn3t.core.event_context import push_event_context
 from skyn3t.studio.mission_setup import (
     augment_brief_with_mission_setup,
@@ -63,6 +63,7 @@ class StudioRunner:
     ) -> None:
         self.event_bus = event_bus
         self.rag = rag
+        self._retry_tasks: Set[asyncio.Task[Any]] = set()
         configured_root = projects_root if projects_root is not None else get_settings().projects_dir
         self.projects_root = Path(configured_root).expanduser()
         self.projects_root.mkdir(parents=True, exist_ok=True)
@@ -157,7 +158,15 @@ class StudioRunner:
                     try:
                         self._save_manifest(p, d)
                     except Exception:
-                        pass
+                        # Manifest write is the ONLY durable record of
+                        # the "interrupted" state — losing it means the
+                        # project shows up as "still running" forever
+                        # in the dashboard after a restart.
+                        logger.warning(
+                            "reap_orphans: failed to persist interrupted "
+                            "state for %s — project will look running on "
+                            "next start", p, exc_info=True,
+                        )
         except Exception:
             logger.exception("reap_orphans failed")
 
@@ -182,8 +191,39 @@ class StudioRunner:
         try:
             setup = normalize_mission_setup(mission_setup)
             repo = self._resolved_repo_target(repo_target)
+            # Enrich BEFORE planning so plan_pipeline / designer-skip /
+            # extensibility detection / etc. see the category's default
+            # features in the brief. The original "enrich after plan"
+            # ordering meant the planner picked DesignerAgent for v29
+            # before the "Homarr/dark theme" defaults were appended,
+            # then the designer-skip post-process couldn't undo it
+            # because... wait, yes it could — but the LLM-planner path
+            # had already locked it in. Moved here so EVERY downstream
+            # consumer sees the enriched text.
+            raw_brief = brief
+            enriched_brief = brief
+            expanded_brief = brief
+            category_defaults = None
+            try:
+                from skyn3t.agents.product_categories import (
+                    enrich_brief,
+                    expand_sparse_brief,
+                )
+                expanded_brief = expand_sparse_brief(brief)
+                enriched_brief, category_defaults = enrich_brief(expanded_brief)
+                if category_defaults and category_defaults.slug != "unknown":
+                    logger.info(
+                        "project %s classified as %s — added %d implicit "
+                        "features + %d aesthetic defaults",
+                        slug, category_defaults.slug,
+                        len(category_defaults.implicit_features),
+                        len(category_defaults.aesthetic_baseline),
+                    )
+            except Exception:
+                logger.debug("category enrichment failed", exc_info=True)
+            execution_profile = self._infer_execution_profile(raw_brief, extra)
             effective_brief = augment_brief_with_repo_target(
-                augment_brief_with_mission_setup(brief, setup),
+                augment_brief_with_mission_setup(enriched_brief, setup),
                 repo,
             )
             template = get_template(template_key)
@@ -200,6 +240,36 @@ class StudioRunner:
                 except Exception:
                     pass
                 planned = await plan_pipeline(brief=effective_brief, llm_client=llm_client)
+                # Belt-and-braces guard: if the brief asks for runnable
+                # software but no code-producing agent made it into the
+                # plan, force CodeAgent in. v52 surfaced a case where the
+                # planner's safety net silently failed to add CodeAgent to
+                # a "build a Vite + React dashboard" brief, and the run
+                # shipped docs-only with reviewer 100/100. This guard runs
+                # after the planner so it cannot be silently bypassed.
+                from skyn3t.studio.planner import PlannedStage, _should_force_code_agent
+                _agents_in_plan = {p.agent for p in planned}
+                if (
+                    _should_force_code_agent(effective_brief)
+                    and "CodeAgent" not in _agents_in_plan
+                    and "CodeImproverAgent" not in _agents_in_plan
+                ):
+                    logger.warning(
+                        "planner produced no code agent for a code-requiring "
+                        "brief; injecting CodeAgent. plan was: %s",
+                        [p.agent for p in planned],
+                    )
+                    insert_at = next(
+                        (i for i, p in enumerate(planned) if p.agent == "ReviewerAgent"),
+                        len(planned),
+                    )
+                    planned.insert(insert_at, PlannedStage(
+                        name="code",
+                        agent="CodeAgent",
+                        capability="code_generation",
+                        expected_artifact="(source files)",
+                        rationale="injected by runner safety net (planner dropped code agent)",
+                    ))
                 # Convert PlannedStage list → a one-off Template instance for this run
                 from skyn3t.studio.templates import StageSpec, Template
                 converted_stages = [
@@ -239,13 +309,25 @@ class StudioRunner:
             )
             repo_source = repo_target if repo_target is not None else manifest.get("repo_target")
             repo = self._resolved_repo_target(repo_source)
+            # Re-resolve effective_brief now that we have setup/repo
+            # from the manifest. Enrichment is already on enriched_brief
+            # from the pre-plan step above; just thread it through here.
             effective_brief = augment_brief_with_repo_target(
-                augment_brief_with_mission_setup(brief, setup),
+                augment_brief_with_mission_setup(enriched_brief, setup),
                 repo,
             )
+            # Record product category on the manifest so the dashboard
+            # can show "classified as homelab_dashboard" + the default
+            # features are auditable.
+            if category_defaults and category_defaults.slug != "unknown":
+                manifest["product_category"] = category_defaults.slug
+                manifest["product_category_label"] = category_defaults.label
             manifest["template"] = template_key
             manifest["title"] = template.title
             manifest["brief"] = brief
+            manifest["brief_raw"] = raw_brief
+            manifest["brief_expanded"] = bool((expanded_brief or "").strip() != (raw_brief or "").strip())
+            manifest["execution_profile"] = execution_profile
             manifest["mission_setup"] = setup
             manifest["repo_target"] = repo
             manifest["workflow_summary"] = self._workflow_from_template(template, template_key)
@@ -282,6 +364,7 @@ class StudioRunner:
                     extra={
                         **mission_setup_stage_hints(setup),
                         **repo_target_stage_hints(repo),
+                        "execution_profile": execution_profile,
                         **(extra or {}),
                     },
                 )
@@ -336,6 +419,14 @@ class StudioRunner:
                 augment_brief_with_mission_setup(new_brief, setup),
                 repo,
             )
+            execution_profile = str(
+                manifest.get("execution_profile")
+                or self._infer_execution_profile(
+                    str(manifest.get("brief_raw") or manifest.get("brief") or new_brief),
+                    None,
+                )
+            )
+            manifest["execution_profile"] = execution_profile
 
             template = get_template(manifest["template"])
             if not template.stages and manifest["template"] == "auto":
@@ -372,6 +463,7 @@ class StudioRunner:
             extra: Dict[str, Any] = {
                 **mission_setup_stage_hints(setup),
                 **repo_target_stage_hints(repo),
+                "execution_profile": execution_profile,
             }
             extra.pop("require_clarification", None)
             extra["clarifications"] = True
@@ -413,7 +505,27 @@ class StudioRunner:
     ) -> dict:
         """Execute the actual stage loop. Caller has already acquired the
         concurrency semaphore and set manifest["status"] = "running"."""
+        # Defensive: never let a bad artifact_dir leak into agent input_data.
+        # This guards against caller bugs, symlink attacks, and env misconfig.
+        resolved_art = artifact_dir.resolve()
+        resolved_root = self.projects_root.resolve()
         try:
+            resolved_art.relative_to(resolved_root)
+        except ValueError:
+            raise RuntimeError(
+                f"artifact_dir {resolved_art} is outside projects_root {resolved_root}. "
+                f"Refusing to run pipeline to prevent writes outside the project sandbox."
+            )
+        # Extra guard: never run if artifact_dir IS the SkyN3t repo root.
+        repo_marker = resolved_art / "skyn3t" / "core" / "agent.py"
+        if repo_marker.exists():
+            raise RuntimeError(
+                f"artifact_dir {resolved_art} appears to be the SkyN3t repo root. "
+                f"Refusing to run pipeline to prevent overwriting source files."
+            )
+
+        try:
+            self._init_benchmark(manifest)
             # Auto-detect target_file from the brief (e.g. "target_file: skyn3t/web/dashboard.html").
             # Also infer from common phrasings so users don't have to type the keyword.
             auto_target = str((extra or {}).get("target_file") or "").strip() or None
@@ -430,7 +542,36 @@ class StudioRunner:
                 extra.setdefault("target_file", auto_target)
                 extra.setdefault("rationale", brief)
 
-            for stage in template.stages:
+            # Inject consistency reviewer before the main reviewer stage.
+            # This catches cross-file mismatches (missing features, service
+            # bleed-through, README drift) before the prose reviewer scores
+            # the project, giving the fix loop a chance to repair issues.
+            stages = list(template.stages)
+            reviewer_idx = None
+            for i, s in enumerate(stages):
+                if s.agent == "ReviewerAgent" and s.name == "reviewer":
+                    reviewer_idx = i
+                    break
+            if reviewer_idx is not None:
+                from skyn3t.studio.templates import StageSpec
+                consistency_stage = StageSpec(
+                    name="consistency_reviewer",
+                    agent="ConsistencyReviewerAgent",
+                    capability="review",
+                    handoff_to="reviewer",
+                    input_extra={},
+                )
+                stages.insert(reviewer_idx, consistency_stage)
+
+            execution_profile = self._infer_execution_profile(
+                str(manifest.get("brief_raw") or manifest.get("brief") or brief),
+                extra,
+            )
+            manifest["execution_profile"] = execution_profile
+            if isinstance(extra, dict):
+                extra = {**extra, "execution_profile": execution_profile}
+
+            for stage in stages:
                 agent = get_agent(stage.agent, event_bus=self.event_bus, rag=self.rag)
                 if hasattr(agent, "initialize"):
                     maybe = agent.initialize()
@@ -499,27 +640,12 @@ class StudioRunner:
                 )
                 try:
                     import asyncio as _asyncio
-                    _stage_to = (extra or {}).get("stage_timeout") if isinstance(extra, dict) else None
+                    _stage_to: Optional[float] = (extra or {}).get("stage_timeout") if isinstance(extra, dict) else None
                     try:
                         _stage_to = float(_stage_to) if _stage_to else None
                     except Exception:
                         _stage_to = None
-                    if _stage_to is None:
-                        # Per-stage defaults. Heavy stages routinely exceed
-                        # the old 300s cap because they consume the full
-                        # prior-artifact context (research 32KB + arch 6KB
-                        # + design 7 files + code 7 files + brief) AND
-                        # produce their own multi-section output:
-                        #   - code: N per-file LLM calls with that whole
-                        #     context per call
-                        #   - research: real MCP web search across
-                        #     multiple services
-                        #   - reviewer: reads all upstream artifacts to
-                        #     grade the swarm's work — added after v8
-                        #     timed out reviewing a 23KB App.jsx + 32KB
-                        #     research.md
-                        heavy_stages = {"code", "research", "reviewer"}
-                        _stage_to = 1800.0 if stage.name in heavy_stages else 300.0
+                    _stage_to = self._stage_timeout_for(stage.name, execution_profile, _stage_to)
                     with push_event_context(
                         project_slug=slug,
                         project_stage=stage.name,
@@ -531,7 +657,8 @@ class StudioRunner:
                             agent.execute(task), timeout=_stage_to
                         )
                 except _asyncio.TimeoutError:
-                    stage_error = f"stage timeout (>{int(_stage_to)}s)"
+                    timeout_secs = int(_stage_to) if _stage_to is not None else 0
+                    stage_error = f"stage timeout (>{timeout_secs}s)"
                     self._publish(
                         "PROJECT_STAGE_FAILED",
                         {
@@ -563,7 +690,7 @@ class StudioRunner:
                         status="failed",
                         stage=stage.name,
                         agent=stage.agent,
-                        message=f"Stage timeout (>{int(_stage_to)}s).",
+                        message=f"Stage timeout (>{timeout_secs}s).",
                         error=stage_error,
                     )
                     self._save_manifest(artifact_dir, manifest)
@@ -590,11 +717,7 @@ class StudioRunner:
                                     stack = detect_stack(brief) or "unknown"
                                 except Exception:
                                     pass
-                                shape = sorted(
-                                    p.relative_to(scaffold_dir).as_posix()
-                                    for p in scaffold_dir.rglob("*")
-                                    if p.is_file() and "__pycache__" not in p.parts
-                                )
+                                shape = self._scaffold_shape(scaffold_dir)
                             get_default_scoreboard().record(stack, shape, "no")
                         except Exception:
                             logger.exception("scoreboard record on stage timeout failed")
@@ -655,11 +778,7 @@ class StudioRunner:
                                     stack = detect_stack(brief) or "unknown"
                                 except Exception:
                                     pass
-                                shape = sorted(
-                                    p.relative_to(scaffold_dir).as_posix()
-                                    for p in scaffold_dir.rglob("*")
-                                    if p.is_file() and "__pycache__" not in p.parts
-                                )
+                                shape = self._scaffold_shape(scaffold_dir)
                             get_default_scoreboard().record(stack, shape, "no")
                         except Exception:
                             logger.exception("scoreboard record on stage error failed")
@@ -707,6 +826,7 @@ class StudioRunner:
                         message=manifest["next_action"],
                         question_count=question_count,
                     )
+                    self._finalize_benchmark(manifest)
                     self._save_manifest(artifact_dir, manifest)
                     self._publish("PROJECT_AWAITING_CLARIFICATION",
                                    {"slug": slug, "stage": stage.name,
@@ -763,6 +883,68 @@ class StudioRunner:
                     )
                     break
 
+                # Consistency reviewer fix loop: if blockers found,
+                # apply targeted fixes before the main reviewer runs.
+                if stage.name == "consistency_reviewer":
+                    review_output = output if isinstance(output, dict) else {}
+                    if review_output.get("verdict") == "needs_fix":
+                        blockers = review_output.get("blocker_count", 0)
+                        if blockers > 0:
+                            self._append_history(
+                                manifest,
+                                "CONSISTENCY_REVIEW_BLOCKERS",
+                                status="running",
+                                message=f"{blockers} blocker(s) found by consistency reviewer.",
+                            )
+                            try:
+                                from skyn3t.adapters import LLMClient
+                                from skyn3t.agents.targeted_fix import (
+                                    FileIssue,
+                                    apply_targeted_fix,
+                                )
+
+                                report_json = review_output.get("report_json", "[]")
+                                import json as _json
+                                report = _json.loads(report_json)
+                                findings = report.get("findings", [])
+                                review_issues = []
+                                for f in findings:
+                                    if f.get("severity") != "blocker":
+                                        continue
+                                    fp = f.get("file", "(unknown)")
+                                    if fp.startswith("scaffold/"):
+                                        fp = fp[len("scaffold/"):]
+                                    review_issues.append(
+                                        FileIssue(
+                                            path=fp,
+                                            error_message=f.get("message", ""),
+                                            suggested_action="regenerate",
+                                        )
+                                    )
+                                issues = review_issues
+                                if issues:
+                                    scaffold_dir = artifact_dir / "scaffold"
+                                    client = LLMClient(
+                                        event_bus=self.event_bus, caller_name="consistency_fix"
+                                    )
+                                    fix_result = await apply_targeted_fix(
+                                        scaffold_dir=scaffold_dir,
+                                        issues=issues,
+                                        llm_client=client,
+                                        brief=brief,
+                                    )
+                                    self._append_history(
+                                        manifest,
+                                        "CONSISTENCY_FIX_APPLIED",
+                                        status="running",
+                                        message=(
+                                            f"Fixed {len(fix_result.files_changed)} file(s), "
+                                            f"created {len(fix_result.files_created)} placeholder(s)."
+                                        ),
+                                    )
+                            except Exception:
+                                logger.exception("consistency reviewer fix loop failed")
+
                 # Inter-agent conversation: cross-model critique +
                 # one bounded revision pass. Returns the original
                 # result if the critic says NO_ISSUES, the revision
@@ -775,6 +957,7 @@ class StudioRunner:
                         artifact_dir=artifact_dir,
                         brief=brief,
                         task=task,
+                        manifest=manifest,
                     )
                     if revised_result is not None and revised_result is not result:
                         result = revised_result
@@ -794,6 +977,18 @@ class StudioRunner:
                         )
                 except Exception:
                     logger.exception("critique pass crashed; continuing with original result")
+
+                # ── Post-code static consistency check ─────────────────────
+                # Run the pure-Python consistency engine after the code stage
+                # to catch import graph errors, missing deps, and service
+                # hallucinations before the expensive build verifier runs.
+                if stage.name == "code" and manifest.get("status") != "failed":
+                    await self._run_post_code_checks(
+                        manifest=manifest,
+                        artifact_dir=artifact_dir,
+                        brief=brief,
+                        stage_name=stage.name,
+                    )
 
                 quality_candidate = self._extract_quality_candidate(
                     stage=stage,
@@ -847,7 +1042,10 @@ class StudioRunner:
             # clean "done" result.
             if manifest.get("status") != "failed":
                 manifest["status"], manifest["next_action"], manifest["error"] = (
-                    self._finalize_project_outcome(manifest.get("quality_summary"))
+                    self._finalize_project_outcome(
+                        manifest.get("quality_summary"),
+                        manifest=manifest,
+                    )
                 )
             else:
                 self._clear_quality_summary(manifest)
@@ -950,6 +1148,188 @@ class StudioRunner:
                                     except Exception:
                                         logger.exception("persist fix-as-skill failed")
                                     break
+                            # BuildVerifier cleared (or skipped). Now run
+                            # BootVerifier — actually start the server and
+                            # confirm it responds to /api/health. Catches
+                            # cross-file inconsistencies (CJS/ESM mismatch,
+                            # missing import, wrong env-var name) that
+                            # node --check passes blindly.
+                            #
+                            # Mirrors the build-verifier flow: failure
+                            # kicks the same fix-round loop with the boot
+                            # hint as the lesson. If still failing after
+                            # the loop, fall through to mark project
+                            # failed so auto-retry can take another swing.
+                            if verdict in ("yes", "skipped"):
+                                try:
+                                    boot_result = await self._run_boot_verifier(
+                                        str(scaffold_dir), brief,
+                                    )
+                                except Exception:
+                                    logger.exception("boot_verifier invocation failed")
+                                    boot_result = None
+                                if boot_result is not None:
+                                    manifest["boot_verification"] = boot_result
+                                    boot_verdict = boot_result.get("verdict")
+                                    BOOT_FIX_ATTEMPTS = 2
+                                    boot_attempt = 0
+                                    while boot_verdict == "no" and boot_attempt < BOOT_FIX_ATTEMPTS:
+                                        boot_attempt += 1
+                                        # Reuse the same fix-round path —
+                                        # but feed the boot failure as the
+                                        # build_result so the LLM sees a
+                                        # concrete "this is what went wrong
+                                        # when we tried to RUN the program"
+                                        # error tail.
+                                        try:
+                                            fixed = await self._apply_build_fix_round(
+                                                scaffold_dir, brief, boot_result, boot_attempt,
+                                            )
+                                        except Exception:
+                                            logger.exception("boot fix round failed")
+                                            fixed = False
+                                        if not fixed:
+                                            break
+                                        try:
+                                            boot_result = await self._run_boot_verifier(
+                                                str(scaffold_dir), brief,
+                                            ) or boot_result
+                                        except Exception:
+                                            logger.exception("re-boot after fix failed")
+                                            break
+                                        manifest["boot_verification"] = boot_result
+                                        boot_verdict = boot_result.get("verdict")
+                                        manifest.setdefault("boot_fix_attempts", []).append({
+                                            "attempt": boot_attempt,
+                                            "verdict": boot_verdict,
+                                            "command": boot_result.get("command"),
+                                        })
+                                        if boot_verdict == "yes":
+                                            self._append_history(
+                                                manifest,
+                                                "BOOT_FIX_SUCCEEDED",
+                                                status="running",
+                                                message=(
+                                                    f"In-place fix round {boot_attempt} "
+                                                    f"got the server booting."
+                                                ),
+                                            )
+                                            try:
+                                                self._persist_fix_as_skill(
+                                                    stack=(boot_result or {}).get("kind") or "unknown",
+                                                    fix_round=boot_attempt,
+                                                    prior_summary=(
+                                                        manifest.get("boot_verification", {}).get("summary")
+                                                    ),
+                                                )
+                                            except Exception:
+                                                logger.exception("persist boot-fix-as-skill failed")
+                                            break
+                                    # Boot still failing after the fix loop
+                                    # → upgrade the project verdict to
+                                    # failed so the auto-retry kicks in
+                                    # with a real "the program didn't run"
+                                    # lesson, not the "files parse" lesson
+                                    # the build verifier already gave us.
+                                    if boot_verdict == "no":
+                                        verdict = "no"
+                                        build_result = boot_result  # used by the failure-marking block below
+
+                                    # Integration contract check: does every
+                                    # frontend API call have a backend route?
+                                    # Runs only when the server actually boots.
+                                    if boot_verdict == "yes":
+                                        try:
+                                            integration_result = await self._run_integration_verifier(
+                                                str(scaffold_dir), brief,
+                                            )
+                                        except Exception:
+                                            logger.exception("integration_verifier invocation failed")
+                                            integration_result = None
+                                        if integration_result is not None:
+                                            manifest["integration_verification"] = integration_result
+                                            integration_verdict = integration_result.get("verdict")
+                                            INTEGRATION_FIX_ATTEMPTS = 2
+                                            integration_attempt = 0
+                                            while (
+                                                integration_verdict == "no"
+                                                and integration_attempt < INTEGRATION_FIX_ATTEMPTS
+                                            ):
+                                                integration_attempt += 1
+                                                try:
+                                                    fixed = await self._apply_integration_fix_round(
+                                                        scaffold_dir=scaffold_dir,
+                                                        brief=brief,
+                                                        integration_result=integration_result,
+                                                        attempt=integration_attempt,
+                                                    )
+                                                except Exception:
+                                                    logger.exception("integration fix round failed")
+                                                    fixed = False
+                                                if not fixed:
+                                                    break
+                                                # Clean up any stray processes before rebooting
+                                                # to prevent port reuse race conditions
+                                                try:
+                                                    await self._kill_stray_server_processes(
+                                                        str(scaffold_dir)
+                                                    )
+                                                    await asyncio.sleep(0.5)
+                                                except Exception:
+                                                    logger.debug("stray process cleanup failed (non-fatal)")
+                                                try:
+                                                    boot_result = await self._run_boot_verifier(
+                                                        str(scaffold_dir), brief,
+                                                    ) or boot_result
+                                                except Exception:
+                                                    logger.exception("re-boot after integration fix failed")
+                                                    break
+                                                manifest["boot_verification"] = boot_result
+                                                boot_verdict = (boot_result or {}).get("verdict")
+                                                if boot_verdict != "yes":
+                                                    verdict = "no"
+                                                    build_result = boot_result
+                                                    break
+                                                try:
+                                                    integration_result = await self._run_integration_verifier(
+                                                        str(scaffold_dir), brief,
+                                                    ) or integration_result
+                                                except Exception:
+                                                    logger.exception("integration re-check failed")
+                                                    break
+                                                manifest["integration_verification"] = integration_result
+                                                integration_verdict = integration_result.get("verdict")
+                                                manifest.setdefault("integration_fix_attempts", []).append({
+                                                    "attempt": integration_attempt,
+                                                    "verdict": integration_verdict,
+                                                })
+                                                if integration_verdict == "yes":
+                                                    self._append_history(
+                                                        manifest,
+                                                        "INTEGRATION_FIX_SUCCEEDED",
+                                                        status="running",
+                                                        message=(
+                                                            f"In-place integration fix round "
+                                                            f"{integration_attempt} cleared "
+                                                            "the integration contract gate."
+                                                        ),
+                                                    )
+                                                    break
+                                            if integration_verdict == "no":
+                                                verdict = "no"
+                                                build_result = integration_result
+                                                manifest["status"] = "failed"
+                                                manifest["error"] = (
+                                                    integration_result.get("summary")
+                                                    or "Integration contract verification failed."
+                                                )
+                                                manifest["next_action"] = (
+                                                    "Retrying with the integration failure as a hint."
+                                                )
+                                                manifest["_retry_hint"] = (
+                                                    integration_result.get("failure_hint") or ""
+                                                )
+
                             # Still failing after the fix loop → mark failed
                             # so PR #2's auto-retry can take a different shape.
                             if verdict == "no":
@@ -973,13 +1353,11 @@ class StudioRunner:
                                 from skyn3t.intelligence.build_patterns import (
                                     get_default_scoreboard,
                                 )
-                                stack = (build_result or {}).get("stack") or "unknown"
-                                shape = sorted(
-                                    p.relative_to(scaffold_dir).as_posix()
-                                    for p in scaffold_dir.rglob("*")
-                                    if p.is_file() and "__pycache__" not in p.parts
-                                )
-                                get_default_scoreboard().record(stack, shape, verdict)
+                                stack = str((build_result or {}).get("stack") or "unknown")
+                                shape = self._scaffold_shape(scaffold_dir)
+                                sb = get_default_scoreboard()
+                                sb.record(stack, shape, str(verdict or "no"))
+                                sb.flush()  # ensure persistence even on single-run processes
                             except Exception:
                                 logger.exception("build_pattern record failed")
             completion_message = (
@@ -987,6 +1365,7 @@ class StudioRunner:
                 if manifest.get("status") in {"done", "needs_fixes"}
                 else manifest.get("error") or manifest["next_action"]
             )
+            self._finalize_benchmark(manifest)
             self._append_history(
                 manifest,
                 "PROJECT_COMPLETED",
@@ -1012,12 +1391,30 @@ class StudioRunner:
                     "status": manifest["status"],
                 },
             )
+            # Retry-success skill capture: when a `-retry` project finishes
+            # well (status done / needs_fixes), the original failure that
+            # triggered the retry is now a solved problem. Persist the
+            # lesson so the next similar brief gets it injected at code-gen
+            # time instead of repeating the same break → retry cycle.
+            if (
+                slug.endswith("-retry")
+                and manifest.get("status") in {"done", "needs_fixes"}
+            ):
+                try:
+                    self._persist_retry_as_skill(retry_slug=slug, retry_manifest=manifest)
+                except Exception:
+                    logger.exception("persist retry-as-skill failed for slug=%s", slug)
+
             # Auto-retry hook: if this attempt failed and we haven't already
             # retried, launch a second attempt with the dynamic "auto" planner
             # and inject the failure context as a lesson. The retry runs as a
             # background task so the original call returns immediately.
             if manifest.get("status") == "failed":
-                await self._maybe_auto_retry(manifest, brief, slug)
+                await self._maybe_auto_retry(
+                    manifest,
+                    str(manifest.get("brief_raw") or manifest.get("brief") or brief),
+                    slug,
+                )
             return manifest
         except Exception as exc:
             # The runner itself crashed (agent init blew up, get_agent raised, etc).
@@ -1033,6 +1430,7 @@ class StudioRunner:
             manifest["current_agent"] = None
             self._clear_quality_summary(manifest)
             manifest["next_action"] = "Project stopped because the runner crashed."
+            self._finalize_benchmark(manifest)
             self._append_history(
                 manifest,
                 "PROJECT_FAILED",
@@ -1043,7 +1441,14 @@ class StudioRunner:
             try:
                 self._save_manifest(artifact_dir, manifest)
             except Exception:
-                pass
+                # Failure-state manifest write — if this loses, the
+                # dashboard never sees this run as failed and the
+                # auto-retry path can't read the error context.
+                logger.warning(
+                    "failure-state manifest write FAILED for slug=%s — "
+                    "dashboard will misreport this run",
+                    slug, exc_info=True,
+                )
             self._publish("PROJECT_FAILED", {"slug": slug, "error": str(exc)})
             raise
 
@@ -1159,16 +1564,21 @@ class StudioRunner:
         build_result: Dict[str, Any],
         attempt: int,
     ) -> bool:
-        """Surgical fix: ask the LLM to rewrite ONLY the files that look
-        broken given the verifier's stderr. Returns True if at least one
-        file was rewritten (so the caller knows to re-verify).
+        """Surgical fix: parse the build log to identify specific broken
+        files, then regenerate ONLY those files using the targeted fix
+        engine. Falls back to whole-scaffold rewrite if parsing fails.
 
-        This is the cheap retry shape — closer to how Paperclip / OpenCLAw
-        iterate. We don't burn a fresh pipeline; we just edit the scaffold
-        in place and re-run the gate.
+        This is the cheap retry shape — closer to how iterative dev works.
+        We don't burn a fresh pipeline; we just edit the scaffold in place
+        and re-run the gate.
         """
-        from skyn3t.adapters import LLMClient
         import re as _re
+
+        from skyn3t.adapters import LLMClient
+        from skyn3t.agents.targeted_fix import (
+            _parse_build_errors,
+            apply_targeted_fix,
+        )
 
         stderr = (build_result.get("stderr") or "")
         stdout = (build_result.get("stdout") or "")
@@ -1177,11 +1587,47 @@ class StudioRunner:
         if not log_tail:
             return False
 
-        # Map current scaffold files → (relpath, content); cap individual
-        # bodies so a giant file doesn't blow the prompt budget.
+        # ── Phase 1: targeted fix (preferred) ────────────────────────────
+        issues = _parse_build_errors(stderr, stdout)
+        if issues:
+            client = LLMClient(event_bus=self.event_bus, caller_name="build_fix")
+            try:
+                result = await apply_targeted_fix(
+                    scaffold_dir=scaffold_dir,
+                    issues=issues,
+                    llm_client=client,
+                    brief=brief,
+                    stack=stack,
+                )
+            except Exception:
+                logger.exception("targeted fix engine failed on round %d", attempt)
+                result = None
+            if result is not None and (result.files_changed or result.files_created):
+                logger.info(
+                    "Targeted fix round %d: changed=%s created=%s errors=%s",
+                    attempt,
+                    result.files_changed,
+                    result.files_created,
+                    result.errors,
+                )
+                return True
+            # If targeted fix produced nothing, fall through to heuristic path
+
+        # ── Phase 2: heuristic fixes for common Rollup/Vite errors ───────
+        # These are fast regex-based fixes that don't need an LLM call.
+        heuristic_fixed = self._apply_heuristic_build_fixes(
+            scaffold_dir, stderr, stdout
+        )
+        if heuristic_fixed:
+            logger.info("Heuristic build fix applied for round %d", attempt)
+            return True
+
+        # ── Phase 3: legacy whole-scaffold rewrite (fallback) ────────────
         files_on_disk: List[tuple[str, str]] = []
         for p in sorted(scaffold_dir.rglob("*")):
-            if not p.is_file() or "__pycache__" in p.parts:
+            if not p.is_file() or "__pycache__" in p.parts or any(
+                part in self._SCAFFOLD_SHAPE_SKIP for part in p.parts
+            ):
                 continue
             try:
                 rel = p.relative_to(scaffold_dir).as_posix()
@@ -1245,6 +1691,10 @@ class StudioRunner:
             content = spec.get("content")
             if not rel or not isinstance(content, str) or not content.strip():
                 continue
+            # Reject paths that touch skip patterns (node_modules, .git, etc.)
+            if any(part in self._SCAFFOLD_SHAPE_SKIP for part in Path(rel).parts):
+                logger.warning("LLM fix proposed skip-path %s; ignoring", rel)
+                continue
             target = (scaffold_dir / rel).resolve()
             try:
                 target.relative_to(resolved_root)
@@ -1258,6 +1708,183 @@ class StudioRunner:
                 logger.exception("could not write fix to %s", target)
                 continue
         return wrote_any
+
+    async def _apply_integration_fix_round(
+        self,
+        *,
+        scaffold_dir: Path,
+        brief: str,
+        integration_result: Dict[str, Any],
+        attempt: int,
+    ) -> bool:
+        """Apply a targeted fix round using integration-verifier findings."""
+        from skyn3t.adapters import LLMClient
+        from skyn3t.agents.targeted_fix import FileIssue, apply_targeted_fix
+
+        targets = self._integration_fix_targets(scaffold_dir, integration_result)
+        failure_hint = (
+            integration_result.get("failure_hint")
+            or integration_result.get("summary")
+            or "Integration contract failed."
+        )
+        stack = integration_result.get("kind") or "unknown"
+
+        if not targets:
+            # Fall back to the generic build-fix path if we couldn't
+            # map missing routes to concrete backend files.
+            synthetic = {
+                "stderr": "",
+                "stdout": failure_hint,
+                "stack": stack,
+            }
+            return await self._apply_build_fix_round(
+                scaffold_dir=scaffold_dir,
+                brief=brief,
+                build_result=synthetic,
+                attempt=attempt,
+            )
+
+        issues = [
+            FileIssue(
+                path=path,
+                error_message=failure_hint,
+                suggested_action="regenerate",
+            )
+            for path in targets
+        ]
+        client = LLMClient(event_bus=self.event_bus, caller_name="integration_fix")
+        try:
+            result = await apply_targeted_fix(
+                scaffold_dir=scaffold_dir,
+                issues=issues,
+                llm_client=client,
+                brief=brief,
+                stack=stack,
+            )
+        except Exception:
+            logger.exception("integration targeted fix failed on round %d", attempt)
+            return False
+        if result is not None and (result.files_changed or result.files_created):
+            logger.info(
+                "Integration fix round %d: changed=%s created=%s errors=%s",
+                attempt,
+                result.files_changed,
+                result.files_created,
+                result.errors,
+            )
+            return True
+        return False
+
+    def _apply_heuristic_build_fixes(
+        self, scaffold_dir: Path, stderr: str, stdout: str
+    ) -> bool:
+        """Fast regex-based fixes for common Rollup/Vite build errors.
+
+        Returns True if any fix was applied. These run before the expensive
+        LLM-based fallback so trivial export/syntax issues are resolved
+        instantly.
+        """
+        import re
+
+        text = f"{stderr}\n{stdout}"
+        fixed_any = False
+
+        # Heuristic 1: Rollup "X is not exported by Y" → add export keyword
+        for m in re.finditer(
+            r'"([^"]+)"\s+is\s+not\s+exported\s+by\s+"([^"]+)"',
+            text,
+            re.IGNORECASE,
+        ):
+            symbol = m.group(1)
+            rel_path = m.group(2)
+            target = scaffold_dir / rel_path
+            if not target.exists():
+                continue
+            try:
+                content = target.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            if symbol == "default":
+                # Importer uses "import X from './file'" but exporter has no
+                # default export. Look for an existing named export first,
+                # then fall back to any top-level definition.
+                # Patterns (in priority order):
+                #   export function X → export default function X
+                #   export const X → export default const X
+                #   export class X → export default class X
+                #   function X → export default function X
+                #   const X → export default const X
+                #   class X → export default class X
+                # If no named symbol is known, try the file basename as a guess.
+                file_stem = Path(rel_path).stem
+                guess_names = {file_stem}
+                # Also extract the importer's local name from the build error
+                # if available: "import useConfig from ..."
+                for imp_m in re.finditer(
+                    rf'import\s+(\w+)\s+from\s+["\'][^"\']*{re.escape(Path(rel_path).name)}["\']',
+                    text,
+                ):
+                    guess_names.add(imp_m.group(1))
+
+                default_patterns = []
+                for name in guess_names:
+                    default_patterns.extend([
+                        (rf'^(\s*)export\s+(function\s+{re.escape(name)}\b)', r'\1export default \2'),
+                        (rf'^(\s*)export\s+(const\s+{re.escape(name)}\b)', r'\1export default \2'),
+                        (rf'^(\s*)export\s+(class\s+{re.escape(name)}\b)', r'\1export default \2'),
+                        (rf'^(\s*)export\s+(let\s+{re.escape(name)}\b)', r'\1export default \2'),
+                        (rf'^(\s*)export\s+(var\s+{re.escape(name)}\b)', r'\1export default \2'),
+                        (rf'^(\s*)(function\s+{re.escape(name)}\b)', r'\1export default \2'),
+                        (rf'^(\s*)(const\s+{re.escape(name)}\b)', r'\1export default \2'),
+                        (rf'^(\s*)(class\s+{re.escape(name)}\b)', r'\1export default \2'),
+                        (rf'^(\s*)(let\s+{re.escape(name)}\b)', r'\1export default \2'),
+                        (rf'^(\s*)(var\s+{re.escape(name)}\b)', r'\1export default \2'),
+                    ])
+                # Also try any existing named export as a last resort
+                default_patterns.extend([
+                    (r'^(\s*)export\s+(function\s+\w+\b)', r'\1export default \2'),
+                    (r'^(\s*)export\s+(const\s+\w+\b)', r'\1export default \2'),
+                    (r'^(\s*)export\s+(class\s+\w+\b)', r'\1export default \2'),
+                    (r'^(\s*)export\s+(let\s+\w+\b)', r'\1export default \2'),
+                    (r'^(\s*)export\s+(var\s+\w+\b)', r'\1export default \2'),
+                    (r'^(\s*)(function\s+\w+\b)', r'\1export default \2'),
+                    (r'^(\s*)(const\s+\w+\b)', r'\1export default \2'),
+                    (r'^(\s*)(class\s+\w+\b)', r'\1export default \2'),
+                    (r'^(\s*)(let\s+\w+\b)', r'\1export default \2'),
+                    (r'^(\s*)(var\s+\w+\b)', r'\1export default \2'),
+                ])
+                for old_pat, new_pat in default_patterns:
+                    new_content, count = re.subn(old_pat, new_pat, content, count=1, flags=re.MULTILINE)
+                    if count > 0:
+                        try:
+                            target.write_text(new_content, encoding="utf-8")
+                            logger.info("Heuristic: added default export to %s", rel_path)
+                            fixed_any = True
+                            break
+                        except Exception:
+                            logger.exception("Heuristic fix write failed for %s", target)
+            else:
+                # Named export missing — look for the symbol definition without
+                # 'export' before it.
+                patterns = [
+                    (rf'^(\s*)(function\s+{re.escape(symbol)}\b)', r'\1export \2'),
+                    (rf'^(\s*)(const\s+{re.escape(symbol)}\b)', r'\1export \2'),
+                    (rf'^(\s*)(let\s+{re.escape(symbol)}\b)', r'\1export \2'),
+                    (rf'^(\s*)(class\s+{re.escape(symbol)}\b)', r'\1export \2'),
+                    (rf'^(\s*)(var\s+{re.escape(symbol)}\b)', r'\1export \2'),
+                ]
+                for old_pat, new_pat in patterns:
+                    new_content, count = re.subn(old_pat, new_pat, content, count=1, flags=re.MULTILINE)
+                    if count > 0:
+                        try:
+                            target.write_text(new_content, encoding="utf-8")
+                            logger.info("Heuristic: added export to %s in %s", symbol, rel_path)
+                            fixed_any = True
+                            break
+                        except Exception:
+                            logger.exception("Heuristic fix write failed for %s", target)
+
+        return fixed_any
 
     def _persist_fix_as_skill(
         self,
@@ -1317,6 +1944,113 @@ class StudioRunner:
         except Exception:
             logger.exception("skill upsert failed for fix-loop skill %s", name)
 
+    def _persist_retry_as_skill(
+        self,
+        *,
+        retry_slug: str,
+        retry_manifest: Dict[str, Any],
+    ) -> None:
+        """Write a skill when an auto-retry resolved a parent project's failure.
+
+        The retry path is a different escape hatch from the in-place fix
+        loop: a parent project hit the verifier wall, an entire new project
+        was scaffolded with the failure as a hint, and that new project
+        succeeded. The next homelab brief (or whatever stack this was)
+        should pre-emptively avoid the same break.
+
+        Skill body is intentionally compact — the model only needs the
+        failure shape and a "watch for this" directive. The full diff
+        is too noisy to bias the system prompt usefully.
+        """
+        try:
+            from skyn3t.intelligence.skill_library import Skill, get_default_library
+        except Exception:
+            return
+        # Find the parent project: retry slug always ends "-retry" and the
+        # parent saved `_retry_slug` on its manifest. Walk back via the
+        # projects_root rather than tracking state in memory so the hook
+        # survives backend restarts.
+        if not retry_slug.endswith("-retry"):
+            return
+        parent_slug = retry_slug[:-len("-retry")]
+        parent_dir = self.projects_root / parent_slug
+        parent_manifest_path = parent_dir / "project.json"
+        if not parent_manifest_path.exists():
+            return
+        try:
+            import json as _json
+            parent_manifest = _json.loads(parent_manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(parent_manifest, dict):
+            return
+        # Pull the failure signature from the parent's verifier output.
+        bv = parent_manifest.get("build_verification") or {}
+        failure_summary = (
+            (parent_manifest.get("_retry_hint") or "").strip()
+            or (bv.get("failure_hint") or "").strip()
+            or (bv.get("summary") or "").strip()
+            or (parent_manifest.get("error") or "").strip()
+        )
+        if not failure_summary:
+            return  # nothing actionable to record
+        # Stack: prefer what the retry produced (which is the
+        # known-good shape) over the parent's stack guess.
+        stack = (
+            (retry_manifest.get("build_verification") or {}).get("stack")
+            or (parent_manifest.get("build_verification") or {}).get("stack")
+            or retry_manifest.get("template")
+            or "unknown"
+        )
+        if not stack or stack == "unknown":
+            return
+        # Skill name: tied to the stack and a short hash of the failure
+        # summary so repeat failures of the same shape upsert into the
+        # same skill (incrementing success_count) instead of spamming
+        # the library with near-duplicates.
+        try:
+            import hashlib as _hashlib
+            sig = _hashlib.sha1(failure_summary.encode("utf-8", "replace")).hexdigest()[:8]
+        except Exception:
+            sig = "x"
+        name = f"{stack}-retry-recovery-{sig}"
+        body_lines = [
+            f"# Retry recovery for `{stack}`.",
+            "",
+            "A prior scaffold of this stack failed verification, then a full "
+            "auto-retry succeeded. The failure shape below is now known-bad — "
+            "pre-empt it on the first attempt next time.",
+            "",
+            "## Failure that triggered the retry",
+            "",
+            failure_summary[:1200],
+            "",
+            "## Action",
+            "",
+            "When generating files for this stack, watch for the failure "
+            "shape above. Common causes for this class of break: malformed "
+            "JS (unterminated template literals, leftover markdown fences), "
+            "JSON with unquoted keys, Python with mis-indented blocks, or "
+            "missing exports. Pre-check syntactically before declaring a "
+            "file complete.",
+        ]
+        skill = Skill(
+            name=name,
+            tags=[stack, "retry-recovery", "build-success"],
+            success_count=1,
+            failure_count=0,
+            source="runner:auto_retry",
+            body="\n".join(body_lines),
+        )
+        try:
+            get_default_library().upsert(skill)
+            logger.info(
+                "persisted retry-recovery skill: %s (parent=%s, retry=%s)",
+                name, parent_slug, retry_slug,
+            )
+        except Exception:
+            logger.exception("skill upsert failed for retry-recovery skill %s", name)
+
     async def _run_build_verifier(self, scaffold_dir: str, brief: str) -> Optional[Dict[str, Any]]:
         """Invoke BuildVerifierAgent in-process and return its output dict.
 
@@ -1346,6 +2080,112 @@ class StudioRunner:
             return None
         return result.output
 
+    async def _run_boot_verifier(self, scaffold_dir: str, brief: str) -> Optional[Dict[str, Any]]:
+        """Invoke BootVerifierAgent — actually start the server and
+        confirm it serves a request.
+
+        Returns the agent's output dict (same shape as build_verifier
+        for fix-loop compatibility) or None if the agent itself
+        couldn't run (not on a failure verdict — that's data we want
+        to surface).
+        """
+        try:
+            from skyn3t.agents.boot_verifier import BootVerifierAgent
+        except Exception:
+            logger.debug("boot_verifier not available", exc_info=True)
+            return None
+        from skyn3t.core.agent import TaskRequest
+        try:
+            agent = BootVerifierAgent(event_bus=self.event_bus)
+            await agent.initialize()
+            result = await agent.execute(
+                TaskRequest(
+                    title="boot-verify",
+                    description=f"boot scaffold for: {brief[:120]}",
+                    input_data={"scaffold_dir": scaffold_dir, "brief": brief},
+                )
+            )
+        except Exception:
+            logger.exception("boot_verifier execute failed")
+            return None
+        if not result.success or not isinstance(result.output, dict):
+            return None
+        return result.output
+
+    async def _run_integration_verifier(self, scaffold_dir: str, brief: str) -> Optional[Dict[str, Any]]:
+        """Invoke IntegrationContractVerifierAgent — checks frontend API
+        calls against backend routes.
+
+        Returns the agent's output dict (same shape as build_verifier
+        for fix-loop compatibility) or None if the agent itself
+        couldn't run.
+        """
+        try:
+            from skyn3t.agents.integration_verifier import IntegrationContractVerifierAgent
+        except Exception:
+            logger.debug("integration_verifier not available", exc_info=True)
+            return None
+        from skyn3t.core.agent import TaskRequest
+        try:
+            agent = IntegrationContractVerifierAgent(event_bus=self.event_bus)
+            await agent.initialize()
+            result = await agent.execute(
+                TaskRequest(
+                    title="integration-verify",
+                    description=f"verify integration for: {brief[:120]}",
+                    input_data={"scaffold_dir": scaffold_dir, "brief": brief},
+                )
+            )
+        except Exception:
+            logger.exception("integration_verifier execute failed")
+            return None
+        if not result.success or not isinstance(result.output, dict):
+            return None
+        return result.output
+
+    async def _kill_stray_server_processes(self, scaffold_dir: str) -> None:
+        """Kill any lingering server processes that may be listening on ports.
+
+        This prevents port reuse race conditions in the integration fix loop.
+        The boot verifier kills processes internally, but we ensure a clean
+        slate before rebooting.
+        """
+        try:
+            import psutil
+            import socket
+
+            # Try to find and kill processes listening on common server ports
+            # Look for Node or Python processes in the scaffold directory
+            scaffold_path = Path(scaffold_dir).resolve()
+            for port in [3000, 3100, 5000, 8000, 8080, 8888]:
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(0.5)
+                    result = s.connect_ex(("127.0.0.1", port))
+                    s.close()
+                    if result == 0:
+                        # Port is listening, try to find the process
+                        for proc in psutil.process_iter(["pid", "name", "cwd"]):
+                            try:
+                                if (
+                                    proc.info["cwd"]
+                                    and Path(proc.info["cwd"]).resolve() == scaffold_path
+                                ):
+                                    if proc.info["name"] in ("node", "python", "python3"):
+                                        proc.terminate()
+                                        await asyncio.sleep(0.5)
+                                        if proc.is_running():
+                                            proc.kill()
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                pass
+                except Exception:
+                    pass
+        except ImportError:
+            # psutil not available, skip this cleanup
+            logger.debug("psutil not available for stray process cleanup")
+        except Exception:
+            logger.debug("stray process cleanup failed (non-fatal)", exc_info=True)
+
     # ─────────────────────────────────────────────────────────────────
     # Inter-agent conversation: critique + revise
     # ─────────────────────────────────────────────────────────────────
@@ -1362,12 +2202,9 @@ class StudioRunner:
         "reviewer",       # is itself the critique step
         "verifier",       # mechanical pass/fail
         "build_verifier", # mechanical pass/fail
-        # Code is skipped because a revision re-runs the ENTIRE per-file
-        # scaffold loop — 5-6 min × 7 files = ~40 min per revision.
-        # BuildVerifier + Reviewer already grade the scaffold. Re-enable
-        # this once CodeAgent supports per-file revision instead of
-        # full re-scaffold.
-        "code",
+        # Code used to be skipped because a revision re-ran the ENTIRE
+        # per-file scaffold loop (~40 min). Now we use targeted_fix
+        # for per-file regeneration, so code-stage critique is enabled.
     }
 
     async def _critique_and_revise(
@@ -1379,16 +2216,14 @@ class StudioRunner:
         artifact_dir: Path,
         brief: str,
         task: TaskRequest,
+        manifest: Optional[Dict[str, Any]] = None,
     ) -> Any:
-        """Run a critique pass on the stage output via a cross-model
-        reviewer. If issues are found, ask the original agent to revise
-        once. Returns the (possibly revised) result.
+        """Agent-mediated critique with multi-round revision loop.
 
-        Cheap escape hatches:
-          - Set SKYN3T_DISABLE_CRITIQUE=1 to turn off entirely
-          - Stages in _CRITIQUE_SKIP_STAGES never get critiqued
-          - If reviewer LLM call fails, return original result unchanged
-            (we never let critique FAIL a stage that was succeeding)
+        Uses a real ReviewerAgent (not a temporary LLMClient) for cross-model
+        debate. Supports multi-round critique → revision. For the code
+        stage, uses targeted_fix for per-file regeneration instead of full
+        re-scaffold.
         """
         import os as _os
         if _os.environ.get("SKYN3T_DISABLE_CRITIQUE") == "1":
@@ -1398,107 +2233,358 @@ class StudioRunner:
 
         output = getattr(result, "output", None) or {}
         summary = self._summarize_stage_output(output)
-        # Read what the stage actually produced — the .md / .json files
-        # under artifact_dir, capped per-file so the critique prompt
-        # doesn't balloon.
         produced = self._collect_stage_artifacts(stage, output, artifact_dir)
         if not produced and not summary:
-            # Nothing concrete to critique. Skip cleanly.
             return result
 
+        # Instantiate a real ReviewerAgent for cross-model critique.
         try:
-            from skyn3t.adapters import LLMClient as _LLMClient
-            # Load reviewer's configured backend (cross-family is what
-            # makes this work — see data/agent_overrides.json).
-            try:
-                from skyn3t.config.agent_overrides import get_override_store
-                rev = (get_override_store().get("reviewer") or {})
-            except Exception:
-                rev = {}
-            critic = _LLMClient(
-                default_model=rev.get("model"),
-                backend=rev.get("backend") or None,
-                caller_name="critique",
-            )
-            critique_prompt = (
-                f"Brief:\n{brief[:2000]}\n\n"
-                f"A swarm member just produced output for stage `{stage.name}` "
-                f"(agent: {stage.agent}). Your job is to find the 1-3 MOST "
-                f"IMPORTANT issues — things that would make the next stage's "
-                f"work worse if not fixed. Be specific, name files/sections, "
-                f"and propose concrete fixes. If the output is solid, reply "
-                f"with exactly: NO_ISSUES.\n\n"
-                f"Output to critique:\n\n{produced[:8000]}\n\n"
-                f"List up to 3 critical issues, each as a single line:\n"
-                f"1. <file/section>: <problem> → <fix>\n"
-                f"2. ...\n\n"
-                f"Or reply NO_ISSUES."
-            )
-            critique = await critic.complete(
-                critique_prompt, max_tokens=1500, temperature=0.2,
-            )
+            reviewer = get_agent("ReviewerAgent", event_bus=self.event_bus, rag=self.rag)
+            if hasattr(reviewer, "initialize"):
+                maybe = reviewer.initialize()
+                if hasattr(maybe, "__await__"):
+                    await maybe
         except Exception as e:
-            logger.warning(f"critique LLM call failed for {stage.name}: {e}")
+            logger.warning(f"Failed to instantiate ReviewerAgent for critique: {e}")
             return result
 
-        critique = (critique or "").strip()
-        if not critique or "NO_ISSUES" in critique[:30].upper() or "[deterministic-stub]" in critique:
-            # Reviewer said it's fine, OR the LLM is in stub mode and
-            # we shouldn't pretend a stub critique is meaningful.
+        execution_profile = str((manifest or {}).get("execution_profile") or "balanced")
+        max_rounds = self._critique_rounds_for(
+            stage_name=stage.name,
+            brief=brief,
+            execution_profile=execution_profile,
+        )
+        current_result = result
+        current_output = output
+
+        for round_num in range(1, max_rounds + 1):
+            if round_num == 1:
+                self._publish(
+                    "AGENT_CONVERSATION_STARTED",
+                    {
+                        "slug": artifact_dir.name,
+                        "stage": stage.name,
+                        "participants": [stage.agent, "ReviewerAgent"],
+                        "max_rounds": max_rounds,
+                    },
+                )
+
+            stage_files = self._normalize_stage_files(
+                current_output.get("files") if isinstance(current_output, dict) else None,
+                artifact_dir=artifact_dir,
+            )
+
+            # For code stage, critique the scaffold contents directly so
+            # file paths in issues are relative to the scaffold root,
+            # matching what apply_targeted_fix expects.
+            critique_artifact_dir = (
+                artifact_dir / "scaffold" if stage.name == "code" else artifact_dir
+            )
+            # Normalize produced_files to be relative to the critique dir.
+            if stage.name == "code" and stage_files:
+                critique_produced_files = [
+                    f[len("scaffold/"):] if f.startswith("scaffold/") else f
+                    for f in stage_files
+                ]
+            else:
+                critique_produced_files = stage_files
             try:
-                await agent.think(f"critique pass on {stage.name}: clean")
+                critique_result = await reviewer.critique(
+                    brief=brief,
+                    artifact_dir=critique_artifact_dir,
+                    stage_name=stage.name,
+                    produced_files=[str(f) for f in critique_produced_files] if critique_produced_files else None,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"ReviewerAgent critique failed for {stage.name} round {round_num}: {e}"
+                )
+                if manifest is not None:
+                    self._append_history(
+                        manifest,
+                        "CRITIQUE_FAILED",
+                        status="running",
+                        stage=stage.name,
+                        message=f"Critique round {round_num} failed: {e}",
+                    )
+                return current_result
+
+            has_issues = critique_result.get("has_issues", False)
+            issues = critique_result.get("issues", [])
+            critique_text = critique_result.get("critique_text", "")
+
+            self._publish(
+                "AGENT_CONVERSATION_TURN",
+                {
+                    "slug": artifact_dir.name,
+                    "stage": stage.name,
+                    "round": round_num,
+                    "has_issues": has_issues,
+                    "issue_count": len(issues),
+                },
+            )
+
+            if not has_issues or not issues:
+                try:
+                    await agent.think(
+                        f"critique pass on {stage.name}: clean (round {round_num})"
+                    )
+                except Exception:
+                    pass
+                self._publish(
+                    "AGENT_CONVERSATION_ENDED",
+                    {
+                        "slug": artifact_dir.name,
+                        "stage": stage.name,
+                        "rounds": round_num,
+                        "resolved": True,
+                    },
+                )
+                return current_result
+
+            try:
+                await agent.think(
+                    f"critique on {stage.name} round {round_num}:\n{critique_text[:400]}"
+                )
             except Exception:
                 pass
-            return result
 
-        # Log the critique to project history so the brain map UI can
-        # eventually replay the conversation.
-        try:
-            await agent.think(f"critique on {stage.name}:\n{critique[:400]}")
-        except Exception:
-            pass
+            if manifest is not None:
+                self._append_history(
+                    manifest,
+                    "CRITIQUE_ISSUES_FOUND",
+                    status="running",
+                    stage=stage.name,
+                    message=f"{len(issues)} issue(s) found in round {round_num}.",
+                )
 
-        # Send the critique back to the original agent for one revision.
-        # We can't depend on each agent knowing how to read a `_critique`
-        # key from input_data — they all read `brief`. So we APPEND the
-        # critique to the brief itself, marked clearly. Agents that
-        # later add critique-aware paths can still also read `_critique`.
-        revise_input = dict(task.input_data or {})
-        original_brief = str(revise_input.get("brief") or brief or "")
-        revise_input["brief"] = (
-            f"{original_brief}\n\n"
-            f"---\n"
-            f"REVISION NOTES from cross-model reviewer (apply these BEFORE\n"
-            f"writing your output — they identify the most important issues\n"
-            f"with your prior attempt):\n\n{critique}\n\n"
-            f"Your previous output summary: {summary or '(none)'}\n"
-            f"---\n"
+            # ── Apply revision ──
+            if stage.name == "code":
+                try:
+                    from skyn3t.adapters import LLMClient
+                    from skyn3t.agents.consistency_engine import check_consistency
+                    from skyn3t.agents.targeted_fix import (
+                        FileIssue,
+                        apply_targeted_fix,
+                    )
+
+                    scaffold_dir = artifact_dir / "scaffold"
+                    if not scaffold_dir.exists():
+                        logger.warning(
+                            "No scaffold dir for targeted fix; falling back to re-execute"
+                        )
+                    else:
+                        file_issues = []
+                        for i in issues:
+                            raw_fp = i.get("file", "unknown")
+                            # Some LLMs concatenate multiple files with " + "; split them.
+                            for fp in [p.strip() for p in raw_fp.split(" + ")]:
+                                if not fp or fp in ("unknown", "(unknown)"):
+                                    continue
+                                # Skip entries that don't look like file paths.
+                                # Reviewers sometimes return prose like "Stack mismatch"
+                                # or "package.json" as the file field when they mean
+                                # something else.  A valid path has at least one dot
+                                # or a slash (except for bare filenames like README).
+                                if "/" not in fp and "." not in fp and fp not in ("README", "README.md"):
+                                    logger.warning(
+                                        "Skipping non-path file entry from reviewer: %s", fp
+                                    )
+                                    continue
+                                # Normalize path to be relative to scaffold_dir.
+                                if fp.startswith("scaffold/"):
+                                    fp = fp[len("scaffold/"):]
+                                # Try to resolve bare basenames by searching under scaffold_dir.
+                                resolved_fp = fp
+                                if resolved_fp and not (scaffold_dir / resolved_fp).exists():
+                                    matches = list(scaffold_dir.rglob(resolved_fp))
+                                    if matches:
+                                        resolved_fp = matches[0].relative_to(scaffold_dir).as_posix()
+                                # If the file still doesn't exist, don't try to
+                                # "regenerate" it — create a placeholder so the
+                                # import graph is at least syntactically valid.
+                                # The next consistency check will flag it if it's
+                                # still wrong.
+                                if not (scaffold_dir / resolved_fp).exists():
+                                    logger.warning(
+                                        "Reviewer flagged missing file %s — creating placeholder", resolved_fp
+                                    )
+                                    file_issues.append(
+                                        FileIssue(
+                                            path=resolved_fp,
+                                            error_message=i.get("problem", ""),
+                                            suggested_action="create_placeholder",
+                                        )
+                                    )
+                                else:
+                                    file_issues.append(
+                                        FileIssue(
+                                            path=resolved_fp,
+                                            error_message=i.get("problem", ""),
+                                            suggested_action="regenerate",
+                                        )
+                                    )
+                        client = LLMClient(
+                            event_bus=self.event_bus,
+                            caller_name="code_critique_fix",
+                        )
+                        fix_result = await apply_targeted_fix(
+                            scaffold_dir=scaffold_dir,
+                            issues=file_issues,
+                            llm_client=client,
+                            brief=brief,
+                        )
+                        if manifest is not None:
+                            fix_msg = (
+                                f"Fixed {len(fix_result.files_changed)} file(s) "
+                                f"via targeted fix (round {round_num})."
+                            )
+                            if fix_result.errors:
+                                fix_msg += " Errors: " + "; ".join(fix_result.errors[:3])
+                            self._append_history(
+                                manifest,
+                                "CODE_CRITIQUE_FIX_APPLIED",
+                                status="running",
+                                stage=stage.name,
+                                message=fix_msg,
+                            )
+                        # Re-check after fix
+                        report = check_consistency(scaffold_dir, brief=brief)
+                        current_output = {
+                            **current_output,
+                            "files_changed": fix_result.files_changed,
+                            "files_created": fix_result.files_created,
+                            "consistency_ok": report.ok,
+                            "consistency_issues": len(report.issues),
+                        }
+                        current_result = TaskResult(
+                            task_id=task.task_id,
+                            success=True,
+                            output=current_output,
+                        )
+                        if round_num == max_rounds:
+                            self._publish(
+                                "AGENT_CONVERSATION_ENDED",
+                                {
+                                    "slug": artifact_dir.name,
+                                    "stage": stage.name,
+                                    "rounds": round_num,
+                                    "resolved": report.ok,
+                                },
+                            )
+                            return current_result
+                        continue
+                except Exception as e:
+                    logger.warning(f"Targeted fix failed for code critique: {e}")
+                    # Fall through to re-execute path
+
+            # Non-code stage (or code fallback): append critique to brief and re-execute
+            revise_input = dict(task.input_data or {})
+            original_brief = str(revise_input.get("brief") or brief or "")
+            revise_input["brief"] = (
+                f"{original_brief}\n\n"
+                f"---\n"
+                f"REVISION NOTES from cross-model reviewer (round {round_num}) "
+                f"(apply these BEFORE writing your output):\n\n"
+                f"{critique_text}\n\n"
+                f"Your previous output summary: {summary or '(none)'}\n"
+                f"---\n"
+            )
+            revise_input["_critique"] = critique_text
+            revise_input["_revision_round"] = round_num
+            revise_input["_prior_output_summary"] = summary
+
+            revise_task = TaskRequest(
+                title=f"revise:{stage.name}:r{round_num}",
+                description=f"Revise after critique for stage {stage.name} (round {round_num})",
+                input_data=revise_input,
+            )
+            try:
+                revised = await asyncio.wait_for(
+                    agent.execute(revise_task), timeout=600.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"revision pass timed out for {stage.name} round {round_num}"
+                )
+                self._publish(
+                    "AGENT_CONVERSATION_ENDED",
+                    {
+                        "slug": artifact_dir.name,
+                        "stage": stage.name,
+                        "rounds": round_num,
+                        "resolved": False,
+                    },
+                )
+                return current_result
+            except Exception as e:
+                logger.warning(
+                    f"revision pass failed for {stage.name} round {round_num}: {e}"
+                )
+                self._publish(
+                    "AGENT_CONVERSATION_ENDED",
+                    {
+                        "slug": artifact_dir.name,
+                        "stage": stage.name,
+                        "rounds": round_num,
+                        "resolved": False,
+                    },
+                )
+                return current_result
+
+            if not getattr(revised, "success", False):
+                self._publish(
+                    "AGENT_CONVERSATION_ENDED",
+                    {
+                        "slug": artifact_dir.name,
+                        "stage": stage.name,
+                        "rounds": round_num,
+                        "resolved": False,
+                    },
+                )
+                return current_result
+
+            current_result = revised
+            current_output = getattr(revised, "output", None) or {}
+            try:
+                await agent.think(
+                    f"revised {stage.name} after critique (round {round_num})"
+                )
+            except Exception:
+                pass
+            self._publish(
+                "PROJECT_STAGE_REVISED",
+                {
+                    "slug": artifact_dir.name,
+                    "stage": stage.name,
+                    "agent": stage.agent,
+                    "round": round_num,
+                },
+            )
+
+            if round_num == max_rounds:
+                self._publish(
+                    "AGENT_CONVERSATION_ENDED",
+                    {
+                        "slug": artifact_dir.name,
+                        "stage": stage.name,
+                        "rounds": round_num,
+                        "resolved": False,
+                    },
+                )
+                return current_result
+
+        # Defensive fallback
+        self._publish(
+            "AGENT_CONVERSATION_ENDED",
+            {
+                "slug": artifact_dir.name,
+                "stage": stage.name,
+                "rounds": max_rounds,
+                "resolved": False,
+            },
         )
-        revise_input["_critique"] = critique
-        revise_input["_revision_round"] = 1
-        revise_input["_prior_output_summary"] = summary
-        revise_task = TaskRequest(
-            title=f"revise:{stage.name}",
-            description=f"Revise after critique for stage {stage.name}",
-            input_data=revise_input,
-        )
-        try:
-            revised = await asyncio.wait_for(agent.execute(revise_task), timeout=600.0)
-        except asyncio.TimeoutError:
-            logger.warning(f"revision pass timed out for {stage.name}; keeping original")
-            return result
-        except Exception as e:
-            logger.warning(f"revision pass failed for {stage.name}: {e}; keeping original")
-            return result
-
-        if not getattr(revised, "success", False):
-            # Don't let a bad revision break a stage that already succeeded.
-            return result
-        try:
-            await agent.think(f"revised {stage.name} after critique")
-        except Exception:
-            pass
-        return revised
+        return current_result
 
     def _collect_stage_artifacts(
         self, stage: Any, output: Any, artifact_dir: Path,
@@ -1509,7 +2595,7 @@ class StudioRunner:
         critic to see the SHAPE of what was produced, not every byte.
         """
         chunks: list[str] = []
-        files = []
+        files: list[str] = []
         if isinstance(output, dict):
             files = output.get("files") or []
         for rel in files[:10]:
@@ -1526,13 +2612,134 @@ class StudioRunner:
                 continue
         return "\n\n---\n\n".join(chunks)
 
+    _SCAFFOLD_SHAPE_SKIP = {
+        "node_modules", ".git", "dist", "build", ".next", "out",
+        "coverage", ".pytest_cache", "__pycache__", ".mypy_cache",
+        ".ruff_cache", ".DS_Store",
+    }
+
+    def _scaffold_shape(self, scaffold_dir: Path) -> List[str]:
+        """Return sorted relative paths of source files in the scaffold.
+
+        Excludes dependency dirs, build outputs, and system files so the
+        scoreboard shape signature reflects the author's intent, not the
+        output of ``npm install``.
+        """
+        if not scaffold_dir.exists():
+            return []
+        return sorted(
+            p.relative_to(scaffold_dir).as_posix()
+            for p in scaffold_dir.rglob("*")
+            if p.is_file()
+            and not any(part in self._SCAFFOLD_SHAPE_SKIP for part in p.parts)
+        )
+
+    def _stack_shape_mismatches(self, scaffold_dir: Path, brief: str) -> List[str]:
+        from skyn3t.agents.stack_templates import detect_stack, validate_stack_shape
+
+        detected = detect_stack(brief) or "unknown"
+        if detected == "unknown":
+            return []
+        all_files = self._scaffold_shape(scaffold_dir)
+        return validate_stack_shape(detected, all_files)
+
+    async def _run_post_code_checks(
+        self,
+        *,
+        manifest: Dict[str, Any],
+        artifact_dir: Path,
+        brief: str,
+        stage_name: str,
+    ) -> None:
+        """Run post-code checks with parallel static verifiers."""
+        scaffold_dir = artifact_dir / "scaffold"
+        if not scaffold_dir.exists():
+            return
+        from skyn3t.agents.consistency_engine import check_consistency
+
+        try:
+            consistency_task = asyncio.to_thread(check_consistency, scaffold_dir, brief)
+            shape_task = asyncio.to_thread(self._stack_shape_mismatches, scaffold_dir, brief)
+            report, mismatches = await asyncio.gather(consistency_task, shape_task)
+        except Exception:
+            logger.exception("post-code checks failed")
+            return
+
+        manifest["consistency_check"] = {
+            "ok": bool(report.ok),
+            "issue_count": len(report.issues),
+        }
+
+        # Fail fast on stack mismatch before mutating files with targeted fix.
+        if mismatches:
+            manifest["stack_shape_mismatches"] = mismatches
+            self._append_history(
+                manifest,
+                "STACK_SHAPE_MISMATCH",
+                status="running",
+                stage=stage_name,
+                message="; ".join(mismatches),
+            )
+            self._save_manifest(artifact_dir, manifest)
+            raise RuntimeError(
+                f"Stack shape mismatch found {len(mismatches)} inconsistent file(s): "
+                + "; ".join(mismatches)
+            )
+
+        if report.ok:
+            return
+
+        from skyn3t.adapters import LLMClient
+        from skyn3t.agents.targeted_fix import FileIssue, apply_targeted_fix
+
+        consistency_issues = [
+            FileIssue(
+                path=self._consistency_fix_target(
+                    scaffold_dir=scaffold_dir,
+                    issue_file=i.file,
+                    category=i.category,
+                ),
+                error_message=i.message,
+                suggested_action=(
+                    "regenerate" if i.category in {"broken_import", "missing_mount"}
+                    else "create_placeholder"
+                ),
+            )
+            for i in report.issues
+            if i.severity == "error"
+        ]
+        if consistency_issues:
+            client = LLMClient(event_bus=self.event_bus, caller_name="consistency_fix")
+            fix_result = await apply_targeted_fix(
+                scaffold_dir=scaffold_dir,
+                issues=consistency_issues,
+                llm_client=client,
+                brief=brief,
+            )
+            manifest["consistency_fix"] = {
+                "changed": fix_result.files_changed,
+                "created": fix_result.files_created,
+                "errors": fix_result.errors,
+            }
+            report = await asyncio.to_thread(check_consistency, scaffold_dir, brief)
+            manifest["consistency_check"]["post_fix_ok"] = bool(report.ok)
+        if not report.ok:
+            self._append_history(
+                manifest,
+                "CONSISTENCY_CHECK_FAILED",
+                status="running",
+                message=f"{len(report.issues)} consistency issues found after code stage.",
+            )
+
     def _scan_artifacts(self, d: Path) -> List[str]:
         """Return relative paths of files under ``d`` (capped at 200)."""
         if not d.exists():
             return []
         entries: List[str] = []
         for p in sorted(d.rglob("*")):
-            if p.is_file():
+            if p.is_file() and not any(
+                part in self._SCAFFOLD_SHAPE_SKIP for part in p.parts
+            ):
                 try:
                     rel = p.relative_to(d).as_posix()
                 except ValueError:
@@ -1547,8 +2754,12 @@ class StudioRunner:
         manifest.setdefault("artifacts", [])
         manifest.setdefault("history", [])
         manifest.setdefault("status", "queued")
+        manifest.setdefault("execution_profile", "balanced")
         manifest["quality_summary"] = self._normalize_quality_summary(
             manifest.get("quality_summary")
+        )
+        manifest["benchmark"] = self._normalize_benchmark_summary(
+            manifest.get("benchmark")
         )
         manifest.setdefault("created_at", manifest.get("started_at") or time.time())
         manifest.setdefault("updated_at", manifest.get("created_at") or time.time())
@@ -1659,18 +2870,91 @@ class StudioRunner:
             "updated_at": updated_at,
         }
 
+    # Composite gate threshold — final project outcome is "done" only
+    # when every signal lines up. The reviewer's verdict alone isn't
+    # enough: v15 scored 100/100 but the program didn't boot until
+    # four manual fixes. Now we require boot=yes AND build=yes AND
+    # reviewer >= REVIEWER_SCORE_THRESHOLD before declaring done.
+    REVIEWER_SCORE_THRESHOLD = 75
+
     def _finalize_project_outcome(
         self,
         quality_summary: Any,
+        *,
+        manifest: Optional[Dict[str, Any]] = None,
     ) -> tuple[str, str, Optional[str]]:
+        """Determine the final project status from ALL quality signals.
+
+        Composite gate: a run only earns "done" when
+          - reviewer verdict is "go" AND reviewer score >= threshold, AND
+          - build_verification verdict is "yes" (or "skipped"), AND
+          - boot_verification verdict is "yes" (or "skipped").
+
+        Any failure of those three downgrades to "needs_fixes" (when
+        recoverable) or "failed" (when irrecoverable). The previous
+        version only looked at the reviewer verdict, so a 100/100
+        scaffold that didn't boot still got marked "done".
+        """
         quality = self._normalize_quality_summary(quality_summary)
+
+        # Build / boot verifier verdicts — pulled from manifest when
+        # available. These are independent of the reviewer.
+        build_verdict = None
+        boot_verdict = None
+        if manifest is not None:
+            bv = manifest.get("build_verification") or {}
+            boot = manifest.get("boot_verification") or {}
+            if isinstance(bv, dict):
+                build_verdict = bv.get("verdict")
+            if isinstance(boot, dict):
+                boot_verdict = boot.get("verdict")
+
+        # 1. Hard failures from verifiers — these can't be reviewer-
+        # overridden. A program that doesn't boot isn't "done".
+        if build_verdict == "no":
+            return (
+                "needs_fixes",
+                "Build verifier rejected the scaffold — see "
+                "build_verification.failure_hint for the cross-file issue.",
+                "build verifier said no",
+            )
+        if boot_verdict == "no":
+            return (
+                "needs_fixes",
+                "Server failed to boot — see boot_verification.failure_hint "
+                "for the diagnosed cross-file issue.",
+                "boot verifier said no",
+            )
+
+        # 2. Reviewer-driven outcome, with the score threshold layered on.
         if quality is None:
+            # No reviewer ran at all — fall back to verifier signals.
+            # If verifiers said yes (or skipped), that's enough for done.
             return "done", "Project finished — open an artifact or download the zip.", None
 
         verdict = str(quality.get("verdict") or "").strip().lower()
+        score_raw = quality.get("score")
+        try:
+            score = int(score_raw) if score_raw is not None else None
+        except (TypeError, ValueError):
+            score = None
         summary = self._truncate_stage_text(quality.get("summary"), limit=240)
+
+        # Reviewer says go but score is below threshold → needs fixes.
+        # This catches the "100/100 marketing reviewer score on a
+        # half-baked scaffold" case AND the inverse (low score even
+        # though verdict said go).
         if verdict == "go":
+            if score is not None and score < self.REVIEWER_SCORE_THRESHOLD:
+                return (
+                    "needs_fixes",
+                    f"Reviewer said go but score {score}/100 is below "
+                    f"the {self.REVIEWER_SCORE_THRESHOLD} threshold for "
+                    f"shipping. Review the findings before merging.",
+                    None,
+                )
             return "done", "Project finished — open an artifact or download the zip.", None
+
         if verdict == "go-with-fixes":
             return (
                 "needs_fixes",
@@ -1717,6 +3001,214 @@ class StudioRunner:
 
     def _clear_quality_summary(self, manifest: Dict[str, Any]) -> None:
         manifest["quality_summary"] = None
+
+    @staticmethod
+    def _normalize_benchmark_summary(value: Any) -> Dict[str, Any]:
+        data = value if isinstance(value, dict) else {}
+        stage_durations = data.get("stage_durations_ms")
+        if not isinstance(stage_durations, dict):
+            stage_durations = {}
+        cleaned_stage_durations: Dict[str, int] = {}
+        for name, ms in stage_durations.items():
+            key = str(name or "").strip()
+            if not key:
+                continue
+            try:
+                cleaned_stage_durations[key] = max(0, int(ms))
+            except (TypeError, ValueError):
+                continue
+        return {
+            "execution_profile": str(data.get("execution_profile") or "balanced"),
+            "total_duration_ms": max(0, int(data.get("total_duration_ms") or 0)),
+            "stage_durations_ms": cleaned_stage_durations,
+            "stage_failures": max(0, int(data.get("stage_failures") or 0)),
+            "retry_launched": bool(data.get("retry_launched", False)),
+            "final_status": str(data.get("final_status") or ""),
+            "updated_at": float(data.get("updated_at") or 0.0),
+        }
+
+    def _init_benchmark(self, manifest: Dict[str, Any]) -> None:
+        benchmark = self._normalize_benchmark_summary(manifest.get("benchmark"))
+        benchmark["execution_profile"] = str(
+            manifest.get("execution_profile") or benchmark.get("execution_profile") or "balanced"
+        )
+        manifest["benchmark"] = benchmark
+
+    def _finalize_benchmark(self, manifest: Dict[str, Any]) -> None:
+        benchmark = self._normalize_benchmark_summary(manifest.get("benchmark"))
+        stages = manifest.get("stages") or []
+        stage_durations: Dict[str, int] = {}
+        stage_failures = 0
+        total_ms = 0
+        for entry in stages:
+            if not isinstance(entry, dict):
+                continue
+            stage_name = str(entry.get("name") or "").strip()
+            started = entry.get("started_at")
+            completed = entry.get("completed_at")
+            if stage_name and started is not None and completed is not None:
+                try:
+                    duration_ms = max(0, int((float(completed) - float(started)) * 1000))
+                    stage_durations[stage_name] = duration_ms
+                    total_ms += duration_ms
+                except (TypeError, ValueError):
+                    pass
+            status = self._normalize_stage_status(entry.get("status"), entry.get("ok"))
+            if status == "failed":
+                stage_failures += 1
+        benchmark["execution_profile"] = str(
+            manifest.get("execution_profile") or benchmark.get("execution_profile") or "balanced"
+        )
+        benchmark["stage_durations_ms"] = stage_durations
+        benchmark["stage_failures"] = stage_failures
+        benchmark["total_duration_ms"] = total_ms
+        benchmark["final_status"] = str(manifest.get("status") or "")
+        benchmark["retry_launched"] = bool(manifest.get("_retry_slug"))
+        benchmark["updated_at"] = time.time()
+        manifest["benchmark"] = benchmark
+
+    @staticmethod
+    def _infer_execution_profile(brief: str, extra: Optional[dict]) -> str:
+        if isinstance(extra, dict):
+            override = str(extra.get("execution_profile") or "").strip().lower()
+            if override in {"fast", "balanced", "deep"}:
+                return override
+        text = (brief or "").lower()
+        words = [w for w in text.split() if w.strip()]
+        integration_cues = (
+            "api", "integration", "oauth", "webhook", "docker", "kubernetes",
+            "sonarr", "radarr", "plex", "jellyfin", "unifi", "home assistant",
+        )
+        cue_hits = sum(1 for cue in integration_cues if cue in text)
+        if len(words) <= 12 and cue_hits == 0:
+            return "fast"
+        if len(words) >= 80 or cue_hits >= 2:
+            return "deep"
+        return "balanced"
+
+    @staticmethod
+    def _stage_timeout_for(
+        stage_name: str,
+        execution_profile: str,
+        explicit_timeout: Optional[float],
+    ) -> float:
+        if explicit_timeout is not None:
+            return float(explicit_timeout)
+        heavy_stages = {"code", "research", "reviewer", "codeimprover"}
+        medium_stages = {"designer", "architect"}
+        if stage_name in heavy_stages:
+            base = 1800.0
+        elif stage_name in medium_stages:
+            base = 600.0
+        else:
+            base = 300.0
+        profile = (execution_profile or "balanced").strip().lower()
+        if profile == "fast":
+            return max(180.0, base * 0.6)
+        if profile == "deep":
+            return base * 1.4
+        return base
+
+    @staticmethod
+    def _consistency_fix_target(
+        scaffold_dir: Path,
+        issue_file: str,
+        category: str,
+    ) -> str:
+        if category != "missing_mount":
+            return issue_file
+        entry = StudioRunner._server_entry_for(scaffold_dir)
+        return entry or issue_file
+
+    @staticmethod
+    def _server_entry_for(scaffold_dir: Path) -> Optional[str]:
+        candidates = (
+            "server/index.js",
+            "server/index.ts",
+            "server/app.js",
+            "server/app.ts",
+            "server/main.js",
+            "server/main.ts",
+        )
+        for rel in candidates:
+            if (scaffold_dir / rel).exists():
+                return rel
+        return None
+
+    @staticmethod
+    def _api_slug_from_route(path: str) -> Optional[str]:
+        m = re.match(r"^/api/([A-Za-z0-9_-]+)(?:/|$)", str(path or "").strip())
+        if not m:
+            return None
+        return m.group(1)
+
+    @staticmethod
+    def _integration_fix_targets(
+        scaffold_dir: Path,
+        integration_result: Dict[str, Any],
+    ) -> List[str]:
+        issues = integration_result.get("issues")
+        if not isinstance(issues, list):
+            return []
+
+        candidates: List[str] = []
+        seen: Set[str] = set()
+        route_exts = (".js", ".ts", ".mjs", ".cjs")
+
+        def _add(rel: Optional[str]) -> None:
+            if not rel or rel in seen:
+                return
+            seen.add(rel)
+            candidates.append(rel)
+
+        for issue in issues:
+            if not isinstance(issue, dict) or issue.get("issue") != "missing":
+                continue
+            frontend_path = str(issue.get("frontend_path") or "")
+            backend_match = str(issue.get("backend_match") or "")
+
+            slug = StudioRunner._api_slug_from_route(frontend_path)
+            if slug is None and backend_match:
+                _, _, backend_path = backend_match.partition(" ")
+                slug = StudioRunner._api_slug_from_route(backend_path)
+            if not slug:
+                continue
+
+            matched_route_file = None
+            for ext in route_exts:
+                rel = f"server/routes/{slug}{ext}"
+                if (scaffold_dir / rel).exists():
+                    matched_route_file = rel
+                    break
+            _add(matched_route_file)
+
+        if not candidates:
+            _add(StudioRunner._server_entry_for(scaffold_dir))
+
+        return candidates
+
+    @staticmethod
+    def _critique_rounds_for(
+        stage_name: str,
+        brief: str,
+        execution_profile: str = "balanced",
+    ) -> int:
+        normalized = (stage_name or "").strip().lower()
+        if normalized != "code":
+            return 2 if (execution_profile or "").strip().lower() == "fast" else 3
+        text = (brief or "").lower()
+        visual_signals = (
+            "dashboard", "frontend", "front end", "landing page", "website",
+            "web app", "ui", "ux", "design", "visual", "theme", "tailwind",
+        )
+        has_visual_signal = any(
+            re.search(rf"(?<!\w){re.escape(signal)}(?!\w)", text, re.IGNORECASE)
+            for signal in visual_signals
+        )
+        profile = (execution_profile or "").strip().lower()
+        if profile == "fast":
+            return 3 if has_visual_signal else 2
+        return 4 if has_visual_signal else 3
 
     @staticmethod
     def _relativize_artifact_path(artifact_dir: Path, value: Any) -> Optional[str]:
@@ -2217,7 +3709,12 @@ class StudioRunner:
         immediately and the dashboard sees PROJECT_COMPLETED with status=failed
         first, then a PROJECT_RETRY_LAUNCHED event, then a fresh project.
         """
-        if manifest.get("_retry_count", 0) >= 1:
+        # Cap on retry depth — derived from the slug, not the manifest,
+        # because each retry creates a fresh manifest with _retry_count=0.
+        # Slug suffix is the ground truth: "foo-retry-retry-retry" already
+        # tried 3 times; another retry would be the 4th.
+        retry_suffix_count = (slug or "").count("-retry")
+        if retry_suffix_count >= 1 or manifest.get("_retry_count", 0) >= 1:
             return  # already retried once; don't loop
         # Don't retry trivially-bad inputs (empty brief, etc) where retry won't help.
         if not brief or not brief.strip():
@@ -2259,7 +3756,9 @@ class StudioRunner:
                 "\n\nPrior attempt failed during build verification. "
                 "Use this as a constraint when picking the next shape:\n"
                 f"{build_hint}\n"
-                "Try a different stack, or fix the specific error above."
+                "Fix the specific error above. "
+                "Keep the same stack and file structure unless the error is "
+                "fundamentally unfixable in this ecosystem."
                 f"{debate_note}"
             )
         else:
@@ -2287,7 +3786,14 @@ class StudioRunner:
             try:
                 self._save_manifest(artifact_dir, manifest)
             except Exception:
-                pass
+                # If this write fails we could double-retry on next
+                # restart (no `_retry_count` on disk → auto-retry path
+                # would fire again).
+                logger.warning(
+                    "retry-state manifest write FAILED for slug=%s — "
+                    "auto-retry may fire twice on restart",
+                    slug, exc_info=True,
+                )
             # Run retry as a fire-and-forget background task with strong ref
             # so it can't be GC'd.
             task = asyncio.create_task(
@@ -2299,7 +3805,6 @@ class StudioRunner:
                     repo_target=manifest.get("repo_target"),
                 )
             )
-            self._retry_tasks = getattr(self, "_retry_tasks", set())
             self._retry_tasks.add(task)
             task.add_done_callback(self._retry_tasks.discard)
         except Exception:

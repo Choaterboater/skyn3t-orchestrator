@@ -24,6 +24,7 @@ class AgentStatus(str, enum.Enum):
     ERROR = "error"
     RECOVERING = "recovering"
     MAINTENANCE = "maintenance"
+    DISABLED = "disabled"
 
 
 class TaskStatus(str, enum.Enum):
@@ -49,6 +50,9 @@ class Agent(Base):
     status: Mapped[AgentStatus] = mapped_column(
         Enum(AgentStatus), default=AgentStatus.IDLE, nullable=False
     )
+    role: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    reports_to: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    lifecycle: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, default="manual")
     capabilities: Mapped[List[str]] = mapped_column(JSON, default=list)
     config: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
     meta: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)

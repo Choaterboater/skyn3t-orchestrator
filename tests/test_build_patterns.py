@@ -9,16 +9,13 @@ correlate with success.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 
 from skyn3t.intelligence.build_patterns import (
     BuildPatternScoreboard,
     BuildPatternStats,
-    get_default_scoreboard,
 )
-
 
 # ─── BuildPatternStats math ────────────────────────────────────────────
 

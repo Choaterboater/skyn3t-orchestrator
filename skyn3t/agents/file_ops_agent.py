@@ -62,7 +62,7 @@ class FileOpsAgent(BaseAgent):
                 parameters={"paths": "list", "events": "list"},
             )
         )
-        self._base_dir = Path(self.config.get("base_dir", os.getcwd())).resolve()
+        self._base_dir = self.resolve_artifact_dir(self.config.get("base_dir"))
         self._watched_paths: Dict[str, Dict[str, Any]] = {}
         self._max_file_size = self.config.get("max_file_size", 10 * 1024 * 1024)  # 10MB
 

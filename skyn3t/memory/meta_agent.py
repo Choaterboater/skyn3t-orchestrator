@@ -405,7 +405,7 @@ class MetaAgent:
                     )
                     + "\n".join(f"- `{p}`" for p in worst.shape)
                     + (
-                        f"\n\n**Distinguishing files in the winner:**\n"
+                        "\n\n**Distinguishing files in the winner:**\n"
                         if distinguishing
                         else "\n\n_(no extra files in the winner — same paths, different content?)_"
                     )

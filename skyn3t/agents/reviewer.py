@@ -18,10 +18,13 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
+
+if TYPE_CHECKING:
+    from skyn3t.core.messaging import AgentMessage
 
 _HEX_RE = re.compile(r"#[0-9A-Fa-f]{6}\b")
 _HEADING_RE = re.compile(r"^(#{1,6})\s*(.*)$", re.MULTILINE)
@@ -105,9 +108,21 @@ class ReviewerAgent(BaseAgent):
             blended = heuristic_score
         blended = max(0, min(100, blended))
 
+        # Hard guard: if the brief explicitly asks for runnable code
+        # ("build a … app/dashboard/site/api/script/cli with React/FastAPI/etc.")
+        # but the artifact dir contains zero source files, the run shipped
+        # docs-only and should NOT pass review. v52 surfaced this — planner
+        # dropped CodeAgent, reviewer scored docs 100/100, run claimed `done`.
+        if self._brief_implies_code(brief) and not self._has_source_files(artifact_dir):
+            risks.append(
+                "Missing core: brief asks for runnable code but no source "
+                "files were produced (docs-only output)."
+            )
+            blended = min(blended, 30)
+            verdict = "no-go"
         # Re-derive verdict from blended score, keeping ReviewWatcher-compatible
         # lowercase strings.
-        if blended >= 75 and not any("Missing core" in r for r in risks):
+        elif blended >= 75 and not any("Missing core" in r for r in risks):
             verdict = "go"
         elif blended >= 50:
             verdict = "go-with-fixes"
@@ -156,6 +171,155 @@ class ReviewerAgent(BaseAgent):
             },
         )
 
+    async def critique(
+        self,
+        *,
+        brief: str,
+        artifact_dir: Path,
+        stage_name: str,
+        produced_files: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Critique a single stage's output for inter-agent conversation.
+
+        Returns a dict with ``has_issues`` (bool), ``issues`` (list of
+        dicts with file/line/problem/fix), and ``critique_text`` (str).
+        This is narrower than a full review — it focuses on the 1-3 most
+        important issues that would make the next stage's work worse.
+        """
+        files = self._artifact_files(artifact_dir)
+        if produced_files:
+            wanted = set(produced_files)
+            files = [p for p in files if self._artifact_name(artifact_dir, p) in wanted]
+
+        contents: Dict[str, str] = {}
+        for p in files:
+            try:
+                contents[self._artifact_name(artifact_dir, p)] = p.read_text(encoding="utf-8")
+            except Exception:
+                contents[self._artifact_name(artifact_dir, p)] = ""
+
+        # Run heuristics on just the stage's files.
+        completeness = self._completeness_checklist(contents)
+        consistency = self._consistency_notes(contents)
+        risks = self._risks(contents)
+        heuristic_verdict, _ = self._verdict(completeness, consistency, risks)
+
+        # LLM critique pass — focused on actionable blockers.
+        llm_critique = await self._llm_critique(
+            brief=brief, contents=contents, stage_name=stage_name
+        )
+
+        issues: List[Dict[str, Any]] = []
+        # Parse structured issues from LLM critique if available.
+        if llm_critique:
+            for line in llm_critique.splitlines():
+                m = re.match(r"^\d+\.\s*([^:]+):\s*(.+?)(?:\s*→\s*(.+))?$", line.strip())
+                if m:
+                    issues.append({
+                        "file": m.group(1).strip(),
+                        "problem": m.group(2).strip(),
+                        "fix": (m.group(3) or "").strip(),
+                    })
+
+        has_issues = bool(issues) or heuristic_verdict == "no-go"
+        return {
+            "has_issues": has_issues,
+            "issues": issues,
+            "critique_text": llm_critique or "",
+            "heuristic_verdict": heuristic_verdict,
+        }
+
+    async def _llm_critique(
+        self,
+        *,
+        brief: str,
+        contents: Dict[str, str],
+        stage_name: str,
+    ) -> Optional[str]:
+        """Run a focused LLM critique for a single stage."""
+        if not contents:
+            return None
+
+        PER_FILE_CAP = 12000
+        TOTAL_BUDGET = 80000
+        snippets: List[Tuple[str, str]] = []
+        for name, body in contents.items():
+            s = (body or "").strip()
+            if len(s) > PER_FILE_CAP:
+                s = s[:PER_FILE_CAP] + "\n... [truncated]"
+            snippets.append((name, s))
+        total = sum(len(s) for _, s in snippets)
+        if total > TOTAL_BUDGET and snippets:
+            ratio = TOTAL_BUDGET / total
+            scaled: List[Tuple[str, str]] = []
+            for name, s in snippets:
+                limit = max(200, int(len(s) * ratio))
+                if len(s) > limit:
+                    s = s[:limit] + "\n... [truncated to fit budget]"
+                scaled.append((name, s))
+            snippets = scaled
+        chunks = [f"### {name}\n{s}" for name, s in snippets]
+        files_block = "\n\n".join(chunks)
+        brief_lower = (brief or "").lower()
+        visual_focus = (
+            stage_name == "code"
+            and any(
+                cue in brief_lower
+                for cue in (
+                    "dashboard",
+                    "ui",
+                    "ux",
+                    "frontend",
+                    "website",
+                    "landing page",
+                    "theme",
+                    "design",
+                    "visual",
+                )
+            )
+        )
+        visual_instructions = ""
+        if visual_focus:
+            visual_instructions = (
+                "Prioritize visual-product issues too: weak hierarchy/spacing, missing responsive "
+                "behavior, absent hover/focus/active states, and dashboards that feel empty because "
+                "there is no realistic sample/live-like data shown in the initial view.\n\n"
+            )
+
+        role = (
+            f"You are a senior reviewer critiquing the `{stage_name}` stage "
+            f"of a build pipeline. Your job is to find the 1-3 MOST IMPORTANT "
+            f"issues — things that would make the next stage's work worse if "
+            f"not fixed. Be specific, name files/sections, and propose "
+            f"concrete fixes. If the output is solid, reply with exactly: "
+            f"NO_ISSUES.\n\n"
+            f"{visual_instructions}"
+            f"Brief:\n{brief[:2000]}\n\n"
+            f"Artifacts:\n{files_block}\n\n"
+            f"List up to 3 critical issues, each as a single line:\n"
+            f"1. <file/section>: <problem> → <fix>\n"
+            f"2. ...\n\n"
+            f"Or reply NO_ISSUES."
+        )
+        out = await self._llm_generate(
+            role_prompt=role,
+            brief=brief or "(no brief provided)",
+            fallback="",
+        )
+        out = (out or "").strip()
+        if not out or "NO_ISSUES" in out[:30].upper():
+            return None
+        return out
+
+    def on_message(self, msg: "AgentMessage") -> Optional["AgentMessage"]:
+        """Handle incoming critique requests via MessageBus."""
+        if msg.kind == "request" and msg.payload.get("intent") == "critique":
+            # Synchronous handler — the actual async critique work is done
+            # by the caller (runner) calling critique() directly for now.
+            # This hook exists so the bus layer can route requests.
+            return None
+        return None
+
     # ------------------------------------------------------------------
     # LLM helper
     # ------------------------------------------------------------------
@@ -172,6 +336,65 @@ class ReviewerAgent(BaseAgent):
             ),
             key=lambda path: self._artifact_name(artifact_dir, path),
         )
+
+    # Source-file extensions counted as "real code" for the docs-only guard.
+    _CODE_EXTS = frozenset({
+        ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+        ".py", ".rb", ".go", ".rs", ".java", ".kt", ".swift",
+        ".html", ".vue", ".svelte",
+    })
+
+    @staticmethod
+    def _has_source_files(artifact_dir: Path) -> bool:
+        """True iff the artifact dir (recursively) contains at least one
+        file with a code extension. ``scaffold/`` is the conventional
+        subdir, but this scans everywhere to be tolerant of layout drift.
+        """
+        if not artifact_dir.exists():
+            return False
+        for p in artifact_dir.rglob("*"):
+            if not p.is_file():
+                continue
+            if "node_modules" in p.parts:
+                continue
+            if p.suffix in ReviewerAgent._CODE_EXTS:
+                return True
+        return False
+
+    @staticmethod
+    def _brief_implies_code(brief: str) -> bool:
+        """Mirror of planner._should_force_code_agent's "this brief asks
+        for runnable software" logic. Kept as a local copy so the reviewer
+        doesn't import from studio.planner (one-way dep).
+        """
+        text = (brief or "").strip().lower()
+        if not text:
+            return False
+        # Pure-docs intent ("write a readme", "draft a spec") opts out.
+        if re.search(
+            r"^\s*(?:write|draft|produce|prepare|compose)\s+(?:an?\s+|the\s+)?"
+            r"(?:readme|spec|specification|brief|plan|proposal|roadmap|"
+            r"analysis|research|blog\s+post|email|summary|report|writeup)\b",
+            text,
+        ):
+            return False
+        # Strong "build a software thing" signal.
+        if re.search(
+            r"\b(?:build|create|make|ship|launch|scaffold|generate|prototype|"
+            r"develop|implement)(?:\s+\S+){0,6}\s+"
+            r"(?:app|site|website|api|backend|frontend|service|tool|script|"
+            r"cli|bot|dashboard|extension|game)\b",
+            text,
+        ):
+            return True
+        # Stack-name signal: brief mentions a code stack/framework.
+        if re.search(
+            r"\b(?:react|vite|next(?:\.js)?|fastapi|flask|express|node(?:\.js)?|"
+            r"typescript|python|swift|rust|go(?:lang)?|django|svelte|vue)\b",
+            text,
+        ):
+            return True
+        return False
 
     @staticmethod
     def _sanitize_llm_review_md(review_md: Optional[str]) -> Optional[str]:

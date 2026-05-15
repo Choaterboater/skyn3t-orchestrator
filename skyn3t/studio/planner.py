@@ -21,22 +21,30 @@ _TARGET_FILE_PATTERN = re.compile(
     r"\b([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+\.\w+|target_file\s*[:=]\s*\S+)",
     re.IGNORECASE,
 )
-_CODE_BUILD_PATTERNS = (
-    re.compile(
-        r"\b(?:source\s+code|source\s+files?|frontend|backend|api|endpoint|function|class|component|schema|migration|html|css|javascript|typescript|python|fastapi|react|next(?:\.js)?|node(?:\.js)?|cli)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        # build/create/etc followed by up to ~6 intervening words (qualifiers,
-        # me, a, an, "tic-tac-toe", etc.) then a software-y noun. The old
-        # version required a fixed adjective vocabulary which made it brittle
-        # for natural briefs like "build me a tic-tac-toe game".
-        r"\b(?:build|create|make|ship|launch|scaffold|generate|prototype|develop|implement)"
-        r"(?:\s+\S+){0,6}\s+"
-        r"(?:app|site|website|api|backend|frontend|service|tool|script|cli|bot|dashboard|extension|game)\b",
-        re.IGNORECASE,
-    ),
+# v44: Only match EXPLICIT user directives like "target_file: src/app.py".
+# Build-error hints often contain file paths (e.g. "server/adapters/sonos.js")
+# but those are NOT user requests to patch a specific file.  Using the broad
+# _TARGET_FILE_PATTERN for those was causing retries to skip CodeAgent and
+# use CodeImproverAgent on a non-existent scaffold.
+_EXPLICIT_TARGET_FILE_PATTERN = re.compile(
+    r"target_file\s*[:=]\s*\S+",
+    re.IGNORECASE,
 )
+_CODE_TECH_SIGNAL_PATTERN = re.compile(
+    r"\b(?:source\s+code|source\s+files?|frontend|backend|api|endpoint|function|class|component|schema|migration|html|css|javascript|typescript|python|fastapi|react|next(?:\.js)?|node(?:\.js)?|cli)\b",
+    re.IGNORECASE,
+)
+_CODE_BUILD_VERB_PATTERN = re.compile(
+    # build/create/etc followed by up to ~6 intervening words (qualifiers,
+    # me, a, an, "tic-tac-toe", etc.) then a software-y noun. The old
+    # version required a fixed adjective vocabulary which made it brittle
+    # for natural briefs like "build me a tic-tac-toe game".
+    r"\b(?:build|create|make|ship|launch|scaffold|generate|prototype|develop|implement)"
+    r"(?:\s+\S+){0,6}\s+"
+    r"(?:app|site|website|api|backend|frontend|service|tool|script|cli|bot|dashboard|extension|game)\b",
+    re.IGNORECASE,
+)
+_CODE_BUILD_PATTERNS = (_CODE_TECH_SIGNAL_PATTERN, _CODE_BUILD_VERB_PATTERN)
 _DOCS_ONLY_PATTERN = re.compile(
     r"\b(?:readme|docs?|documentation|spec|brief|plan|proposal|roadmap|analysis|research|copy|content|blog|email|summary)\b",
     re.IGNORECASE,
@@ -141,6 +149,16 @@ async def plan_pipeline(*, brief: str, llm_client=None) -> List[PlannedStage]:
         chosen_agents,
         expected_artifacts,
         rationales,
+    )
+
+    # Strip DesignerAgent when the brief ALREADY locks the visual
+    # direction (UI library + reference app or aesthetic descriptor).
+    # The LLM planner reliably includes Designer for any visual-sounding
+    # brief, but when the brief itself specifies Tailwind + Homarr +
+    # rounded-cards + dark-theme, designer just rephrases the brief in
+    # JSON tokens — costing 3-5 min for redundant output.
+    chosen_agents, expected_artifacts, rationales = _strip_redundant_designer(
+        brief, chosen_agents, expected_artifacts, rationales,
     )
 
     # Brainstorm first (if not chosen) + Reviewer last (always)
@@ -267,10 +285,36 @@ def _heuristic_plan(brief: str) -> tuple[List[str], List[str], Dict[str, str]]:
             "landing",
         ],
     )
-    if needs_design:
+    # Keep designer for software-build briefs even when style cues are
+    # present in the brief. Without a design stage, code generation tends
+    # to satisfy "works" while regressing visual polish and UX states.
+    needs_software_build = _should_force_code_agent(brief)
+    design_already_specified = _mentions_any(
+        b, ["tailwind", "shadcn", "chakra", "material ui", "material-ui",
+            "mui", "ant design", "bootstrap", "tokens.css", "design tokens"]
+    ) and _mentions_any(
+        b, [
+            # Reference apps with known aesthetic
+            "homarr", "heimdall", "dashy", "linear-style", "linear style",
+            "vercel-style", "vercel style", "stripe-style", "notion-style",
+            "supabase-style",
+            # Concrete aesthetic descriptors that lock the look
+            "rounded cards", "soft shadows", "dark theme", "light theme",
+            "glassmorphism", "neumorphism", "brutalist", "minimalist",
+            "monospace",
+        ]
+    )
+    if needs_design and (needs_software_build or not design_already_specified):
         chosen.append("DesignerAgent")
         arts.append("brand.md")
         why["DesignerAgent"] = "brief asks for visual/brand work"
+    elif needs_design and design_already_specified:
+        # The brief locked the aesthetic itself; record why we skipped so
+        # the dashboard's stage rationale tells the truth.
+        why["DesignerAgent_skipped"] = (
+            "brief already specifies UI library + aesthetic — designer "
+            "output would just rephrase what the brief said. Saves ~3-5 min."
+        )
 
     needs_marketing = _mentions_any(
         b,
@@ -290,7 +334,7 @@ def _heuristic_plan(brief: str) -> tuple[List[str], List[str], Dict[str, str]]:
         arts.append("market_scan.md")
         why["BusinessAnalystAgent"] = "brief mentions business model/pricing/strategy"
 
-    target_match = _TARGET_FILE_PATTERN.search(brief or "")
+    target_match = _EXPLICIT_TARGET_FILE_PATTERN.search(brief or "")
     if target_match:
         chosen.append("CodeImproverAgent")
         arts.append("(branch+commit)")
@@ -331,8 +375,9 @@ async def _llm_plan(brief: str, llm_client) -> tuple[List[str], List[str], Dict[
         "ONLY include CodeImproverAgent when the brief mentions a SPECIFIC FILE PATH "
         "(like 'src/app.py' or 'target_file: ...'). For brand kits, "
         "marketing, copy, or strategy work with no code, omit code agents entirely. "
-        "Only include DesignerAgent when the brief explicitly asks for UI, UX, brand, "
-        "landing page, or visual direction. "
+        "Include DesignerAgent for any software brief that builds UI "
+        "(app/site/dashboard/page/frontend), even if style is already specified; "
+        "this stage improves polish and interaction consistency. "
         "**ALWAYS include ResearchAgent** when the brief names third-party "
         "products, services, APIs, or devices the program must talk to "
         "(examples: sonarr, radarr, sonos, emby, plex, docker, home assistant, "
@@ -356,9 +401,34 @@ async def _llm_plan(brief: str, llm_client) -> tuple[List[str], List[str], Dict[
     if not m:
         return [], [], {}
     data = json.loads(m.group(0))
-    agents = [str(a) for a in (data.get("agents") or [])]
-    artifacts = [str(a) for a in (data.get("expected_artifacts") or [])]
-    rationale = {str(k): str(v) for k, v in (data.get("rationale") or {}).items()}
+    raw_agents = data.get("agents") or []
+    agents: List[str] = []
+    artifacts: List[str] = []
+    rationale: Dict[str, str] = {}
+    # Kimi sometimes returns [{"name": "BrainstormAgent", "reason": "...", "produces": "..."}]
+    # instead of the requested ["BrainstormAgent", ...]. Normalize either shape.
+    for entry in raw_agents:
+        if isinstance(entry, dict):
+            name = entry.get("name") or entry.get("agent")
+            if not name:
+                continue
+            name = str(name)
+            agents.append(name)
+            produced = entry.get("produces") or entry.get("artifact") or entry.get("expected_artifact")
+            if produced:
+                artifacts.append(str(produced))
+            reason = entry.get("reason") or entry.get("rationale") or entry.get("why")
+            if reason:
+                rationale[name] = str(reason)
+        else:
+            agents.append(str(entry))
+    # Top-level expected_artifacts/rationale (the originally-requested shape)
+    # only kicks in when the per-agent dicts didn't carry them.
+    for a in (data.get("expected_artifacts") or []):
+        if not isinstance(a, dict):
+            artifacts.append(str(a))
+    for k, v in (data.get("rationale") or {}).items():
+        rationale.setdefault(str(k), str(v))
     return agents, artifacts, rationale
 
 
@@ -396,14 +466,23 @@ def _should_force_code_agent(brief: str) -> bool:
     if not text:
         # Empty brief — let the LLM planner decide; don't force a code stage.
         return False
-    if _TARGET_FILE_PATTERN.search(text):
-        return False
     # Hard "I want docs, only docs" signal — short brief leading with
     # write/draft/produce <docs-noun>. Don't force code in that case.
     if _PURE_DOCS_INTENT_PATTERN.search(text):
         return False
     # Strongest signal: explicit code-build phrase ("build an app", "create
-    # an API", etc). Original behavior — preserved.
+    # an API", etc). Keep this ahead of path checks so retry hints like
+    # "add dependency to server/package.json" don't accidentally suppress a
+    # real build brief.
+    if _CODE_BUILD_VERB_PATTERN.search(text):
+        return True
+    # Skip force-code-agent when the brief names a specific file path and
+    # there wasn't a direct build phrase — that's usually patch/improver
+    # territory, not a fresh scaffold request.
+    if _TARGET_FILE_PATTERN.search(text):
+        return False
+    # Strongest signal: explicit code-build phrase ("build an app", "create
+    # an API", etc) OR strong technology signal words.
     if any(pattern.search(text) for pattern in _CODE_BUILD_PATTERNS):
         return True
     # Software-specific verbs that are essentially never used about prose.
@@ -517,7 +596,7 @@ def _ensure_code_stage(
     expected_artifacts: List[str],
     rationales: Dict[str, str],
 ) -> tuple[List[str], List[str], Dict[str, str]]:
-    target_match = _TARGET_FILE_PATTERN.search(brief or "")
+    target_match = _EXPLICIT_TARGET_FILE_PATTERN.search(brief or "")
     if target_match:
         _insert_code_stage(chosen_agents, "CodeImproverAgent")
         _insert_expected_artifact(expected_artifacts, "(branch+commit)")
@@ -537,4 +616,76 @@ def _ensure_code_stage(
             "CodeAgent",
             "brief asks SkyN3t to build working software, so the plan must include code output",
         )
+    return chosen_agents, expected_artifacts, rationales
+
+
+# Strong "the brief itself locks the visual direction" signals. When
+# both groups match, the designer stage produces 7+ files (palette,
+# brand, components, tokens, logo, etc.) that just rephrase what the
+# brief already specified. ~3-5 min of wall-time savings per matching
+# brief, no quality loss.
+
+_UI_LIBRARY_KEYWORDS: List[str] = [
+    "tailwind", "shadcn", "chakra", "material ui", "material-ui",
+    "mui", "ant design", "bootstrap", "tokens.css", "design tokens",
+    "headlessui", "headless ui", "radix", "mantine",
+    # Frameworks that already constrain the UI shape enough that
+    # designer-stage output is mostly redundant when paired with an
+    # aesthetic descriptor in the brief.
+    "vite + react", "vite+react", "react + vite", "react+vite",
+    "next.js", "nextjs", "remix", "svelte", "sveltekit", "solid",
+    "qwik", "astro",
+]
+
+_AESTHETIC_LOCK_KEYWORDS: List[str] = [
+    # Reference apps with a known aesthetic
+    "homarr", "heimdall", "dashy", "linear-style", "linear style",
+    "vercel-style", "vercel style", "stripe-style", "notion-style",
+    "supabase-style",
+    # Concrete aesthetic descriptors
+    "rounded cards", "soft shadows", "dark theme", "light theme",
+    "glassmorphism", "neumorphism", "brutalist", "minimalist",
+    "monospace", "cyberpunk", "skeuomorphic",
+]
+
+
+def _strip_redundant_designer(
+    brief: str,
+    chosen_agents: List[str],
+    expected_artifacts: List[str],
+    rationales: Dict[str, str],
+) -> tuple[List[str], List[str], Dict[str, str]]:
+    """Remove DesignerAgent from the plan when the brief itself already
+    fully specifies the visual direction.
+
+    Behavior preserved when:
+      - Designer wasn't in the plan to begin with (no-op).
+      - Brief lacks an explicit UI library OR a concrete aesthetic
+        signal (designer's output is genuinely useful).
+    """
+    if "DesignerAgent" not in chosen_agents:
+        return chosen_agents, expected_artifacts, rationales
+    b = (brief or "").lower()
+    has_ui_lib = _mentions_any(b, _UI_LIBRARY_KEYWORDS)
+    has_aesthetic = _mentions_any(b, _AESTHETIC_LOCK_KEYWORDS)
+    if not (has_ui_lib and has_aesthetic):
+        return chosen_agents, expected_artifacts, rationales
+    # Do not strip designer for software builds: these briefs need
+    # dedicated visual pass for state handling and component consistency.
+    if _should_force_code_agent(brief):
+        return chosen_agents, expected_artifacts, rationales
+    # Strip designer + its brand artifact entries. Artifacts can be
+    # listed multiple ways (brand.md, palette.json, components.md);
+    # drop the standard set if present.
+    designer_arts = {
+        "brand.md", "palette.json", "components.md",
+        "tokens.css", "tokens.json", "logo.svg",
+    }
+    chosen_agents = [a for a in chosen_agents if a != "DesignerAgent"]
+    expected_artifacts = [a for a in expected_artifacts if a not in designer_arts]
+    rationales.pop("DesignerAgent", None)
+    rationales["DesignerAgent_skipped"] = (
+        "brief locks UI library + aesthetic — designer would only "
+        "rephrase the brief's own visual instructions. Saves ~3-5 min."
+    )
     return chosen_agents, expected_artifacts, rationales

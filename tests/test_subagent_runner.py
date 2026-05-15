@@ -11,20 +11,16 @@ deterministically.
 
 from __future__ import annotations
 
-import json
-import os
 import time
 
 import pytest
 
 from skyn3t.intelligence.subagent_runner import (
-    DEFAULT_TIMEOUT_SECONDS,
     SubagentResult,
     SubagentRunner,
     _parse_last_json_line,
     _truncate,
 )
-
 
 # ─── Pure-helper tests ─────────────────────────────────────────────────
 
