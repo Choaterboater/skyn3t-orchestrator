@@ -9,7 +9,6 @@ import pytest
 
 from skyn3t.intelligence.lesson_attribution import LessonScoreboard, LessonStats
 
-
 # ---------------------------------------------------------------------------
 # LessonStats math
 # ---------------------------------------------------------------------------

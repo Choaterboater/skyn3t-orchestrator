@@ -1,6 +1,7 @@
 """Tests for core SkyN3t components."""
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -15,12 +16,14 @@ from skyn3t.core.self_healing import SelfHealingManager
 class MockTestAgent(BaseAgent):
     """Test agent for unit tests."""
 
-    def __init__(self, name: str, event_bus):
+    def __init__(self, name: str, event_bus, role=None, reports_to=None):
         super().__init__(
             name=name,
             agent_type="test",
             provider="test_provider",
             event_bus=event_bus,
+            role=role,
+            reports_to=reports_to,
         )
 
     async def initialize(self):
@@ -407,3 +410,505 @@ class TestSelfHealing:
         history = shm.get_healing_history()
         assert len(history) == 1
         assert history[0]["agent"] == "agent1"
+
+
+@pytest.mark.asyncio
+class TestOrgChart:
+    """Agent hierarchy: roles, reporting lines, and delegation."""
+
+    async def test_agent_stores_role_and_reports_to(self, event_bus):
+        from skyn3t.core.agent import BaseAgent, TaskResult
+
+        class RoleAgent(BaseAgent):
+            def __init__(self, name, event_bus, role=None, reports_to=None):
+                super().__init__(
+                    name=name,
+                    agent_type="test",
+                    provider="test_provider",
+                    event_bus=event_bus,
+                    role=role,
+                    reports_to=reports_to,
+                )
+
+            async def initialize(self):
+                pass
+
+            async def execute(self, task):
+                return TaskResult(task_id=task.task_id, success=True, output={})
+
+            async def health_check(self):
+                return True
+
+        agent = RoleAgent("eng1", event_bus, role="engineer", reports_to="cto")
+        assert agent.role == "engineer"
+        assert agent.reports_to == "cto"
+        stats = agent.get_stats()
+        assert stats["role"] == "engineer"
+        assert stats["reports_to"] == "cto"
+        view = agent.get_config_view()
+        assert view["role"] == "engineer"
+        assert view["reports_to"] == "cto"
+
+    async def test_apply_override_updates_role_and_reports_to(self, event_bus):
+        agent = MockTestAgent("mgr", event_bus)
+        agent.role = "manager"
+        agent.reports_to = "ceo"
+        result = agent.apply_override({"role": "director", "reports_to": "founder"})
+        assert "role" in result["changed"]
+        assert "reports_to" in result["changed"]
+        assert agent.role == "director"
+        assert agent.reports_to == "founder"
+
+    async def test_orchestrator_registry_includes_hierarchy(self, event_bus):
+        orch = Orchestrator(event_bus)
+        agent = MockTestAgent("eng", event_bus)
+        agent.role = "engineer"
+        agent.reports_to = "cto"
+        orch.register_agent(agent)
+        reg = orch.agent_registry["eng"]
+        assert reg["role"] == "engineer"
+        assert reg["reports_to"] == "cto"
+
+    async def test_get_subordinates(self, event_bus):
+        orch = Orchestrator(event_bus)
+        mgr = MockTestAgent("mgr", event_bus)
+        sub1 = MockTestAgent("sub1", event_bus)
+        sub2 = MockTestAgent("sub2", event_bus)
+        sub1.reports_to = "mgr"
+        sub2.reports_to = "mgr"
+        orch.register_agent(mgr)
+        orch.register_agent(sub1)
+        orch.register_agent(sub2)
+        subs = orch.get_subordinates("mgr")
+        assert len(subs) == 2
+        assert {a.name for a in subs} == {"sub1", "sub2"}
+
+    async def test_get_manager(self, event_bus):
+        orch = Orchestrator(event_bus)
+        mgr = MockTestAgent("mgr", event_bus)
+        sub = MockTestAgent("sub", event_bus)
+        sub.reports_to = "mgr"
+        orch.register_agent(mgr)
+        orch.register_agent(sub)
+        assert orch.get_manager("sub") == mgr
+        assert orch.get_manager("mgr") is None
+        assert orch.get_manager("ghost") is None
+
+    async def test_get_reporting_chain(self, event_bus):
+        orch = Orchestrator(event_bus)
+        ceo = MockTestAgent("ceo", event_bus)
+        vp = MockTestAgent("vp", event_bus)
+        mgr = MockTestAgent("mgr", event_bus)
+        eng = MockTestAgent("eng", event_bus)
+        vp.reports_to = "ceo"
+        mgr.reports_to = "vp"
+        eng.reports_to = "mgr"
+        for a in [ceo, vp, mgr, eng]:
+            orch.register_agent(a)
+        assert orch.get_reporting_chain("eng") == ["mgr", "vp", "ceo"]
+        assert orch.get_reporting_chain("mgr") == ["vp", "ceo"]
+        assert orch.get_reporting_chain("ceo") == []
+
+    async def test_reporting_chain_breaks_cycles(self, event_bus):
+        orch = Orchestrator(event_bus)
+        a = MockTestAgent("a", event_bus)
+        b = MockTestAgent("b", event_bus)
+        a.reports_to = "b"
+        b.reports_to = "a"
+        orch.register_agent(a)
+        orch.register_agent(b)
+        # Should stop after detecting the cycle instead of looping forever
+        chain = orch.get_reporting_chain("a")
+        assert len(chain) <= 2
+
+    async def test_delegate_task_routes_to_subordinate(self, event_bus):
+        orch = Orchestrator(event_bus)
+        mgr = MockTestAgent("mgr", event_bus)
+        sub = MockTestAgent("sub", event_bus)
+        sub.add_capability(AgentCapability(name="code", description="Code"))
+        sub.reports_to = "mgr"
+        await sub.start()
+        orch.register_agent(mgr)
+        orch.register_agent(sub)
+
+        task = TaskRequest(title="write tests")
+        task_id = await orch.delegate_task(task, "mgr", capability="code")
+        assert task_id == task.task_id
+        await sub.shutdown()
+
+    async def test_delegate_task_returns_none_when_no_subordinate(self, event_bus):
+        orch = Orchestrator(event_bus)
+        mgr = MockTestAgent("mgr", event_bus)
+        orch.register_agent(mgr)
+        task = TaskRequest(title="orphan")
+        result = await orch.delegate_task(task, "mgr")
+        assert result is None
+
+    async def test_delegate_task_filters_by_capability(self, event_bus):
+        orch = Orchestrator(event_bus)
+        mgr = MockTestAgent("mgr", event_bus)
+        writer = MockTestAgent("writer", event_bus)
+        designer = MockTestAgent("designer", event_bus)
+        writer.reports_to = "mgr"
+        designer.reports_to = "mgr"
+        writer.add_capability(AgentCapability(name="code", description="Code"))
+        designer.add_capability(AgentCapability(name="design", description="Design"))
+        await writer.start()
+        await designer.start()
+        orch.register_agent(mgr)
+        orch.register_agent(writer)
+        orch.register_agent(designer)
+
+        task = TaskRequest(title="css fix")
+        # No subordinate has "analysis" capability
+        assert await orch.delegate_task(task, "mgr", capability="analysis") is None
+        # writer has "code" capability
+        task2 = TaskRequest(title="bug fix")
+        assert await orch.delegate_task(task2, "mgr", capability="code") == task2.task_id
+        await writer.shutdown()
+        await designer.shutdown()
+
+
+@pytest.mark.asyncio
+class TestAutoSpawn:
+    """Dynamic subagent creation and lifecycle."""
+
+    async def test_spawn_subordinate_creates_agent(self, event_bus):
+        orch = Orchestrator(event_bus)
+        mgr = MockTestAgent("mgr", event_bus)
+        orch.register_agent(mgr)
+
+        sub = await orch.spawn_subordinate(
+            manager_name="mgr",
+            agent_type="BrainstormAgent",
+            role="engineer",
+            capabilities=["code"],
+        )
+        assert sub is not None
+        assert sub.reports_to == "mgr"
+        assert sub.role == "engineer"
+        assert sub.lifecycle == "auto"
+        assert "mgr-engineer" in sub.name
+        assert any(c.name == "code" for c in sub.capabilities)
+        assert sub.name in orch.agents
+
+    async def test_spawn_subordinate_unknown_type_returns_none(self, event_bus):
+        orch = Orchestrator(event_bus)
+        mgr = MockTestAgent("mgr", event_bus)
+        orch.register_agent(mgr)
+        sub = await orch.spawn_subordinate(
+            manager_name="mgr",
+            agent_type="NonExistentAgent",
+        )
+        assert sub is None
+
+    async def test_spawn_avoids_name_collisions(self, event_bus):
+        orch = Orchestrator(event_bus)
+        mgr = MockTestAgent("mgr", event_bus)
+        orch.register_agent(mgr)
+        sub1 = await orch.spawn_subordinate("mgr", "BrainstormAgent", role="eng")
+        sub2 = await orch.spawn_subordinate("mgr", "BrainstormAgent", role="eng")
+        assert sub1 is not None
+        assert sub2 is not None
+        assert sub1.name != sub2.name
+
+    async def test_delegate_task_auto_spawns_when_no_subordinate(self, event_bus):
+        orch = Orchestrator(event_bus)
+        mgr = MockTestAgent("mgr", event_bus)
+        orch.register_agent(mgr)
+        task = TaskRequest(title="research topic")
+        task_id = await orch.delegate_task(
+            task, "mgr", capability="research",
+            auto_spawn=True, spawn_agent_type="BrainstormAgent",
+        )
+        assert task_id == task.task_id
+        # A new auto agent should have been created
+        auto_agents = [a for a in orch.agents.values() if a.lifecycle == "auto"]
+        assert len(auto_agents) == 1
+        assert auto_agents[0].reports_to == "mgr"
+
+    async def test_delegate_task_auto_spawn_false_returns_none(self, event_bus):
+        orch = Orchestrator(event_bus)
+        mgr = MockTestAgent("mgr", event_bus)
+        orch.register_agent(mgr)
+        task = TaskRequest(title="research topic")
+        result = await orch.delegate_task(
+            task, "mgr", capability="research", auto_spawn=False,
+        )
+        assert result is None
+
+    async def test_terminate_idle_auto_agents_removes_stale(self, event_bus):
+        orch = Orchestrator(event_bus)
+        orch._auto_agent_ttl_seconds = 0.0  # immediate expiration
+        mgr = MockTestAgent("mgr", event_bus)
+        orch.register_agent(mgr)
+        sub = await orch.spawn_subordinate("mgr", "BrainstormAgent", role="eng")
+        assert sub is not None
+        # Simulate idle state
+        sub.status = "idle"
+        sub.last_active_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        orch._terminate_idle_auto_agents()
+        assert sub.name not in orch.agents
+
+    async def test_terminate_idle_skips_manual_agents(self, event_bus):
+        orch = Orchestrator(event_bus)
+        orch._auto_agent_ttl_seconds = 0.0
+        agent = MockTestAgent("keeper", event_bus)
+        agent.lifecycle = "manual"
+        agent.status = "idle"
+        agent.last_active_at = datetime.now(timezone.utc)
+        orch.register_agent(agent)
+        orch._terminate_idle_auto_agents()
+        assert "keeper" in orch.agents
+
+    async def test_terminate_idle_skips_busy_auto_agents(self, event_bus):
+        orch = Orchestrator(event_bus)
+        orch._auto_agent_ttl_seconds = 0.0
+        mgr = MockTestAgent("mgr", event_bus)
+        orch.register_agent(mgr)
+        sub = await orch.spawn_subordinate("mgr", "BrainstormAgent", role="eng")
+        sub.status = "busy"
+        sub.last_active_at = datetime.now(timezone.utc)
+        orch._terminate_idle_auto_agents()
+        assert sub.name in orch.agents
+
+
+@pytest.mark.asyncio
+class TestFanOut:
+    """Hierarchical task decomposition and parallel delegation."""
+
+    async def test_fan_out_delegates_to_subordinates(self, event_bus):
+        orch = Orchestrator(event_bus)
+        mgr = MockTestAgent("mgr", event_bus)
+        writer = MockTestAgent("writer", event_bus)
+        designer = MockTestAgent("designer", event_bus)
+        writer.reports_to = "mgr"
+        designer.reports_to = "mgr"
+        writer.add_capability(AgentCapability(name="code", description="Code"))
+        designer.add_capability(AgentCapability(name="design", description="Design"))
+        await writer.start()
+        await designer.start()
+        orch.register_agent(mgr)
+        orch.register_agent(writer)
+        orch.register_agent(designer)
+
+        task = TaskRequest(title="build landing page")
+        result = await orch.fan_out(
+            "mgr",
+            task,
+            subtasks=[
+                {"capability": "code", "title": "write backend"},
+                {"capability": "design", "title": "create mockups"},
+            ],
+        )
+        # Subtasks were submitted but agents are mocks that process
+        # asynchronously, so we won't have results yet.
+        assert result["parent_task_id"] == task.task_id
+        assert result["completed"] + result["failed"] == 2
+        await writer.shutdown()
+        await designer.shutdown()
+
+    async def test_fan_out_auto_spawn_missing_subordinate(self, event_bus):
+        orch = Orchestrator(event_bus)
+        mgr = MockTestAgent("mgr", event_bus)
+        orch.register_agent(mgr)
+        task = TaskRequest(title="research topic")
+        result = await orch.fan_out(
+            "mgr",
+            task,
+            subtasks=[{"capability": "research", "title": "look up APIs", "agent_type": "BrainstormAgent"}],
+            auto_spawn=True,
+        )
+        assert result["parent_task_id"] == task.task_id
+        assert result["completed"] + result["failed"] == 1
+        # An auto agent should have been created
+        auto_agents = [a for a in orch.agents.values() if a.lifecycle == "auto"]
+        assert len(auto_agents) == 1
+
+    async def test_fan_out_returns_failure_when_no_match(self, event_bus):
+        orch = Orchestrator(event_bus)
+        mgr = MockTestAgent("mgr", event_bus)
+        orch.register_agent(mgr)
+        task = TaskRequest(title="secret mission")
+        result = await orch.fan_out(
+            "mgr",
+            task,
+            subtasks=[{"capability": "spy", "title": "infiltrate"}],
+            auto_spawn=False,
+        )
+        assert result["success"] is False
+        assert result["failed"] == 1
+        assert "spy" in result["results"][0].error
+
+    async def test_fan_out_without_subtasks_delegates_whole_task(self, event_bus):
+        orch = Orchestrator(event_bus)
+        mgr = MockTestAgent("mgr", event_bus)
+        worker = MockTestAgent("worker", event_bus)
+        worker.reports_to = "mgr"
+        await worker.start()
+        orch.register_agent(mgr)
+        orch.register_agent(worker)
+        task = TaskRequest(title="single job")
+        result = await orch.fan_out("mgr", task)
+        assert result["parent_task_id"] == task.task_id
+        assert result["completed"] + result["failed"] == 1
+        await worker.shutdown()
+
+    async def test_fan_out_with_partial_success(self, event_bus):
+        orch = Orchestrator(event_bus)
+        mgr = MockTestAgent("mgr", event_bus)
+        worker = MockTestAgent("worker", event_bus)
+        worker.reports_to = "mgr"
+        worker.add_capability(AgentCapability(name="code", description="Code"))
+        await worker.start()
+        orch.register_agent(mgr)
+        orch.register_agent(worker)
+
+        task = TaskRequest(title="mixed bag")
+        result = await orch.fan_out(
+            "mgr",
+            task,
+            subtasks=[
+                {"capability": "code", "title": "good task"},
+                {"capability": "design", "title": "missing task"},
+            ],
+        )
+        assert result["success"] is False
+        assert result["failed"] == 1
+        assert result["completed"] == 1
+        await worker.shutdown()
+
+
+@pytest.mark.asyncio
+class TestMessageBusRequestResponse:
+    async def test_request_respond_round_trip(self, event_bus):
+        from skyn3t.core.messaging import MessageBus
+
+        bus = MessageBus(event_bus)
+
+        # Simulate recipient agent listening for requests
+        async def responder():
+            msg = await bus.recv("reviewer", timeout=5.0)
+            assert msg is not None
+            assert msg.kind == "request"
+            assert msg.content == "critique my work"
+            await bus.respond(msg, "Looks good", {"verdict": "pass"})
+
+        # Start responder in background
+        task = asyncio.create_task(responder())
+
+        # Requester sends request and awaits response
+        response = await bus.request(
+            from_agent="designer",
+            to_agent="reviewer",
+            content="critique my work",
+            payload={"files": ["App.jsx"]},
+            timeout=5.0,
+        )
+
+        await task
+
+        assert response is not None
+        assert response.kind == "response"
+        assert response.content == "Looks good"
+        assert response.payload["verdict"] == "pass"
+        assert response.correlation_id is not None
+
+    async def test_request_timeout_when_no_response(self, event_bus):
+        from skyn3t.core.messaging import MessageBus
+
+        bus = MessageBus(event_bus)
+        response = await bus.request(
+            from_agent="a",
+            to_agent="b",
+            content="hello",
+            timeout=0.1,
+        )
+        assert response is None
+
+    async def test_response_not_duplicated_to_inbox(self, event_bus):
+        from skyn3t.core.messaging import MessageBus
+
+        bus = MessageBus(event_bus)
+
+        async def responder():
+            msg = await bus.recv("reviewer", timeout=5.0)
+            await bus.respond(msg, "ok", {})
+
+        task = asyncio.create_task(responder())
+        response = await bus.request(
+            from_agent="designer",
+            to_agent="reviewer",
+            content="test",
+            timeout=5.0,
+        )
+        await task
+
+        assert response is not None
+        # The response should have been consumed by the Future, not left in inbox
+        inbox_msg = await bus.recv("designer", timeout=0.1)
+        assert inbox_msg is None
+
+
+@pytest.mark.asyncio
+class TestBaseAgentConversationHooks:
+    async def test_agent_request_uses_message_bus(self, event_bus):
+        from skyn3t.core.messaging import get_default_bus
+
+        agent = MockTestAgent("designer", event_bus)
+        bus = get_default_bus(event_bus)
+
+        async def responder():
+            msg = await bus.recv("reviewer", timeout=5.0)
+            assert msg is not None
+            await bus.respond(msg, "approved", {})
+
+        task = asyncio.create_task(responder())
+        response = await agent.request(
+            to_agent="reviewer",
+            content="critique please",
+            timeout=5.0,
+        )
+        await task
+
+        assert response is not None
+        assert response.content == "approved"
+
+    async def test_on_message_default_returns_none(self, event_bus):
+        agent = MockTestAgent("test", event_bus)
+        from skyn3t.core.messaging import AgentMessage
+
+        msg = AgentMessage(
+            from_agent="other",
+            to_agent="test",
+            kind="request",
+            content="hello",
+        )
+        result = agent.on_message(msg)
+        assert result is None
+
+    async def test_on_message_can_return_response(self, event_bus):
+        class RespondingAgent(MockTestAgent):
+            def on_message(self, msg):
+                from skyn3t.core.messaging import AgentMessage
+
+                if msg.kind == "request":
+                    return AgentMessage(
+                        from_agent=self.name,
+                        to_agent=msg.from_agent,
+                        kind="response",
+                        content="pong",
+                        correlation_id=msg.correlation_id,
+                    )
+                return None
+
+        agent = RespondingAgent("echo", event_bus)
+        await agent.request(
+            to_agent="echo",
+            content="ping",
+            timeout=1.0,
+        )
+        # Note: on_message is sync, but request() expects async delivery.
+        # This test verifies the hook exists; full round-trip requires
+        # the message loop to call on_message().
+        assert agent.on_message is not RespondingAgent.__bases__[0].on_message

@@ -120,7 +120,7 @@ class Settings(BaseSettings):
     def parse_paths(cls, v: Any) -> Any:
         if v is None:
             return None
-        return Path(v).expanduser()
+        return Path(v).expanduser().absolute()
 
     def ensure_directories(self) -> None:
         """Create necessary data directories."""

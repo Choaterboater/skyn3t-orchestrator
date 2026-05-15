@@ -8,7 +8,6 @@ stack detectors (python, node, static) plus the unknown-stack skip path.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 
@@ -114,8 +113,8 @@ async def test_failure_hint_carries_tail_of_stderr(tmp_path):
 @pytest.mark.asyncio
 async def test_node_project_passes_when_shape_ok_and_no_syntax_errors(tmp_path, monkeypatch):
     """A well-shaped package.json + no .js files = pass (shape gate succeeds,
-    syntax gate has nothing to check, install gate is opt-in off)."""
-    monkeypatch.delenv("SKYN3T_VERIFY_NPM_INSTALL", raising=False)
+    syntax gate has nothing to check). Install+build runs by default since v40."""
+    monkeypatch.setenv("SKYN3T_VERIFY_NPM_INSTALL", "0")
     scaffold = tmp_path / "scaffold"
     scaffold.mkdir()
     (scaffold / "package.json").write_text(
@@ -127,7 +126,7 @@ async def test_node_project_passes_when_shape_ok_and_no_syntax_errors(tmp_path, 
     out = res.output
     assert out["verdict"] == "yes", out
     assert out["stack"] == "node"
-    assert "install skipped" in out["command"]
+    assert "install disabled by env" in out["command"]
 
 
 @pytest.mark.asyncio

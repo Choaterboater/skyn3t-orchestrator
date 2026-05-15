@@ -25,4 +25,8 @@ def test_catalog_metadata_marks_internal_utility_agents():
 
     assert metadata["tier"] == "internal"
     assert metadata["label"] == "Code improver"
-    assert metadata["recommended_backend"] == "copilot_cli"
+    # recommended_backend was intentionally nulled for routed agents so
+    # skyn3t.core.model_router picks the tier per-stage (and per-file
+    # inside CodeAgent) instead of being short-circuited by a catalog
+    # default. Confirm it's no longer hard-pinned to copilot_cli.
+    assert metadata.get("recommended_backend") in (None, "")

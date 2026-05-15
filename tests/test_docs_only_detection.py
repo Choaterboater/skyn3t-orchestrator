@@ -9,7 +9,6 @@ import pytest
 from skyn3t.studio.planner import _should_force_code_agent
 from skyn3t.studio.runner import StudioRunner
 
-
 # ---------------------------------------------------------------------------
 # Planner: which briefs force a code stage?
 # ---------------------------------------------------------------------------

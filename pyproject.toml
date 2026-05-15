@@ -114,3 +114,6 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 norecursedirs = ["data", ".git", ".venv"]
+markers = [
+    "slow: marks tests as slower-running integration/e2e checks",
+]

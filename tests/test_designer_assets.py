@@ -11,10 +11,7 @@ from __future__ import annotations
 import json
 import xml.etree.ElementTree as ET
 
-import pytest
-
 from skyn3t.agents.designer import DesignerAgent
-
 
 PALETTE = {
     "primary": "#C8102E",

@@ -6,20 +6,16 @@ the router lookup, and the FastAPI webhook glue.
 
 from __future__ import annotations
 
-import asyncio
-import hmac
 from typing import Any, Dict, List
 
 import pytest
 
 from skyn3t.core.events import Event, EventBus, EventType
 from skyn3t.integrations.messaging import (
-    InboundMessage,
     MessagingRouter,
     TelegramChannel,
     _strip_case_insensitive,
 )
-
 
 # ─── helpers ───────────────────────────────────────────────────────────
 

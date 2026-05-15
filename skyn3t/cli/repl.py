@@ -1341,7 +1341,7 @@ def run() -> None:
     except Exception:
         pass
 
-    pt_session = None
+    pt_session: Any = None
     if _HAS_PT:
         pt_session = PromptSession(
             history=InMemoryHistory(),

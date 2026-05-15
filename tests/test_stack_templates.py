@@ -12,12 +12,11 @@ from __future__ import annotations
 import pytest
 
 from skyn3t.agents.stack_templates import (
+    STACK_TEMPLATES,
     detect_stack,
     plan_for_stack,
-    STACK_TEMPLATES,
     template_keys,
 )
-
 
 # ─── detect_stack ──────────────────────────────────────────────────────
 
@@ -108,6 +107,7 @@ def test_node_manifests_use_modern_pins(stack, must_dep_pin):
     matching the build hint (Next 14, React 18). Catches the 'model
     pinned react ^17 but the code is hooks-only' failure class."""
     import json
+
     from skyn3t.agents.stack_templates import manifest_for
     body = manifest_for(stack, "package.json")
     assert body is not None
@@ -122,6 +122,7 @@ def test_node_manifests_use_modern_pins(stack, must_dep_pin):
 
 def test_node_manifests_are_valid_json():
     import json
+
     from skyn3t.agents.stack_templates import manifest_for
     for stack in ("node_cli", "react_vite", "next"):
         body = manifest_for(stack, "package.json")
@@ -140,6 +141,7 @@ def test_node_cli_manifest_sets_esm_and_bin():
     """node_cli template hint says `"type": "module"` + `bin` entry — the
     manifest must back that up."""
     import json
+
     from skyn3t.agents.stack_templates import manifest_for
     pkg = json.loads(manifest_for("node_cli", "package.json"))
     assert pkg.get("type") == "module"
@@ -161,6 +163,7 @@ def test_next_manifest_does_not_set_module_type():
     is CJS by default). Setting `"type": "module"` breaks Next builds —
     pin this case down."""
     import json
+
     from skyn3t.agents.stack_templates import manifest_for
     pkg = json.loads(manifest_for("next", "package.json"))
     assert pkg.get("type") != "module"
@@ -338,3 +341,59 @@ def test_readme_handles_empty_brief():
     body = readme_for_stack("static_site", "")
     assert body is not None
     assert "## Run" in body  # structure intact
+
+
+
+
+def test_validate_stack_shape_rejects_nextjs_in_react_vite():
+    from skyn3t.agents.stack_templates import validate_stack_shape
+    files = ["index.html", "src/main.jsx", "app/page.tsx", "next.config.js"]
+    errs = validate_stack_shape("react_vite", files)
+    assert len(errs) == 2
+    assert any("app/page.tsx" in e for e in errs)
+    assert any("next.config.js" in e for e in errs)
+
+
+def test_validate_stack_shape_allows_clean_react_vite():
+    from skyn3t.agents.stack_templates import validate_stack_shape
+    files = ["index.html", "src/main.jsx", "src/App.jsx", "package.json", "vite.config.js"]
+    assert validate_stack_shape("react_vite", files) == []
+
+
+def test_validate_stack_shape_rejects_vite_in_next():
+    from skyn3t.agents.stack_templates import validate_stack_shape
+    files = ["app/page.tsx", "app/layout.tsx", "vite.config.js", "src/main.jsx"]
+    errs = validate_stack_shape("next", files)
+    assert len(errs) == 2
+    assert any("vite.config.js" in e for e in errs)
+    assert any("src/main.jsx" in e for e in errs)
+
+
+def test_validate_stack_shape_strips_scaffold_prefix():
+    from skyn3t.agents.stack_templates import validate_stack_shape
+    files = ["scaffold/app/page.tsx", "scaffold/next.config.js"]
+    errs = validate_stack_shape("react_vite", files)
+    assert len(errs) == 2
+
+
+def test_validate_stack_shape_no_stack_is_no_op():
+    from skyn3t.agents.stack_templates import validate_stack_shape
+    assert validate_stack_shape(None, ["anything.txt"]) == []
+    assert validate_stack_shape("", []) == []
+
+
+def test_validate_stack_shape_unknown_stack_is_no_op():
+    from skyn3t.agents.stack_templates import validate_stack_shape
+    assert validate_stack_shape("unknown_stack", ["anything.txt"]) == []
+
+
+def test_configurable_tier_route_contract_is_consistent():
+    from skyn3t.agents.stack_templates import _configurable_tier_files
+
+    plan = dict(_configurable_tier_files(["sonarr"]))
+    backend_desc = plan["server/routes/config.js"]
+    frontend_desc = plan["src/components/ServiceEditor.jsx"]
+
+    assert "/api/config/:slug/test" in backend_desc
+    assert "/api/config/test/:slug" not in backend_desc
+    assert "/api/config/:slug/test" in frontend_desc

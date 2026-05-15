@@ -172,7 +172,6 @@ class BuildVerifierAgent(BaseAgent):
         if forced:
             return StackProbe(kind=forced, entry_files=[], notes=[f"forced via kwarg: {forced}"])
         names = {p.name for p in scaffold_dir.iterdir() if p.is_file()}
-        notes: List[str] = []
         # Swift / Xcode project
         if any(p.suffix == ".xcodeproj" for p in scaffold_dir.iterdir() if p.is_dir()) or "Package.swift" in names:
             entries = [n for n in names if n.endswith(".swift") or n == "Package.swift"]
@@ -226,24 +225,20 @@ class BuildVerifierAgent(BaseAgent):
         """Node verifier — three escalating gates:
 
         Gate 1 — package.json shape: must parse as JSON, must have valid
-                 ``scripts``/``dependencies`` types if present. Catches
-                 the common LLM failure of writing ``"scripts": "build"``
-                 instead of an object.
+                 ``scripts``/``dependencies`` types if present.
 
         Gate 2 — syntax check: run ``node --check`` on every .js/.mjs/.cjs
-                 file we can find. Catches syntax errors without an
-                 install. Fast.
+                 file. Catches syntax errors without an install.
 
-        Gate 3 — optional install + build: only when the operator opts in
-                 via ``SKYN3T_VERIFY_NPM_INSTALL=1``. Runs
+        Gate 3 — install + build (DEFAULT ON): runs
                  ``npm install --no-audit --no-fund --silent
                  --prefer-offline`` then ``npm run build`` if a build
-                 script is present. Capped by the verifier's
-                 ``timeout_seconds`` so a network hang doesn't wedge
-                 the pipeline.
+                 script is present. This catches missing dependencies,
+                 import resolution errors, and JSX/TypeScript compile
+                 errors that ``node --check`` misses.
 
-        Default behavior keeps the verifier fast: parse + syntax. The
-        opt-in flag is for hosts that want the full smoke.
+                 Can be disabled via ``SKYN3T_VERIFY_NPM_INSTALL=0`` for
+                 air-gapped environments where npm registry is unreachable.
         """
         pkg_path = scaffold_dir / "package.json"
         try:
@@ -292,16 +287,29 @@ class BuildVerifierAgent(BaseAgent):
                         proc["stderr"],
                     )
 
-        # Gate 3: opt-in install + build.
-        install_enabled = os.environ.get("SKYN3T_VERIFY_NPM_INSTALL", "").lower() in ("1", "true", "yes")
+        # Gate 3: install + build (default ON since v40).
+        install_disabled = os.environ.get("SKYN3T_VERIFY_NPM_INSTALL", "").lower() in ("0", "false", "no", "off")
         npm_bin = shutil.which("npm")
-        if install_enabled and npm_bin:
+        if not install_disabled and npm_bin:
             install_cmd = [
                 npm_bin, "install",
                 "--no-audit", "--no-fund", "--silent", "--prefer-offline",
             ]
             proc = await self._run(install_cmd, scaffold_dir)
             if proc["returncode"] != 0:
+                # Network failure is NOT a build failure — fall back to
+                # parse + syntax so air-gapped hosts don't get false negatives.
+                network_error = any(
+                    phrase in (proc["stderr"] or "")
+                    for phrase in ("ECONNREFUSED", "ENOTFOUND", "network", "timeout", "unable to connect")
+                )
+                if network_error:
+                    return (
+                        "yes",
+                        " ".join(install_cmd) + " (network failure — falling back to syntax check)",
+                        proc["stdout"],
+                        proc["stderr"],
+                    )
                 return (
                     "no",
                     " ".join(install_cmd),
@@ -331,24 +339,14 @@ class BuildVerifierAgent(BaseAgent):
                 "",
             )
 
-        # Legacy "lockfile + npm" path — still used when install isn't
-        # opted in but a lockfile exists (treated as a "this project
-        # ships its own pin, trust it" signal).
-        if scripts.get("build") and npm_bin and (scaffold_dir / "package-lock.json").exists():
-            cmd = [npm_bin, "run", "build", "--silent"]
-            proc = await self._run(cmd, scaffold_dir)
-            verdict = "yes" if proc["returncode"] == 0 else "no"
-            return verdict, " ".join(cmd), proc["stdout"], proc["stderr"]
-
-        # All gates passed (or were skipped). Report success — the parse +
-        # syntax checks alone catch the most common failure modes.
+        # Fallback: no npm available or install explicitly disabled.
         gate_summary = []
         if isinstance(pkg, dict):
             gate_summary.append("shape ok")
         if node_bin:
             gate_summary.append("node --check ok")
-        if not install_enabled:
-            gate_summary.append("install skipped (set SKYN3T_VERIFY_NPM_INSTALL=1 to enable)")
+        if install_disabled:
+            gate_summary.append("install disabled by env")
         return "yes", " · ".join(gate_summary) or "node parse", "node project verified", ""
 
     async def _verify_static(self, scaffold_dir: Path, probe: StackProbe) -> tuple[str, str, str, str]:

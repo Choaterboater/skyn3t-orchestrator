@@ -35,9 +35,19 @@ class ReviewWatcher:
         try:
             import json as _j
             self._seen_path.parent.mkdir(parents=True, exist_ok=True)
-            self._seen_path.write_text(_j.dumps(sorted(self._seen)))
+            # Atomic write — partial write of a JSON file makes the
+            # next load() return an empty set, which causes EVERY
+            # previously-reviewed run to be re-flagged as "new" and
+            # spam studio_debug proposals.
+            tmp = self._seen_path.with_suffix(self._seen_path.suffix + ".tmp")
+            tmp.write_text(_j.dumps(sorted(self._seen)))
+            tmp.replace(self._seen_path)
         except Exception:
-            pass
+            logger.warning(
+                "review_watcher: failed to persist seen-set to %s — "
+                "next restart will re-flag every reviewed run",
+                self._seen_path, exc_info=True,
+            )
 
     def start(self) -> None:
         if self._wired:

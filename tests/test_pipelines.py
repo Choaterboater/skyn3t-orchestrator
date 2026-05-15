@@ -1050,6 +1050,15 @@ class TestStudioRunner:
                 return VerifierStageAgent()
             if name == "ReviewerAgent":
                 return ReviewerStageAgent()
+            if name == "ConsistencyReviewerAgent":
+                # Return a minimal pass-through agent for the consistency reviewer stage
+                class ConsistencyReviewerStageAgent:
+                    async def initialize(self):
+                        pass
+                    async def execute(self, task, stdin_data=None):
+                        from skyn3t.core.agent import TaskResult
+                        return TaskResult(task_id=task.task_id, success=True, output={"verdict": "pass", "blocker_count": 0})
+                return ConsistencyReviewerStageAgent()
             raise AssertionError(f"unexpected agent {name}")
 
         monkeypatch.setattr("skyn3t.studio.runner.get_agent", fake_get_agent)

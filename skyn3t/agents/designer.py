@@ -13,7 +13,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
@@ -686,7 +685,6 @@ class DesignerAgent(BaseAgent):
         moods we don't have explicit art for.
         """
         primary = palette["primary"]
-        secondary = palette["secondary"]
         accent = palette["accent"]
         bg = palette["bg"]
         text = palette["text"]

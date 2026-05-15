@@ -8,9 +8,6 @@ verification per the README.
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 import pytest
 
 from skyn3t.intelligence.docker_backend import (
@@ -19,7 +16,6 @@ from skyn3t.intelligence.docker_backend import (
     DockerSubagentRunner,
     docker_available,
 )
-
 
 # ─── Command construction ──────────────────────────────────────────────
 
@@ -70,7 +66,6 @@ def test_build_cmd_passes_through_explicit_env_vars(tmp_path, monkeypatch):
         env_passthrough=["SKYN3T_TEST_FLAG"],  # ONLY this — secret stays out
     )
     cmd = runner._build_cmd("sub-x")
-    env_args = [c for c in cmd if "=" in c and c.split("=")[0]]
     # The -e flag is the previous element; collect those properly.
     passes = [cmd[i + 1] for i, c in enumerate(cmd) if c == "-e" and i + 1 < len(cmd)]
     assert "SKYN3T_TEST_FLAG=child-saw-it" in passes

@@ -1,6 +1,14 @@
+import os
+import time
+from pathlib import Path
+
 import pytest
 
-from skyn3t.adapters.llm_client import LLMClient
+from skyn3t.adapters.llm_client import (
+    LLMClient,
+    _append_sandbox_artifacts,
+    _collect_sandbox_artifacts,
+)
 from skyn3t.core.events import EventBus, EventType
 
 
@@ -75,3 +83,25 @@ async def test_llm_complete_warning_includes_caller_backend_and_error(caplog, mo
     assert "caller=planner" in caplog.text
     assert "backend=deterministic" in caplog.text
     assert "error=RuntimeError" in caplog.text
+
+
+def test_collect_sandbox_artifacts_harvests_new_files(tmp_path: Path):
+    root = tmp_path / "cwd"
+    root.mkdir(parents=True, exist_ok=True)
+    old_file = root / "sandbox" / "server" / "old.js"
+    old_file.parent.mkdir(parents=True, exist_ok=True)
+    old_file.write_text("old", encoding="utf-8")
+    started_at = time.time()
+    os.utime(old_file, (started_at - 10, started_at - 10))
+
+    new_file = root / "sandbox" / "server" / "index.js"
+    new_file.write_text("export default {};", encoding="utf-8")
+
+    artifacts = _collect_sandbox_artifacts(str(root), started_at=started_at)
+    assert ("server/index.js", "export default {};") in artifacts
+    assert not any(path == "server/old.js" for path, _ in artifacts)
+
+
+def test_append_sandbox_artifacts_prefers_single_file_when_stdout_empty():
+    out = _append_sandbox_artifacts("", [("server/index.js", "console.log('ok');\n")])
+    assert out == "console.log('ok');"

@@ -47,7 +47,10 @@ class MemoryStore:
 
     async def save_agent(self, agent_id: str, name: str, agent_type: str,
                          provider: str, status: str, capabilities: List[str],
-                         config: Dict[str, Any], meta: Dict[str, Any]) -> None:
+                         config: Dict[str, Any], meta: Dict[str, Any],
+                         role: Optional[str] = None,
+                         reports_to: Optional[str] = None,
+                         lifecycle: Optional[str] = None) -> None:
         """Upsert an agent record."""
         async with self._lock:
             async with await self._session() as session:
@@ -60,6 +63,9 @@ class MemoryStore:
                         existing.agent_type = agent_type
                         existing.provider = provider
                         existing.status = AgentStatus(status) if status in [s.value for s in AgentStatus] else AgentStatus.IDLE
+                        existing.role = role
+                        existing.reports_to = reports_to
+                        existing.lifecycle = lifecycle
                         existing.capabilities = capabilities
                         existing.config = config
                         existing.meta = meta
@@ -71,6 +77,9 @@ class MemoryStore:
                             agent_type=agent_type,
                             provider=provider,
                             status=AgentStatus(status) if status in [s.value for s in AgentStatus] else AgentStatus.IDLE,
+                            role=role,
+                            reports_to=reports_to,
+                            lifecycle=lifecycle,
                             capabilities=capabilities,
                             config=config,
                             meta=meta,
@@ -91,6 +100,9 @@ class MemoryStore:
                     "agent_type": agent.agent_type,
                     "provider": agent.provider,
                     "status": agent.status.value,
+                    "role": agent.role,
+                    "reports_to": agent.reports_to,
+                    "lifecycle": agent.lifecycle,
                     "capabilities": agent.capabilities,
                     "config": agent.config,
                     "meta": agent.meta,
@@ -110,6 +122,9 @@ class MemoryStore:
                     "agent_type": a.agent_type,
                     "provider": a.provider,
                     "status": a.status.value,
+                    "role": a.role,
+                    "reports_to": a.reports_to,
+                    "lifecycle": a.lifecycle,
                     "capabilities": a.capabilities,
                     "last_heartbeat": a.last_heartbeat.isoformat() if a.last_heartbeat else None,
                 }

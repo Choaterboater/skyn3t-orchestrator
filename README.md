@@ -227,6 +227,14 @@ ruff check skyn3t tests
 mypy skyn3t
 ```
 
+### CI quality gate
+
+Every push/PR to `main` runs the same baseline checks in GitHub Actions:
+
+- `ruff check skyn3t tests`
+- `mypy skyn3t`
+- `pytest tests/ --ignore=tests/test_observability.py -q`
+
 ## Project Structure
 
 ```

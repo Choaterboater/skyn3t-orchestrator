@@ -65,21 +65,24 @@ class TokenTracker:
     def _on_exchange(self, event: Any) -> None:
         try:
             payload = getattr(event, "payload", {}) or {}
-            prompt_chars = len(payload.get("prompt") or "")
-            response_chars = len(payload.get("response") or "")
-            system_chars = len(payload.get("system") or "")
-            # The dashboard receives truncated prompt/response (2000/500
-            # cap, see llm_client.py). For *accurate* rollups we'd want
-            # the pre-truncation length. As a partial fix, look for
-            # cap-tells and bump the estimate.
-            if prompt_chars >= 2000:
-                # Truncated — caller saw at least 2000 of prompt. Add a
-                # conservative bump so we don't massively under-report
-                # large per-file scaffold prompts (research.md alone
-                # can be 18-32KB).
-                prompt_chars = max(prompt_chars, 8000)
-            if response_chars >= 2000:
-                response_chars = max(response_chars, 4000)
+            # Prefer the accurate pre-truncation length fields if the
+            # client provided them (llm_client.py now does). Fall back
+            # to the legacy "len of truncated preview + bump constant"
+            # estimate for older event sources.
+            if "prompt_chars" in payload or "response_chars" in payload:
+                prompt_chars = int(payload.get("prompt_chars") or 0)
+                response_chars = int(payload.get("response_chars") or 0)
+                system_chars = int(payload.get("system_chars") or 0)
+            else:
+                # Legacy path — only the truncated preview field
+                # available. Best-effort estimate.
+                prompt_chars = len(payload.get("prompt") or "")
+                response_chars = len(payload.get("response") or "")
+                system_chars = len(payload.get("system") or "")
+                if prompt_chars >= 2000:
+                    prompt_chars = max(prompt_chars, 8000)
+                if response_chars >= 2000:
+                    response_chars = max(response_chars, 4000)
 
             prompt_tokens = _estimate_tokens("x" * prompt_chars)
             prompt_tokens += _estimate_tokens("x" * system_chars)

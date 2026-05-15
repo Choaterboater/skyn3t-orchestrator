@@ -56,6 +56,9 @@ class EventType(Enum):
     INGEST_PROGRESS = auto()
     INGEST_COMPLETE = auto()
     LLM_EXCHANGE = auto()
+    AGENT_CONVERSATION_STARTED = auto()
+    AGENT_CONVERSATION_TURN = auto()
+    AGENT_CONVERSATION_ENDED = auto()
 
 
 @dataclass

@@ -7,12 +7,14 @@ from skyn3t.agents.build_verifier import BuildVerifierAgent
 from skyn3t.agents.business_analyst import BusinessAnalystAgent
 from skyn3t.agents.code_agent import CodeAgent
 from skyn3t.agents.code_improver import CodeImproverAgent
+from skyn3t.agents.consistency_reviewer import ConsistencyReviewerAgent
 from skyn3t.agents.designer import DesignerAgent
 from skyn3t.agents.docs_ingestor import DocsIngestorAgent
 from skyn3t.agents.explorer import ExplorerAgent
 from skyn3t.agents.file_ops_agent import FileOpsAgent
 from skyn3t.agents.github_explorer import GitHubExplorerAgent
 from skyn3t.agents.github_ingestor import GitHubIngestorAgent
+from skyn3t.agents.integration_verifier import IntegrationContractVerifierAgent
 from skyn3t.agents.marketer import MarketerAgent
 from skyn3t.agents.project_memory import ProjectMemoryAgent
 from skyn3t.agents.research_agent import ResearchAgent
@@ -30,7 +32,9 @@ __all__ = [
     "ClaudeCLIAgent",
     "CodeAgent",
     "CodeImproverAgent",
+    "ConsistencyReviewerAgent",
     "CopilotCLIAgent",
+    "IntegrationContractVerifierAgent",
     "DesignerAgent",
     "DocsIngestorAgent",
     "ExplorerAgent",

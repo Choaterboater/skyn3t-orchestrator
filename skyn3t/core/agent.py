@@ -7,13 +7,17 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 from skyn3t.core.event_context import current_event_correlation_id, merge_event_payload
 from skyn3t.core.events import Event, EventBus, EventType
 from skyn3t.observability.metrics import get_collector
 from skyn3t.observability.tracing import SpanStatus, get_tracer
+
+if TYPE_CHECKING:
+    from skyn3t.core.messaging import AgentMessage
 
 logger = logging.getLogger("skyn3t.core.agent")
 
@@ -75,6 +79,8 @@ class BaseAgent(ABC):
         provider: str,
         event_bus: EventBus,
         config: Optional[Dict[str, Any]] = None,
+        role: Optional[str] = None,
+        reports_to: Optional[str] = None,
     ):
         self.id = str(uuid4())
         self.name = name
@@ -82,6 +88,10 @@ class BaseAgent(ABC):
         self.provider = provider
         self.event_bus = event_bus
         self.config = config or {}
+        self.role = role
+        self.reports_to = reports_to
+        self.lifecycle = "manual"  # "manual" | "auto" — auto agents may be terminated
+        self.last_active_at: Optional[datetime] = None
         self.capabilities: List[AgentCapability] = []
         self.status = "idle"
         self.metadata: Dict[str, Any] = {}
@@ -346,7 +356,15 @@ class BaseAgent(ABC):
                                     payload={
                                         "task_id": task.task_id,
                                         "error": result.error,
-                                        "retry_count": task.max_retries,
+                                        # ACTUAL attempts so far (was
+                                        # incorrectly publishing the
+                                        # configured ceiling, which
+                                        # made every failure look
+                                        # like a max-retries
+                                        # exhaustion to downstream
+                                        # telemetry).
+                                        "retry_count": getattr(task, "retry_count", 0),
+                                        "max_retries": task.max_retries,
                                     },
                                     correlation_id=task.task_id,
                                 )
@@ -446,6 +464,10 @@ class BaseAgent(ABC):
             "health_checks": self._health_checks,
             "recent_errors": len(self._errors),
             "metadata": self.metadata,
+            "role": self.role,
+            "reports_to": self.reports_to,
+            "lifecycle": self.lifecycle,
+            "last_active_at": self.last_active_at.isoformat() if self.last_active_at else None,
         }
 
     async def send_message(
@@ -476,6 +498,38 @@ class BaseAgent(ABC):
         bus = get_default_bus(self.event_bus)
         await bus.send(msg)
 
+    async def request(
+        self,
+        to_agent: str,
+        content: str,
+        payload: Optional[Dict[str, Any]] = None,
+        timeout: float = 60.0,
+    ) -> Optional["AgentMessage"]:
+        """Send a request to another agent and await a response.
+
+        Returns the response ``AgentMessage`` or ``None`` on timeout.
+        """
+        from skyn3t.core.messaging import get_default_bus
+
+        bus = get_default_bus(self.event_bus)
+        return await bus.request(
+            from_agent=self.name,
+            to_agent=to_agent,
+            content=content,
+            payload=merge_event_payload(payload),
+            timeout=timeout,
+        )
+
+    def on_message(self, msg: "AgentMessage") -> Optional["AgentMessage"]:
+        """Handle an incoming A2A message.
+
+        Subclasses may override this to respond to ``request`` messages.
+        The default implementation returns ``None`` (no auto-response).
+        If a non-None message is returned, it is sent back as a response
+        via the MessageBus.
+        """
+        return None
+
     def resolve_artifact_dir(self, raw: Any) -> "Path":
         """Centralized artifact-dir resolution to stop leaks into the repo root.
 
@@ -485,15 +539,48 @@ class BaseAgent(ABC):
         brainstorm.md / tech_stack.json files accumulating in the repo root.
 
         Resolution order:
-          1. Caller-provided path (Studio pipeline path).
+          1. Caller-provided path (Studio pipeline path) — validated to
+             reject repo-root, CWD, and other dangerous locations.
           2. Per-agent scratch under <projects_dir>/_agent_scratch/<agent>/<ts>/
-             when no path provided. Keeps files in the configured projects root,
-             never the repo root.
+             when no path provided or validation fails. Keeps files in the
+             configured projects root, never the repo root.
         """
-        from pathlib import Path as _PP
         import time as _t
+        from pathlib import Path as _PP
+
+        def _is_dangerous(path: "Path") -> bool:
+            """Reject paths that look like the repo root, CWD, or system dirs."""
+            try:
+                resolved = path.resolve()
+                cwd = _PP().resolve()
+                # Never write to CWD if CWD is the SkyN3t repo root
+                if resolved == cwd:
+                    return True
+                # Never write to the repo root OR any subdirectory of it.
+                # Walk up the directory tree looking for SkyN3t repo markers.
+                for parent in [resolved, *resolved.parents]:
+                    if (parent / "skyn3t" / "core" / "agent.py").exists():
+                        return True
+                    # Alternative marker combo for robustness
+                    if (parent / ".git").exists() and (parent / "AGENTS.md").exists():
+                        return True
+                # Never write to common system dirs
+                for bad in ("/", "/tmp", "/var", "/usr", "/home", "~"):
+                    if resolved == _PP(bad).expanduser().resolve():
+                        return True
+            except Exception:
+                return True
+            return False
+
         if raw:
-            return _PP(str(raw)).expanduser()
+            candidate = _PP(str(raw)).expanduser()
+            if not _is_dangerous(candidate):
+                return candidate
+            logger.warning(
+                "resolve_artifact_dir: rejecting dangerous path %s for agent %s; "
+                "falling back to scratch.",
+                candidate, self.name,
+            )
         try:
             from skyn3t.config.settings import get_settings
             base = _PP(str(get_settings().projects_dir)).expanduser()
@@ -589,6 +676,9 @@ class BaseAgent(ABC):
             "agent_type": self.agent_type,
             "provider": self.provider,
             "enabled": getattr(self, "_enabled", True),
+            "role": self.role,
+            "reports_to": self.reports_to,
+            "lifecycle": self.lifecycle,
             "capabilities": [c.name for c in self.capabilities],
             "config": {
                 "backend": self.config.get("backend"),
@@ -612,6 +702,9 @@ class BaseAgent(ABC):
             known_keys = {
                 "provider",
                 "enabled",
+                "role",
+                "reports_to",
+                "lifecycle",
                 "capabilities",
                 "backend",
                 "model",
@@ -619,6 +712,42 @@ class BaseAgent(ABC):
                 "temperature",
                 "max_tokens",
             }
+
+            # role: empty string is valid; None → skip
+            if "role" in patch:
+                try:
+                    val = patch["role"]
+                    if val is None:
+                        logger.debug("apply_override: role is None, skipping")
+                    else:
+                        self.role = str(val) if not isinstance(val, str) else val
+                        changed.append("role")
+                except Exception:
+                    logger.exception("apply_override: failed to set role")
+
+            # reports_to: empty string means "no manager"; None → skip
+            if "reports_to" in patch:
+                try:
+                    val = patch["reports_to"]
+                    if val is None:
+                        logger.debug("apply_override: reports_to is None, skipping")
+                    else:
+                        self.reports_to = str(val) if not isinstance(val, str) else val
+                        changed.append("reports_to")
+                except Exception:
+                    logger.exception("apply_override: failed to set reports_to")
+
+            # lifecycle: must be "manual" or "auto"
+            if "lifecycle" in patch:
+                try:
+                    val = patch["lifecycle"]
+                    if val in ("manual", "auto"):
+                        self.lifecycle = val
+                        changed.append("lifecycle")
+                    else:
+                        logger.debug("apply_override: lifecycle must be manual|auto, got %r", val)
+                except Exception:
+                    logger.exception("apply_override: failed to set lifecycle")
 
             # provider: skip if empty/None
             if "provider" in patch:
@@ -821,13 +950,43 @@ class BaseAgent(ABC):
 
     @property
     def llm(self):
-        """Lazy LLMClient bound to this agent's overrides."""
+        """Lazy LLMClient bound to this agent's overrides.
+
+        Resolution order (first non-None wins):
+          1. Explicit config (per-agent ``backend`` / ``model`` in
+             ``data/agent_overrides.json`` or set via the dashboard).
+          2. Model-routing policy by stage name (``cheap``/``strong``
+             tier from ``core/model_router.py``).
+          3. LLMClient's own auto-discovery default.
+
+        Operators wanting to flip every cheap stage to balanced can
+        point ``SKYN3T_MODEL_ROUTING`` at a JSON file; see
+        ``core/model_router.py``.
+        """
         if getattr(self, "_llm", None) is None:
+            backend = self.config.get("backend")
+            model = self.config.get("model")
+            # Layer in the routing policy when the agent didn't set
+            # an explicit backend. Identify the stage by agent name
+            # — agents are named brainstorm / research / architect /
+            # designer / code_agent / reviewer in the runner.
+            if not backend:
+                try:
+                    from skyn3t.core.model_router import resolve_model
+                    policy_backend, policy_model = resolve_model(self.name)
+                    backend = policy_backend
+                    if model is None:
+                        model = policy_model
+                except Exception:
+                    logger.debug(
+                        "model router lookup failed for %s",
+                        self.name, exc_info=True,
+                    )
             try:
                 from skyn3t.adapters import LLMClient
                 self._llm = LLMClient(
-                    default_model=self.config.get("model"),
-                    backend=self.config.get("backend"),
+                    default_model=model,
+                    backend=backend,
                     event_bus=self.event_bus,
                     caller_name=self.name,
                 )

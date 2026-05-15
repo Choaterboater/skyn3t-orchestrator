@@ -9,16 +9,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, Awaitable, Callable, Dict, List
+from typing import Any, Dict, List
 
 import pytest
 
 from skyn3t.integrations.acp_server import (
     ACP_PROTOCOL_VERSION,
-    ACPServer,
     METHOD_INITIALIZE,
     METHOD_SESSION_NEW,
     METHOD_SESSION_PROMPT,
+    ACPServer,
 )
 
 

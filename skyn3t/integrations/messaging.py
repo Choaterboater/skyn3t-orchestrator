@@ -37,7 +37,7 @@ import abc
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from skyn3t.core.events import Event, EventBus, EventType
 
@@ -360,7 +360,7 @@ class MatrixChannel(MessagingChannel):
     ):
         super().__init__(event_bus)
         self.homeserver_url = (
-            homeserver_url or os.getenv("MATRIX_HOMESERVER_URL", "")
+            homeserver_url or os.getenv("MATRIX_HOMESERVER_URL", "") or ""
         ).rstrip("/")
         self.access_token = access_token or os.getenv("MATRIX_ACCESS_TOKEN", "")
         self._http: Any = None
@@ -466,7 +466,7 @@ class SignalChannel(MessagingChannel):
         number: Optional[str] = None,
     ):
         super().__init__(event_bus)
-        self.bridge_url = (bridge_url or os.getenv("SIGNAL_BRIDGE_URL", "")).rstrip("/")
+        self.bridge_url = (bridge_url or os.getenv("SIGNAL_BRIDGE_URL", "") or "").rstrip("/")
         self.number = number or os.getenv("SIGNAL_NUMBER", "")
         self._http: Any = None
 
@@ -581,7 +581,7 @@ class IMessageChannel(MessagingChannel):
         password: Optional[str] = None,
     ):
         super().__init__(event_bus)
-        self.bridge_url = (bridge_url or os.getenv("BLUEBUBBLES_URL", "")).rstrip("/")
+        self.bridge_url = (bridge_url or os.getenv("BLUEBUBBLES_URL", "") or "").rstrip("/")
         self.password = password or os.getenv("BLUEBUBBLES_PASSWORD", "")
         self._http: Any = None
 
@@ -646,8 +646,8 @@ class IMessageChannel(MessagingChannel):
             f"?password={self.password}"
         )
         # BlueBubbles requires a deterministic tempGuid for idempotency.
-        import time as _time
         import hashlib as _hashlib
+        import time as _time
         seed = f"{channel}|{int(_time.time() * 1000)}|{text[:64]}"
         temp_guid = "temp-" + _hashlib.sha1(seed.encode("utf-8")).hexdigest()[:24]
         payload = {

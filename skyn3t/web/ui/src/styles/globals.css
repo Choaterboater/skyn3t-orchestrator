@@ -2,44 +2,79 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Match the atelier display class the existing dashboard uses, so
-   shared headings render the same. */
+/* ============================================================
+   SkyN3t — Global Styles
+   Tactical Ops (warm) machine-room aesthetic.
+   Deep graphite browns + ember-orange accent.
+   Fonts: Orbitron (display), Rajdhani (body), JetBrains Mono (data).
+   ============================================================ */
+
+/* ---------- Display headings (Orbitron, engineered) ---------- */
 .display {
-  font-family: var(--font-display, "Instrument Serif", Georgia, serif);
-  font-style: italic;
-  font-weight: 400;
-  letter-spacing: -0.01em;
-  line-height: 1.05;
+  font-family: var(--font-display, "Orbitron", system-ui, sans-serif);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  line-height: 1.1;
 }
 
-/* Atelier background: warm bloom + dot grain on a graphite base.
-   Same recipe used in dashboard.html so the SPA and the legacy
-   dashboard look like the same product. */
+/* ---------- Tabular numerals on all data ---------- */
+.font-mono,
+code,
+pre,
+.font-tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Atelier background: warm bloom + dot grain ---------- */
 .bg-atelier {
   position: relative;
-  background-color: #0f0e0c;
+  background-color: #0F0D0A;
 }
+
 .bg-atelier::before {
   content: "";
   position: fixed;
   inset: 0;
   background:
     radial-gradient(ellipse 1200px 800px at 10% -10%,
-      rgba(201, 169, 110, 0.10), transparent 60%),
+      rgba(224, 92, 26, 0.08), transparent 60%),
     radial-gradient(ellipse 900px 700px at 100% 110%,
-      rgba(58, 38, 28, 0.55), transparent 70%);
+      rgba(40, 28, 20, 0.55), transparent 70%);
   pointer-events: none;
   z-index: 0;
 }
+
 .bg-atelier::after {
   content: "";
   position: fixed;
   inset: 0;
   background-image:
-    radial-gradient(circle at 1px 1px, rgba(201, 169, 110, 0.04) 1px, transparent 0);
+    radial-gradient(circle at 1px 1px, rgba(224, 92, 26, 0.03) 1px, transparent 0);
   background-size: 22px 22px;
   opacity: 0.5;
   mix-blend-mode: overlay;
   pointer-events: none;
   z-index: 0;
+}
+
+/* ---------- Scrollbar styling (WebKit) ---------- */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #0F0D0A;
+}
+::-webkit-scrollbar-thumb {
+  background: #3B3429;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #4A4337;
+}
+
+/* ---------- Selection ---------- */
+::selection {
+  background: rgba(224, 92, 26, 0.25);
+  color: #E8DDCB;
 }

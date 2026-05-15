@@ -233,7 +233,10 @@ class ACPServer:
     async def _handle_session_prompt(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Run the user prompt through the orchestrator, streaming
         ``session/update`` notifications, then return a final stopReason."""
-        session_id = params.get("sessionId")
+        session_id_any = params.get("sessionId")
+        session_id = str(session_id_any) if session_id_any else ""
+        if not session_id:
+            return {"stopReason": "refusal"}
         session = self._sessions.get(session_id)
         if session is None:
             return {"stopReason": "refusal"}

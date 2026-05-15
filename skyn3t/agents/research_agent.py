@@ -1,5 +1,6 @@
 """Research Agent - searches, summarizes, compares, and fact-checks information."""
 
+import asyncio
 import logging
 import re
 import time
@@ -10,6 +11,29 @@ from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResul
 from skyn3t.core.events import EventBus
 
 logger = logging.getLogger("skyn3t.agents.research_agent")
+
+# Known API doc URLs for services the agent can fetch directly.
+# This gives the LLM real ground-truth instead of hallucinated endpoints.
+_SERVICE_DOC_URLS: Dict[str, str] = {
+    "sonarr": "https://sonarr.tv/docs/api/",
+    "radarr": "https://radarr.video/docs/api/",
+    "lidarr": "https://lidarr.audio/docs/api/",
+    "prowlarr": "https://prowlarr.com/docs/api/",
+    "readarr": "https://readarr.com/docs/api/",
+    "qbittorrent": "https://github.com/qbittorrent/qBittorrent/wiki/WebUI-API-(qBittorrent-4.1)",
+    "transmission": "https://github.com/transmission/transmission/blob/main/docs/rpc-spec.md",
+    "sabnzbd": "https://sabnzbd.org/wiki/configuration/4.3/api",
+    "emby": "https://github.com/MediaBrowser/Emby/wiki/REST-API",
+    "jellyfin": "https://api.jellyfin.org/",
+    "plex": "https://plexapi.dev/",
+    "sonos": "https://github.com/jishi/node-sonos-http-api",
+    "docker": "https://docs.docker.com/engine/api/v1.45/",
+    "home_assistant": "https://developers.home-assistant.io/docs/api/rest/",
+    "unifi": "https://dl.ubnt.com/unifi/8.0.24/unifi_sh_api",
+    "nzbget": "https://nzbget.net/api/",
+    "overseerr": "https://api-docs.overseerr.dev/",
+    "tautulli": "https://github.com/Tautulli/Tautulli/wiki/Tautulli-API-Reference",
+}
 
 
 class ResearchAgent(BaseAgent):
@@ -167,63 +191,139 @@ class ResearchAgent(BaseAgent):
             is_integration_brief = any(h in q_lower for h in integration_hints)
 
             if is_integration_brief:
-                # Build the per-service "skip these" hint from cache.
-                cached_services_str = ""
-                if cached_specs:
-                    names = ", ".join(sorted(cached_specs.keys()))
-                    cached_services_str = (
-                        f"\n\nIMPORTANT: skip these services entirely — their "
-                        f"specs are already in memory and will be appended "
-                        f"after your output: **{names}**. Do NOT include "
-                        f"`## {names.split(', ')[0]}` etc. in your response.\n"
+                # ── PER-SERVICE FAN-OUT ─────────────────────────────
+                # Old design was one giant prompt covering every service
+                # in one response: ~16 min CLI streaming for a 15-20KB
+                # markdown spec. New design fans out one short prompt
+                # PER service and runs them concurrently. Each per-
+                # service call is ~2KB out, much faster to stream.
+                # Bottleneck for 7 services with concurrency=4 drops
+                # from ~16 min to ~4-6 min.
+                #
+                # Reuses the same integration_hints list to identify
+                # which services to research. Anything not on that list
+                # falls through to the generic 1-prompt path (preserves
+                # behavior on non-named-service briefs).
+                uncached_services = []
+                for svc in integration_hints:
+                    # Skip the generic phrases that aren't service names
+                    if svc in ("integrate with", "talk to the", "query the"):
+                        continue
+                    if svc not in q_lower:
+                        continue
+                    # Cached specs keyed by service slug; check both
+                    # bare name ("emby") and api-suffixed name ("stripe api").
+                    bare = svc.split(" ")[0]
+                    if bare in cached_specs or svc in cached_specs:
+                        continue
+                    uncached_services.append(bare)
+                # Dedupe preserving first-seen order
+                seen_svc: set[str] = set()
+                deduped_services: list[str] = []
+                for svc_name in uncached_services:
+                    if svc_name in seen_svc:
+                        continue
+                    seen_svc.add(svc_name)
+                    deduped_services.append(svc_name)
+                uncached_services = deduped_services
+
+                async def _research_one(svc_name: str) -> str:
+                    """Return the markdown section for one service."""
+                    # Fetch real API docs first so the LLM has ground truth.
+                    fetched_docs = await self._fetch_service_docs(svc_name)
+                    docs_block = (
+                        f"\n\nReal API documentation excerpts:\n\n{fetched_docs}\n\n"
+                        if fetched_docs else ""
                     )
-                prompt = (
-                    f"Brief:\n{query}\n{cached_services_str}\n"
-                    "This brief names third-party products, services, or APIs. "
-                    "Produce an INTEGRATION SPEC the code-writing agent can use "
-                    "to wire real API calls (not mock data).\n\n"
-                    "For each remaining product/service, output a markdown section:\n\n"
-                    "## <Product name>\n"
-                    "- **Base URL**: typical default (e.g. http://localhost:8989)\n"
-                    "- **Auth**: header/query-param scheme (e.g. `X-Api-Key`, "
-                    "Bearer token, basic auth, none on local socket)\n"
-                    "- **Key endpoints**: 3-6 most useful for a dashboard, each "
-                    "with method + path + one-line of what it returns. Format: "
-                    "`GET /api/v3/queue → current download queue with progress`\n"
-                    "- **Response shape**: critical field names the UI will read "
-                    "(e.g. `series.title`, `episode.airDate`, `sizeleft`)\n"
-                    "- **Env var convention**: e.g. SONARR_URL, SONARR_API_KEY\n"
-                    "- **Gotchas**: rate limits, CORS, websocket vs REST, etc.\n\n"
-                    "Be concrete. These are real, well-documented APIs — name "
-                    "the actual endpoints, not placeholders. If you don't know "
-                    "an endpoint for sure, say so explicitly rather than "
-                    "inventing one."
-                )
-                out = ""
-                try:
-                    out = await client.complete(prompt, max_tokens=4000, temperature=0.2)
-                except Exception as e:
-                    logger.warning(f"research primary backend failed: {e}; retrying on fallback")
-                    out = ""
-                # Cross-model retry: if the configured backend timed out
-                # or returned empty, build a fresh LLMClient that skips
-                # the failing backend and try a different one. Skip-list
-                # is a constructor-time arg on LLMClient, not a per-call
-                # kwarg — earlier attempt to pass it inline raised TypeError.
-                if not out or "[deterministic-stub]" in out:
-                    primary = self.config.get("backend") or ""
+                    one_prompt = (
+                        f"Brief context (for grounding only):\n{query}\n\n"
+                        f"Produce the INTEGRATION SPEC for **{svc_name.title()}** "
+                        f"ONLY. The code-writing agent will use this to wire "
+                        f"real API calls (not mock data).{docs_block}\n\n"
+                        f"Output exactly this markdown section:\n\n"
+                        f"## {svc_name.title()}\n"
+                        f"- **Base URL**: typical default (e.g. http://localhost:8989)\n"
+                        f"- **Auth**: header/query-param scheme (e.g. `X-Api-Key`, "
+                        f"Bearer token, basic auth, none on local socket)\n"
+                        f"- **Key endpoints**: 3-6 most useful for a dashboard, "
+                        f"each `METHOD /path → what it returns`\n"
+                        f"- **Response shape**: critical field names the UI "
+                        f"will read (e.g. `series.title`, `sizeleft`)\n"
+                        f"- **Env var convention**: e.g. SONARR_URL, SONARR_API_KEY\n"
+                        f"- **Gotchas**: rate limits, CORS, ws vs REST, etc.\n\n"
+                        f"Concrete and grounded. If you don't know an endpoint "
+                        f"for sure, say so rather than inventing one. Do NOT "
+                        f"include sections for any other service."
+                    )
                     try:
-                        from skyn3t.adapters import LLMClient as _LLMClient
-                        retry_client = _LLMClient(
-                            default_model=None,
-                            backend=None,  # "auto" picks next available
-                            skip_backends=[primary] if primary else [],
+                        s_out = await client.complete(
+                            one_prompt, max_tokens=1200, temperature=0.2,
                         )
-                        out = await retry_client.complete(
-                            prompt, max_tokens=4000, temperature=0.2,
+                    except Exception as exc:
+                        logger.warning(
+                            "per-service research failed for %s: %s",
+                            svc_name, exc,
                         )
-                    except Exception as e:
-                        logger.warning(f"research fallback backend also failed: {e}")
+                        s_out = ""
+                    # Fallback-backend retry per service (mirrors old logic).
+                    if not s_out or "[deterministic-stub]" in s_out:
+                        primary = self.config.get("backend") or ""
+                        try:
+                            from skyn3t.adapters import LLMClient as _LLMClient
+                            retry_client = _LLMClient(
+                                default_model=None, backend=None,
+                                skip_backends=[primary] if primary else [],
+                            )
+                            s_out = await retry_client.complete(
+                                one_prompt, max_tokens=1200, temperature=0.2,
+                            )
+                        except Exception:
+                            s_out = ""
+                    return s_out.strip() if s_out else ""
+
+                out = ""
+                if uncached_services:
+                    # Concurrency 4 matches CodeAgent's. The CLI's
+                    # subprocess model gives diminishing returns past
+                    # this point; tested in v18.
+                    sem = asyncio.Semaphore(4)
+
+                    async def _bounded(svc: str) -> str:
+                        async with sem:
+                            return await _research_one(svc)
+
+                    await self.think(
+                        f"researching {len(uncached_services)} service(s) "
+                        f"in parallel (concurrency=4): "
+                        f"{', '.join(uncached_services)}"
+                    )
+                    sections = await asyncio.gather(
+                        *(_bounded(s) for s in uncached_services),
+                        return_exceptions=True,
+                    )
+                    section_texts = [
+                        s for s in sections
+                        if isinstance(s, str) and s
+                    ]
+                    if section_texts:
+                        out = "\n\n".join(section_texts)
+                # If nothing to fan out (or fan-out produced nothing),
+                # we still need SOME content for research.md when there
+                # are uncached services. Fall through to a small generic
+                # prompt only in that edge case.
+                if not out and uncached_services:
+                    fallback_prompt = (
+                        f"Brief:\n{query}\n\n"
+                        f"Produce short integration notes for: "
+                        f"{', '.join(uncached_services)}. "
+                        f"One section per service, base URL + auth + "
+                        f"3 key endpoints. Concrete. No invented endpoints."
+                    )
+                    try:
+                        out = await client.complete(
+                            fallback_prompt, max_tokens=4000, temperature=0.2,
+                        )
+                    except Exception:
                         out = ""
             else:
                 prompt = (
@@ -455,6 +555,79 @@ class ResearchAgent(BaseAgent):
                 logger.info(f"promoted spec to skill: {slug}")
             except Exception:
                 logger.exception(f"promote skill {slug} failed")
+
+    # ── Web fetch for real API docs ─────────────────────────────────
+
+    async def _fetch_service_docs(self, svc_name: str) -> Optional[str]:
+        """Fetch and extract key info from a service's API documentation.
+
+        Returns a markdown snippet with base URL, auth, and endpoints,
+        or None when the fetch fails or the service is unknown.
+        """
+        url = _SERVICE_DOC_URLS.get(svc_name.lower())
+        if not url:
+            return None
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "skyn3t-research-agent/1.0",
+                    "Accept": "text/html, application/json, text/plain, */*",
+                },
+            )
+            # Run blocking urllib in executor so we don't stall the loop.
+            loop = asyncio.get_event_loop()
+            raw = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, lambda: urllib.request.urlopen(req, timeout=15).read().decode("utf-8", errors="ignore")
+                ),
+                timeout=20,
+            )
+        except Exception as exc:
+            logger.debug("web fetch failed for %s: %s", svc_name, exc)
+            return None
+
+        # Extract useful snippets from the HTML/markdown body.
+        lines: List[str] = [
+            f"## {svc_name.title()} (from {url})",
+            "",
+        ]
+
+        # Look for auth patterns in the raw text.
+        auth_patterns = [
+            r"(?i)(api[-_]?key|token|bearer|basic auth|username|password)",
+            r"(?i)(x-api-key|authorization|x-auth-token)",
+        ]
+        auth_hits: set[str] = set()
+        for pat in auth_patterns:
+            for m in re.finditer(pat, raw):
+                auth_hits.add(m.group(0))
+        if auth_hits:
+            lines.append(f"- **Auth**: {', '.join(sorted(auth_hits))}")
+
+        # Look for endpoint patterns like GET /api/v3/queue or POST /auth
+        endpoint_re = re.compile(r"(?i)(GET|POST|PUT|DELETE|PATCH)\s+(/[a-z0-9_/\-{}:]+)")
+        endpoints: set[str] = set()
+        for m in endpoint_re.finditer(raw):
+            endpoints.add(f"{m.group(1).upper()} {m.group(2)}")
+        if endpoints:
+            lines.append("- **Endpoints** (extracted from docs):")
+            for ep in sorted(endpoints)[:8]:
+                lines.append(f"  - `{ep}`")
+
+        # Look for base URL hints.
+        url_re = re.compile(r"(?i)(https?://[a-z0-9.:\-]+/api[a-z0-9/\-]*)")
+        base_urls: set[str] = set()
+        for m in url_re.finditer(raw):
+            base_urls.add(m.group(1))
+        if base_urls:
+            lines.append(f"- **Base URLs**: {', '.join(sorted(base_urls)[:3])}")
+
+        if len(lines) <= 3:
+            # Nothing useful extracted — treat as failure.
+            return None
+        return "\n".join(lines)
 
     async def _summarize(self, task: TaskRequest) -> Dict[str, Any]:
         """Summarize a document or text."""

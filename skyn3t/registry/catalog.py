@@ -31,8 +31,11 @@ _CATALOG = [
         tier="primary",
         label="Research",
         summary="Finds context, sources, and comparisons that shape the build.",
-        recommended_backend="copilot_cli",
-        recommended_model="gpt-5.4",
+        # Catalog defaults intentionally left blank — model router
+        # picks (cheap tier for research). To pin a backend, set it
+        # in data/agent_overrides.json instead.
+        recommended_backend=None,
+        recommended_model=None,
     ),
     AgentCatalogEntry(
         class_name="ArchitectAgent",
@@ -49,8 +52,9 @@ _CATALOG = [
         tier="primary",
         label="Code",
         summary="Scaffolds and implements new source files for fresh builds.",
-        recommended_backend="copilot_cli",
-        recommended_model="gpt-5.3-codex",
+        # Router → strong tier (claude_cli/opus).
+        recommended_backend=None,
+        recommended_model=None,
     ),
     AgentCatalogEntry(
         class_name="WriterAgent",
@@ -58,8 +62,9 @@ _CATALOG = [
         tier="primary",
         label="Writer",
         summary="Produces polished copy, docs, and supporting prose when needed.",
-        recommended_backend="claude_cli",
-        recommended_model="sonnet",
+        # Router → cheap tier (kimi_cli).
+        recommended_backend=None,
+        recommended_model=None,
     ),
     AgentCatalogEntry(
         class_name="DesignerAgent",
@@ -67,8 +72,9 @@ _CATALOG = [
         tier="primary",
         label="Designer",
         summary="Shapes visual direction, brand cues, and UI polish.",
-        recommended_backend="claude_cli",
-        recommended_model="sonnet",
+        # Router → cheap tier (kimi_cli) when designer runs at all.
+        recommended_backend=None,
+        recommended_model=None,
     ),
     AgentCatalogEntry(
         class_name="MarketerAgent",
@@ -85,8 +91,10 @@ _CATALOG = [
         tier="primary",
         label="Reviewer",
         summary="Grades output quality and summarizes whether the mission is ready.",
-        recommended_backend="claude_cli",
-        recommended_model="sonnet",
+        # Router → strong tier (claude_cli/opus) since reviewer
+        # quality matters more than anywhere else.
+        recommended_backend=None,
+        recommended_model=None,
     ),
     AgentCatalogEntry(
         class_name="BusinessAnalystAgent",
@@ -103,8 +111,10 @@ _CATALOG = [
         tier="internal",
         label="Code improver",
         summary="Applies targeted repo edits when a mission points at existing files.",
-        recommended_backend="copilot_cli",
-        recommended_model="gpt-5.3-codex",
+        # Router → strong tier (claude_cli/opus) — fix loops need
+        # the same quality as fresh code gen.
+        recommended_backend=None,
+        recommended_model=None,
     ),
     AgentCatalogEntry(
         class_name="VerifierAgent",
