@@ -237,7 +237,7 @@ class FeatureSuggester:
             source = getattr(event, "source", "")
 
             # 1. recurring task failures → suggest behavior change
-            if etype_value == "TASK_FAILED" or etype_value == "TASK_FAILED_FINAL":
+            if etype_value in ("TASK_FAILED", "TASK_FAILED_FINAL"):
                 sig = f"{payload.get('agent') or source}::{payload.get('capability','')}"
                 self._failure_counter[sig] += 1
                 if self._failure_counter[sig] >= self.min_signal:
