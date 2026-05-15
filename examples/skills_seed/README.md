@@ -9,7 +9,10 @@ loop has run.
 ## Install
 
 ```bash
-cp examples/skills_seed/*.md data/skills/
+# Skill files only — never copy this README, it has no frontmatter
+# and would land as a junk "untitled" skill in the registry.
+find examples/skills_seed -maxdepth 1 -type f -name '*.md' ! -name 'README.md' \
+    -exec cp {} data/skills/ \;
 ```
 
 After that, builds will pick them up via `BaseAgent.load_skills_for_prompt()`.

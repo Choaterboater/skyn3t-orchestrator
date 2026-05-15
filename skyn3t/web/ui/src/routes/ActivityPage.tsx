@@ -8,10 +8,12 @@ import { api, getAuthToken } from "../api/client";
 // pane fills in immediately even between bursts).
 type SwarmEvent = {
   kind?: string;
-  ts?: number;
+  // backend emits ISO string; legacy clients may have numeric epoch seconds
+  ts?: string | number;
   from?: string;
   to?: string;
   label?: string;
+  event_type?: string;
   meta?: Record<string, any>;
 };
 
@@ -188,8 +190,8 @@ export default function ActivityPage() {
 }
 
 function EventRow({ e }: { e: SwarmEvent }) {
-  const ts = e.ts ? new Date(e.ts * 1000) : null;
-  const color = kindColor(e.kind);
+  const ts = parseEventTs(e.ts);
+  const color = kindColor(e.kind, e.event_type);
   return (
     <li className="px-3 py-2 text-sm hover:bg-bg-3 min-w-0">
       <div className="flex items-baseline gap-3 min-w-0">
@@ -324,21 +326,53 @@ function ConnBadge({ connected }: { connected: boolean }) {
   );
 }
 
-function kindColor(kind: string | undefined): string {
+function parseEventTs(ts: unknown): Date | null {
+  if (ts == null) return null;
+  if (typeof ts === "number") {
+    // legacy epoch-seconds; multiply to ms
+    const d = new Date(ts * 1000);
+    return isNaN(d.getTime()) ? null : d;
+  }
+  if (typeof ts === "string") {
+    const d = new Date(ts);
+    return isNaN(d.getTime()) ? null : d;
+  }
+  return null;
+}
+
+function kindColor(kind: string | undefined, eventType?: string | undefined): string {
+  // Server kinds: thought, message, learning, rag, task, stage, ingest, convo, project.
+  // Success/failure coloring is derived from the underlying event_type name
+  // because the kind alone is too coarse (e.g. both TASK_COMPLETED and
+  // TASK_FAILED share kind="task").
+  const et = (eventType || "").toUpperCase();
+  if (
+    et.endsWith("_FAILED") ||
+    et.endsWith("_FAILED_FINAL") ||
+    et === "ERROR"
+  ) {
+    return "bg-status-red/20 text-status-red border-status-red/30";
+  }
+  if (
+    et.endsWith("_COMPLETED") ||
+    et === "INGEST_COMPLETE" ||
+    et === "PIPELINE_COMPLETED"
+  ) {
+    return "bg-status-green/20 text-status-green border-status-green/30";
+  }
   switch (kind) {
-    case "task_completed":
-    case "stage_completed":
-    case "build_passed":
-      return "bg-status-green/20 text-status-green border-status-green/30";
-    case "task_failed":
-    case "stage_failed":
-    case "build_failed":
-    case "error":
-      return "bg-status-red/20 text-status-red border-status-red/30";
-    case "task_started":
-    case "stage_started":
-    case "agent_message":
+    case "task":
+    case "stage":
+    case "message":
+    case "convo":
       return "bg-accent-soft text-accent border-accent-line";
+    case "thought":
+    case "learning":
+    case "rag":
+      return "bg-status-yellow/20 text-status-yellow border-status-yellow/30";
+    case "ingest":
+    case "project":
+      return "bg-bg-3 text-text-primary border-border";
     default:
       return "bg-bg-3 text-text-dim border-border";
   }

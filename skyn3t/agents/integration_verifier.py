@@ -316,7 +316,12 @@ class IntegrationContractVerifierAgent(BaseAgent):
         # Frontend detection: look for src/ with JSX/TSX, or any HTML/JS entry.
         for fe_dir in (scaffold_dir / "src", scaffold_dir / "app", scaffold_dir):
             if fe_dir.is_dir():
-                has_jsx = any(fe_dir.rglob(p) for p in ("*.jsx", "*.tsx", "*.js", "*.ts"))
+                # rglob() returns a generator (always truthy); take the
+                # first hit to actually verify a JSX/TS file exists.
+                has_jsx = any(
+                    next(fe_dir.rglob(p), None) is not None
+                    for p in ("*.jsx", "*.tsx", "*.js", "*.ts")
+                )
                 has_html = list(scaffold_dir.glob("index.html"))
                 if has_jsx or has_html:
                     probe.frontend_dir = fe_dir if fe_dir != scaffold_dir else scaffold_dir

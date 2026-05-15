@@ -137,13 +137,27 @@ function AgentTableRow({
   onChanged: () => void;
   usage?: { total_tokens: number; calls: number };
 }) {
+  const warnIfPersistFailed = (action: string, res: { persisted?: boolean; persist_error?: string } | undefined) => {
+    if (res && res.persisted === false) {
+      console.warn(
+        `Agent ${a.name}: ${action} succeeded in-memory but persistence failed: ` +
+          (res.persist_error ?? "(no detail)"),
+      );
+    }
+  };
   const enable = useMutation({
     mutationFn: () => api.enableAgent(a.name),
-    onSuccess: onChanged,
+    onSuccess: (res) => {
+      warnIfPersistFailed("enable", res);
+      onChanged();
+    },
   });
   const disable = useMutation({
     mutationFn: () => api.disableAgent(a.name),
-    onSuccess: onChanged,
+    onSuccess: (res) => {
+      warnIfPersistFailed("disable", res);
+      onChanged();
+    },
   });
   return (
     <tr
@@ -236,7 +250,15 @@ function AgentEditDrawer({
   const save = useMutation({
     mutationFn: (patch: Record<string, unknown>) =>
       api.patchAgentConfig(name, patch),
-    onSuccess: () => {
+    onSuccess: (res) => {
+      if (res && res.persisted === false) {
+        // Persistence failed but the in-memory change succeeded. Surface
+        // it so operators know the config will revert on restart.
+        console.warn(
+          `Agent ${name}: in-memory updated but persistence failed: ` +
+            (res.persist_error ?? "(no detail)"),
+        );
+      }
       onChanged();
       refetch();
     },
@@ -244,7 +266,26 @@ function AgentEditDrawer({
 
   const del = useMutation({
     mutationFn: () => api.deleteAgent(name),
-    onSuccess: () => {
+    onSuccess: (res) => {
+      const failedSteps = res?.errors ?? [];
+      const cleanup = res?.cleanup ?? {};
+      const partialFailures = Object.entries(cleanup)
+        .filter(([, ok]) => ok === false)
+        .map(([step]) => step);
+      if (failedSteps.length || partialFailures.length) {
+        // Partial delete — the agent may be gone from memory but not
+        // from the spec store, override file, or registry. Tell the
+        // operator so they can re-run or fix the underlying cause.
+        const detail = [
+          ...partialFailures.map((s) => `${s} cleanup failed`),
+          ...failedSteps,
+        ].join("; ");
+        console.warn(`Agent ${name}: partial delete — ${detail}`);
+        alert(
+          `Agent "${name}" was partially deleted.\n\n${detail}\n\n` +
+            "Some on-disk state may remain. Check server logs.",
+        );
+      }
       onChanged();
       onClose();
     },

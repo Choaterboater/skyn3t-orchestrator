@@ -194,7 +194,13 @@ class SkillLibrary:
             entries = sorted(self.root.glob("*.md"))
         except Exception:
             return out
+        # Documentation files in the skills dir aren't skills; they
+        # have no frontmatter and would otherwise land as untitled
+        # records that clutter the registry and confuse the curator.
+        _skip_names = {"README.md", "readme.md", "INDEX.md", "index.md"}
         for p in entries:
+            if p.name in _skip_names:
+                continue
             try:
                 text = p.read_text(encoding="utf-8")
             except Exception:

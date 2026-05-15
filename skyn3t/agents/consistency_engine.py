@@ -292,13 +292,41 @@ def _scan_for_hallucinations(scaffold_dir: Path, allowed_services: Set[str]) -> 
     if not allowed_services:
         return issues
 
-    # Known service words to scan for (case-insensitive)
-    service_words = {
-        "plex", "jellyfin", "emby", "sonarr", "radarr", "prowlarr",
-        "qbittorrent", "transmission", "nzbget", "sabnzbd", "sonos",
-        "docker", "home assistant", "home-assistant", "pihole", "pi-hole",
-        "unifi", "overseerr", "tautulli",
+    # Known service words to scan for (case-insensitive). Some have
+    # display/slug variants that must all map to the same canonical id
+    # so we don't flag "Home Assistant" as a hallucination when the
+    # brief allowed "home_assistant".
+    service_aliases: Dict[str, set[str]] = {
+        "plex": {"plex"},
+        "jellyfin": {"jellyfin"},
+        "emby": {"emby"},
+        "sonarr": {"sonarr"},
+        "radarr": {"radarr"},
+        "prowlarr": {"prowlarr"},
+        "qbittorrent": {"qbittorrent"},
+        "transmission": {"transmission"},
+        "nzbget": {"nzbget"},
+        "sabnzbd": {"sabnzbd"},
+        "sonos": {"sonos"},
+        "docker": {"docker"},
+        "home_assistant": {"home_assistant", "home assistant", "home-assistant"},
+        "pihole": {"pihole", "pi-hole", "pi hole"},
+        "unifi": {"unifi"},
+        "overseerr": {"overseerr"},
+        "tautulli": {"tautulli"},
     }
+    # Lowercase the caller-allowed set and expand it through the alias
+    # map so callers can pass either slug or display form.
+    allowed_normalized: set[str] = set()
+    for svc in allowed_services:
+        lowered = svc.lower()
+        for canonical, aliases in service_aliases.items():
+            if lowered == canonical or lowered in aliases:
+                allowed_normalized.add(canonical)
+                break
+        else:
+            allowed_normalized.add(lowered)
+
     for path in scaffold_dir.rglob("*"):
         if path.is_dir():
             continue
@@ -308,24 +336,43 @@ def _scan_for_hallucinations(scaffold_dir: Path, allowed_services: Set[str]) -> 
             text = path.read_text(encoding="utf-8").lower()
         except (OSError, UnicodeDecodeError):
             continue
-        for word in service_words:
-            if word not in allowed_services and word in text:
-                # Avoid false positives: only flag if the word appears as a
-                # standalone token (not inside another word like "complex").
+        # Scan each canonical service. A canonical is "mentioned" if
+        # ANY of its aliases appears as a standalone token. It's a
+        # hallucination only when the canonical isn't in the allowed
+        # set.
+        for canonical, aliases in service_aliases.items():
+            if canonical in allowed_normalized:
+                continue
+            matched_word: Optional[str] = None
+            for word in aliases:
+                if word not in text:
+                    continue
+                # Avoid false positives: only flag if the word appears
+                # as a standalone token (not inside another word like
+                # "complex").
                 pattern = r"\b" + re.escape(word) + r"\b"
                 if re.search(pattern, text):
-                    rel = path.relative_to(scaffold_dir).as_posix()
-                    issues.append(
-                        ConsistencyIssue(
-                            severity="warning",
-                            category="hallucination",
-                            file=rel,
-                            message=f"Mentions '{word}' which is not in the brief's requested services.",
-                            suggestion=f"Remove references to {word} or add it to the service registry.",
-                        )
-                    )
-                    # Only report once per file per word
+                    matched_word = word
                     break
+            if matched_word is None:
+                continue
+            rel = path.relative_to(scaffold_dir).as_posix()
+            issues.append(
+                ConsistencyIssue(
+                    severity="warning",
+                    category="hallucination",
+                    file=rel,
+                    message=(
+                        f"Mentions '{matched_word}' which is not in the "
+                        f"brief's requested services."
+                    ),
+                    suggestion=(
+                        f"Remove references to {matched_word} or add it "
+                        f"to the service registry."
+                    ),
+                )
+            )
+            # Only report each canonical once per file
     return issues
 
 

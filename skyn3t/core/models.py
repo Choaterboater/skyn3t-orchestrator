@@ -163,6 +163,38 @@ async def init_db() -> None:
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_ensure_added_columns)
+
+
+def _ensure_added_columns(sync_conn) -> None:
+    """Add columns introduced on existing databases.
+
+    ``Base.metadata.create_all`` is a no-op for tables that already
+    exist — it never issues ``ALTER TABLE``. So when we add a column
+    to an existing model (e.g. ``agents.role`` / ``reports_to`` /
+    ``lifecycle``), pre-existing databases keep their old schema and
+    queries against the new column fail with ``OperationalError``.
+
+    This runs lightweight, idempotent ``ALTER TABLE ... ADD COLUMN``
+    statements for columns that have been added since the original
+    schema. New entries should be appended below, never removed.
+    """
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(sync_conn)
+    added_columns: list[tuple[str, str, str]] = [
+        # (table, column, "column_type default_clause")
+        ("agents", "role", "VARCHAR(100) NULL"),
+        ("agents", "reports_to", "VARCHAR(255) NULL"),
+        ("agents", "lifecycle", "VARCHAR(20) NULL DEFAULT 'manual'"),
+    ]
+    for table, column, decl in added_columns:
+        if not inspector.has_table(table):
+            continue
+        existing = {c["name"] for c in inspector.get_columns(table)}
+        if column in existing:
+            continue
+        sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {decl}"))
 
 
 @asynccontextmanager

@@ -70,6 +70,23 @@ def test_normal_content_length_passes_size_check():
     assert response.status_code != 413
 
 
+# ─── 2b. Chunked / no-Content-Length oversized body → 413 ────────────
+def test_chunked_oversized_body_returns_413():
+    """Without a Content-Length header, the middleware must still cap
+    the streamed body size — otherwise a malicious chunked POST can
+    push unlimited bytes through."""
+    client = TestClient(web_app.app)
+    oversized = b"x" * (web_app.MAX_REQUEST_BODY_BYTES + 1024)
+    # TestClient's stream chunks the body and omits Content-Length.
+    response = client.post(
+        "/api/proposals/feature",
+        content=iter([oversized]),
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert response.status_code == 413
+    assert "too large" in response.json()["error"]
+
+
 # ─── 3. Security headers on root ─────────────────────────────────────
 def test_root_returns_security_headers():
     client = TestClient(web_app.app)

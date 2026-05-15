@@ -246,35 +246,62 @@ class MemoryStore:
                 )
                 tasks = [self._task_to_dict(t) for t in sql_result.scalars().all()]
             except Exception:
-                fallback = await session.execute(
+                task_fallback_result = await session.execute(
                     select(TaskModel).order_by(desc(TaskModel.created_at)).limit(1000)
                 )
-                for t in fallback.scalars().all():
+                for t in task_fallback_result.scalars().all():
                     sid = t.input_data.get("_meta", {}).get("session_id") if t.input_data else None
                     if sid == session_id:
                         tasks.append(self._task_to_dict(t))
                         if len(tasks) >= limit:
                             break
 
-            # Also get messages
-            msg_result = await session.execute(
-                select(MessageModel)
-                .where(MessageModel.context.contains({"session_id": session_id}))
-                .order_by(desc(MessageModel.created_at))
-                .limit(limit)
-            )
-            messages = [
-                {
-                    "id": m.id,
-                    "source_agent": m.source_agent,
-                    "target_agent": m.target_agent,
-                    "content": m.content,
-                    "message_type": m.message_type,
-                    "context": m.context,
-                    "created_at": m.created_at.isoformat(),
-                }
-                for m in msg_result.scalars().all()
-            ]
+            # Also get messages. ``context.contains()`` works on
+            # PostgreSQL JSONB but is fragile on SQLite's JSON1 backend
+            # — fall back to a bounded Python-side scan whenever the
+            # SQL-level filter errors or yields nothing.
+            messages: List[Dict[str, Any]] = []
+            try:
+                msg_result = await session.execute(
+                    select(MessageModel)
+                    .where(MessageModel.context.contains({"session_id": session_id}))
+                    .order_by(desc(MessageModel.created_at))
+                    .limit(limit)
+                )
+                messages = [
+                    {
+                        "id": m.id,
+                        "source_agent": m.source_agent,
+                        "target_agent": m.target_agent,
+                        "content": m.content,
+                        "message_type": m.message_type,
+                        "context": m.context,
+                        "created_at": m.created_at.isoformat(),
+                    }
+                    for m in msg_result.scalars().all()
+                ]
+            except Exception:
+                messages = []
+            if not messages:
+                message_fallback_result = await session.execute(
+                    select(MessageModel)
+                    .order_by(desc(MessageModel.created_at))
+                    .limit(1000)
+                )
+                for m in message_fallback_result.scalars().all():
+                    ctx = m.context or {}
+                    if isinstance(ctx, dict) and ctx.get("session_id") == session_id:
+                        messages.append({
+                            "id": m.id,
+                            "source_agent": m.source_agent,
+                            "target_agent": m.target_agent,
+                            "content": m.content,
+                            "message_type": m.message_type,
+                            "context": m.context,
+                            "created_at": m.created_at.isoformat(),
+                        })
+                        if len(messages) >= limit:
+                            break
 
             # Merge and sort by created_at
             combined = [{"type": "task", **t} for t in tasks[:limit]]
@@ -308,10 +335,21 @@ class MemoryStore:
 
     async def save_message(self, source_agent: str, target_agent: Optional[str],
                            content: str, message_type: str = "chat",
-                           context: Optional[Dict[str, Any]] = None) -> str:
-        """Save an inter-agent message."""
+                           context: Optional[Dict[str, Any]] = None,
+                           session_id: Optional[str] = None) -> str:
+        """Save an inter-agent message.
+
+        ``session_id`` is hoisted into the stored ``context`` so
+        ``get_recent_context(session_id=...)`` can find the message
+        later. Without this hoist, callers that pass only
+        ``context=None`` (or context without a session_id) make
+        session-scoped recall return zero rows.
+        """
         from uuid import uuid4
         msg_id = str(uuid4())
+        merged_context: Dict[str, Any] = dict(context or {})
+        if session_id and "session_id" not in merged_context:
+            merged_context["session_id"] = session_id
         async with self._lock:
             async with await self._session() as session:
                 async with session.begin():
@@ -321,7 +359,7 @@ class MemoryStore:
                         target_agent=target_agent,
                         content=content,
                         message_type=message_type,
-                        context=context or {},
+                        context=merged_context,
                     ))
         return msg_id
 
