@@ -162,7 +162,7 @@ def install_handlers(orchestrator) -> None:
             else:
                 input_data["mode"] = "search"
                 input_data["query"] = topic
-            req = TaskRequest(title=f"approved ingest: {topic or repo}", input_data=input_data)
+            req = TaskRequest(title=f"approved ingest: {topic or repo or 'unspecified'}", input_data=input_data)
             result = await ingestor.execute(req)
             ok = bool(getattr(result, "success", False))
             out = getattr(result, "output", {}) or {}
