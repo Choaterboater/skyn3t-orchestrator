@@ -154,7 +154,7 @@ def install_handlers(orchestrator) -> None:
                 return {"ok": False, "error": "github_ingestor agent not registered"}
             from skyn3t.core.agent import TaskRequest
             input_data: Dict[str, Any] = {
-                "max_files": max(1, int(payload.get("limit", 5))),
+                "max_files": max(1, int(payload.get("limit") or 5)),
             }
             if repo:
                 input_data["mode"] = "single_repo"
