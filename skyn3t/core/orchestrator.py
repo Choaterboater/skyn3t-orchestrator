@@ -536,14 +536,15 @@ class Orchestrator:
             for cap_name in capabilities:
                 agent.add_capability(AgentCapability(name=cap_name, description=cap_name))
 
-        if hasattr(agent, "initialize"):
-            try:
-                init = agent.initialize()
-                if inspect.iscoroutine(init):
-                    await init
-            except Exception:
-                logger.exception("spawn_subordinate: initialize failed for %s", name)
-                return None
+        # Use start() rather than bare initialize(): an auto-spawned agent
+        # needs its task-processing loop running, otherwise tasks submitted
+        # via delegate_task sit in the queue indefinitely. start() runs
+        # initialize() then kicks off the loop.
+        try:
+            await agent.start()
+        except Exception:
+            logger.exception("spawn_subordinate: start failed for %s", name)
+            return None
 
         self.register_agent(agent)
         logger.info("spawn_subordinate: %s (%s) reporting to %s", name, agent_type, manager_name)
