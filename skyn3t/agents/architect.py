@@ -129,18 +129,41 @@ class ArchitectAgent(BaseAgent):
         await self.think(f"selected stack profile '{target}'")
 
         # STEP 0: try LLM for architecture.md, fall back to deterministic template.
+        # The previous prompt let the LLM over-promise (AES-256-GCM
+        # encryption, node-cron schedulers, Next.js + Hono — none of
+        # which CodeAgent actually shipped). Result: every canary's
+        # reviewer LLM correctly flagged the drift and deducted ~10–20
+        # points. This prompt now forbids over-promising and pins the
+        # architect to what's in the chosen stack template.
+        _stack_picks = ", ".join(
+            f"{k}={v}" for k, v in stack.items() if v
+        )
         arch_role_prompt = (
-            "You are a senior software architect. Given the user's brief, produce a "
-            "concise markdown architecture document with these sections (## headings):\n"
+            "You are a senior software architect writing an architecture doc that "
+            "the CodeAgent will implement verbatim. CodeAgent ships exactly what's "
+            "in the chosen stack template — nothing more. So this document MUST be "
+            "honest about scope.\n\n"
+            "Stack the swarm will actually build with:\n"
+            f"  {_stack_picks}\n\n"
+            "Produce markdown with these sections (## headings):\n"
             "- Overview (2-3 sentences)\n"
             "- Components (bullet list of services/modules with one-sentence purpose each)\n"
             "- Data model (key entities and relationships)\n"
             "- APIs (key endpoints if applicable)\n"
-            "- Deployment (suggested infra, focused on what's needed for THIS specific project)\n"
+            "- Deployment (only describe infra that fits the chosen stack)\n"
             "- Risks (3-5 specific risks tied to the brief)\n\n"
-            "Match the brief's actual scope - if it's a static HTML file, don't propose a "
-            "SaaS backend. If it's a marketing campaign, focus on content infrastructure "
-            "not microservices.\n\n"
+            "RULES (non-negotiable — violations cause downstream review failures):\n"
+            "- Do NOT mention frameworks/libraries that aren't in the stack list above. "
+            "If the stack says backend=express, do NOT promise Hono, Fastify, or Nest.\n"
+            "- Do NOT promise features the stack doesn't deliver — no AES-256-GCM "
+            "encryption unless the stack includes crypto, no cron/scheduler unless "
+            "the stack includes a scheduling lib, no auth flow unless the stack lists "
+            "an auth lib.\n"
+            "- If the brief asks for a feature the stack lacks, write `(out of scope "
+            "for this stack)` next to it rather than pretending it ships.\n"
+            "- Match the brief's actual scope — if it's a static HTML file, don't "
+            "propose a SaaS backend. If it's a marketing campaign, focus on content "
+            "infrastructure not microservices.\n\n"
             f"Target profile hint: {target}."
         )
         fallback_arch_md = self._render_architecture_md(brief, target, stack)
@@ -154,9 +177,21 @@ class ArchitectAgent(BaseAgent):
         await self.think(f"wrote {arch_path.name}")
 
         # STEP 0: try LLM for tech_stack.json, fall back to deterministic template.
+        # The LLM picks here MUST match what CodeAgent's stack templates
+        # can actually scaffold — otherwise tech_stack.json becomes a
+        # contract drift source. Constrain to well-known choices.
         stack_role_prompt = (
-            "Given the brief, return a JSON object with keys: frontend, backend, db, infra, ci. "
-            "Pick choices that match the actual scope of the brief. "
+            "Given the brief, return a JSON object with keys: frontend, backend, db, "
+            "infra, ci.\n\n"
+            "ALLOWED VALUES (CodeAgent can only scaffold these):\n"
+            "  frontend: react-vite, react-vite-tailwind, next, vue-vite, vanilla-vite, none\n"
+            "  backend:  express, hono-node, fastify, fastapi, flask, none\n"
+            "  db:       better-sqlite3, postgres, mongodb, none\n"
+            "  infra:    local-node, docker-compose, vercel, fly, none\n"
+            "  ci:       github-actions, none\n\n"
+            "Pick choices that match the actual scope of the brief. If the brief "
+            "doesn't need a DB or backend, return 'none' for that slot — do NOT "
+            "invent values outside the allowed list.\n\n"
             "Return ONLY valid JSON, nothing else. No code fences, no commentary."
         )
         llm_stack = await self._llm_generate_json(

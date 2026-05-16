@@ -389,6 +389,67 @@ def test_contract_no_drift_when_architecture_matches_scaffold(tmp_path: Path) ->
     assert not drift
 
 
+def test_contract_drift_blocks_when_package_declared_but_not_imported(
+    tmp_path: Path,
+) -> None:
+    """canary-115 pattern: architecture.md promises Next.js + better-sqlite3,
+    package.json declares both, but no source file imports them. The drift
+    check must catch this — declared-but-unused is the same lie as missing.
+    """
+    artifact = tmp_path
+    scaffold = artifact / "scaffold"
+    _write(
+        artifact / "architecture.md",
+        "## Stack\n\nNext.js 14 App Router with better-sqlite3 persistence.\n",
+    )
+    _write(
+        scaffold / "package.json",
+        json.dumps({"dependencies": {
+            "next": "^14",
+            "react": "^18",
+            "better-sqlite3": "^11",
+        }}),
+    )
+    # Scaffold ships a Vite app instead — no Next.js routes, no sqlite usage.
+    _write(scaffold / "src" / "App.jsx", "export default function App(){return <div/>}\n")
+    _write(scaffold / "vite.config.js", "export default {};\n")
+
+    report = check_contract(scaffold, brief="", artifact_dir=artifact)
+    drift = [f for f in report.findings if f.category == "architecture_drift"]
+    keywords = {f.fix_hint.get("keyword", "") for f in drift}
+    assert "nextjs" in keywords, f"expected nextjs drift, got {keywords}"
+    assert "better-sqlite3" in keywords, f"expected sqlite drift, got {keywords}"
+    # The fix_hint should distinguish declared-but-unused from missing —
+    # downstream regen prompts read differently for the two cases.
+    next_drift = [f for f in drift if f.fix_hint.get("keyword") == "nextjs"][0]
+    assert next_drift.fix_hint.get("package_declared") is True
+    assert next_drift.fix_hint.get("import_present") is False
+    assert "but no source file imports" in next_drift.message
+
+
+def test_contract_drift_passes_when_package_declared_and_imported(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path
+    scaffold = artifact / "scaffold"
+    _write(
+        artifact / "architecture.md",
+        "## Stack\n\nUses better-sqlite3 for persistence.\n",
+    )
+    _write(
+        scaffold / "server" / "package.json",
+        json.dumps({"dependencies": {"better-sqlite3": "^11"}}),
+    )
+    _write(
+        scaffold / "server" / "db.js",
+        "import Database from 'better-sqlite3';\nconst db = new Database('app.db');\n",
+    )
+
+    report = check_contract(scaffold, brief="", artifact_dir=artifact)
+    drift = [f for f in report.findings if f.category == "architecture_drift"]
+    assert not drift, f"unexpected drift findings: {[f.fix_hint for f in drift]}"
+
+
 def test_contract_drift_skips_rejected_alternatives(tmp_path: Path) -> None:
     """Sentences like 'we considered Next.js but chose Vite' should not
     fire a drift blocker — the architecture doc is naming an alternative,

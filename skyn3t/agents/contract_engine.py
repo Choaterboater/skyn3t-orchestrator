@@ -105,27 +105,62 @@ _HEX_RE = re.compile(r"#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b")
 # tech_stack.json roles we map. ``infra``/``ci`` carry no npm contract.
 _TECH_STACK_ROLES: Tuple[str, ...] = ("frontend", "backend", "db")
 
-# Architecture-mention keyword tuple -> required npm package fragments.
-# Used by _check_architecture_drift: if architecture.md uses any keyword
-# in the tuple, scaffold's package.json must declare at least one of the
-# listed packages. Tuned for the patterns that drift in canary runs.
-ARCHITECTURE_TECH_MAP: List[Tuple[Tuple[str, ...], List[str]]] = [
-    # framework mismatches that score-bombed canary-113
-    ((r"\bnext\.?js\b", r"\bapp router\b"), ["next"]),
-    ((r"\bhono\b",), ["hono", "@hono/node-server"]),
-    ((r"\bfastify\b",), ["fastify"]),
-    ((r"\bnestjs\b", r"\bnest\.js\b"), ["@nestjs/core"]),
-    ((r"\bsveltekit\b", r"\bsvelte ?kit\b"), ["@sveltejs/kit"]),
+# Architecture-mention keyword tuple -> (required npm package fragments,
+# required source-code import patterns). The second field is what fixes
+# canary-115's false-pass: package.json declared `next` but no `app/`
+# directory or `from "next"` import existed, so the architecture's
+# Next.js claim was a lie. The drift check now verifies both that the
+# package is declared AND that at least one import pattern appears in
+# non-vendor source.
+#
+# Empty import_patterns means "package declaration is sufficient" — use
+# this when the dep doesn't have a recognizable import shape (e.g. CSS-
+# only deps).
+ARCHITECTURE_TECH_MAP: List[Tuple[Tuple[str, ...], List[str], List[str]]] = [
+    # framework mismatches
+    ((r"\bnext\.?js\b", r"\bapp router\b"),
+     ["next"],
+     [r"from\s+['\"]next/", r"import\s+.*\s+from\s+['\"]next['\"]"]),
+    ((r"\bhono\b",),
+     ["hono", "@hono/node-server"],
+     [r"from\s+['\"]hono['\"]", r"new\s+Hono\s*\("]),
+    ((r"\bfastify\b",),
+     ["fastify"],
+     [r"require\s*\(\s*['\"]fastify['\"]", r"from\s+['\"]fastify['\"]"]),
+    ((r"\bnestjs\b", r"\bnest\.js\b"),
+     ["@nestjs/core"],
+     [r"from\s+['\"]@nestjs/"]),
+    ((r"\bsveltekit\b", r"\bsvelte ?kit\b"),
+     ["@sveltejs/kit"],
+     [r"from\s+['\"]@sveltejs/kit['\"]"]),
     # databases
-    ((r"\bbetter-?sqlite3?\b",), ["better-sqlite3"]),
-    ((r"\bprisma\b",), ["@prisma/client", "prisma"]),
-    ((r"\bdrizzle\b",), ["drizzle-orm"]),
-    ((r"\bpostgres(?:ql)?\b", r"\bpg\b"), ["pg", "postgres", "@vercel/postgres"]),
-    ((r"\bmongodb\b", r"\bmongoose\b"), ["mongodb", "mongoose"]),
-    # scheduling / crypto layers that architecture often promises but
-    # scaffold quietly drops
-    ((r"\bnode-cron\b", r"\bcron jobs?\b"), ["node-cron", "croner", "agenda"]),
-    ((r"\baes-?256-?gcm\b", r"\benvelope encryption\b"), ["crypto", "node:crypto"]),
+    ((r"\bbetter-?sqlite3?\b",),
+     ["better-sqlite3"],
+     [r"require\s*\(\s*['\"]better-sqlite3['\"]", r"from\s+['\"]better-sqlite3['\"]"]),
+    ((r"\bprisma\b",),
+     ["@prisma/client", "prisma"],
+     [r"from\s+['\"]@prisma/client['\"]", r"new\s+PrismaClient\s*\("]),
+    ((r"\bdrizzle\b",),
+     ["drizzle-orm"],
+     [r"from\s+['\"]drizzle-orm"]),
+    ((r"\bpostgres(?:ql)?\b", r"\bpg\b"),
+     ["pg", "postgres", "@vercel/postgres"],
+     [r"require\s*\(\s*['\"]pg['\"]", r"from\s+['\"]pg['\"]", r"from\s+['\"]postgres['\"]"]),
+    ((r"\bmongodb\b", r"\bmongoose\b"),
+     ["mongodb", "mongoose"],
+     [r"from\s+['\"]mongoose['\"]", r"require\s*\(\s*['\"]mongodb['\"]"]),
+    # scheduling — architecture promises cron but scaffold rarely ships it
+    ((r"\bnode-cron\b", r"\bcron jobs?\b"),
+     ["node-cron", "croner", "agenda"],
+     [r"require\s*\(\s*['\"]node-cron['\"]", r"from\s+['\"]node-cron['\"]",
+      r"from\s+['\"]croner['\"]", r"new\s+Agenda\s*\("]),
+    # AES-256-GCM is a stdlib feature, but architecture promises it
+    # specifically — check for the actual call shape, not just `crypto`
+    # (every node project imports crypto somewhere).
+    ((r"\baes-?256-?gcm\b", r"\benvelope encryption\b"),
+     ["crypto", "node:crypto"],
+     [r"createCipheriv\s*\(\s*['\"]aes-256-gcm",
+      r"createDecipheriv\s*\(\s*['\"]aes-256-gcm"]),
 ]
 
 # tech-stack name -> npm-package fragments. Match rule: at least one
@@ -541,46 +576,102 @@ def _check_architecture_drift(scaffold_dir: Path, artifact_dir: Path) -> List[Co
     pruned = " ".join(kept).lower()
 
     declared_deps = _read_package_deps(scaffold_dir)
+    source_blob = _scaffold_source_blob(scaffold_dir)
     seen: Set[str] = set()
-    for keyword_patterns, expected_packages in ARCHITECTURE_TECH_MAP:
+    for keyword_patterns, expected_packages, import_patterns in ARCHITECTURE_TECH_MAP:
         if not any(re.search(kw, pruned, re.IGNORECASE) for kw in keyword_patterns):
             continue
-        if any(pkg in declared_deps for pkg in expected_packages):
+
+        package_declared = any(pkg in declared_deps for pkg in expected_packages)
+        import_present = (
+            not import_patterns  # no import patterns means declaration suffices
+            or any(re.search(p, source_blob) for p in import_patterns)
+        )
+
+        if package_declared and import_present:
             continue
-        # Use the first keyword pattern as the human label. Strip regex
-        # metachars including word boundaries (\b) before display so we
-        # don't show "bnextjsb" — that confused the auto-fix prompt and
-        # made the regen instructions read awkwardly.
+
+        # Clean label for human-facing messages.
         label = keyword_patterns[0]
-        label = re.sub(r"\\b", "", label)              # drop word boundaries
-        label = re.sub(r"[\\$^.*+?|()]", "", label)    # drop other regex chars
+        label = re.sub(r"\\b", "", label)
+        label = re.sub(r"[\\$^.*+?|()]", "", label)
         label = re.sub(r"\s+", " ", label).strip()
         if label in seen:
             continue
         seen.add(label)
+
         target_pkg = _package_json_for_role(
             scaffold_dir, "backend" if "server" in str(arch_path).lower() else "frontend"
         )
+
+        # Tailor the message to which gate failed — package missing,
+        # vs declared-but-unused (the canary-115 false-pass case).
+        if not package_declared:
+            message = (
+                f"architecture.md describes {label!r} but no package.json "
+                f"includes any of: {', '.join(expected_packages)}. The "
+                "scaffold doesn't match its own architecture doc."
+            )
+            suggestion = (
+                f"Either add one of {expected_packages} to {target_pkg}, "
+                f"or revise architecture.md to drop the {label!r} claim."
+            )
+        else:
+            message = (
+                f"architecture.md describes {label!r} and package.json "
+                f"declares it, but no source file imports/uses it. The "
+                "dep is dead weight; the feature is unbuilt."
+            )
+            suggestion = (
+                f"Either add real {label!r} usage (one of the import "
+                "shapes the swarm expects) to the scaffold, or revise "
+                "architecture.md to drop the claim."
+            )
+
         findings.append(ContractFinding(
             severity="blocker",
             category="architecture_drift",
             file=target_pkg,
-            message=(
-                f"architecture.md describes {label!r} but no package.json "
-                f"includes any of: {', '.join(expected_packages)}. The "
-                "scaffold doesn't match its own architecture doc."
-            ),
-            suggestion=(
-                f"Either add one of {expected_packages} to {target_pkg}, "
-                f"or revise architecture.md to drop the {label!r} "
-                "claim if the swarm chose differently."
-            ),
+            message=message,
+            suggestion=suggestion,
             fix_hint={
                 "keyword": label,
                 "expected_packages": expected_packages,
+                "expected_import_patterns": import_patterns,
+                "package_declared": package_declared,
+                "import_present": import_present,
             },
         ))
     return findings
+
+
+def _scaffold_source_blob(scaffold_dir: Path) -> str:
+    """Concatenate non-vendor source for grep checks.
+
+    Skips _SKIP_DIRS so vendor crypto/dotenv code can't make AES-256-GCM
+    checks falsely pass (canary-115 pattern). Caps total size at 2 MB to
+    keep regex fast.
+    """
+    chunks: List[str] = []
+    total = 0
+    code_suffixes = {
+        ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+        ".py", ".rb", ".go", ".rs", ".java",
+        ".html", ".vue", ".svelte",
+    }
+    for _rel, path in _iter_files(scaffold_dir, suffixes=code_suffixes):
+        try:
+            size = path.stat().st_size
+            if size > 256 * 1024:
+                continue
+            if total + size > 2 * 1024 * 1024:
+                break
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        chunks.append(text)
+        total += size
+    return "\n".join(chunks)
 
 
 # ---------------------------------------------------------------------
