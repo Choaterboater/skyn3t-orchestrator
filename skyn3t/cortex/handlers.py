@@ -166,7 +166,7 @@ def install_handlers(orchestrator) -> None:
             result = await ingestor.execute(req)
             ok = bool(getattr(result, "success", False))
             out = getattr(result, "output", {}) or {}
-            return {"ok": ok, "ingested": len(out.get("ingested", [])),
+            return {"ok": ok, "ingested": len(out.get("ingested", []) or []),
                     "summary": out.get("summary", "")}
         except Exception as e:
             logger.exception("ingest_handler failed")
