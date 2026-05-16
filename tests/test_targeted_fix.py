@@ -74,6 +74,20 @@ def test_parse_build_errors_not_exported_by():
     assert any(i.path == "src/hooks/useConfig.js" for i in issues)
 
 
+def test_parse_build_errors_node_named_export_mismatch_uses_scaffold_relative_path():
+    stderr = (
+        "file:///tmp/demo/scaffold/server/routes/config.js:2\n"
+        'import { get } from "../config-store.js";\n'
+        "         ^^^\n"
+        "SyntaxError: The requested module '../config-store.js' does not provide "
+        "an export named 'get'\n"
+    )
+    issues = _parse_build_errors(stderr, "")
+    assert len(issues) >= 1
+    assert any(i.path == "server/config-store.js" for i in issues)
+    assert any(i.error_message == "Missing export: get" for i in issues)
+
+
 def test_parse_build_errors_dedups_same_path_and_action():
     stderr = (
         "src/App.jsx:1:1: error: foo\n"
@@ -306,3 +320,96 @@ def test_apply_targeted_fix_rejects_empty_path(tmp_path: Path):
     result = asyncio.run(apply_targeted_fix(scaffold_dir=scaffold, issues=issues))
     assert result.files_created == []
     assert any(result.errors)
+
+
+def test_apply_targeted_fix_preserves_existing_file_for_build_invalid_output(tmp_path: Path):
+    scaffold = tmp_path / "scaffold"
+    (scaffold / "src").mkdir(parents=True)
+    target = scaffold / "src" / "App.jsx"
+    target.write_text("export default function App() { return <div>ok</div>; }\n")
+
+    class FakeLLM:
+        async def complete(self, prompt: str, max_tokens: int, temperature: float) -> str:  # noqa: ARG002
+            return "export default const App = () => <div>broken</div>;"
+
+    issues = [
+        FileIssue(
+            path="src/App.jsx",
+            error_message="unexpected build failure",
+            suggested_action="regenerate",
+        )
+    ]
+
+    result = asyncio.run(
+        apply_targeted_fix(scaffold_dir=scaffold, issues=issues, llm_client=FakeLLM())
+    )
+
+    assert "src/App.jsx" not in result.files_created
+    assert "src/App.jsx" not in result.files_changed
+    assert any("Build-invalid regenerated content for src/App.jsx" in e for e in result.errors)
+    assert target.read_text(encoding="utf-8") == "export default function App() { return <div>ok</div>; }\n"
+
+
+def test_apply_targeted_fix_timeout_preserves_existing_file(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from skyn3t.agents import targeted_fix as targeted_fix_module
+
+    scaffold = tmp_path / "scaffold"
+    (scaffold / "src").mkdir(parents=True)
+    target = scaffold / "src" / "App.jsx"
+    target.write_text("export default function App() { return <div>ok</div>; }\n")
+
+    class SlowLLM:
+        async def complete(self, prompt: str, max_tokens: int, temperature: float) -> str:  # noqa: ARG002
+            await asyncio.sleep(0.2)
+            return "export default function App() { return <main>fixed</main>; }\n"
+
+    monkeypatch.setattr(targeted_fix_module, "_regenerate_timeout_for", lambda _existing: 0.05)
+    issues = [
+        FileIssue(
+            path="src/App.jsx",
+            error_message="unexpected build failure",
+            suggested_action="regenerate",
+        )
+    ]
+
+    result = asyncio.run(
+        apply_targeted_fix(scaffold_dir=scaffold, issues=issues, llm_client=SlowLLM())
+    )
+
+    assert "src/App.jsx" not in result.files_created
+    assert "src/App.jsx" not in result.files_changed
+    assert any("Timed out regenerating src/App.jsx" in e for e in result.errors)
+    assert "preserved existing file instead" in result.errors[0]
+    assert target.read_text(encoding="utf-8") == "export default function App() { return <div>ok</div>; }\n"
+
+
+def test_apply_targeted_fix_preserves_existing_file_for_syntax_invalid_output(tmp_path: Path):
+    scaffold = tmp_path / "scaffold"
+    (scaffold / "src").mkdir(parents=True)
+    target = scaffold / "src" / "App.jsx"
+    original = "export default function App() { return <div>ok</div>; }\n"
+    target.write_text(original)
+
+    class FakeLLM:
+        async def complete(self, prompt: str, max_tokens: int, temperature: float) -> str:  # noqa: ARG002
+            return "export default function App() { return <div>broken</div>;\n"
+
+    issues = [
+        FileIssue(
+            path="src/App.jsx",
+            error_message="unexpected build failure",
+            suggested_action="regenerate",
+        )
+    ]
+
+    result = asyncio.run(
+        apply_targeted_fix(scaffold_dir=scaffold, issues=issues, llm_client=FakeLLM())
+    )
+
+    assert "src/App.jsx" not in result.files_created
+    assert "src/App.jsx" not in result.files_changed
+    assert any("Invalid regenerated content for src/App.jsx" in e for e in result.errors)
+    assert target.read_text(encoding="utf-8") == original

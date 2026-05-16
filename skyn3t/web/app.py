@@ -1872,6 +1872,24 @@ async def swarm_snapshot():
 
 
 # ─── Proposals (Cortex) ───
+@app.get("/api/cortex/status")
+async def cortex_status():
+    if orchestrator and hasattr(orchestrator, "get_cortex_status"):
+        return orchestrator.get_cortex_status()
+    from skyn3t.cortex import get_store
+
+    store = get_store()
+    return {
+        "running": False,
+        "booted": False,
+        "components": [],
+        "proposal_handlers": store.registered_handlers(),
+        "proposal_counts": {},
+        "recent_failures": [],
+        "warnings": ["Orchestrator not initialized."],
+    }
+
+
 @app.get("/api/proposals")
 async def proposals_list(status: str | None = None, origin: str | None = None):
     from skyn3t.cortex import get_store
@@ -2351,3 +2369,28 @@ async def cleanup_execute(payload: dict):
 async def studio_project_delete(slug: str):
     from skyn3t.cli.cleanup import delete_project
     return delete_project(slug)
+
+
+# SPA catch-all — must be the last route registered. React Router owns
+# the URL once the SPA loads, but a hard reload (Cmd-Shift-R) makes the
+# browser ask the server for /activity, /studio, /cortex, etc. directly.
+# Without this fallback, FastAPI returns 404 for those paths. The route
+# matches any GET that isn't an API endpoint or a static asset and hands
+# back index.html so the SPA can take over.
+@app.get("/{full_path:path}", response_class=HTMLResponse)
+async def spa_fallback(full_path: str):
+    # Reserved prefixes: anything routed by FastAPI before this catch-all
+    # already matched. We only get here for unknown paths, so just
+    # exclude obvious server-owned namespaces to surface real 404s for
+    # bogus API URLs instead of silently returning HTML.
+    if (
+        full_path.startswith("api/")
+        or full_path.startswith("ws/")
+        or full_path.startswith("assets/")
+        or full_path.startswith("static/")
+    ):
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
+    index = _SPA_DIST / "index.html"
+    if index.exists():
+        return FileResponse(str(index), media_type="text/html")
+    return FileResponse(str(_DASHBOARD_PATH), media_type="text/html")

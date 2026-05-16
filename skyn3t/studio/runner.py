@@ -16,7 +16,7 @@ import re
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from skyn3t.config.settings import get_settings
 from skyn3t.core.agent import AgentCapability, TaskRequest, TaskResult
@@ -37,6 +37,8 @@ from skyn3t.studio.templates import get_template
 
 logger = logging.getLogger("skyn3t.studio")
 
+_BUILD_FIX_LLM_TIMEOUT_SECONDS = 120.0
+
 
 class StackShapeMismatchError(RuntimeError):
     """Raised when post-code stack validation finds inconsistent files.
@@ -45,6 +47,14 @@ class StackShapeMismatchError(RuntimeError):
     outer exception handler distinguishes it from a real crash so the
     user sees an accurate ``next_action`` instead of "runner crashed."
     """
+
+
+class UnresolvedScaffoldStubError(RuntimeError):
+    """Raised when generated TODO stubs remain after the consistency fix pass."""
+
+
+class MissingPlannedFilesError(RuntimeError):
+    """Raised when planned scaffold files are still missing after fix passes."""
 
 
 class StudioRunner:
@@ -379,6 +389,14 @@ class StudioRunner:
                     },
                 )
         except Exception as exc:
+            if isinstance(
+                exc,
+                (StackShapeMismatchError, UnresolvedScaffoldStubError, MissingPlannedFilesError),
+            ):
+                logger.info("studio start exited intentionally for slug=%s: %s", slug, exc)
+                existing = self.get_project(slug)
+                if existing is not None:
+                    return existing
             logger.exception("studio start failed for slug=%s", slug)
             error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-2000:]}"
             self.mark_project_failed(
@@ -552,10 +570,12 @@ class StudioRunner:
                 extra.setdefault("target_file", auto_target)
                 extra.setdefault("rationale", brief)
 
-            # Inject consistency reviewer before the main reviewer stage.
-            # This catches cross-file mismatches (missing features, service
-            # bleed-through, README drift) before the prose reviewer scores
-            # the project, giving the fix loop a chance to repair issues.
+            # Inject contract verifier + consistency reviewer before the
+            # main reviewer stage. Contract runs first (cheap deterministic
+            # palette/tech_stack/placeholder checks); consistency reviewer
+            # runs second (semantic LLM critique on the repaired scaffold);
+            # main reviewer scores last. Each stage's fix loop repairs the
+            # scaffold before the next one re-evaluates it.
             stages = list(template.stages)
             reviewer_idx = None
             for i, s in enumerate(stages):
@@ -571,7 +591,15 @@ class StudioRunner:
                     handoff_to="reviewer",
                     input_extra={},
                 )
+                contract_stage = StageSpec(
+                    name="contract_verifier",
+                    agent="ContractVerifierAgent",
+                    capability="review",
+                    handoff_to="consistency_reviewer",
+                    input_extra={},
+                )
                 stages.insert(reviewer_idx, consistency_stage)
+                stages.insert(reviewer_idx, contract_stage)
 
             execution_profile = self._infer_execution_profile(
                 str(manifest.get("brief_raw") or manifest.get("brief") or brief),
@@ -901,6 +929,165 @@ class StudioRunner:
                     )
                     break
 
+                # Contract verifier fix loop: deterministic
+                # palette/tech_stack/placeholder findings → targeted
+                # regen of the offending files. Runs before the
+                # consistency reviewer so the LLM critique sees the
+                # repaired scaffold.
+                if stage.name == "contract_verifier":
+                    contract_output = output if isinstance(output, dict) else {}
+                    if contract_output.get("verdict") == "needs_fix":
+                        blockers = contract_output.get("blocker_count", 0)
+                        if blockers > 0:
+                            self._append_history(
+                                manifest,
+                                "CONTRACT_VERIFIER_BLOCKERS",
+                                status="running",
+                                message=f"{blockers} blocker(s) found by contract verifier.",
+                            )
+                            try:
+                                from skyn3t.adapters import LLMClient
+                                from skyn3t.agents.targeted_fix import (
+                                    FileIssue,
+                                    apply_targeted_fix,
+                                )
+
+                                import json as _json
+                                report_json = contract_output.get("report_json", "{}")
+                                report = _json.loads(report_json)
+                                findings = report.get("findings", [])
+                                scaffold_dir = artifact_dir / "scaffold"
+
+                                # Group findings by target file. The
+                                # mapping per category mirrors the plan.
+                                merged: Dict[str, Dict[str, Any]] = {}
+                                for f in findings:
+                                    if f.get("severity") != "blocker":
+                                        continue
+                                    category = str(f.get("category") or "")
+                                    raw_file = str(f.get("file") or "")
+                                    fix_hint = f.get("fix_hint") or {}
+                                    base_msg = str(f.get("message") or "")
+
+                                    if category == "palette_schism_css":
+                                        target = raw_file
+                                        palette = fix_hint.get("canonical_palette") or []
+                                        offending = fix_hint.get("offending_hexes") or []
+                                        err = (
+                                            base_msg
+                                            + "\nRewrite this file using ONLY the canonical palette: "
+                                            + ", ".join(palette)
+                                            + ".\nDo NOT introduce any other hex literals. "
+                                            "Preserve all selectors, layout rules, and class names. "
+                                            "Detected unauthorized hex(es): "
+                                            + ", ".join(offending)
+                                            + "."
+                                        )
+                                    elif category == "tech_stack_mismatch":
+                                        target = raw_file
+                                        expected = fix_hint.get("expected_packages") or []
+                                        role = fix_hint.get("role") or ""
+                                        declared = fix_hint.get("declared") or ""
+                                        err = (
+                                            base_msg
+                                            + f"\nAdd one of {expected} to {target} so the manifest "
+                                            "matches the declared tech stack. "
+                                            "Preserve all existing scripts and the name/version/type fields. "
+                                            f"(role={role}, declared={declared})"
+                                        )
+                                    elif category == "architecture_drift":
+                                        target = raw_file
+                                        expected = fix_hint.get("expected_packages") or []
+                                        keyword = fix_hint.get("keyword") or ""
+                                        err = (
+                                            base_msg
+                                            + f"\narchitecture.md mentions {keyword!r}. "
+                                            f"Add one of {expected} to {target} (use a sane semver) "
+                                            "so the scaffold matches the architecture doc. "
+                                            "Preserve all existing scripts and the name/version/type fields."
+                                        )
+                                    elif category == "placeholder_leak":
+                                        target = raw_file
+                                        literal = fix_hint.get("literal") or ""
+                                        err = (
+                                            base_msg
+                                            + f"\nRemove the literal {literal!r} from this file. "
+                                            "Replace with concrete content consistent with the brief: "
+                                            + (brief[:400] if brief else "")
+                                            + ". Preserve overall structure."
+                                        )
+                                    elif category == "missing_feature_evidence":
+                                        target = fix_hint.get("fix_target") or raw_file
+                                        instruction = fix_hint.get("fix_instruction") or ""
+                                        keyword = fix_hint.get("keyword") or ""
+                                        err = (
+                                            base_msg
+                                            + f"\nBrief requires {keyword!r}. {instruction}"
+                                            + "\nDo not remove or rename existing exports/selectors."
+                                        )
+                                    elif category == "cli_prose_leak":
+                                        target = raw_file
+                                        matched = fix_hint.get("matched") or ""
+                                        err = (
+                                            base_msg
+                                            + f"\nThe file begins with LLM tool-call narration "
+                                            f"(matched: {matched!r}). Rewrite the file from scratch "
+                                            "so it contains ONLY the real file content. "
+                                            "Brief context: "
+                                            + (brief[:400] if brief else "")
+                                            + ". No planning chatter, no '● Search', no 'I'm checking'."
+                                        )
+                                    else:
+                                        # Categories not eligible for targeted-fix
+                                        # (e.g. palette_schism_palette which lives
+                                        # outside the scaffold).
+                                        continue
+
+                                    normalized = self._normalize_scaffold_issue_path(
+                                        scaffold_dir, target
+                                    )
+                                    if not normalized:
+                                        logger.warning(
+                                            "Skipping unresolved contract-verifier file entry: %s",
+                                            target,
+                                        )
+                                        continue
+                                    bucket = merged.setdefault(
+                                        normalized,
+                                        {"messages": [], "action": "regenerate"},
+                                    )
+                                    bucket["messages"].append(err)
+
+                                if merged:
+                                    issues = [
+                                        FileIssue(
+                                            path=path,
+                                            error_message="\n\n".join(bucket["messages"])[:2048],
+                                            suggested_action=bucket["action"],
+                                        )
+                                        for path, bucket in merged.items()
+                                    ]
+                                    client = LLMClient(
+                                        event_bus=self.event_bus, caller_name="contract_fix"
+                                    )
+                                    fix_result = await apply_targeted_fix(
+                                        scaffold_dir=scaffold_dir,
+                                        issues=issues,
+                                        llm_client=client,
+                                        brief=brief,
+                                    )
+                                    self._append_history(
+                                        manifest,
+                                        "CONTRACT_FIX_APPLIED",
+                                        status="running",
+                                        message=(
+                                            f"Fixed {len(fix_result.files_changed)} file(s), "
+                                            f"created {len(fix_result.files_created)} placeholder(s)."
+                                        ),
+                                    )
+                            except Exception:
+                                logger.exception("contract verifier fix loop failed")
+
                 # Consistency reviewer fix loop: if blockers found,
                 # apply targeted fixes before the main reviewer runs.
                 if stage.name == "consistency_reviewer":
@@ -929,12 +1116,24 @@ class StudioRunner:
                                 for f in findings:
                                     if f.get("severity") != "blocker":
                                         continue
-                                    fp = f.get("file", "(unknown)")
-                                    if fp.startswith("scaffold/"):
-                                        fp = fp[len("scaffold/"):]
+                                    target_fp = self._consistency_fix_target(
+                                        scaffold_dir=scaffold_dir,
+                                        issue_file=f.get("file", "(unknown)"),
+                                        category=str(f.get("category") or ""),
+                                    )
+                                    normalized_fp = self._normalize_scaffold_issue_path(
+                                        scaffold_dir,
+                                        target_fp,
+                                    )
+                                    if not normalized_fp:
+                                        logger.warning(
+                                            "Skipping unresolved consistency-reviewer file entry: %s",
+                                            f.get("file", "(unknown)"),
+                                        )
+                                        continue
                                     review_issues.append(
                                         FileIssue(
-                                            path=fp,
+                                            path=normalized_fp,
                                             error_message=f.get("message", ""),
                                             suggested_action="regenerate",
                                         )
@@ -967,15 +1166,22 @@ class StudioRunner:
                 # one bounded revision pass. Returns the original
                 # result if the critic says NO_ISSUES, the revision
                 # fails, or the stage is in the skip list.
+                critique_timeout_seconds = self._critique_timeout_for(
+                    stage_name=stage.name,
+                    execution_profile=execution_profile,
+                )
                 try:
-                    revised_result = await self._critique_and_revise(
-                        stage=stage,
-                        agent=agent,
-                        result=result,
-                        artifact_dir=artifact_dir,
-                        brief=brief,
-                        task=task,
-                        manifest=manifest,
+                    revised_result = await asyncio.wait_for(
+                        self._critique_and_revise(
+                            stage=stage,
+                            agent=agent,
+                            result=result,
+                            artifact_dir=artifact_dir,
+                            brief=brief,
+                            task=task,
+                            manifest=manifest,
+                        ),
+                        timeout=critique_timeout_seconds,
                     )
                     if revised_result is not None and revised_result is not result:
                         result = revised_result
@@ -993,6 +1199,22 @@ class StudioRunner:
                                 "agent": stage.agent,
                             },
                         )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "critique window timed out for %s after %.1fs; continuing with original result",
+                        stage.name,
+                        critique_timeout_seconds,
+                    )
+                    self._append_history(
+                        manifest,
+                        "CRITIQUE_FAILED",
+                        status="running",
+                        stage=stage.name,
+                        message=(
+                            f"Critique window timed out after "
+                            f"{critique_timeout_seconds:.0f}s."
+                        ),
+                    )
                 except Exception:
                     logger.exception("critique pass crashed; continuing with original result")
 
@@ -1006,6 +1228,7 @@ class StudioRunner:
                         artifact_dir=artifact_dir,
                         brief=brief,
                         stage_name=stage.name,
+                        stage_output=output if isinstance(output, dict) else None,
                     )
 
                 quality_candidate = self._extract_quality_candidate(
@@ -1075,13 +1298,20 @@ class StudioRunner:
             manifest["current_agent"] = None
             manifest["completed_at"] = time.time()
             manifest["artifacts"] = self._scan_artifacts(artifact_dir)
+            scaffold_dir = artifact_dir / "scaffold"
+            quality_summary = self._normalize_quality_summary(manifest.get("quality_summary"))
+            reviewer_failed = (
+                quality_summary is not None
+                and quality_summary.get("source") == "reviewer"
+                and manifest.get("status") == "failed"
+            )
             # "Docs-only" failure detection: if the user's brief implied code
             # work but every artifact produced was markdown/text, the project
             # ran the wrong shape. Mark it failed so the auto-retry hook
             # spawns a new attempt with a forced code stage. Skip this check
             # when the brief was clearly docs-oriented (write/draft/produce
             # docs-noun) — those projects are expected to produce only docs.
-            if manifest["status"] in {"done", "needs_fixes"}:
+            if manifest["status"] in {"done", "needs_fixes"} and not scaffold_dir.exists():
                 if self._is_docs_only_for_code_brief(brief, manifest["artifacts"]):
                     manifest["status"] = "failed"
                     manifest["error"] = (
@@ -1092,292 +1322,255 @@ class StudioRunner:
                         "Retrying with a code-producing planner."
                     )
                 else:
-                    # If a scaffold dir was produced, run BuildVerifier as a
-                    # post-stage gate. A scaffold that doesn't compile / parse
-                    # is a failure even if every stage reported success — the
-                    # user wants programs that RUN, not just files that exist.
-                    # Verifier failure surfaces a `failure_hint` we attach to
-                    # the manifest so the auto-retry can inject it as a lesson.
-                    scaffold_dir = artifact_dir / "scaffold"
-                    if scaffold_dir.exists() and scaffold_dir.is_dir():
+                    pass
+            # If a scaffold dir was produced, run the verifiers even when the
+            # reviewer marked the run no-go. Reviewer no-go used to short-
+            # circuit the mechanical verifiers, which hid the concrete build /
+            # boot / integration failure that the retry system actually needs.
+            should_run_verifiers = (
+                scaffold_dir.exists()
+                and scaffold_dir.is_dir()
+                and (
+                    manifest["status"] in {"done", "needs_fixes"}
+                    or reviewer_failed
+                )
+            )
+            if should_run_verifiers:
+                skip_fix_loops = reviewer_failed
+                failed_verifier = "build"
+                try:
+                    build_result = await self._run_build_verifier(
+                        str(scaffold_dir), brief,
+                    )
+                except Exception:
+                    logger.exception("build_verifier invocation failed")
+                    build_result = None
+                if build_result is not None:
+                    manifest["build_verification"] = build_result
+                    verdict = build_result.get("verdict")
+                    if not skip_fix_loops:
+                        FIX_ATTEMPTS = 2
+                        attempt = 0
+                        while verdict == "no" and attempt < FIX_ATTEMPTS:
+                            attempt += 1
+                            try:
+                                fixed = await self._apply_build_fix_round(
+                                    scaffold_dir, brief, build_result, attempt,
+                                )
+                            except Exception:
+                                logger.exception("fix round failed")
+                                fixed = False
+                            if not fixed:
+                                break
+                            try:
+                                build_result = await self._run_build_verifier(
+                                    str(scaffold_dir), brief,
+                                ) or build_result
+                            except Exception:
+                                logger.exception("re-verify after fix failed")
+                                break
+                            manifest["build_verification"] = build_result
+                            verdict = build_result.get("verdict")
+                            manifest.setdefault("build_fix_attempts", []).append({
+                                "attempt": attempt,
+                                "verdict": verdict,
+                                "command": build_result.get("command"),
+                            })
+                            if verdict == "yes":
+                                self._append_history(
+                                    manifest,
+                                    "BUILD_FIX_SUCCEEDED",
+                                    status="running",
+                                    message=f"In-place fix round {attempt} cleared the build.",
+                                )
+                                try:
+                                    self._persist_fix_as_skill(
+                                        stack=(build_result or {}).get("stack") or "unknown",
+                                        fix_round=attempt,
+                                        prior_summary=manifest.get("build_verification", {}).get("summary"),
+                                    )
+                                except Exception:
+                                    logger.exception("persist fix-as-skill failed")
+                                break
+                    if verdict in ("yes", "skipped"):
                         try:
-                            build_result = await self._run_build_verifier(
+                            boot_result = await self._run_boot_verifier(
                                 str(scaffold_dir), brief,
                             )
                         except Exception:
-                            logger.exception("build_verifier invocation failed")
-                            build_result = None
-                        if build_result is not None:
-                            manifest["build_verification"] = build_result
-                            verdict = build_result.get("verdict")
-                            # On failure: try a surgical in-place fix loop
-                            # BEFORE falling back to a full-pipeline retry.
-                            # This is the cheap path — only re-generates
-                            # broken files, keeps the rest of the scaffold.
-                            # Up to FIX_ATTEMPTS rounds; each round re-runs
-                            # BuildVerifier and either declares success or
-                            # collects a fresher failure hint.
-                            FIX_ATTEMPTS = 2
-                            attempt = 0
-                            while verdict == "no" and attempt < FIX_ATTEMPTS:
-                                attempt += 1
-                                try:
-                                    fixed = await self._apply_build_fix_round(
-                                        scaffold_dir, brief, build_result, attempt,
-                                    )
-                                except Exception:
-                                    logger.exception("fix round failed")
-                                    fixed = False
-                                if not fixed:
-                                    break
-                                # Re-verify after the fix attempt.
-                                try:
-                                    build_result = await self._run_build_verifier(
-                                        str(scaffold_dir), brief,
-                                    ) or build_result
-                                except Exception:
-                                    logger.exception("re-verify after fix failed")
-                                    break
-                                manifest["build_verification"] = build_result
-                                verdict = build_result.get("verdict")
-                                manifest.setdefault("build_fix_attempts", []).append({
-                                    "attempt": attempt,
-                                    "verdict": verdict,
-                                    "command": build_result.get("command"),
-                                })
-                                if verdict == "yes":
-                                    self._append_history(
-                                        manifest,
-                                        "BUILD_FIX_SUCCEEDED",
-                                        status="running",
-                                        message=f"In-place fix round {attempt} cleared the build.",
-                                    )
-                                    # Persist the fix as a learned skill —
-                                    # "this kind of build failure was solved
-                                    # this way." Next time the same stack
-                                    # sees a similar error tail, the skill
-                                    # is already in the system prompt.
+                            logger.exception("boot_verifier invocation failed")
+                            boot_result = None
+                        if boot_result is not None:
+                            manifest["boot_verification"] = boot_result
+                            boot_verdict = boot_result.get("verdict")
+                            if not skip_fix_loops:
+                                BOOT_FIX_ATTEMPTS = 2
+                                boot_attempt = 0
+                                while boot_verdict == "no" and boot_attempt < BOOT_FIX_ATTEMPTS:
+                                    boot_attempt += 1
                                     try:
-                                        self._persist_fix_as_skill(
-                                            stack=(build_result or {}).get("stack") or "unknown",
-                                            fix_round=attempt,
-                                            prior_summary=manifest.get("build_verification", {}).get("summary"),
+                                        fixed = await self._apply_build_fix_round(
+                                            scaffold_dir, brief, boot_result, boot_attempt,
                                         )
                                     except Exception:
-                                        logger.exception("persist fix-as-skill failed")
-                                    break
-                            # BuildVerifier cleared (or skipped). Now run
-                            # BootVerifier — actually start the server and
-                            # confirm it responds to /api/health. Catches
-                            # cross-file inconsistencies (CJS/ESM mismatch,
-                            # missing import, wrong env-var name) that
-                            # node --check passes blindly.
-                            #
-                            # Mirrors the build-verifier flow: failure
-                            # kicks the same fix-round loop with the boot
-                            # hint as the lesson. If still failing after
-                            # the loop, fall through to mark project
-                            # failed so auto-retry can take another swing.
-                            if verdict in ("yes", "skipped"):
+                                        logger.exception("boot fix round failed")
+                                        fixed = False
+                                    if not fixed:
+                                        break
+                                    try:
+                                        boot_result = await self._run_boot_verifier(
+                                            str(scaffold_dir), brief,
+                                        ) or boot_result
+                                    except Exception:
+                                        logger.exception("re-boot after fix failed")
+                                        break
+                                    manifest["boot_verification"] = boot_result
+                                    boot_verdict = boot_result.get("verdict")
+                                    manifest.setdefault("boot_fix_attempts", []).append({
+                                        "attempt": boot_attempt,
+                                        "verdict": boot_verdict,
+                                        "command": boot_result.get("command"),
+                                    })
+                                    if boot_verdict == "yes":
+                                        self._append_history(
+                                            manifest,
+                                            "BOOT_FIX_SUCCEEDED",
+                                            status="running",
+                                            message=(
+                                                f"In-place fix round {boot_attempt} "
+                                                f"got the server booting."
+                                            ),
+                                        )
+                                        try:
+                                            self._persist_fix_as_skill(
+                                                stack=(boot_result or {}).get("kind") or "unknown",
+                                                fix_round=boot_attempt,
+                                                prior_summary=(
+                                                    manifest.get("boot_verification", {}).get("summary")
+                                                ),
+                                            )
+                                        except Exception:
+                                            logger.exception("persist boot-fix-as-skill failed")
+                                        break
+                                if boot_verdict == "no":
+                                    verdict = "no"
+                                    build_result = boot_result
+                                    failed_verifier = "boot"
+                            if boot_verdict == "yes":
                                 try:
-                                    boot_result = await self._run_boot_verifier(
+                                    integration_result = await self._run_integration_verifier(
                                         str(scaffold_dir), brief,
                                     )
                                 except Exception:
-                                    logger.exception("boot_verifier invocation failed")
-                                    boot_result = None
-                                if boot_result is not None:
-                                    manifest["boot_verification"] = boot_result
-                                    boot_verdict = boot_result.get("verdict")
-                                    BOOT_FIX_ATTEMPTS = 2
-                                    boot_attempt = 0
-                                    while boot_verdict == "no" and boot_attempt < BOOT_FIX_ATTEMPTS:
-                                        boot_attempt += 1
-                                        # Reuse the same fix-round path —
-                                        # but feed the boot failure as the
-                                        # build_result so the LLM sees a
-                                        # concrete "this is what went wrong
-                                        # when we tried to RUN the program"
-                                        # error tail.
-                                        try:
-                                            fixed = await self._apply_build_fix_round(
-                                                scaffold_dir, brief, boot_result, boot_attempt,
-                                            )
-                                        except Exception:
-                                            logger.exception("boot fix round failed")
-                                            fixed = False
-                                        if not fixed:
-                                            break
-                                        try:
-                                            boot_result = await self._run_boot_verifier(
-                                                str(scaffold_dir), brief,
-                                            ) or boot_result
-                                        except Exception:
-                                            logger.exception("re-boot after fix failed")
-                                            break
-                                        manifest["boot_verification"] = boot_result
-                                        boot_verdict = boot_result.get("verdict")
-                                        manifest.setdefault("boot_fix_attempts", []).append({
-                                            "attempt": boot_attempt,
-                                            "verdict": boot_verdict,
-                                            "command": boot_result.get("command"),
-                                        })
-                                        if boot_verdict == "yes":
-                                            self._append_history(
-                                                manifest,
-                                                "BOOT_FIX_SUCCEEDED",
-                                                status="running",
-                                                message=(
-                                                    f"In-place fix round {boot_attempt} "
-                                                    f"got the server booting."
-                                                ),
-                                            )
+                                    logger.exception("integration_verifier invocation failed")
+                                    integration_result = None
+                                if integration_result is not None:
+                                    manifest["integration_verification"] = integration_result
+                                    integration_verdict = integration_result.get("verdict")
+                                    if not skip_fix_loops:
+                                        INTEGRATION_FIX_ATTEMPTS = 2
+                                        integration_attempt = 0
+                                        while (
+                                            integration_verdict == "no"
+                                            and integration_attempt < INTEGRATION_FIX_ATTEMPTS
+                                        ):
+                                            integration_attempt += 1
                                             try:
-                                                self._persist_fix_as_skill(
-                                                    stack=(boot_result or {}).get("kind") or "unknown",
-                                                    fix_round=boot_attempt,
-                                                    prior_summary=(
-                                                        manifest.get("boot_verification", {}).get("summary")
-                                                    ),
+                                                fixed = await self._apply_integration_fix_round(
+                                                    scaffold_dir=scaffold_dir,
+                                                    brief=brief,
+                                                    integration_result=integration_result,
+                                                    attempt=integration_attempt,
                                                 )
                                             except Exception:
-                                                logger.exception("persist boot-fix-as-skill failed")
-                                            break
-                                    # Boot still failing after the fix loop
-                                    # → upgrade the project verdict to
-                                    # failed so the auto-retry kicks in
-                                    # with a real "the program didn't run"
-                                    # lesson, not the "files parse" lesson
-                                    # the build verifier already gave us.
-                                    if boot_verdict == "no":
-                                        verdict = "no"
-                                        build_result = boot_result  # used by the failure-marking block below
-
-                                    # Integration contract check: does every
-                                    # frontend API call have a backend route?
-                                    # Runs only when the server actually boots.
-                                    if boot_verdict == "yes":
-                                        try:
-                                            integration_result = await self._run_integration_verifier(
-                                                str(scaffold_dir), brief,
-                                            )
-                                        except Exception:
-                                            logger.exception("integration_verifier invocation failed")
-                                            integration_result = None
-                                        if integration_result is not None:
+                                                logger.exception("integration fix round failed")
+                                                fixed = False
+                                            if not fixed:
+                                                break
+                                            try:
+                                                await self._kill_stray_server_processes(
+                                                    str(scaffold_dir)
+                                                )
+                                                await asyncio.sleep(0.5)
+                                            except Exception:
+                                                logger.debug("stray process cleanup failed (non-fatal)")
+                                            try:
+                                                boot_result = await self._run_boot_verifier(
+                                                    str(scaffold_dir), brief,
+                                                ) or boot_result
+                                            except Exception:
+                                                logger.exception("re-boot after integration fix failed")
+                                                break
+                                            manifest["boot_verification"] = boot_result
+                                            boot_verdict = (boot_result or {}).get("verdict")
+                                            if boot_verdict != "yes":
+                                                verdict = "no"
+                                                build_result = boot_result
+                                                failed_verifier = "boot"
+                                                break
+                                            try:
+                                                integration_result = await self._run_integration_verifier(
+                                                    str(scaffold_dir), brief,
+                                                ) or integration_result
+                                            except Exception:
+                                                logger.exception("integration re-check failed")
+                                                break
                                             manifest["integration_verification"] = integration_result
                                             integration_verdict = integration_result.get("verdict")
-                                            INTEGRATION_FIX_ATTEMPTS = 2
-                                            integration_attempt = 0
-                                            while (
-                                                integration_verdict == "no"
-                                                and integration_attempt < INTEGRATION_FIX_ATTEMPTS
-                                            ):
-                                                integration_attempt += 1
-                                                try:
-                                                    fixed = await self._apply_integration_fix_round(
-                                                        scaffold_dir=scaffold_dir,
-                                                        brief=brief,
-                                                        integration_result=integration_result,
-                                                        attempt=integration_attempt,
-                                                    )
-                                                except Exception:
-                                                    logger.exception("integration fix round failed")
-                                                    fixed = False
-                                                if not fixed:
-                                                    break
-                                                # Clean up any stray processes before rebooting
-                                                # to prevent port reuse race conditions
-                                                try:
-                                                    await self._kill_stray_server_processes(
-                                                        str(scaffold_dir)
-                                                    )
-                                                    await asyncio.sleep(0.5)
-                                                except Exception:
-                                                    logger.debug("stray process cleanup failed (non-fatal)")
-                                                try:
-                                                    boot_result = await self._run_boot_verifier(
-                                                        str(scaffold_dir), brief,
-                                                    ) or boot_result
-                                                except Exception:
-                                                    logger.exception("re-boot after integration fix failed")
-                                                    break
-                                                manifest["boot_verification"] = boot_result
-                                                boot_verdict = (boot_result or {}).get("verdict")
-                                                if boot_verdict != "yes":
-                                                    verdict = "no"
-                                                    build_result = boot_result
-                                                    break
-                                                try:
-                                                    integration_result = await self._run_integration_verifier(
-                                                        str(scaffold_dir), brief,
-                                                    ) or integration_result
-                                                except Exception:
-                                                    logger.exception("integration re-check failed")
-                                                    break
-                                                manifest["integration_verification"] = integration_result
-                                                integration_verdict = integration_result.get("verdict")
-                                                manifest.setdefault("integration_fix_attempts", []).append({
-                                                    "attempt": integration_attempt,
-                                                    "verdict": integration_verdict,
-                                                })
-                                                if integration_verdict == "yes":
-                                                    self._append_history(
-                                                        manifest,
-                                                        "INTEGRATION_FIX_SUCCEEDED",
-                                                        status="running",
-                                                        message=(
-                                                            f"In-place integration fix round "
-                                                            f"{integration_attempt} cleared "
-                                                            "the integration contract gate."
-                                                        ),
-                                                    )
-                                                    break
-                                            if integration_verdict == "no":
-                                                verdict = "no"
-                                                build_result = integration_result
-                                                manifest["status"] = "failed"
-                                                manifest["error"] = (
-                                                    integration_result.get("summary")
-                                                    or "Integration contract verification failed."
+                                            manifest.setdefault("integration_fix_attempts", []).append({
+                                                "attempt": integration_attempt,
+                                                "verdict": integration_verdict,
+                                            })
+                                            if integration_verdict == "yes":
+                                                self._append_history(
+                                                    manifest,
+                                                    "INTEGRATION_FIX_SUCCEEDED",
+                                                    status="running",
+                                                    message=(
+                                                        f"In-place integration fix round "
+                                                        f"{integration_attempt} cleared "
+                                                        "the integration contract gate."
+                                                    ),
                                                 )
-                                                manifest["next_action"] = (
-                                                    "Retrying with the integration failure as a hint."
-                                                )
-                                                manifest["_retry_hint"] = (
-                                                    integration_result.get("failure_hint") or ""
-                                                )
+                                                break
+                                        if integration_verdict == "no":
+                                            verdict = "no"
+                                            build_result = integration_result
+                                            failed_verifier = "integration"
 
-                            # Still failing after the fix loop → mark failed
-                            # so PR #2's auto-retry can take a different shape.
-                            if verdict == "no":
-                                manifest["status"] = "failed"
-                                manifest["error"] = (
-                                    build_result.get("summary")
-                                    or "Build verifier rejected the scaffold."
-                                )
-                                manifest["next_action"] = (
-                                    "Retrying with the build failure as a hint."
-                                )
-                                manifest["_retry_hint"] = (
-                                    build_result.get("failure_hint") or ""
-                                )
-                            # Record the (stack, shape, verdict) outcome in
-                            # the build-pattern scoreboard regardless of
-                            # success/fail — the meta-agent reads this to
-                            # spot which shapes correlate with success so
-                            # future scaffolds can be biased toward them.
-                            try:
-                                from skyn3t.intelligence.build_patterns import (
-                                    get_default_scoreboard,
-                                )
-                                stack = str((build_result or {}).get("stack") or "unknown")
-                                shape = self._scaffold_shape(scaffold_dir)
-                                sb = get_default_scoreboard()
-                                sb.record(stack, shape, str(verdict or "no"))
-                                sb.flush()  # ensure persistence even on single-run processes
-                            except Exception:
-                                logger.exception("build_pattern record failed")
+                    if not skip_fix_loops and verdict == "no":
+                        manifest["status"] = "failed"
+                        failure_label = {
+                            "build": "build failure",
+                            "boot": "boot failure",
+                            "integration": "integration failure",
+                        }.get(failed_verifier, "build failure")
+                        default_error = {
+                            "build": "Build verifier rejected the scaffold.",
+                            "boot": "Server failed to boot during verification.",
+                            "integration": "Integration contract verification failed.",
+                        }.get(failed_verifier, "Build verifier rejected the scaffold.")
+                        manifest["error"] = (
+                            build_result.get("summary")
+                            or default_error
+                        )
+                        manifest["next_action"] = (
+                            f"Retrying with the {failure_label} as a hint."
+                        )
+                        manifest["_retry_hint"] = (
+                            build_result.get("failure_hint") or ""
+                        )
+                    try:
+                        from skyn3t.intelligence.build_patterns import (
+                            get_default_scoreboard,
+                        )
+                        stack = str((build_result or {}).get("stack") or "unknown")
+                        shape = self._scaffold_shape(scaffold_dir)
+                        sb = get_default_scoreboard()
+                        sb.record(stack, shape, str(verdict or "no"))
+                        sb.flush()
+                    except Exception:
+                        logger.exception("build_pattern record failed")
             completion_message = (
                 manifest["next_action"]
                 if manifest.get("status") in {"done", "needs_fixes"}
@@ -1438,7 +1631,10 @@ class StudioRunner:
             # The runner itself crashed (agent init blew up, get_agent raised, etc).
             # Without this guard the manifest stays at {stages: [], completed_at: None}
             # and the user sees a project that ran 0 stages with no error.
-            is_intentional_bail = isinstance(exc, StackShapeMismatchError)
+            is_stack_mismatch = isinstance(exc, StackShapeMismatchError)
+            is_stub_bail = isinstance(exc, UnresolvedScaffoldStubError)
+            is_missing_files_bail = isinstance(exc, MissingPlannedFilesError)
+            is_intentional_bail = is_stack_mismatch or is_stub_bail or is_missing_files_bail
             if is_intentional_bail:
                 logger.info(
                     "studio runner bailed for slug=%s (intentional): %s", slug, exc
@@ -1446,19 +1642,29 @@ class StudioRunner:
             else:
                 logger.exception("studio runner failed for slug=%s", slug)
             manifest["status"] = "failed"
-            manifest["error"] = (
-                f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-2000:]}"
-            )
+            if is_intentional_bail:
+                manifest["error"] = str(exc)
+            else:
+                manifest["error"] = (
+                    f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-2000:]}"
+                )
             manifest["completed_at"] = time.time()
             manifest["current_stage"] = None
             manifest["current_agent"] = None
             self._clear_quality_summary(manifest)
-            manifest["next_action"] = (
-                "Project stopped: stack shape validation flagged files inconsistent "
-                "with the chosen stack. Review manifest['stack_shape_mismatches']."
-                if is_intentional_bail
-                else "Project stopped because the runner crashed."
-            )
+            if is_stack_mismatch:
+                manifest["next_action"] = (
+                    "Project stopped: stack shape validation flagged files inconsistent "
+                    "with the chosen stack. Review manifest['stack_shape_mismatches']."
+                )
+            elif is_stub_bail:
+                manifest["next_action"] = "Retrying with the unresolved stub failure as a hint."
+                manifest["_retry_hint"] = str(exc)
+            elif is_missing_files_bail:
+                manifest["next_action"] = "Retrying with the missing file witness as a hint."
+                manifest["_retry_hint"] = str(exc)
+            else:
+                manifest["next_action"] = "Project stopped because the runner crashed."
             self._finalize_benchmark(manifest)
             self._append_history(
                 manifest,
@@ -1693,7 +1899,12 @@ class StudioRunner:
 
         try:
             out = await client.complete(
-                prompt, system=system, max_tokens=8000, temperature=0.2,
+                prompt,
+                system=system,
+                max_tokens=8000,
+                temperature=0.2,
+                timeout=_BUILD_FIX_LLM_TIMEOUT_SECONDS,
+                _allow_backend_failover=False,
             )
         except Exception:
             logger.exception("LLM call during fix round %d failed", attempt)
@@ -2262,6 +2473,34 @@ class StudioRunner:
             return result
 
         output = getattr(result, "output", None) or {}
+        if stage.name == "code":
+            missing_planned_files, unresolved_stub_files = self._code_stage_fast_retry_signals(
+                artifact_dir=artifact_dir,
+                brief=brief,
+                output=output if isinstance(output, dict) else None,
+            )
+            if missing_planned_files or unresolved_stub_files:
+                reasons: List[str] = []
+                if missing_planned_files:
+                    reasons.append(
+                        f"{len(missing_planned_files)} planned file(s) still missing"
+                    )
+                if unresolved_stub_files:
+                    reasons.append(
+                        f"{len(unresolved_stub_files)} unresolved TODO stub(s)"
+                    )
+                if manifest is not None:
+                    self._append_history(
+                        manifest,
+                        "CRITIQUE_SKIPPED",
+                        status="running",
+                        stage=stage.name,
+                        message=(
+                            "Skipped code critique because the scaffold already needs "
+                            "fast retry: " + ", ".join(reasons) + "."
+                        ),
+                    )
+                return result
         summary = self._summarize_stage_output(output)
         produced = self._collect_stage_artifacts(stage, output, artifact_dir)
         if not produced and not summary:
@@ -2318,13 +2557,37 @@ class StudioRunner:
                 ]
             else:
                 critique_produced_files = stage_files
+            critique_timeout_seconds = 180.0
             try:
-                critique_result = await reviewer.critique(
-                    brief=brief,
-                    artifact_dir=critique_artifact_dir,
-                    stage_name=stage.name,
-                    produced_files=[str(f) for f in critique_produced_files] if critique_produced_files else None,
+                critique_result = await asyncio.wait_for(
+                    reviewer.critique(
+                        brief=brief,
+                        artifact_dir=critique_artifact_dir,
+                        stage_name=stage.name,
+                        produced_files=[str(f) for f in critique_produced_files]
+                        if critique_produced_files
+                        else None,
+                    ),
+                    timeout=critique_timeout_seconds,
                 )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "ReviewerAgent critique timed out for %s round %s",
+                    stage.name,
+                    round_num,
+                )
+                if manifest is not None:
+                    self._append_history(
+                        manifest,
+                        "CRITIQUE_FAILED",
+                        status="running",
+                        stage=stage.name,
+                        message=(
+                            f"Critique round {round_num} timed out after "
+                            f"{critique_timeout_seconds:.0f}s."
+                        ),
+                    )
+                return current_result
             except Exception as e:
                 logger.warning(
                     f"ReviewerAgent critique failed for {stage.name} round {round_num}: {e}"
@@ -2421,39 +2684,23 @@ class StudioRunner:
                                         "Skipping non-path file entry from reviewer: %s", fp
                                     )
                                     continue
-                                # Normalize path to be relative to scaffold_dir.
-                                if fp.startswith("scaffold/"):
-                                    fp = fp[len("scaffold/"):]
-                                # Try to resolve bare basenames by searching under scaffold_dir.
-                                resolved_fp = fp
-                                if resolved_fp and not (scaffold_dir / resolved_fp).exists():
-                                    matches = list(scaffold_dir.rglob(resolved_fp))
-                                    if matches:
-                                        resolved_fp = matches[0].relative_to(scaffold_dir).as_posix()
-                                # If the file still doesn't exist, don't try to
-                                # "regenerate" it — create a placeholder so the
-                                # import graph is at least syntactically valid.
-                                # The next consistency check will flag it if it's
-                                # still wrong.
-                                if not (scaffold_dir / resolved_fp).exists():
+                                resolved_fp = self._normalize_scaffold_issue_path(
+                                    scaffold_dir,
+                                    fp,
+                                )
+                                if not resolved_fp:
                                     logger.warning(
-                                        "Reviewer flagged missing file %s — creating placeholder", resolved_fp
+                                        "Skipping unresolved reviewer file entry from critique: %s",
+                                        fp,
                                     )
-                                    file_issues.append(
-                                        FileIssue(
-                                            path=resolved_fp,
-                                            error_message=i.get("problem", ""),
-                                            suggested_action="create_placeholder",
-                                        )
+                                    continue
+                                file_issues.append(
+                                    FileIssue(
+                                        path=resolved_fp,
+                                        error_message=i.get("problem", ""),
+                                        suggested_action="regenerate",
                                     )
-                                else:
-                                    file_issues.append(
-                                        FileIssue(
-                                            path=resolved_fp,
-                                            error_message=i.get("problem", ""),
-                                            suggested_action="regenerate",
-                                        )
-                                    )
+                                )
                         client = LLMClient(
                             event_bus=self.event_bus,
                             caller_name="code_critique_fix",
@@ -2713,6 +2960,34 @@ class StudioRunner:
             logger.debug("scoreboard pre-warning lookup failed", exc_info=True)
         return warnings
 
+    def _code_stage_fast_retry_signals(
+        self,
+        *,
+        artifact_dir: Path,
+        brief: str,
+        output: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[List[str], List[str]]:
+        """Return missing-file and unresolved-stub signals for code-stage bailouts.
+
+        When the scaffold already has missing planned files or visible TODO-style
+        placeholders, the code-stage critique loop is low value: downstream retry
+        logic and the dedicated reviewer/fix stages handle those cases better
+        than spending several more minutes on targeted-fix attempts inside the
+        code stage itself.
+        """
+        scaffold_dir = artifact_dir / "scaffold"
+        missing_planned_files = self._remaining_missing_planned_files(output, scaffold_dir)
+        unresolved_stub_files: List[str] = []
+        if scaffold_dir.exists():
+            try:
+                from skyn3t.agents.consistency_engine import check_consistency
+
+                report = check_consistency(scaffold_dir, brief)
+                unresolved_stub_files = self._unresolved_todo_stub_files(report.issues)
+            except Exception:
+                logger.debug("code-stage fast-retry probe failed", exc_info=True)
+        return missing_planned_files, unresolved_stub_files
+
     async def _run_post_code_checks(
         self,
         *,
@@ -2720,6 +2995,7 @@ class StudioRunner:
         artifact_dir: Path,
         brief: str,
         stage_name: str,
+        stage_output: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Run post-code checks with parallel static verifiers."""
         scaffold_dir = artifact_dir / "scaffold"
@@ -2739,6 +3015,22 @@ class StudioRunner:
             "ok": bool(report.ok),
             "issue_count": len(report.issues),
         }
+
+        missing_planned_files = self._remaining_missing_planned_files(stage_output, scaffold_dir)
+        if missing_planned_files:
+            hint = self._missing_planned_files_retry_hint(missing_planned_files)
+            manifest["consistency_check"]["missing_planned_files"] = missing_planned_files
+            manifest["_retry_hint"] = hint
+            manifest["next_action"] = "Retrying with the missing file witness as a hint."
+            self._append_history(
+                manifest,
+                "MISSING_PLANNED_FILES",
+                status="running",
+                stage=stage_name,
+                message=f"{len(missing_planned_files)} planned file(s) still missing after code stage.",
+            )
+            self._save_manifest(artifact_dir, manifest)
+            raise MissingPlannedFilesError(hint)
 
         # Record per-category tags on the build-pattern scoreboard so the
         # planner can pre-warn future runs about shapes that historically
@@ -2761,6 +3053,15 @@ class StudioRunner:
             except Exception:
                 logger.exception("missing_mount scoreboard tag failed")
 
+        unresolved_stub_files = self._unresolved_todo_stub_files(report.issues)
+        if unresolved_stub_files:
+            hint = self._todo_stub_retry_hint(unresolved_stub_files)
+            manifest["consistency_check"]["unresolved_todo_stubs"] = unresolved_stub_files
+            manifest["_retry_hint"] = hint
+            manifest["next_action"] = "Retrying with the unresolved stub failure as a hint."
+            self._save_manifest(artifact_dir, manifest)
+            raise UnresolvedScaffoldStubError(hint)
+
         # Fail fast on stack mismatch before mutating files with targeted fix.
         if mismatches:
             manifest["stack_shape_mismatches"] = mismatches
@@ -2777,54 +3078,49 @@ class StudioRunner:
                 + "; ".join(mismatches)
             )
 
-        if report.ok:
-            return
-
-        from skyn3t.adapters import LLMClient
-        from skyn3t.agents.targeted_fix import FileIssue, apply_targeted_fix
-
-        consistency_issues = [
-            FileIssue(
-                path=self._consistency_fix_target(
-                    scaffold_dir=scaffold_dir,
-                    issue_file=i.file,
-                    category=i.category,
-                ),
-                error_message=i.message,
-                suggested_action=(
-                    "regenerate" if i.category in {"broken_import", "missing_mount"}
-                    else "create_placeholder"
-                ),
-            )
-            for i in report.issues
-            if i.severity == "error"
-        ]
-        if consistency_issues:
-            client = LLMClient(event_bus=self.event_bus, caller_name="consistency_fix")
-            fix_result = await apply_targeted_fix(
-                scaffold_dir=scaffold_dir,
-                issues=consistency_issues,
-                llm_client=client,
-                brief=brief,
-            )
-            manifest["consistency_fix"] = {
-                "changed": fix_result.files_changed,
-                "created": fix_result.files_created,
-                "errors": fix_result.errors,
-            }
-            report = await asyncio.to_thread(check_consistency, scaffold_dir, brief)
-            manifest["consistency_check"]["post_fix_ok"] = bool(report.ok)
-            # Persist now so consistency_fix diagnostics survive a
-            # crash in the next stage (otherwise the post-fix state
-            # only saves later, and is lost if the run dies first).
-            self._save_manifest(artifact_dir, manifest)
         if not report.ok:
-            self._append_history(
-                manifest,
-                "CONSISTENCY_CHECK_FAILED",
-                status="running",
-                message=f"{len(report.issues)} consistency issues found after code stage.",
-            )
+            from skyn3t.adapters import LLMClient
+            from skyn3t.agents.targeted_fix import FileIssue, apply_targeted_fix
+
+            consistency_issues = [
+                FileIssue(
+                    path=self._consistency_fix_target(
+                        scaffold_dir=scaffold_dir,
+                        issue_file=i.file,
+                        category=i.category,
+                    ),
+                    error_message=i.message,
+                    suggested_action=self._consistency_fix_action(i.category),
+                )
+                for i in report.issues
+                if i.severity == "error"
+            ]
+            if consistency_issues:
+                client = LLMClient(event_bus=self.event_bus, caller_name="consistency_fix")
+                fix_result = await apply_targeted_fix(
+                    scaffold_dir=scaffold_dir,
+                    issues=consistency_issues,
+                    llm_client=client,
+                    brief=brief,
+                )
+                manifest["consistency_fix"] = {
+                    "changed": fix_result.files_changed,
+                    "created": fix_result.files_created,
+                    "errors": fix_result.errors,
+                }
+                report = await asyncio.to_thread(check_consistency, scaffold_dir, brief)
+                manifest["consistency_check"]["post_fix_ok"] = bool(report.ok)
+                # Persist now so consistency_fix diagnostics survive a
+                # crash in the next stage (otherwise the post-fix state
+                # only saves later, and is lost if the run dies first).
+                self._save_manifest(artifact_dir, manifest)
+            if not report.ok:
+                self._append_history(
+                    manifest,
+                    "CONSISTENCY_CHECK_FAILED",
+                    status="running",
+                    message=f"{len(report.issues)} consistency issues found after code stage.",
+                )
 
         # ── Frontend build dry-run (proposal #3) ───────────────────────────
         # Shift Class-2 failures (vite build fails inside the final
@@ -2837,6 +3133,79 @@ class StudioRunner:
             artifact_dir=artifact_dir,
             scaffold_dir=scaffold_dir,
             brief=brief,
+        )
+
+    @staticmethod
+    def _unresolved_todo_stub_files(issues: List[Any]) -> List[str]:
+        files: List[str] = []
+        seen: Set[str] = set()
+        for issue in issues:
+            category = getattr(issue, "category", None)
+            severity = getattr(issue, "severity", None)
+            file_path = str(getattr(issue, "file", "") or "").strip()
+            if category != "todo_stub" or severity != "error" or not file_path or file_path in seen:
+                continue
+            seen.add(file_path)
+            files.append(file_path)
+        return files
+
+    @staticmethod
+    def _todo_stub_retry_hint(files: List[str]) -> str:
+        ordered = [str(path).strip() for path in files if str(path).strip()]
+        if not ordered:
+            return (
+                "Generated scaffold still contains unresolved TODO stubs. "
+                "Regenerate those files with real implementations; do not ship placeholders."
+            )
+        preview = ", ".join(ordered[:5])
+        more = f" (+{len(ordered) - 5} more)" if len(ordered) > 5 else ""
+        return (
+            "Generated scaffold still contains unresolved TODO stubs: "
+            f"{preview}{more}. Regenerate those files with real implementations; "
+            "do not ship placeholders."
+        )
+
+    @staticmethod
+    def _remaining_missing_planned_files(
+        stage_output: Optional[Dict[str, Any]],
+        scaffold_dir: Path,
+    ) -> List[str]:
+        if not isinstance(stage_output, dict):
+            return []
+        raw_missing = stage_output.get("missing_files")
+        if not isinstance(raw_missing, list):
+            return []
+        remaining: List[str] = []
+        seen: Set[str] = set()
+        scaffold_root = scaffold_dir.resolve()
+        for raw_path in raw_missing:
+            rel_path = str(raw_path or "").lstrip("/").strip()
+            if not rel_path or rel_path in seen:
+                continue
+            seen.add(rel_path)
+            target_path = (scaffold_dir / rel_path).resolve()
+            try:
+                target_path.relative_to(scaffold_root)
+            except ValueError:
+                continue
+            if not target_path.exists():
+                remaining.append(rel_path)
+        return remaining
+
+    @staticmethod
+    def _missing_planned_files_retry_hint(files: List[str]) -> str:
+        ordered = [str(path).strip() for path in files if str(path).strip()]
+        if not ordered:
+            return (
+                "Generated scaffold is still missing planned files. "
+                "Write the full file set from the scaffold plan before handoff."
+            )
+        preview = ", ".join(ordered[:5])
+        more = f" (+{len(ordered) - 5} more)" if len(ordered) > 5 else ""
+        return (
+            "Generated scaffold is still missing planned files: "
+            f"{preview}{more}. Write the missing files with real implementations "
+            "before handoff."
         )
 
     async def _run_frontend_build_dryrun(
@@ -3444,11 +3813,88 @@ class StudioRunner:
         return None
 
     @staticmethod
+    def _normalize_scaffold_issue_path(
+        scaffold_dir: Path,
+        raw_issue_file: str,
+    ) -> Optional[str]:
+        """Resolve reviewer/fix-loop file references to a real scaffold path.
+
+        Reviewer critique lines sometimes include section labels or annotations
+        after a real filename, e.g. ``src/App.jsx Drawer`` or
+        ``src/App.jsx: missing import``. Normalize those back to the concrete
+        file so targeted_fix doesn't create bogus placeholders like
+        ``src/App.jsx Drawer``.
+        """
+        cleaned = str(raw_issue_file or "").strip()
+        if not cleaned or cleaned in {"unknown", "(unknown)"}:
+            return None
+        if cleaned.startswith("scaffold/"):
+            cleaned = cleaned[len("scaffold/"):]
+
+        exact = scaffold_dir / cleaned
+        if exact.exists() and exact.is_file():
+            return cleaned
+
+        file_token_match = re.search(r"([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)", cleaned)
+        if file_token_match:
+            token = file_token_match.group(1).lstrip("/")
+            if token.startswith("scaffold/"):
+                token = token[len("scaffold/"):]
+            token_path = scaffold_dir / token
+            if token_path.exists() and token_path.is_file():
+                return token
+            cleaned = token
+
+        common_exts = (
+            ".jsx", ".js", ".tsx", ".ts", ".mjs", ".cjs",
+            ".py", ".json", ".css", ".scss", ".html", ".md", ".yml", ".yaml",
+        )
+        if "." not in Path(cleaned).name:
+            stem_matches = [
+                f"{cleaned}{ext}"
+                for ext in common_exts
+                if (scaffold_dir / f"{cleaned}{ext}").exists()
+                and (scaffold_dir / f"{cleaned}{ext}").is_file()
+            ]
+            if len(stem_matches) == 1:
+                return stem_matches[0]
+
+        basename = Path(cleaned).name
+        if not basename:
+            return None
+
+        basename_matches: List[str] = []
+        if "." in basename:
+            basename_matches = [
+                p.relative_to(scaffold_dir).as_posix()
+                for p in scaffold_dir.rglob(basename)
+                if p.is_file()
+            ]
+        else:
+            for ext in common_exts:
+                basename_matches.extend(
+                    p.relative_to(scaffold_dir).as_posix()
+                    for p in scaffold_dir.rglob(f"{basename}{ext}")
+                    if p.is_file()
+                )
+        deduped = sorted(set(basename_matches))
+        if len(deduped) == 1:
+            return deduped[0]
+
+        return None
+
+    @staticmethod
     def _api_slug_from_route(path: str) -> Optional[str]:
         m = re.match(r"^/api/([A-Za-z0-9_-]+)(?:/|$)", str(path or "").strip())
         if not m:
             return None
         return m.group(1)
+
+    @staticmethod
+    def _consistency_fix_action(category: str) -> str:
+        if category in {"broken_import", "missing_mount", "todo_stub"}:
+            return "regenerate"
+        return "create_placeholder"
 
     @staticmethod
     def _integration_fix_targets(
@@ -3517,6 +3963,26 @@ class StudioRunner:
         if profile == "fast":
             return 3 if has_visual_signal else 2
         return 4 if has_visual_signal else 3
+
+    @staticmethod
+    def _critique_timeout_for(
+        stage_name: str,
+        execution_profile: str = "balanced",
+    ) -> float:
+        normalized = (stage_name or "").strip().lower()
+        if normalized == "code":
+            base = 420.0
+        elif normalized in {"designer", "architect", "research", "marketer", "business"}:
+            base = 180.0
+        else:
+            base = 120.0
+
+        profile = (execution_profile or "balanced").strip().lower()
+        if profile == "fast":
+            return max(60.0, base * 0.6)
+        if profile == "deep":
+            return base * 1.3
+        return base
 
     @staticmethod
     def _relativize_artifact_path(artifact_dir: Path, value: Any) -> Optional[str]:

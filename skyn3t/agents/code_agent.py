@@ -14,8 +14,14 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
+from skyn3t.prompt_compression import compress_prompt_context
 
 logger = logging.getLogger("skyn3t.agents.code_agent")
+
+_PLAN_TIMEOUT_SECONDS = 120.0
+_FILE_BUILD_TIMEOUT_SECONDS = 180.0
+_FILE_RETRY_TIMEOUT_SECONDS = 120.0
+_CLUSTER_BUILD_TIMEOUT_SECONDS = 240.0
 
 
 def _strip_fences(body: str) -> str:
@@ -56,19 +62,32 @@ _CLI_TRACE_PATTERNS: Tuple[str, ...] = (
     r"^│\s",                 # tree-style continuation lines
     r"^Understood[—\-\s,]",  # common conversational lead-in
     r"^Let me\s",            # common conversational lead-in
-    r"^I'll\s",              # common conversational lead-in
+    r"^I['’]ll\s",           # smart-quote-tolerant "I'll"
+    r"^I['’]m\s",            # smart-quote-tolerant "I'm" (canary-113 README leak)
+    r"^I['’]ve\s",           # smart-quote-tolerant "I've"
     r"^I will\s",            # common conversational lead-in
     r"^Sure[!\.\,\s]",       # common conversational lead-in
-    r"^Here(?:'s| is) (?:the|a)\s",  # "Here's the file:"
+    r"^Here(?:['’]s| is) (?:the|a)\s",  # "Here's the file:"
     # Kimi / other CLI backends emit prose without bullet prefixes
-    r"^The existing\s",       # "The existing index.html already matches..."
+    r"^The (?:existing|workspace|file)\s",  # "The existing X already matches..."
     r"^This (?:file|is|looks?)\s",   # "This file is...", "This looks good"
     r"^I (?:have|can|see|am)\s",     # "I have verified...", "I can see..."
     r"^It (?:already|is|looks?)\s",  # "It already matches..."
     r"^That (?:looks?|is)\s",        # "That looks correct"
-    r"^No changes\s",         # "No changes needed"
+    r"^No (?:changes|matches?)\s",   # "No changes needed", "No matches found"
     r"^Looks? good\s",        # "Looks good"
+    r"^Path does not exist\b",       # CLI tool error leaked into body
+    r"^Permission denied\b",         # same
 )
+
+
+_CSS_CONTENT_START_RE = _RE.compile(
+    r"^(@|:root\b|[.#*]|/\*|[a-zA-Z][\w:-]*(?:\s*[,{]|::?[\w-]+|\s+\{))"
+)
+
+
+def _looks_like_css_content_start(line: str) -> bool:
+    return bool(_CSS_CONTENT_START_RE.match(line.strip()))
 
 
 def _relevant_context(prior_context: str, rel_path: str) -> str:
@@ -179,11 +198,16 @@ def _strip_cli_prelude(body: str, rel_path: str) -> str:
     elif rl.endswith((".yml", ".yaml")):
         start_re = _RE.compile(r"^([a-zA-Z][a-zA-Z0-9_\-]*:|---|#\s)")
     elif rl.endswith(".css"):
-        start_re = _RE.compile(r"^(@|:root|\*|\.|#|[a-zA-Z]|/\*)")
+        start_re = _CSS_CONTENT_START_RE
     elif rl.endswith(".html"):
         start_re = _RE.compile(r"^(<!DOCTYPE|<html|<\?xml)", _RE.IGNORECASE)
     elif rl.endswith((".md", ".markdown")):
-        start_re = _RE.compile(r"^(#\s|\*\s|-\s|\d+\.\s|>\s|[A-Z])")
+        # Real markdown lines begin with a heading hash, frontmatter `---`,
+        # a list bullet/number, a blockquote `>`, a fenced code block,
+        # or an HTML tag. Plain prose starting with a capital letter is
+        # NOT enough signal — canary-113's server/README.md leaked with
+        # "I'm checking the project structure..." as its first line.
+        start_re = _RE.compile(r"^(#{1,6}\s|---\s*$|\*\s|-\s|\d+\.\s|>\s|```|<!?[a-zA-Z])")
     elif rl.endswith(".sh"):
         start_re = _RE.compile(r"^(#!|#\s|set\s|export\s|[A-Z_][A-Z0-9_]*=)")
     else:
@@ -266,6 +290,14 @@ def _syntax_ok(body: str, rel_path: str, timeout: float = 5.0) -> bool:
             return True
         except Exception:
             return False
+    if rl.endswith(".css"):
+        lines = body.splitlines()
+        first_nonempty = next((line.strip() for line in lines if line.strip()), "")
+        if not first_nonempty or not _looks_like_css_content_start(first_nonempty):
+            return False
+        if body.count("/*") != body.count("*/"):
+            return False
+        return True
     if rl.endswith(".py"):
         try:
             ast.parse(body)
@@ -622,8 +654,7 @@ class CodeAgent(BaseAgent):
                     continue
                 if not body:
                     continue
-                if len(body) > max_chars:
-                    body = body[:max_chars] + f"\n\n_[truncated to {max_chars} chars]_"
+                body = compress_prompt_context(body, max_chars=max_chars)
                 chunks.append(f"### {name}\n\n{body}")
                 seen.add(name)
         # Catch any other .md at top level we didn't enumerate.
@@ -637,8 +668,7 @@ class CodeAgent(BaseAgent):
                     continue
                 if not body:
                     continue
-                if len(body) > 1500:
-                    body = body[:1500] + "\n\n_[truncated]_"
+                body = compress_prompt_context(body, max_chars=1500)
                 chunks.append(f"### {p.name}\n\n{body}")
         except Exception:
             pass
@@ -678,6 +708,29 @@ class CodeAgent(BaseAgent):
         # model — which is why integration briefs produced fake demos.
         prior_context = self._read_prior_artifacts(artifact_dir)
 
+        # Read palette.json once so the CSS prelude in brief_requirements
+        # can lock in real brand colors instead of fallback defaults.
+        # Backend-agnostic: same prelude format works regardless of which
+        # CLI/API model executes the per-file write.
+        _palette_hexes: List[str] = []
+        try:
+            import json as _json_palette
+            _palette_path = artifact_dir / "palette.json"
+            if _palette_path.exists():
+                _palette_data = _json_palette.loads(_palette_path.read_text(encoding="utf-8"))
+                # Accept either flat dict (primary/bg/accent/...) or list of hex.
+                if isinstance(_palette_data, dict):
+                    for _v in _palette_data.values():
+                        if isinstance(_v, str) and _v.startswith("#") and len(_v) in (4, 7, 9):
+                            _palette_hexes.append(_v)
+                elif isinstance(_palette_data, list):
+                    _palette_hexes.extend(
+                        v for v in _palette_data
+                        if isinstance(v, str) and v.startswith("#")
+                    )
+        except Exception:
+            logger.debug("palette.json read for prelude failed", exc_info=True)
+
         # Hard cap on plan size so a runaway model can't generate 1000 files.
         # Dynamic based on brief signals: extensible / marketplace / plugin
         # briefs get 80, default 25. Without the higher cap, the planner
@@ -700,8 +753,34 @@ class CodeAgent(BaseAgent):
             # the right file SHAPE for an ecosystem it's seen many variants
             # of. A wrong shape (e.g. Next 12 `pages/` vs Next 14 `app/`)
             # breaks the build before any code runs.
-            from skyn3t.agents.stack_templates import detect_stack, plan_for_stack
-            template_key = detect_stack(brief)
+            architecture_text = ""
+            try:
+                architecture_text = (
+                    (artifact_dir / "architecture.md")
+                    .read_text(encoding="utf-8", errors="ignore")
+                    .strip()
+                )
+            except Exception:
+                architecture_text = ""
+            tech_stack: Dict[str, Any] = {}
+            try:
+                raw_tech_stack = (
+                    (artifact_dir / "tech_stack.json")
+                    .read_text(encoding="utf-8", errors="ignore")
+                    .strip()
+                )
+                parsed_tech_stack = _json.loads(raw_tech_stack) if raw_tech_stack else {}
+                if isinstance(parsed_tech_stack, dict):
+                    tech_stack = parsed_tech_stack
+            except Exception:
+                tech_stack = {}
+
+            from skyn3t.agents.stack_templates import detect_stack_from_handoff, plan_for_stack
+            template_key = detect_stack_from_handoff(
+                brief,
+                architecture_text=architecture_text,
+                tech_stack=tech_stack,
+            )
             template_plan = plan_for_stack(template_key, brief) if template_key else None
 
             plan: Dict[str, Any] = {}
@@ -804,7 +883,11 @@ class CodeAgent(BaseAgent):
                 plan_prompt = f"Brief:\n{brief}\n\nReturn the JSON plan."
                 await self.think("planning project structure")
                 plan_out = await client.complete(
-                    plan_prompt, system=plan_system, max_tokens=4000, temperature=0.3,
+                    plan_prompt,
+                    system=plan_system,
+                    max_tokens=4000,
+                    temperature=0.3,
+                    timeout=_PLAN_TIMEOUT_SECONDS,
                 )
                 if plan_out and "[deterministic-stub]" not in plan_out:
                     m = _re.search(r"\{[\s\S]*\}", plan_out)
@@ -1103,6 +1186,27 @@ class CodeAgent(BaseAgent):
                         f"Brief:\n{brief}\n\n",
                         f"Stack: {stack}\n\n",
                     ]
+                    # Brief-derived non-negotiable rules for THIS file
+                    # type. Backend-agnostic — same compact bullets work
+                    # across claude/copilot/kimi/openrouter free models.
+                    # Skip if no rules match (empty rules block would
+                    # just be dead context that costs tokens).
+                    try:
+                        from skyn3t.agents.brief_requirements import (
+                            extract_requirements,
+                            format_hard_rules,
+                        )
+                        _reqs = extract_requirements(brief or "")
+                        _rules_md = format_hard_rules(
+                            _reqs, rel, palette_hexes=_palette_hexes
+                        )
+                        if _rules_md:
+                            file_prompt_parts.append(_rules_md)
+                    except Exception:
+                        logger.debug(
+                            "brief_requirements injection failed for %s", rel,
+                            exc_info=True,
+                        )
                     # Filter prior_context to just the sections this
                     # file actually needs. Cuts ~10KB off most CLI
                     # prompts, which directly saves wall-clock time
@@ -1202,6 +1306,7 @@ class CodeAgent(BaseAgent):
                                 backend=per_file_backend,
                                 event_bus=self.event_bus,
                                 caller_name=self.name,
+                                backend_is_policy=True,
                             )
                     except Exception:
                         logger.debug(
@@ -1212,8 +1317,12 @@ class CodeAgent(BaseAgent):
                     # First attempt with the per-file-routed backend.
                     try:
                         body_local = await file_client.complete(
-                            file_prompt, system=build_system,
-                            max_tokens=8000, temperature=0.3,
+                            file_prompt,
+                            system=build_system,
+                            max_tokens=8000,
+                            temperature=0.3,
+                            timeout=_FILE_BUILD_TIMEOUT_SECONDS,
+                            _allow_backend_failover=False,
                         )
                     except Exception:
                         body_local = ""
@@ -1274,8 +1383,12 @@ class CodeAgent(BaseAgent):
                                 skip_backends=[primary] if primary else [],
                             )
                             retry_body = await retry_client.complete(
-                                file_prompt, system=build_system,
-                                max_tokens=8000, temperature=0.3,
+                                file_prompt,
+                                system=build_system,
+                                max_tokens=8000,
+                                temperature=0.3,
+                                timeout=_FILE_RETRY_TIMEOUT_SECONDS,
+                                _allow_backend_failover=False,
                             )
                             marked_retry = _extract_marked_files(retry_body or "")
                             if marked_retry:
@@ -1360,6 +1473,25 @@ class CodeAgent(BaseAgent):
                         f"Brief:\n{brief}\n\n",
                         f"Stack: {stack}\n\n",
                     ]
+                    # Brief-derived non-negotiable rules for the cluster's
+                    # dominant file type. Backend-agnostic compact rules
+                    # so even small-context free-tier models stay on rails.
+                    try:
+                        from skyn3t.agents.brief_requirements import (
+                            extract_requirements,
+                            format_hard_rules,
+                        )
+                        _reqs = extract_requirements(brief or "")
+                        _cluster_rules_md = format_hard_rules(
+                            _reqs, cluster_paths[0], palette_hexes=_palette_hexes
+                        )
+                        if _cluster_rules_md:
+                            prompt_parts.append(_cluster_rules_md)
+                    except Exception:
+                        logger.debug(
+                            "brief_requirements injection failed for cluster %s",
+                            parent_dir, exc_info=True,
+                        )
                     if prior_context:
                         prompt_parts.append(
                             "Prior stages already produced these artifacts. "
@@ -1403,6 +1535,7 @@ class CodeAgent(BaseAgent):
                             backend=cluster_backend,
                             event_bus=self.event_bus,
                             caller_name=self.name,
+                            backend_is_policy=True,
                         )
                     else:
                         cluster_client = client
@@ -1412,8 +1545,12 @@ class CodeAgent(BaseAgent):
                     )
                     try:
                         raw = await cluster_client.complete(
-                            cluster_prompt, system=build_system,
-                            max_tokens=8000, temperature=0.3,
+                            cluster_prompt,
+                            system=build_system,
+                            max_tokens=8000,
+                            temperature=0.3,
+                            timeout=_CLUSTER_BUILD_TIMEOUT_SECONDS,
+                            _allow_backend_failover=False,
                         )
                     except Exception:
                         raw = ""
