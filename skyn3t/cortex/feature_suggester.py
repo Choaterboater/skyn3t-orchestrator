@@ -177,7 +177,7 @@ def infer_feature_target_file(idea: str, *, repo_root: Path | None = None) -> Op
         score = 0
         matches = 0
         for keyword in keywords:
-            if keyword in rel_lower:
+            if re.search(rf"\b{re.escape(keyword)}\b", rel_lower):
                 score += 12
                 matches += 1
         for hint_keywords, hint_paths in _TARGET_HINTS:
