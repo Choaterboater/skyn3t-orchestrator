@@ -946,13 +946,13 @@ class StudioRunner:
                                 message=f"{blockers} blocker(s) found by contract verifier.",
                             )
                             try:
+                                import json as _json
+
                                 from skyn3t.adapters import LLMClient
                                 from skyn3t.agents.targeted_fix import (
                                     FileIssue,
                                     apply_targeted_fix,
                                 )
-
-                                import json as _json
                                 report_json = contract_output.get("report_json", "{}")
                                 report = _json.loads(report_json)
                                 findings = report.get("findings", [])

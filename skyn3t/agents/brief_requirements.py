@@ -12,10 +12,8 @@ max — so small/free models on weak context windows still see it.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import List, Optional
-
 
 # Each rule: (matchers in the brief, file types it applies to, NON_NEGOTIABLE rule text).
 # Matching is OR across the patterns; case-insensitive; substring (not
