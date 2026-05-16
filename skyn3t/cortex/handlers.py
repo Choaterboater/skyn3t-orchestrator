@@ -177,7 +177,7 @@ def install_handlers(orchestrator) -> None:
         target = payload.get("target_file") or ""
         risks = normalize_review_risks(payload.get("risks") or [])
         verdict = payload.get("verdict") or ""
-        if not risks:
+        if not risks and not verdict:
             return {"ok": True, "status": "noop", "details": "review flagged no actionable risks"}
         rationale = (
             f"Address Reviewer's critique on `{target}`.\n\n"
