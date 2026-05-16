@@ -450,6 +450,74 @@ def test_contract_drift_passes_when_package_declared_and_imported(
     assert not drift, f"unexpected drift findings: {[f.fix_hint for f in drift]}"
 
 
+def test_contract_flags_python_lib_in_npm_package_json(tmp_path: Path) -> None:
+    """canary-117 pattern: server/package.json had \"fastapi\": \"^0.1.0\".
+    That's a Python framework as an npm dep — `npm install` will fail or
+    pull a squatter. Always a blocker.
+    """
+    artifact = tmp_path
+    scaffold = artifact / "scaffold"
+    _write(
+        scaffold / "server" / "package.json",
+        json.dumps({"dependencies": {
+            "express": "^4.21",
+            "fastapi": "^0.1.0",       # Python lib as npm dep
+            "pydantic": "^2.0",        # ditto
+        }}),
+    )
+
+    report = check_contract(scaffold, brief="", artifact_dir=artifact)
+    leaks = [f for f in report.findings if f.category == "language_mismatch"]
+    assert leaks
+    assert leaks[0].severity == "blocker"
+    polluted = leaks[0].fix_hint.get("polluted_packages", [])
+    assert "fastapi" in polluted
+    assert "pydantic" in polluted
+
+
+def test_contract_flags_python_promised_but_node_shipped(tmp_path: Path) -> None:
+    """canary-116/117 pattern: tech_stack says backend=fastapi but the
+    scaffold has package.json + no pyproject.toml.
+    """
+    artifact = tmp_path
+    scaffold = artifact / "scaffold"
+    _write(artifact / "tech_stack.json", json.dumps({"backend": "fastapi", "db": "postgres"}))
+    _write(scaffold / "package.json", json.dumps({"dependencies": {"express": "^4"}}))
+    _write(scaffold / "server" / "index.js", "import express from 'express';\n")
+
+    report = check_contract(scaffold, brief="", artifact_dir=artifact)
+    findings = [
+        f for f in report.findings
+        if f.category == "language_mismatch" and f.file == "tech_stack.json"
+    ]
+    assert findings
+    assert findings[0].severity == "blocker"
+    assert "Python (fastapi)" in findings[0].message
+
+
+def test_contract_no_language_mismatch_when_python_scaffold_real(tmp_path: Path) -> None:
+    """If tech_stack says Python AND scaffold has pyproject.toml, no finding."""
+    artifact = tmp_path
+    scaffold = artifact / "scaffold"
+    _write(artifact / "tech_stack.json", json.dumps({"backend": "fastapi"}))
+    _write(scaffold / "pyproject.toml", "[project]\nname = 'app'\n")
+    _write(scaffold / "app" / "main.py", "from fastapi import FastAPI\napp = FastAPI()\n")
+
+    report = check_contract(scaffold, brief="", artifact_dir=artifact)
+    assert not [f for f in report.findings if f.category == "language_mismatch"]
+
+
+def test_contract_no_language_mismatch_when_pure_node(tmp_path: Path) -> None:
+    """Pure Node scaffold with Node tech_stack — no finding."""
+    artifact = tmp_path
+    scaffold = artifact / "scaffold"
+    _write(artifact / "tech_stack.json", json.dumps({"backend": "express", "db": "better-sqlite3"}))
+    _write(scaffold / "server" / "package.json", json.dumps({"dependencies": {"express": "^4"}}))
+
+    report = check_contract(scaffold, brief="", artifact_dir=artifact)
+    assert not [f for f in report.findings if f.category == "language_mismatch"]
+
+
 def test_contract_drift_skips_rejected_alternatives(tmp_path: Path) -> None:
     """Sentences like 'we considered Next.js but chose Vite' should not
     fire a drift blocker — the architecture doc is naming an alternative,

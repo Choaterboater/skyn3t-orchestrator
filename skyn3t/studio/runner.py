@@ -1029,6 +1029,34 @@ class StudioRunner:
                                             "so the scaffold matches the architecture doc. "
                                             "Preserve all existing scripts and the name/version/type fields."
                                         )
+                                    elif category == "language_mismatch":
+                                        # Two subtypes: polluted package.json (remove
+                                        # Python libs) vs tech_stack-says-Python-
+                                        # scaffold-is-Node (revise tech_stack).
+                                        polluted = fix_hint.get("polluted_packages") or []
+                                        if polluted:
+                                            target = fix_hint.get("package_json") or raw_file
+                                            err = (
+                                                base_msg
+                                                + f"\nRemove these Python libs that are NOT valid "
+                                                f"npm packages: {', '.join(polluted)}. "
+                                                "Keep all other dependencies, scripts, and the "
+                                                "name/version/type fields exactly as-is. Return "
+                                                "the corrected package.json."
+                                            )
+                                        else:
+                                            # tech_stack lies — regenerate to match actual Node scaffold
+                                            target = "tech_stack.json"
+                                            err = (
+                                                base_msg
+                                                + "\nThe scaffold is actually a Node project "
+                                                "(package.json present, no pyproject.toml). "
+                                                "Rewrite tech_stack.json with Node-compatible "
+                                                "values: backend should be 'express' or 'hono-node', "
+                                                "frontend should be 'react-vite' or similar, db "
+                                                "should be 'better-sqlite3' or 'postgres' (the npm "
+                                                "package). Do not return Python framework names."
+                                            )
                                     elif category == "placeholder_leak":
                                         target = raw_file
                                         literal = fix_hint.get("literal") or ""
