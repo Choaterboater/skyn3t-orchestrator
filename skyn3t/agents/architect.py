@@ -176,23 +176,40 @@ class ArchitectAgent(BaseAgent):
         arch_path.write_text(arch_md, encoding="utf-8")
         await self.think(f"wrote {arch_path.name}")
 
-        # STEP 0: try LLM for tech_stack.json, fall back to deterministic template.
-        # The LLM picks here MUST match what CodeAgent's stack templates
-        # can actually scaffold — otherwise tech_stack.json becomes a
-        # contract drift source. Constrain to well-known choices.
+        # STEP 0: try LLM for tech_stack.json. The previous version
+        # allowed pairwise-incoherent picks (e.g. backend=fastapi +
+        # db=better-sqlite3 → Python framework + Node lib). canary-116/117
+        # both produced "fastapi" as a literal npm dependency, breaking
+        # `npm install` outright. The fix is to constrain to COHERENT
+        # BUNDLES that CodeAgent has stack templates for, not to free
+        # pick from per-slot lists.
         stack_role_prompt = (
             "Given the brief, return a JSON object with keys: frontend, backend, db, "
             "infra, ci.\n\n"
-            "ALLOWED VALUES (CodeAgent can only scaffold these):\n"
-            "  frontend: react-vite, react-vite-tailwind, next, vue-vite, vanilla-vite, none\n"
-            "  backend:  express, hono-node, fastify, fastapi, flask, none\n"
-            "  db:       better-sqlite3, postgres, mongodb, none\n"
-            "  infra:    local-node, docker-compose, vercel, fly, none\n"
-            "  ci:       github-actions, none\n\n"
-            "Pick choices that match the actual scope of the brief. If the brief "
-            "doesn't need a DB or backend, return 'none' for that slot — do NOT "
-            "invent values outside the allowed list.\n\n"
-            "Return ONLY valid JSON, nothing else. No code fences, no commentary."
+            "Pick from EXACTLY one of these coherent bundles (CodeAgent only knows "
+            "how to scaffold these — anything else will silently downgrade and the "
+            "scaffold will not match the manifest):\n\n"
+            "NODE BUNDLES (use these unless the brief explicitly demands Python):\n"
+            "  - {frontend: 'react-vite-tailwind', backend: 'express', db: 'better-sqlite3', infra: 'docker-compose', ci: 'github-actions'}\n"
+            "  - {frontend: 'react-vite-tailwind', backend: 'express', db: 'none', infra: 'docker-compose', ci: 'github-actions'}\n"
+            "  - {frontend: 'react-vite', backend: 'express', db: 'better-sqlite3', infra: 'local-node', ci: 'github-actions'}\n"
+            "  - {frontend: 'react-vite', backend: 'hono-node', db: 'better-sqlite3', infra: 'docker-compose', ci: 'github-actions'}\n"
+            "  - {frontend: 'next', backend: 'next', db: 'better-sqlite3', infra: 'vercel', ci: 'github-actions'}\n"
+            "  - {frontend: 'vue-vite', backend: 'express', db: 'better-sqlite3', infra: 'local-node', ci: 'github-actions'}\n"
+            "  - {frontend: 'vanilla-vite', backend: 'none', db: 'none', infra: 'vercel', ci: 'github-actions'}\n\n"
+            "PYTHON BUNDLES (only when brief explicitly demands Python/FastAPI/Flask):\n"
+            "  - {frontend: 'react-vite', backend: 'fastapi', db: 'postgres', infra: 'docker-compose', ci: 'github-actions'}\n"
+            "  - {frontend: 'none', backend: 'flask', db: 'postgres', infra: 'docker-compose', ci: 'github-actions'}\n\n"
+            "RULES:\n"
+            "- Pick the bundle whose backend+db combo matches the SAME language. NEVER\n"
+            "  return {backend: 'fastapi', db: 'better-sqlite3'} — that mixes Python\n"
+            "  and Node and breaks the scaffold.\n"
+            "- If the brief mentions a feature that isn't in any bundle (e.g. Hono\n"
+            "  + Postgres), pick the CLOSEST bundle and accept the substitution\n"
+            "  rather than inventing new values.\n"
+            "- 'none' means the role is genuinely not needed (e.g. a CLI tool sets\n"
+            "  frontend=none).\n\n"
+            "Return ONLY valid JSON for one bundle, nothing else. No code fences."
         )
         llm_stack = await self._llm_generate_json(
             role_prompt=stack_role_prompt,

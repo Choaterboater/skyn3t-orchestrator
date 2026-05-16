@@ -430,6 +430,141 @@ def _check_palette(scaffold_dir: Path, artifact_dir: Path, brief: str) -> List[C
 
 
 # ---------------------------------------------------------------------
+# Language-coherence check (Python↔Node mismatch)
+# ---------------------------------------------------------------------
+
+# Tech-stack values that imply a Python scaffold.
+_PYTHON_TECH_VALUES: Set[str] = {
+    "fastapi", "flask", "django", "starlette",
+}
+# Tech-stack values that imply a Node scaffold.
+_NODE_TECH_VALUES: Set[str] = {
+    "express", "express-node", "hono", "hono-node", "fastify", "koa",
+    "nestjs", "next", "nextjs", "next.js",
+    "react", "react-vite", "react-vite-tailwind", "vue-vite", "vanilla-vite",
+    "svelte-kit", "sveltekit",
+}
+# npm package names that are actually Python libraries — if any of these
+# appear in package.json, that's a Python↔Node confusion. Will install
+# either a squatter or break.
+_PYTHON_LIB_NAMES_IN_NPM: Set[str] = {
+    "fastapi", "flask", "django", "starlette", "uvicorn", "pydantic",
+    "sqlalchemy", "alembic", "celery", "tornado",
+}
+
+
+def _check_language_coherence(
+    scaffold_dir: Path,
+    artifact_dir: Path,
+) -> List[ContractFinding]:
+    """Detect Python↔Node mixing — declared in one stack, scaffolded in another.
+
+    Two patterns from canary-116/117:
+    1. tech_stack.json says backend=fastapi but scaffold ships package.json
+       (Node manifest, no pyproject.toml). CodeAgent silently downgraded
+       to Express.
+    2. package.json includes literal "fastapi": "..." as an npm dep. Will
+       install some squatter package or break `npm install` outright.
+    """
+    findings: List[ContractFinding] = []
+
+    # Case 1: tech_stack lies about language. Requires tech_stack.json.
+    ts_path = artifact_dir / "tech_stack.json"
+    promised_python = False
+    declared_backend = ""
+    declared_frontend = ""
+    if ts_path.exists():
+        ts = _load_json(ts_path)
+        if isinstance(ts, dict):
+            declared_backend = _resolve_stack_value(ts.get("backend")) or ""
+            declared_frontend = _resolve_stack_value(ts.get("frontend")) or ""
+            promised_python = (
+                declared_backend in _PYTHON_TECH_VALUES
+                or declared_frontend in _PYTHON_TECH_VALUES
+            )
+
+    # What did the scaffold actually ship? (computed even without
+    # tech_stack.json — Case 2 below needs to scan package.json files
+    # regardless of manifest presence.)
+    has_package_json = any(
+        path.name == "package.json"
+        for _rel, path in _iter_files(scaffold_dir, suffixes={".json"})
+    )
+    has_pyproject = (scaffold_dir / "pyproject.toml").exists()
+    has_requirements = (scaffold_dir / "requirements.txt").exists()
+    is_python_scaffold = has_pyproject or has_requirements
+
+    # Case 1: tech_stack says Python but scaffold is Node (no pyproject,
+    # no requirements.txt, only package.json).
+    if promised_python and has_package_json and not is_python_scaffold:
+        findings.append(ContractFinding(
+            severity="blocker",
+            category="language_mismatch",
+            file="tech_stack.json",
+            message=(
+                f"tech_stack.json declares Python ({declared_backend or declared_frontend}) "
+                "but the scaffold ships a Node project (package.json present, no "
+                "pyproject.toml or requirements.txt). CodeAgent likely silently "
+                "downgraded to a Node stack — this is the canary-116/117 pattern."
+            ),
+            suggestion=(
+                "Either revise tech_stack.json to match the actual Node scaffold, "
+                "or scaffold a real Python project (pyproject.toml + Python source). "
+                "Don't ship a manifest that lies about the language."
+            ),
+            fix_hint={
+                "declared_backend": declared_backend,
+                "declared_frontend": declared_frontend,
+                "actual": "node",
+            },
+        ))
+
+    # Case 2: Python lib names polluting package.json. Always a blocker —
+    # `npm install` will either fail or pull a squatter.
+    for _rel, path in _iter_files(scaffold_dir, suffixes={".json"}):
+        if path.name != "package.json":
+            continue
+        # Skip vendored.
+        try:
+            rel_str = path.relative_to(scaffold_dir).as_posix()
+        except ValueError:
+            rel_str = path.name
+        data = _load_json(path)
+        if not isinstance(data, dict):
+            continue
+        polluted: List[str] = []
+        for dep_key in ("dependencies", "devDependencies", "peerDependencies"):
+            section = data.get(dep_key)
+            if not isinstance(section, dict):
+                continue
+            for name in section.keys():
+                if name.lower() in _PYTHON_LIB_NAMES_IN_NPM:
+                    polluted.append(name)
+        if polluted:
+            findings.append(ContractFinding(
+                severity="blocker",
+                category="language_mismatch",
+                file=rel_str,
+                message=(
+                    f"{rel_str} lists Python libraries as npm dependencies: "
+                    f"{', '.join(polluted)}. These are not valid npm packages — "
+                    "npm install will fail or pull squatter packages."
+                ),
+                suggestion=(
+                    f"Remove {', '.join(polluted)} from package.json. If the "
+                    "feature is genuinely needed, scaffold a Python service "
+                    "alongside (with its own pyproject.toml) — don't mix."
+                ),
+                fix_hint={
+                    "polluted_packages": polluted,
+                    "package_json": rel_str,
+                },
+            ))
+
+    return findings
+
+
+# ---------------------------------------------------------------------
 # tech_stack.json check
 # ---------------------------------------------------------------------
 
@@ -876,6 +1011,7 @@ def check_contract(
 
     findings: List[ContractFinding] = []
     findings.extend(_check_palette(scaffold_dir, artifact_dir, brief or ""))
+    findings.extend(_check_language_coherence(scaffold_dir, artifact_dir))
     findings.extend(_check_tech_stack(scaffold_dir, artifact_dir))
     findings.extend(_check_architecture_drift(scaffold_dir, artifact_dir))
     findings.extend(_check_placeholders(scaffold_dir))
