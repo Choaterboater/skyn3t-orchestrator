@@ -18,12 +18,34 @@ This is cheaper (~1/10th the tokens) and safer (untouched files stay intact).
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
 logger = logging.getLogger("skyn3t.agents.targeted_fix")
+
+# Per-file regen timeout. Used to be a flat 90s, which fired
+# consistently on the largest scaffold files (App.jsx, styles.css,
+# config-store.js) — the targeted-fix loop would then "preserve
+# existing file instead" and the same 3 issues would resurface in the
+# next critique round (canary-19/20 pattern). We now scale the budget
+# with the existing file's size, since regen time grows roughly linearly
+# with output length on streaming CLI backends. The shared LLM client
+# already enforces its own streaming-idle + hard-cap window, so a
+# generous outer ceiling here just lets the inner one do its job.
+_REGENERATE_TIMEOUT_BASE_SECONDS = 90.0
+_REGENERATE_TIMEOUT_PER_KB_SECONDS = 12.0
+_REGENERATE_TIMEOUT_MAX_SECONDS = 300.0
+
+
+def _regenerate_timeout_for(existing_content: str) -> float:
+    """Per-file regen budget, scaled by current file size."""
+    size_kb = max(0, len(existing_content)) / 1024.0
+    budget = _REGENERATE_TIMEOUT_BASE_SECONDS + size_kb * _REGENERATE_TIMEOUT_PER_KB_SECONDS
+    return min(_REGENERATE_TIMEOUT_MAX_SECONDS, budget)
 
 
 @dataclass
@@ -39,6 +61,14 @@ class FixResult:
     files_changed: List[str]
     files_created: List[str]
     errors: List[str]
+
+
+def _preserve_existing_on_regenerate_failure(issue: FileIssue, reason: str) -> None:
+    logger.warning(
+        "Targeted fix could not safely rewrite %s (%s). Preserving existing file.",
+        issue.path,
+        reason,
+    )
 
 
 def _parse_build_errors(stderr: str, stdout: str) -> List[FileIssue]:
@@ -161,6 +191,51 @@ def _parse_build_errors(stderr: str, stdout: str) -> List[FileIssue]:
             )
         )
 
+    # Pattern 7: Node ESM runtime "does not provide an export named"
+    export_match = re.search(
+        r"does not provide an export named ['\"]([^'\"]+)['\"]",
+        text,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if export_match is not None:
+        lines = text.splitlines()
+        importer_path = None
+        import_spec = None
+        for idx, line in enumerate(lines):
+            path_match = re.search(
+                r"^(?:file://)?(.+\.(?:js|jsx|ts|tsx|mjs|cjs)):\d+",
+                line.strip(),
+            )
+            if path_match is None:
+                continue
+            importer_path = Path(path_match.group(1))
+            if idx + 1 < len(lines):
+                import_match = re.search(r"""from\s+['"]([^'"]+)['"]""", lines[idx + 1])
+                if import_match is not None:
+                    import_spec = import_match.group(1)
+            break
+
+        target_path = None
+        if importer_path is not None and import_spec and import_spec.startswith("."):
+            resolved = (importer_path.resolve().parent / import_spec).resolve()
+            resolved_posix = resolved.as_posix()
+            marker = "/scaffold/"
+            if marker in resolved_posix:
+                target_path = resolved_posix.split(marker, 1)[1]
+            else:
+                target_path = resolved.name
+        elif import_spec:
+            target_path = import_spec
+
+        if target_path:
+            issues.append(
+                FileIssue(
+                    path=target_path,
+                    error_message=f"Missing export: {export_match.group(1)}",
+                    suggested_action="regenerate",
+                )
+            )
+
     # Deduplicate by path, keeping the first error message.
     seen: set = set()
     deduped: List[FileIssue] = []
@@ -170,6 +245,34 @@ def _parse_build_errors(stderr: str, stdout: str) -> List[FileIssue]:
             seen.add(key)
             deduped.append(i)
     return deduped
+
+
+# Lines that are *never* real file content — CLI tool-call telemetry
+# emitted by copilot/claude/kimi backends despite the prompt forbidding it.
+# Kept compatible with code_agent._CLI_TRACE_PATTERNS so the two
+# sanitizers can't diverge silently. See also styles.css canary-19
+# incident where prose like "I'm checking the surrounding components..."
+# leaked into a CSS file because the old CSS branch only required
+# alnum-leading lines.
+_CLI_TRACE_LINE_RE = re.compile(
+    r"^\s*(?:"
+    r"[●✗✓└│]"                                # tree bullets / status markers
+    r"|(?:Read|Search|Write|Edit|List|Web\s+Search|Locate)\s"  # tool names
+    r"|(?:I['’]m|I['’]ll|I\s+will|I['’]ve|I\s+have|I\s+can|"
+    r"Let\s+me|Here(?:['’]s|\s+is)|Sure|Okay|Understood|"
+    r"The\s+(?:existing|workspace|file)|This\s+(?:file|is|looks?)|"
+    r"That\s+(?:looks?|is)|It\s+(?:already|is|looks?)|"
+    r"No\s+(?:changes|matches?)|Looks?\s+good|Below|"
+    r"Path\s+does\s+not\s+exist|Permission\s+denied|"
+    r"No\s+matches\s+found|The\s+workspace\s+looks)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_cli_trace_line(line: str) -> bool:
+    """True for CLI narration / tool-call telemetry lines."""
+    return bool(_CLI_TRACE_LINE_RE.match(line))
 
 
 def _strip_preamble(content: str, rel_path: str) -> str:
@@ -190,41 +293,78 @@ def _strip_preamble(content: str, rel_path: str) -> str:
     ext = Path(rel_path).suffix.lower()
     lines = content.splitlines()
 
+    def _scan(start_test) -> str:
+        """Walk lines, skipping CLI trace + blank lines, until start_test matches."""
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if _is_cli_trace_line(stripped):
+                continue
+            if start_test(stripped):
+                return "\n".join(lines[i:])
+        # No clear start marker — return original content untouched.
+        return content
+
     # File-type aware start-of-content detection
     if ext == ".json":
-        # JSON starts with { or [
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped and (stripped.startswith("{") or stripped.startswith("[")):
-                return "\n".join(lines[i:])
-    elif ext in (".html", ".htm"):
-        # HTML starts with <
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped and stripped.startswith("<"):
-                return "\n".join(lines[i:])
-    elif ext in (".css", ".scss"):
-        # CSS starts with /*, @, or a selector/rule
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped and (stripped.startswith("/*") or stripped.startswith("@") or stripped[0].isalnum()):
-                return "\n".join(lines[i:])
-    elif ext in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"):
-        # JS/TS starts with import, export, const, let, var, function, class,
-        # comment, or use strict
-        js_starts = ("import ", "export ", "const ", "let ", "var ", "function ", "class ", "//", "/*", "use strict", '"use strict"', "'use strict'")
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped and any(stripped.startswith(s) for s in js_starts):
-                return "\n".join(lines[i:])
-    else:
-        # Generic: skip blank lines and obvious preamble markers
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped and not stripped.lower().startswith(("here", "okay", "sure", "below", "the ", "this ", "i've ", "let me")):
-                return "\n".join(lines[i:])
+        return _scan(lambda s: s.startswith(("{", "[")))
+    if ext in (".html", ".htm"):
+        return _scan(lambda s: s.startswith("<"))
+    if ext in (".css", ".scss", ".sass", ".less"):
+        # Real CSS lines begin with /*, @, :root, a selector char, or a
+        # bare identifier followed by ,/{/:. Plain prose (even alnum)
+        # must NOT pass here — canary-19 styles.css was wrecked because
+        # the old rule accepted "I'm checking ..." as a CSS selector.
+        css_start_re = re.compile(
+            r"^(?:/\*|@[a-zA-Z]|:root\b|[.#*&]|"
+            r"[a-zA-Z][\w-]*\s*(?:[,{]|::?[\w-]+|\s+\{))"
+        )
+        return _scan(lambda s: bool(css_start_re.match(s)))
+    if ext in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"):
+        js_starts = (
+            "import ", "import{", "import(", "export ",
+            "const ", "let ", "var ", "function ", "function(",
+            "class ", "async ", "//", "/*", "#!",
+            "use strict", '"use strict"', "'use strict'",
+            "module.exports", "require(",
+        )
+        return _scan(lambda s: any(s.startswith(p) for p in js_starts))
+    if ext == ".py":
+        py_starts_re = re.compile(
+            r"^(?:import\s|from\s|def\s|async\s+def\s|class\s|@\w|#!|#\s|\"\"\"|''')"
+        )
+        return _scan(lambda s: bool(py_starts_re.match(s)))
+    if ext in (".yml", ".yaml"):
+        yaml_start_re = re.compile(r"^(?:---|[a-zA-Z_][\w\-]*\s*:|#\s|-\s)")
+        return _scan(lambda s: bool(yaml_start_re.match(s)))
+    if ext in (".env",) or Path(rel_path).name.startswith(".env"):
+        env_start_re = re.compile(r"^(?:#\s|[A-Z][A-Z0-9_]*=)")
+        return _scan(lambda s: bool(env_start_re.match(s)))
+    if ext in (".md", ".markdown"):
+        # Real markdown starts with a heading, frontmatter, list, blockquote,
+        # fenced code block, or HTML tag. Plain prose-with-capital is NOT
+        # enough — canary-113's server/README.md shipped LLM tool-call
+        # narration ("I'm checking the project structure...") because the
+        # old regex accepted the leading capital.
+        md_start_re = re.compile(r"^(?:#{1,6}\s|---\s*$|\*\s|-\s|\d+\.\s|>\s|```|<!?[a-zA-Z])")
+        return _scan(lambda s: bool(md_start_re.match(s)))
 
-    # Fallback: if no start marker found, return as-is (might still be valid)
+    # Generic: skip blank lines, CLI trace lines, and the most common
+    # narration lead-ins. Anything else is treated as content.
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _is_cli_trace_line(stripped):
+            continue
+        lower = stripped.lower()
+        if lower.startswith(
+            ("here", "okay", "sure", "below", "the ", "this ", "i've ",
+             "i'm ", "i ", "let me", "understood")
+        ):
+            continue
+        return "\n".join(lines[i:])
     return content
 
 
@@ -406,11 +546,29 @@ async def apply_targeted_fix(
                 f"```\n{old_content}\n```\n\n"
                 f"Rewrite the ENTIRE file so the error is fixed. "
                 f"Do not change the file's overall purpose or exports. "
+                f"Output the COMPLETE file; never truncate or stop mid-function. "
+                f"Do not add TODO, FIXME, placeholder, or 'not implemented' markers. "
+                f"Do not remove or rename existing exports. "
+                f"The result must be build-valid for this file type. "
                 f"Only fix the specific error. "
                 f"Return ONLY the fixed file content, no markdown fences, no explanations."
             )
+            regen_timeout = _regenerate_timeout_for(old_content)
             try:
-                new_content = await llm_client.complete(prompt, max_tokens=4000, temperature=0.2)
+                new_content = await asyncio.wait_for(
+                    llm_client.complete(prompt, max_tokens=4000, temperature=0.2),
+                    timeout=regen_timeout,
+                )
+            except asyncio.TimeoutError:
+                _preserve_existing_on_regenerate_failure(
+                    issue,
+                    f"timeout after {regen_timeout:.0f}s",
+                )
+                errors.append(
+                    f"Timed out regenerating {issue.path} after "
+                    f"{regen_timeout:.0f}s; preserved existing file instead."
+                )
+                continue
             except Exception as exc:
                 errors.append(f"LLM call failed for {issue.path}: {exc}")
                 continue
@@ -426,14 +584,27 @@ async def apply_targeted_fix(
             ext = Path(issue.path).suffix.lower()
             validation_error = _validate_syntax(new_content, ext, issue.path)
             if validation_error:
-                logger.warning(
-                    "LLM generated invalid syntax for %s: %s. Using placeholder instead.",
-                    issue.path,
-                    validation_error,
+                _preserve_existing_on_regenerate_failure(
+                    issue,
+                    f"invalid syntax: {validation_error}",
                 )
-                # Fall back to placeholder instead of writing invalid code
-                target_path.write_text(_placeholder_for(issue.path), encoding="utf-8")
-                created.append(issue.path)
+                errors.append(
+                    f"Invalid regenerated content for {issue.path}: "
+                    f"{validation_error}; preserved existing file instead."
+                )
+                continue
+
+            from skyn3t.agents.code_agent import _syntax_ok
+
+            if not _syntax_ok(new_content, issue.path):
+                _preserve_existing_on_regenerate_failure(
+                    issue,
+                    "build-invalid output",
+                )
+                errors.append(
+                    f"Build-invalid regenerated content for {issue.path}; "
+                    "preserved existing file instead."
+                )
                 continue
 
             target_path.write_text(new_content + "\n", encoding="utf-8")

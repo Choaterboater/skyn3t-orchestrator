@@ -299,7 +299,7 @@ class TestStudioRunner:
             title="Demo template",
             stages=[
                 SimpleNamespace(
-                    name="writer",
+                    name="code",
                     agent="WriterAgent",
                     capability="copywriting",
                     handoff_to=None,
@@ -394,6 +394,195 @@ class TestStudioRunner:
         assert stage["capability"] == "copywriting"
         assert stage["expected_artifact"] == "readme.md"
         assert stage["started_at"] <= stage["completed_at"]
+
+    async def test_run_pipeline_continues_when_critique_times_out(
+        self, event_bus, tmp_path, monkeypatch
+    ):
+        from skyn3t.studio.runner import StudioRunner
+
+        class FakeStudioAgent:
+            async def initialize(self) -> None:
+                return None
+
+            async def execute(self, task: TaskRequest) -> TaskResult:
+                out_dir = Path(task.input_data["artifact_dir"])
+                (out_dir / "readme.md").write_text("# Demo\n", encoding="utf-8")
+                return TaskResult(
+                    task_id=task.task_id,
+                    success=True,
+                    output={"files": ["readme.md"], "summary": "Drafted the README."},
+                )
+
+        class TimeoutReviewer:
+            async def initialize(self) -> None:
+                return None
+
+            async def critique(self, **kwargs):  # noqa: ARG002
+                raise asyncio.TimeoutError
+
+        def fake_get_agent(name, *args, **kwargs):  # noqa: ARG001
+            if name == "ReviewerAgent":
+                return TimeoutReviewer()
+            return FakeStudioAgent()
+
+        monkeypatch.setattr("skyn3t.studio.runner.get_agent", fake_get_agent)
+        monkeypatch.setattr(
+            "skyn3t.studio.runner.get_template",
+            lambda _key: SimpleNamespace(
+                title="Demo template",
+                description="Turn a brief into a README.",
+                stages=[
+                    SimpleNamespace(
+                        name="writer",
+                        agent="WriterAgent",
+                        capability="copywriting",
+                        handoff_to=None,
+                        input_extra={},
+                    )
+                ],
+            ),
+        )
+
+        runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
+        manifest = await runner.start("demo", "Make a landing page", slug="critique-timeout")
+
+        events = [entry["event"] for entry in manifest["history"]]
+        stage = manifest["stages"][0]
+
+        assert manifest["status"] == "done"
+        assert stage["status"] == "done"
+        assert stage["summary"] == "Drafted the README."
+        assert "CRITIQUE_FAILED" in events
+        critique_failure = next(
+            entry for entry in manifest["history"] if entry["event"] == "CRITIQUE_FAILED"
+        )
+        assert "timed out" in critique_failure["message"]
+
+    async def test_run_pipeline_continues_when_reviewer_llm_times_out(
+        self, event_bus, tmp_path, monkeypatch
+    ):
+        from skyn3t.agents.reviewer import ReviewerAgent
+        from skyn3t.studio.runner import StudioRunner
+
+        class FakeStudioAgent:
+            async def initialize(self) -> None:
+                return None
+
+            async def execute(self, task: TaskRequest) -> TaskResult:
+                out_dir = Path(task.input_data["artifact_dir"])
+                (out_dir / "readme.md").write_text(
+                    "# Demo\n\nA concise launch brief with enough detail to avoid stub heuristics.\n",
+                    encoding="utf-8",
+                )
+                return TaskResult(
+                    task_id=task.task_id,
+                    success=True,
+                    output={"files": ["readme.md"], "summary": "Drafted the README."},
+                )
+
+        class SlowLLMClient:
+            async def complete(self, prompt, max_tokens, temperature):  # noqa: ARG002
+                await asyncio.sleep(1)
+                return "1. readme.md: this should never be returned"
+
+        def fake_get_agent(name, *args, **kwargs):  # noqa: ARG001
+            if name == "ReviewerAgent":
+                return ReviewerAgent(event_bus=event_bus)
+            return FakeStudioAgent()
+
+        monkeypatch.setattr("skyn3t.studio.runner.get_agent", fake_get_agent)
+        monkeypatch.setattr("skyn3t.adapters.LLMClient", lambda *args, **kwargs: SlowLLMClient())
+        monkeypatch.setattr("skyn3t.agents.reviewer._LLM_CRITIQUE_TIMEOUT_SECONDS", 0.01)
+        monkeypatch.setattr(
+            "skyn3t.studio.runner.get_template",
+            lambda _key: SimpleNamespace(
+                title="Demo template",
+                description="Turn a brief into a README.",
+                stages=[
+                    SimpleNamespace(
+                        name="writer",
+                        agent="WriterAgent",
+                        capability="copywriting",
+                        handoff_to=None,
+                        input_extra={},
+                    )
+                ],
+            ),
+        )
+
+        runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
+        manifest = await runner.start("demo", "Make a landing page", slug="critique-llm-timeout")
+
+        stage = manifest["stages"][0]
+
+        assert manifest["status"] == "done"
+        assert stage["status"] == "done"
+        assert stage["summary"] == "Drafted the README."
+        assert "CRITIQUE_FAILED" not in [entry["event"] for entry in manifest["history"]]
+
+    async def test_run_pipeline_continues_when_critique_window_times_out(
+        self, event_bus, tmp_path, monkeypatch
+    ):
+        from skyn3t.studio.runner import StudioRunner
+
+        class FakeStudioAgent:
+            async def initialize(self) -> None:
+                return None
+
+            async def execute(self, task: TaskRequest) -> TaskResult:
+                out_dir = Path(task.input_data["artifact_dir"])
+                (out_dir / "readme.md").write_text(
+                    "# Demo\n\nA concise launch brief with enough detail to avoid stub heuristics.\n",
+                    encoding="utf-8",
+                )
+                return TaskResult(
+                    task_id=task.task_id,
+                    success=True,
+                    output={"files": ["readme.md"], "summary": "Drafted the README."},
+                )
+
+        async def slow_critique(self, **kwargs):  # noqa: ARG001
+            await asyncio.sleep(1)
+            return kwargs["result"]
+
+        monkeypatch.setattr("skyn3t.studio.runner.get_agent", lambda *args, **kwargs: FakeStudioAgent())
+        monkeypatch.setattr(StudioRunner, "_critique_and_revise", slow_critique)
+        monkeypatch.setattr(
+            StudioRunner,
+            "_critique_timeout_for",
+            staticmethod(lambda stage_name, execution_profile="balanced": 0.01),
+        )
+        monkeypatch.setattr(
+            "skyn3t.studio.runner.get_template",
+            lambda _key: SimpleNamespace(
+                title="Demo template",
+                description="Turn a brief into a README.",
+                stages=[
+                    SimpleNamespace(
+                        name="writer",
+                        agent="WriterAgent",
+                        capability="copywriting",
+                        handoff_to=None,
+                        input_extra={},
+                    )
+                ],
+            ),
+        )
+
+        runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
+        manifest = await runner.start("demo", "Make a landing page", slug="critique-window-timeout")
+
+        events = [entry["event"] for entry in manifest["history"]]
+        stage = manifest["stages"][0]
+
+        assert manifest["status"] == "done"
+        assert stage["status"] == "done"
+        assert stage["summary"] == "Drafted the README."
+        assert "CRITIQUE_FAILED" in events
+        critique_failure = next(
+            entry for entry in manifest["history"] if entry["event"] == "CRITIQUE_FAILED"
+        )
+        assert "Critique window timed out" in critique_failure["message"]
 
     async def test_normalize_manifest_migrates_legacy_stage_records(
         self, event_bus, tmp_path
@@ -636,7 +825,7 @@ class TestStudioRunner:
                 description="Draft a launch brief.",
                 stages=[
                     SimpleNamespace(
-                        name="writer",
+                        name="code",
                         agent="WriterAgent",
                         capability="copywriting",
                         handoff_to=None,
@@ -720,7 +909,7 @@ class TestStudioRunner:
                 description="Draft a launch brief.",
                 stages=[
                     SimpleNamespace(
-                        name="writer",
+                        name="code",
                         agent="WriterAgent",
                         capability="copywriting",
                         handoff_to=None,
@@ -1050,15 +1239,16 @@ class TestStudioRunner:
                 return VerifierStageAgent()
             if name == "ReviewerAgent":
                 return ReviewerStageAgent()
-            if name == "ConsistencyReviewerAgent":
-                # Return a minimal pass-through agent for the consistency reviewer stage
-                class ConsistencyReviewerStageAgent:
+            if name in ("ConsistencyReviewerAgent", "ContractVerifierAgent"):
+                # Pass-through stub: report a clean verdict so the
+                # injected pre-reviewer stages don't change pipeline behavior.
+                class _PassThroughStageAgent:
                     async def initialize(self):
                         pass
                     async def execute(self, task, stdin_data=None):
                         from skyn3t.core.agent import TaskResult
                         return TaskResult(task_id=task.task_id, success=True, output={"verdict": "pass", "blocker_count": 0})
-                return ConsistencyReviewerStageAgent()
+                return _PassThroughStageAgent()
             raise AssertionError(f"unexpected agent {name}")
 
         monkeypatch.setattr("skyn3t.studio.runner.get_agent", fake_get_agent)
@@ -1096,6 +1286,362 @@ class TestStudioRunner:
         assert manifest["quality_summary"]["verdict"] == "no-go"
         assert manifest["quality_summary"]["score"] == 41
         assert manifest["quality_summary"]["review_file"] == "review.md"
+
+    async def test_reviewer_no_go_still_runs_post_run_verifiers(
+        self, event_bus, tmp_path, monkeypatch
+    ):
+        from skyn3t.studio.runner import StudioRunner
+
+        class ReviewerStageAgent:
+            async def initialize(self) -> None:
+                return None
+
+            async def execute(self, task: TaskRequest) -> TaskResult:
+                artifact_dir = Path(task.input_data["artifact_dir"]).resolve()
+                review_path = artifact_dir / "review.md"
+                review_path.write_text("# Review\n", encoding="utf-8")
+                scaffold_dir = artifact_dir / "scaffold"
+                scaffold_dir.mkdir(parents=True, exist_ok=True)
+                (scaffold_dir / "package.json").write_text('{"name":"demo"}\n', encoding="utf-8")
+                return TaskResult(
+                    task_id=task.task_id,
+                    success=True,
+                    output={
+                        "verdict": "no-go",
+                        "score": 41,
+                        "summary": "Reviewer found launch-blocking gaps.",
+                        "files": [str(review_path)],
+                    },
+                )
+
+        class ConsistencyReviewerStageAgent:
+            async def initialize(self) -> None:
+                return None
+
+            async def execute(self, task, stdin_data=None):
+                return TaskResult(
+                    task_id=task.task_id,
+                    success=True,
+                    output={"verdict": "pass", "blocker_count": 0},
+                )
+
+        def fake_get_agent(name, *args, **kwargs):
+            if name == "ReviewerAgent":
+                return ReviewerStageAgent()
+            if name in ("ConsistencyReviewerAgent", "ContractVerifierAgent"):
+                return ConsistencyReviewerStageAgent()
+            raise AssertionError(f"unexpected agent {name}")
+
+        monkeypatch.setattr("skyn3t.studio.runner.get_agent", fake_get_agent)
+        monkeypatch.setattr(
+            "skyn3t.studio.runner.get_template",
+            lambda _key: SimpleNamespace(
+                title="Quality template",
+                description="Review a scaffold.",
+                stages=[
+                    SimpleNamespace(
+                        name="reviewer",
+                        agent="ReviewerAgent",
+                        capability="review",
+                        handoff_to=None,
+                        input_extra={},
+                    )
+                ],
+            ),
+        )
+
+        runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
+        calls: list[str] = []
+
+        async def fake_build(scaffold_dir: str, brief: str):
+            calls.append("build")
+            return {
+                "verdict": "yes",
+                "stack": "node",
+                "summary": "build ok",
+                "command": "npm run build",
+            }
+
+        async def fake_boot(scaffold_dir: str, brief: str):
+            calls.append("boot")
+            return {
+                "verdict": "yes",
+                "kind": "node-express",
+                "summary": "boot ok",
+                "command": "node index.js",
+            }
+
+        async def fake_integration(scaffold_dir: str, brief: str):
+            calls.append("integration")
+            return {
+                "verdict": "yes",
+                "kind": "node-express",
+                "summary": "integration ok",
+                "command": "node index.js",
+            }
+
+        async def fake_retry(manifest, brief, slug):
+            calls.append("retry")
+            return None
+
+        async def fail_build_fix_round(*args, **kwargs):
+            raise AssertionError("build fix loop should be skipped on reviewer no-go")
+
+        async def fail_integration_fix_round(*args, **kwargs):
+            raise AssertionError("integration fix loop should be skipped on reviewer no-go")
+
+        monkeypatch.setattr(runner, "_run_build_verifier", fake_build)
+        monkeypatch.setattr(runner, "_run_boot_verifier", fake_boot)
+        monkeypatch.setattr(runner, "_run_integration_verifier", fake_integration)
+        monkeypatch.setattr(runner, "_maybe_auto_retry", fake_retry)
+        monkeypatch.setattr(runner, "_apply_build_fix_round", fail_build_fix_round)
+        monkeypatch.setattr(runner, "_apply_integration_fix_round", fail_integration_fix_round)
+
+        manifest = await runner.start("demo", "Build a dashboard", slug="quality-no-go")
+
+        assert calls == ["build", "boot", "integration", "retry"]
+        assert manifest["status"] == "failed"
+        assert manifest["error"] == "Reviewer found launch-blocking gaps."
+        assert manifest["quality_summary"]["verdict"] == "no-go"
+        assert manifest["build_verification"]["verdict"] == "yes"
+        assert manifest["boot_verification"]["verdict"] == "yes"
+        assert manifest["integration_verification"]["verdict"] == "yes"
+
+    async def test_boot_failure_uses_boot_retry_hint(
+        self, event_bus, tmp_path, monkeypatch
+    ):
+        from skyn3t.studio.runner import StudioRunner
+
+        class WriterStageAgent:
+            async def initialize(self) -> None:
+                return None
+
+            async def execute(self, task: TaskRequest) -> TaskResult:
+                artifact_dir = Path(task.input_data["artifact_dir"]).resolve()
+                scaffold_dir = artifact_dir / "scaffold"
+                scaffold_dir.mkdir(parents=True, exist_ok=True)
+                (scaffold_dir / "package.json").write_text(
+                    '{"name":"demo"}\n',
+                    encoding="utf-8",
+                )
+                return TaskResult(
+                    task_id=task.task_id,
+                    success=True,
+                    output={"files": [str(scaffold_dir / "package.json")]},
+                )
+
+        def fake_get_agent(name, *args, **kwargs):
+            if name == "WriterAgent":
+                return WriterStageAgent()
+            raise AssertionError(f"unexpected agent {name}")
+
+        monkeypatch.setattr("skyn3t.studio.runner.get_agent", fake_get_agent)
+        monkeypatch.setattr(
+            "skyn3t.studio.runner.get_template",
+            lambda _key: SimpleNamespace(
+                title="Writer template",
+                description="Create a scaffold.",
+                stages=[
+                    SimpleNamespace(
+                        name="writer",
+                        agent="WriterAgent",
+                        capability="copywriting",
+                        handoff_to=None,
+                        input_extra={},
+                    )
+                ],
+            ),
+        )
+
+        runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
+
+        async def fake_build(scaffold_dir: str, brief: str):
+            return {
+                "verdict": "yes",
+                "stack": "node",
+                "summary": "build ok",
+                "command": "npm run build",
+            }
+
+        async def fake_boot(scaffold_dir: str, brief: str):
+            return {
+                "verdict": "no",
+                "kind": "node-express",
+                "summary": "server failed to start within 45s",
+                "command": "node index.js",
+                "failure_hint": "server/config-store.js is still a generated TODO stub",
+            }
+
+        async def should_not_run_integration(scaffold_dir: str, brief: str):
+            raise AssertionError("integration verifier should not run after boot failure")
+
+        async def no_fix_round(*args, **kwargs):
+            return False
+
+        async def fake_retry(manifest, brief, slug):
+            return None
+
+        monkeypatch.setattr(runner, "_run_build_verifier", fake_build)
+        monkeypatch.setattr(runner, "_run_boot_verifier", fake_boot)
+        monkeypatch.setattr(runner, "_run_integration_verifier", should_not_run_integration)
+        monkeypatch.setattr(runner, "_apply_build_fix_round", no_fix_round)
+        monkeypatch.setattr(runner, "_maybe_auto_retry", fake_retry)
+
+        manifest = await runner.start("demo", "Build a dashboard", slug="boot-failure")
+
+        assert manifest["status"] == "failed"
+        assert manifest["error"] == "server failed to start within 45s"
+        assert manifest["next_action"] == "Retrying with the boot failure as a hint."
+        assert manifest["_retry_hint"] == "server/config-store.js is still a generated TODO stub"
+
+    async def test_unresolved_stub_failure_uses_stub_retry_hint(
+        self, event_bus, tmp_path, monkeypatch
+    ):
+        from skyn3t.studio.runner import StudioRunner, UnresolvedScaffoldStubError
+
+        class WriterStageAgent:
+            async def initialize(self) -> None:
+                return None
+
+            async def execute(self, task: TaskRequest) -> TaskResult:
+                artifact_dir = Path(task.input_data["artifact_dir"]).resolve()
+                scaffold_dir = artifact_dir / "scaffold"
+                scaffold_dir.mkdir(parents=True, exist_ok=True)
+                (scaffold_dir / "package.json").write_text(
+                    '{"name":"demo"}\n',
+                    encoding="utf-8",
+                )
+                return TaskResult(
+                    task_id=task.task_id,
+                    success=True,
+                    output={"files": [str(scaffold_dir / "package.json")]},
+                )
+
+        def fake_get_agent(name, *args, **kwargs):
+            if name == "WriterAgent":
+                return WriterStageAgent()
+            raise AssertionError(f"unexpected agent {name}")
+
+        monkeypatch.setattr("skyn3t.studio.runner.get_agent", fake_get_agent)
+        monkeypatch.setattr(
+            "skyn3t.studio.runner.get_template",
+            lambda _key: SimpleNamespace(
+                title="Writer template",
+                description="Create a scaffold.",
+                stages=[
+                    SimpleNamespace(
+                        name="code",
+                        agent="WriterAgent",
+                        capability="copywriting",
+                        handoff_to=None,
+                        input_extra={},
+                    )
+                ],
+            ),
+        )
+
+        runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
+
+        async def fake_retry(manifest, brief, slug):
+            return None
+
+        async def should_not_run_build(scaffold_dir: str, brief: str):
+            raise AssertionError("build verifier should not run when unresolved stubs remain")
+
+        async def fail_post_code_checks(*args, **kwargs):
+            raise UnresolvedScaffoldStubError(
+                "Generated scaffold still contains unresolved TODO stubs: "
+                "server/index.js. Regenerate those files with real implementations; "
+                "do not ship placeholders."
+            )
+
+        monkeypatch.setattr(runner, "_maybe_auto_retry", fake_retry)
+        monkeypatch.setattr(runner, "_run_build_verifier", should_not_run_build)
+        monkeypatch.setattr(runner, "_run_post_code_checks", fail_post_code_checks)
+
+        manifest = await runner.start("demo", "Build a dashboard", slug="stub-failure")
+
+        assert manifest["status"] == "failed"
+        assert manifest["error"].startswith(
+            "Generated scaffold still contains unresolved TODO stubs:"
+        )
+        assert manifest["next_action"] == "Retrying with the unresolved stub failure as a hint."
+        assert manifest["_retry_hint"].startswith(
+            "Generated scaffold still contains unresolved TODO stubs:"
+        )
+
+    async def test_missing_planned_files_failure_uses_witness_retry_hint(
+        self, event_bus, tmp_path, monkeypatch
+    ):
+        from skyn3t.studio.runner import StudioRunner
+
+        class WriterStageAgent:
+            async def initialize(self) -> None:
+                return None
+
+            async def execute(self, task: TaskRequest) -> TaskResult:
+                artifact_dir = Path(task.input_data["artifact_dir"]).resolve()
+                scaffold_dir = artifact_dir / "scaffold"
+                scaffold_dir.mkdir(parents=True, exist_ok=True)
+                (scaffold_dir / "package.json").write_text(
+                    '{"name":"demo"}\n',
+                    encoding="utf-8",
+                )
+                return TaskResult(
+                    task_id=task.task_id,
+                    success=True,
+                    output={
+                        "files": [str(scaffold_dir / "package.json")],
+                        "missing_files": ["src/App.jsx", "src/hooks/useConfig.js"],
+                    },
+                )
+
+        def fake_get_agent(name, *args, **kwargs):
+            if name == "WriterAgent":
+                return WriterStageAgent()
+            raise AssertionError(f"unexpected agent {name}")
+
+        monkeypatch.setattr("skyn3t.studio.runner.get_agent", fake_get_agent)
+        monkeypatch.setattr(
+            "skyn3t.studio.runner.get_template",
+            lambda _key: SimpleNamespace(
+                title="Writer template",
+                description="Create a scaffold.",
+                stages=[
+                    SimpleNamespace(
+                        name="code",
+                        agent="WriterAgent",
+                        capability="copywriting",
+                        handoff_to=None,
+                        input_extra={},
+                    )
+                ],
+            ),
+        )
+
+        runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
+
+        async def fake_retry(manifest, brief, slug):  # noqa: ARG001
+            return None
+
+        async def should_not_run_build(scaffold_dir: str, brief: str):  # noqa: ARG001
+            raise AssertionError("build verifier should not run when planned files are still missing")
+
+        async def fake_frontend_dryrun(**kwargs):
+            return None
+
+        monkeypatch.setattr(runner, "_maybe_auto_retry", fake_retry)
+        monkeypatch.setattr(runner, "_run_build_verifier", should_not_run_build)
+        monkeypatch.setattr(runner, "_run_frontend_build_dryrun", fake_frontend_dryrun)
+
+        manifest = await runner.start("demo", "Build a dashboard", slug="missing-files")
+
+        assert manifest["status"] == "failed"
+        assert manifest["next_action"] == "Retrying with the missing file witness as a hint."
+        assert manifest["_retry_hint"].startswith(
+            "Generated scaffold is still missing planned files:"
+        )
+        assert "src/App.jsx" in manifest["_retry_hint"]
 
     async def test_stage_failure_clears_quality_summary(
         self, event_bus, tmp_path, monkeypatch

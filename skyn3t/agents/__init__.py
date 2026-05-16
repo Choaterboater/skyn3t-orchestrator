@@ -8,6 +8,7 @@ from skyn3t.agents.business_analyst import BusinessAnalystAgent
 from skyn3t.agents.code_agent import CodeAgent
 from skyn3t.agents.code_improver import CodeImproverAgent
 from skyn3t.agents.consistency_reviewer import ConsistencyReviewerAgent
+from skyn3t.agents.contract_verifier import ContractVerifierAgent
 from skyn3t.agents.designer import DesignerAgent
 from skyn3t.agents.docs_ingestor import DocsIngestorAgent
 from skyn3t.agents.explorer import ExplorerAgent
@@ -33,6 +34,7 @@ __all__ = [
     "CodeAgent",
     "CodeImproverAgent",
     "ConsistencyReviewerAgent",
+    "ContractVerifierAgent",
     "CopilotCLIAgent",
     "IntegrationContractVerifierAgent",
     "DesignerAgent",

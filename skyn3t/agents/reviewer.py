@@ -15,7 +15,9 @@ remains compatible with ReviewWatcher (lowercase ``go`` / ``go-with-fixes`` /
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -31,6 +33,10 @@ _HEADING_RE = re.compile(r"^(#{1,6})\s*(.*)$", re.MULTILINE)
 _TODO_RE = re.compile(r"\b(TODO|FIXME|TBD|XXX)\b")
 _CTA_HINTS = ("cta", "call to action", "get started", "sign up", "start free", "buy", "try")
 _SCORE_RE = re.compile(r"(?:score|rating)[^\d]{0,15}(\d{1,3})", re.IGNORECASE)
+
+logger = logging.getLogger(__name__)
+_LLM_REVIEW_TIMEOUT_SECONDS = 180.0
+_LLM_CRITIQUE_TIMEOUT_SECONDS = 90.0
 
 
 class ReviewerAgent(BaseAgent):
@@ -305,6 +311,8 @@ class ReviewerAgent(BaseAgent):
             role_prompt=role,
             brief=brief or "(no brief provided)",
             fallback="",
+            timeout_seconds=_LLM_CRITIQUE_TIMEOUT_SECONDS,
+            purpose=f"{stage_name} critique",
         )
         out = (out or "").strip()
         if not out or "NO_ISSUES" in out[:30].upper():
@@ -327,12 +335,41 @@ class ReviewerAgent(BaseAgent):
     def _artifact_name(artifact_dir: Path, path: Path) -> str:
         return path.relative_to(artifact_dir).as_posix()
 
+    # Directory names anywhere in the path that mark third-party / build
+    # output. Walking into these poisons both the heuristic (every TODO
+    # in @babel/* etc. costs 8 points) and the LLM context (real source
+    # files get scaled down to ~200 chars to make room for vendor code).
+    _SKIP_DIR_PARTS = frozenset({
+        "node_modules", "dist", "build", ".git", ".next", ".turbo",
+        ".cache", ".parcel-cache", ".vite", ".svelte-kit", ".nuxt",
+        "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+        "venv", ".venv", "env", "target", "out",
+    })
+    # Filenames that aren't worth feeding to the reviewer.
+    _SKIP_FILE_NAMES = frozenset({
+        "review.md",
+        "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+        "poetry.lock", "Pipfile.lock", "Cargo.lock", "composer.lock",
+    })
+
+    @classmethod
+    def _should_skip_artifact(cls, path: Path, artifact_dir: Path) -> bool:
+        try:
+            rel = path.relative_to(artifact_dir)
+        except ValueError:
+            rel = path
+        if cls._SKIP_DIR_PARTS.intersection(rel.parts):
+            return True
+        if path.name in cls._SKIP_FILE_NAMES:
+            return True
+        return False
+
     def _artifact_files(self, artifact_dir: Path) -> List[Path]:
         return sorted(
             (
                 path
                 for path in artifact_dir.rglob("*")
-                if path.is_file() and path.name != "review.md"
+                if path.is_file() and not self._should_skip_artifact(path, artifact_dir)
             ),
             key=lambda path: self._artifact_name(artifact_dir, path),
         )
@@ -344,8 +381,8 @@ class ReviewerAgent(BaseAgent):
         ".html", ".vue", ".svelte",
     })
 
-    @staticmethod
-    def _has_source_files(artifact_dir: Path) -> bool:
+    @classmethod
+    def _has_source_files(cls, artifact_dir: Path) -> bool:
         """True iff the artifact dir (recursively) contains at least one
         file with a code extension. ``scaffold/`` is the conventional
         subdir, but this scans everywhere to be tolerant of layout drift.
@@ -355,9 +392,9 @@ class ReviewerAgent(BaseAgent):
         for p in artifact_dir.rglob("*"):
             if not p.is_file():
                 continue
-            if "node_modules" in p.parts:
+            if cls._should_skip_artifact(p, artifact_dir):
                 continue
-            if p.suffix in ReviewerAgent._CODE_EXTS:
+            if p.suffix in cls._CODE_EXTS:
                 return True
         return False
 
@@ -423,6 +460,8 @@ class ReviewerAgent(BaseAgent):
         brief: str,
         fallback: str,
         max_tokens: int = 2500,
+        timeout_seconds: float = _LLM_REVIEW_TIMEOUT_SECONDS,
+        purpose: str = "review",
     ) -> str:
         try:
             client = self.get_llm() if hasattr(self, "get_llm") else None
@@ -455,9 +494,20 @@ class ReviewerAgent(BaseAgent):
                     prompt = prompt + skills_block
             except Exception:
                 pass
-            out = await client.complete(prompt, max_tokens=max_tokens, temperature=0.2)
+            out = str(
+                await asyncio.wait_for(
+                    client.complete(prompt, max_tokens=max_tokens, temperature=0.2),
+                    timeout=timeout_seconds,
+                )
+            )
             if out and "[deterministic-stub]" not in out and len(out.strip()) > 80:
                 return out.strip()
+        except asyncio.TimeoutError:
+            logger.warning(
+                "reviewer llm_generate timed out after %.1fs for %s; using fallback",
+                timeout_seconds,
+                purpose,
+            )
         except Exception:
             pass
         return fallback
