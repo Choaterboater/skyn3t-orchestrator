@@ -57,6 +57,12 @@ class ExperienceIngestor:
             event_bus.subscribe(self._on_task_completed, EventType.TASK_COMPLETED)
             event_bus.subscribe(self._on_task_failed, EventType.TASK_FAILED)
             event_bus.subscribe(self._on_knowledge_updated, EventType.KNOWLEDGE_UPDATED)
+            # Studio publishes project events via SYSTEM_ALERT with a
+            # `kind` field on the payload (see StudioRunner._publish).
+            # Without this subscription, every canary failure has been
+            # invisible to the experience store — we discovered this
+            # after 20+ canary runs that taught the system nothing.
+            event_bus.subscribe(self._on_system_alert, EventType.SYSTEM_ALERT)
 
     async def initialize(self) -> None:
         """Initialize the RAG engine."""
@@ -108,6 +114,32 @@ class ExperienceIngestor:
             suggestions=payload.get("suggestions", []),
             task_id=payload.get("task_id", ""),
         ))
+        t.add_done_callback(_log_task_exception)
+
+    # Project events the studio runner emits via SYSTEM_ALERT.
+    # Each of these triggers an experience-doc write so the next
+    # canary's RAG recall returns a concrete failure example.
+    _PROJECT_EVENT_KINDS = {
+        "PROJECT_STAGE_FAILED",
+        "PROJECT_COMPLETED",
+        "CONTRACT_VERIFIER_BLOCKERS",
+        "CONSISTENCY_REVIEW_BLOCKERS",
+    }
+
+    def _on_system_alert(self, event: Event) -> None:
+        """Catch studio project events that ride on SYSTEM_ALERT.
+
+        Studio doesn't have its own EventType members; it stuffs the
+        real event name into payload["kind"]. We filter and route the
+        ones that carry useful learning signal into the experience store.
+        """
+        if not self._running:
+            return
+        payload = event.payload or {}
+        kind = payload.get("kind")
+        if kind not in self._PROJECT_EVENT_KINDS:
+            return
+        t = asyncio.create_task(self.ingest_project_event(kind, payload))
         t.add_done_callback(_log_task_exception)
 
     # ------------------------------------------------------------------
@@ -263,6 +295,85 @@ class ExperienceIngestor:
         if embedding_id:
             self._record_seen(content_hash)
             await self._persist_doc(title, content, "reflection", "pattern", metadata, embedding_id)
+        return embedding_id
+
+    async def ingest_project_event(
+        self,
+        kind: str,
+        payload: Dict[str, Any],
+    ) -> Optional[str]:
+        """Ingest a studio project event (failure/blocker) as an experience.
+
+        Doc type ``experience`` with ``success=False`` so CodeAgent's
+        existing RAG query (filters on doc_type=experience + success=False)
+        retrieves these directly. The tag fields (``stack``, ``feature_tags``)
+        let future queries narrow further when the brief mentions specific
+        features the dropped run was building.
+        """
+        slug = payload.get("project_slug") or payload.get("slug") or "?"
+        stage = payload.get("stage") or "?"
+        message = payload.get("message") or ""
+        error = payload.get("error") or ""
+        verdict = payload.get("verdict") or ""
+
+        # Build a structured lesson body. Keep it terse — RAG hits return
+        # the content directly into a prompt; we want < 600 chars after
+        # the agent's truncation step.
+        lines = [
+            f"Project Event: {kind}",
+            f"Slug: {slug}",
+            f"Stage: {stage}",
+        ]
+        if verdict:
+            lines.append(f"Verdict: {verdict}")
+        if message:
+            lines.append(f"Message: {message[:300]}")
+        if error:
+            lines.append(f"Error: {error[:300]}")
+
+        # Pull contract-verifier blockers out if present — these are the
+        # most actionable signal we can record.
+        findings = payload.get("findings") or []
+        if findings:
+            lines.append("Blockers:")
+            for f in findings[:5]:
+                cat = (f.get("category") if isinstance(f, dict) else "") or ""
+                file = (f.get("file") if isinstance(f, dict) else "") or ""
+                msg = (f.get("message") if isinstance(f, dict) else "") or ""
+                lines.append(f"  - [{cat}] {file}: {msg[:140]}")
+
+        content = "\n".join(lines)
+        content_hash = self._hash(content)
+        if await self._is_duplicate(content_hash):
+            return None
+
+        # Tag with whatever signal the runner sent through. Frontends
+        # querying RAG can match on these for stack-specific recall.
+        stack = payload.get("stack") or ""
+        feature_tags = payload.get("feature_tags") or []
+        if not isinstance(feature_tags, list):
+            feature_tags = []
+
+        title = f"Project {kind} — {slug}"
+        metadata = {
+            "kind": kind,
+            "project_slug": slug,
+            "stage": stage,
+            "stack": stack,
+            "feature_tags": ", ".join(feature_tags) if feature_tags else "",
+            "success": False,
+            "content_hash": content_hash,
+        }
+        embedding_id = await self.rag.add_knowledge_one(
+            content=content,
+            title=title,
+            source="studio",
+            doc_type="experience",
+            metadata=metadata,
+        )
+        if embedding_id:
+            self._record_seen(content_hash)
+            await self._persist_doc(title, content, "studio", "experience", metadata, embedding_id)
         return embedding_id
 
     # ------------------------------------------------------------------
