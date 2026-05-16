@@ -956,6 +956,29 @@ class StudioRunner:
                                 report_json = contract_output.get("report_json", "{}")
                                 report = _json.loads(report_json)
                                 findings = report.get("findings", [])
+                                # Publish structured event so ExperienceIngestor
+                                # can write a concrete failure lesson into
+                                # the vector store. The ingestor filters on
+                                # payload["kind"] (see _on_system_alert).
+                                # This is what makes the next canary smarter.
+                                try:
+                                    self._publish(
+                                        "CONTRACT_VERIFIER_BLOCKERS",
+                                        {
+                                            "slug": slug,
+                                            "project_slug": slug,
+                                            "stage": stage.name,
+                                            "findings": [
+                                                f for f in findings
+                                                if isinstance(f, dict)
+                                                and f.get("severity") == "blocker"
+                                            ][:8],
+                                            "stack": manifest.get("stack") or "",
+                                            "verdict": "needs_fix",
+                                        },
+                                    )
+                                except Exception:
+                                    logger.debug("contract blocker publish failed", exc_info=True)
                                 scaffold_dir = artifact_dir / "scaffold"
 
                                 # Group findings by target file. The
@@ -1584,6 +1607,25 @@ class StudioRunner:
                 message=completion_message,
             )
             self._save_manifest(artifact_dir, manifest)
+            # Build payload enrichments for the experience ingestor:
+            # extract feature tags from the brief (glassmorphism, dark
+            # mode, etc.) so the next canary's RAG query on the same
+            # features retrieves this run's lessons.
+            _feature_tags: List[str] = []
+            try:
+                from skyn3t.agents.brief_requirements import extract_requirements
+                _reqs = extract_requirements(brief or "")
+                # Flatten rule labels to terse tags (the first word of each rule).
+                seen_tags: set = set()
+                for rule_list in _reqs.rules_by_ext.values():
+                    for rule in rule_list:
+                        first_word = rule.split(":", 1)[0].strip().lower()
+                        if first_word and first_word not in seen_tags:
+                            seen_tags.add(first_word)
+                            _feature_tags.append(first_word)
+            except Exception:
+                logger.debug("feature_tag extraction for completion failed", exc_info=True)
+
             self._publish(
                 "PROJECT_COMPLETED",
                 {
@@ -1600,6 +1642,10 @@ class StudioRunner:
                         == "done"
                     ),
                     "status": manifest["status"],
+                    "verdict": (manifest.get("quality_summary") or {}).get("verdict") or "",
+                    "stack": manifest.get("stack") or "",
+                    "feature_tags": _feature_tags,
+                    "message": completion_message,
                 },
             )
             # Retry-success skill capture: when a `-retry` project finishes
