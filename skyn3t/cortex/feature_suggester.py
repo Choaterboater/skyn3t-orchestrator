@@ -272,7 +272,7 @@ class FeatureSuggester:
             # 3. meta-agent pattern observations
             if source == "meta_agent" and kind in ("pattern", "observation", "anomaly"):
                 self._observation_buf.append(payload)
-                if len(self._observation_buf) >= 5:
+                if len(self._observation_buf) >= self.min_signal:
                     # naive: file a digest
                     observations = list(self._observation_buf)
                     digest = "; ".join(
@@ -283,7 +283,7 @@ class FeatureSuggester:
                     self._observation_buf.clear()
                     if digest:
                         self._maybe_file(
-                            signature=f"meta-{hash(digest) & 0xffff}",
+                            signature=f"meta-{abs(hash(digest)) & 0xffff}",
                             title="Meta-agent: behavior trend detected",
                             summary=digest[:140],
                             detail=f"_MetaAgent aggregated 5 observations:_\n\n{digest}",
