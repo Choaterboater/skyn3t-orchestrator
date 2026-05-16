@@ -242,7 +242,7 @@ class AutoCleanup:
                 ts = float(ts_raw)
             except Exception:
                 continue
-            if ts >= cutoff:
+            if ts > cutoff:
                 continue
             try:
                 proc = subprocess.run(

@@ -6,8 +6,6 @@ import asyncio
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
 
-import pytest
-
 from skyn3t.core.events import Event, EventType
 from skyn3t.memory.ingestor import ExperienceIngestor
 

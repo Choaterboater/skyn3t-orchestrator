@@ -26,7 +26,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-
 # ---------------------------------------------------------------------
 # Public report shape
 # ---------------------------------------------------------------------
