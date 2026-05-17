@@ -273,6 +273,118 @@ async def test_ingest_without_structured_fields_still_works():
 
 
 # ---------------------------------------------------------------------
+# mark_latest_unresolved_fix_worked (the resolution side)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mark_latest_unresolved_resolves_newest_row():
+    """When several unresolved rows share a signature, resolution
+    lands on the NEWEST one — the verifier outcome reflects the most
+    recent fix attempt, not a stale one."""
+    import asyncio
+    store = MemoryStore()
+    # Three unresolved rows, same signature, distinct embedding ids.
+    for i in range(3):
+        await store.record_experience_index(
+            embedding_id=f"emb-{i}",
+            task_id="t",
+            stack="react_vite", stage="contract_verifier",
+            error_signature="contract:missing_mount",
+            fix_applied=f"regenerate:try-{i}",
+            fix_worked=None,
+            success=False,
+        )
+        # Small sleep so created_at timestamps differ across rows.
+        await asyncio.sleep(0.01)
+    eid = await store.mark_latest_unresolved_fix_worked(
+        "contract:missing_mount", True,
+    )
+    assert eid == "emb-2"
+    # Other rows remain unresolved.
+    ranked = await store.rank_fixes_for_signature("contract:missing_mount")
+    assert ranked == [
+        {"fix_applied": "regenerate:try-2", "wins": 1, "attempts": 1, "rate": 1.0},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mark_latest_unresolved_skips_already_resolved():
+    """Rows with fix_worked already set must not be reclobbered."""
+    store = MemoryStore()
+    await store.record_experience_index(
+        embedding_id="emb-resolved",
+        task_id="t",
+        stack="react_vite", stage="contract_verifier",
+        error_signature="sig",
+        fix_applied="fix-A", fix_worked=True, success=True,
+    )
+    await store.record_experience_index(
+        embedding_id="emb-unresolved",
+        task_id="t",
+        stack="react_vite", stage="contract_verifier",
+        error_signature="sig",
+        fix_applied="fix-B", fix_worked=None, success=False,
+    )
+    eid = await store.mark_latest_unresolved_fix_worked("sig", False)
+    assert eid == "emb-unresolved"
+    # Verify the resolved row was untouched.
+    ranked = await store.rank_fixes_for_signature("sig")
+    assert {r["fix_applied"]: r["rate"] for r in ranked} == {
+        "fix-A": 1.0,
+        "fix-B": 0.0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_mark_latest_unresolved_returns_none_when_none_exist():
+    store = MemoryStore()
+    assert await store.mark_latest_unresolved_fix_worked("never-recorded", True) is None
+    assert await store.mark_latest_unresolved_fix_worked("", True) is None
+
+
+# ---------------------------------------------------------------------
+# targeted_fix.FixResult.fix_label
+# ---------------------------------------------------------------------
+
+
+def test_fix_label_single_issue_uses_basename():
+    from skyn3t.agents.targeted_fix import FileIssue, _derive_fix_label
+
+    label = _derive_fix_label(
+        [FileIssue(path="src/App.jsx", error_message="x", suggested_action="regenerate")],
+        changed=["src/App.jsx"], created=[],
+    )
+    assert label == "regenerate:App.jsx"
+
+
+def test_fix_label_multiple_same_action_uses_count():
+    from skyn3t.agents.targeted_fix import FileIssue, _derive_fix_label
+
+    issues = [
+        FileIssue(path="a.jsx", error_message="x", suggested_action="patch"),
+        FileIssue(path="b.jsx", error_message="x", suggested_action="patch"),
+    ]
+    assert _derive_fix_label(issues, changed=["a.jsx", "b.jsx"], created=[]) == "patch:2"
+
+
+def test_fix_label_mixed_actions_returns_mixed():
+    from skyn3t.agents.targeted_fix import FileIssue, _derive_fix_label
+
+    issues = [
+        FileIssue(path="a.jsx", error_message="x", suggested_action="regenerate"),
+        FileIssue(path="b.css", error_message="x", suggested_action="create_placeholder"),
+    ]
+    assert _derive_fix_label(issues, changed=["a.jsx"], created=["b.css"]) == "mixed:2"
+
+
+def test_fix_label_empty_issues_returns_empty():
+    from skyn3t.agents.targeted_fix import _derive_fix_label
+
+    assert _derive_fix_label([], changed=[], created=[]) == ""
+
+
+# ---------------------------------------------------------------------
 # CodeAgent ranked-fix prompt injection (Phase 2 last mile)
 # ---------------------------------------------------------------------
 

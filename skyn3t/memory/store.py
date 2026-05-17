@@ -534,6 +534,52 @@ class MemoryStore:
                     row.fix_worked = bool(worked)
                     return True
 
+    async def mark_latest_unresolved_fix_worked(
+        self,
+        error_signature: str,
+        worked: bool,
+    ) -> Optional[str]:
+        """Resolve the most-recent unresolved fix row for a signature.
+
+        Used by the post-fix verifier path: after applying a targeted
+        fix, the next verifier pass either confirms or invalidates it.
+        That outcome lands here as a True/False on the index row whose
+        ``error_signature`` matches and whose ``fix_applied`` is set
+        but ``fix_worked`` is still None.
+
+        Returns the ``embedding_id`` of the updated row, or None when
+        no unresolved row exists for this signature.
+        """
+        sig = (error_signature or "").strip()
+        if not sig:
+            return None
+        async with self._lock:
+            async with await self._session() as session:
+                async with session.begin():
+                    # Sort by created_at + auto-increment id. SQLite's
+                    # CURRENT_TIMESTAMP has 1-second resolution; two
+                    # rows inserted in the same second tie on
+                    # created_at and need the PK as the tiebreaker
+                    # so "newest" is unambiguous.
+                    result = await session.execute(
+                        select(ExperienceIndex)
+                        .where(
+                            ExperienceIndex.error_signature == sig,
+                            ExperienceIndex.fix_applied.is_not(None),
+                            ExperienceIndex.fix_worked.is_(None),
+                        )
+                        .order_by(
+                            desc(ExperienceIndex.created_at),
+                            desc(ExperienceIndex.id),
+                        )
+                        .limit(1)
+                    )
+                    row = result.scalar_one_or_none()
+                    if row is None:
+                        return None
+                    row.fix_worked = bool(worked)
+                    return row.embedding_id
+
     async def rank_fixes_for_signature(
         self,
         error_signature: str,
