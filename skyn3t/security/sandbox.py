@@ -204,6 +204,10 @@ class Sandbox:
                 del env[key]
         # Apply overrides
         env.update(self.config.env_vars)
+        # Force unbuffered output for Python-based CLIs (kimi, openai, etc.)
+        # so they flush stdout/stderr promptly instead of block-buffering
+        # when connected to a pipe.
+        env.setdefault("PYTHONUNBUFFERED", "1")
         # Strip PATH to safe directories on Linux
         if self._linux:
             safe_path = "/usr/local/bin:/usr/bin:/bin"

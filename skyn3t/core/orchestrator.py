@@ -87,10 +87,12 @@ class Orchestrator:
         self._feature_suggester: Optional[Any] = None
         self._review_watcher: Optional[Any] = None
         self._curiosity: Optional[Any] = None
+        self._gated_tuner: Optional[Any] = None
 
         # Autonomy cortex (auto-booted on start)
         self._learning_loop: Optional[Any] = None
         self._auto_cleanup: Optional[Any] = None
+        self._cortex_bootstrap: Optional[Any] = None
         self._cortex_started = False
         self._cortex_tasks: List[asyncio.Task] = []
 
@@ -155,6 +157,20 @@ class Orchestrator:
     def selector(self) -> AgentSelector:
         """Access the agent selector for tuning or inspection."""
         return self._agent_selector
+
+    def get_cortex_status(self) -> Dict[str, Any]:
+        """Return runtime status for the Cortex proposal loop."""
+        if self._cortex_bootstrap is None:
+            return {
+                "running": self._running,
+                "booted": self._cortex_started,
+                "components": [],
+                "proposal_handlers": [],
+                "proposal_counts": {},
+                "recent_failures": [],
+                "warnings": ["Cortex bootstrap has not been initialized."],
+            }
+        return cast(Dict[str, Any], self._cortex_bootstrap.status())
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -312,55 +328,13 @@ class Orchestrator:
             logging.getLogger("skyn3t.cortex").exception("meta_agent boot failed")
 
         try:
-            from skyn3t.cortex.feature_suggester import FeatureSuggester
-            if getattr(self, "_feature_suggester", None) is None:
-                self._feature_suggester = FeatureSuggester(event_bus=self.event_bus)
-                self._feature_suggester.start()
-        except Exception:
-            import logging
-            logging.getLogger("skyn3t.cortex").exception("feature_suggester boot failed")
+            from skyn3t.cortex.bootstrap import CortexBootstrap
 
-        try:
-            from skyn3t.cortex.curiosity import CuriosityLoop
-            if getattr(self, "_curiosity", None) is None:
-                self._curiosity = CuriosityLoop(orchestrator=self, event_bus=self.event_bus)
-                await self._curiosity.start()
+            if self._cortex_bootstrap is None:
+                self._cortex_bootstrap = CortexBootstrap(self)
+            await self._cortex_bootstrap.start()
         except Exception:
-            logger.exception("curiosity boot failed")
-
-        try:
-            from skyn3t.cortex.review_watcher import ReviewWatcher
-            if getattr(self, "_review_watcher", None) is None:
-                self._review_watcher = ReviewWatcher(event_bus=self.event_bus)
-                self._review_watcher.start()
-        except Exception:
-            logger.exception("review_watcher boot failed")
-
-        try:
-            from skyn3t.cortex.handlers import install_handlers
-            install_handlers(self)
-        except Exception:
-            logger.exception("cortex handlers install failed")
-
-        try:
-            from skyn3t.memory.tuner import SelfTuningEngine as _ST
-            if self._tuner is None:
-                self._tuner = _ST(
-                    event_bus=self.event_bus,
-                    memory_store=self._memory,
-                )
-                await _maybe_start(self._tuner)
-        except Exception:
-            import logging
-            logging.getLogger("skyn3t.cortex").exception("tuner boot failed")
-
-        try:
-            from skyn3t.cortex.auto_cleanup import AutoCleanup
-            if getattr(self, "_auto_cleanup", None) is None:
-                self._auto_cleanup = AutoCleanup(event_bus=self.event_bus)
-                await self._auto_cleanup.start()
-        except Exception:
-            logger.exception("auto_cleanup boot failed")
+            logger.exception("cortex bootstrap failed")
 
     async def _stop_cortex(self) -> None:
         """Stop autonomy cortex components that were booted by us."""
@@ -387,9 +361,8 @@ class Orchestrator:
         # the main stop() flow; _maybe_stop is defensive but safe to call
         # because each component's stop is idempotent enough for this use.
         await _maybe_stop(self._learning_loop)
-        await _maybe_stop(self._tuner)
-        await _maybe_stop(self._curiosity)
-        await _maybe_stop(getattr(self, "_auto_cleanup", None))
+        if self._cortex_bootstrap is not None:
+            await self._cortex_bootstrap.stop()
 
         for task in self._cortex_tasks:
             if not task.done():

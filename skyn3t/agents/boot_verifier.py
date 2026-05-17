@@ -43,6 +43,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import socket
 import time
@@ -66,6 +67,73 @@ DEFAULT_TOTAL_TIMEOUT = 360     # 6 min absolute ceiling for the whole flow
 # (or any 2xx/3xx) is good enough — we're checking the server lives,
 # not testing every route.
 HEALTH_ENDPOINTS: Tuple[str, ...] = ("/api/health", "/health", "/healthz", "/")
+
+_STUB_MARKER = "TODO[skyn3t]: code generation failed"
+
+
+def _named_export_mismatch_hint(stderr: str, scaffold_dir: Path) -> Optional[str]:
+    export_match = re.search(
+        r"does not provide an export named ['\"]([^'\"]+)['\"]",
+        stderr or "",
+    )
+    if export_match is None:
+        return None
+
+    missing_export = export_match.group(1)
+    importer_path: Optional[Path] = None
+    import_spec: Optional[str] = None
+    lines = (stderr or "").splitlines()
+    scaffold_root = scaffold_dir.resolve()
+
+    for idx, line in enumerate(lines):
+        path_match = re.search(
+            r"^(?:file://)?(.+\.(?:js|jsx|ts|tsx|mjs|cjs)):\d+",
+            line.strip(),
+        )
+        if path_match is None:
+            continue
+        importer_path = Path(path_match.group(1))
+        if idx + 1 < len(lines):
+            import_match = re.search(r"""from\s+['"]([^'"]+)['"]""", lines[idx + 1])
+            if import_match is not None:
+                import_spec = import_match.group(1)
+        break
+
+    resolved_import: Optional[Path] = None
+    if importer_path is not None and import_spec and import_spec.startswith("."):
+        resolved_import = (importer_path.parent / import_spec).resolve()
+
+    rel_importer = "<unknown importer>"
+    if importer_path is not None:
+        try:
+            rel_importer = importer_path.resolve().relative_to(scaffold_root).as_posix()
+        except Exception:
+            rel_importer = importer_path.as_posix()
+
+    rel_imported = import_spec or "<unknown module>"
+    if resolved_import is not None:
+        try:
+            rel_imported = resolved_import.relative_to(scaffold_root).as_posix()
+        except Exception:
+            rel_imported = resolved_import.as_posix()
+
+    if resolved_import is not None and resolved_import.is_file():
+        try:
+            head = resolved_import.read_text(encoding="utf-8", errors="ignore")[:2000]
+        except OSError:
+            head = ""
+        if _STUB_MARKER in head:
+            return (
+                f"{rel_imported} is still a generated TODO stub, so {rel_importer} "
+                f"cannot import `{missing_export}` from it. Regenerate {rel_imported} "
+                "with its real implementation instead of shipping the placeholder."
+            )
+
+    return (
+        f"Named export mismatch: {rel_importer} imports `{missing_export}` from "
+        f"{rel_imported}, but that module does not export it. Either add the "
+        f"`{missing_export}` export or change the import to match the module's real exports."
+    )
 
 
 @dataclass
@@ -843,6 +911,9 @@ class BootVerifierAgent(BaseAgent):
                 "(ESM) or `module.exports = router;` (CJS) — NOT "
                 "`export { router }` or `export const router`."
             )
+        named_export_hint = _named_export_mismatch_hint(s, scaffold_dir)
+        if named_export_hint:
+            return named_export_hint
         if "SyntaxError" in s:
             # node may catch a syntax error at runtime that escaped
             # `node --check` (template-literal patterns, etc).

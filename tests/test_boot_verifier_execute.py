@@ -171,6 +171,45 @@ def test_guess_port_from_files_handles_env_var_port(tmp_path: Path):
     assert port is None or isinstance(port, int)
 
 
+def test_diagnose_boot_failure_prefers_stub_named_export_hint(tmp_path: Path):
+    agent = _make_agent()
+    server = tmp_path / "server"
+    routes = server / "routes"
+    routes.mkdir(parents=True)
+    (routes / "config.js").write_text(
+        'import { get } from "../config-store.js";\n',
+        encoding="utf-8",
+    )
+    (server / "config-store.js").write_text(
+        "// TODO[skyn3t]: code generation failed for server/config-store.js\n"
+        "export default null;\n",
+        encoding="utf-8",
+    )
+    stderr = (
+        f"file://{(routes / 'config.js').as_posix()}:2\n"
+        'import { get } from "../config-store.js";\n'
+        "         ^^^\n"
+        "SyntaxError: The requested module '../config-store.js' does not provide "
+        "an export named 'get'\n"
+    )
+    hint = agent._diagnose_boot_failure(
+        stderr,
+        tmp_path,
+        BootProbe(
+            kind="node-express",
+            entry="server/index.js",
+            install_cmd=None,
+            boot_cmd=["node", "index.js"],
+            cwd="server",
+            port=3100,
+            env_file=None,
+            notes=[],
+        ),
+    )
+    assert "server/config-store.js is still a generated TODO stub" in hint
+    assert "`get`" in hint
+
+
 # ─── BootProbe dataclass ───────────────────────────────────────────────
 
 

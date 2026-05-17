@@ -1,5 +1,6 @@
 """Tests for agent implementations."""
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -188,6 +189,200 @@ class TestCodeAgent:
         assert result.output["files"] == [str(tmp_path / "scaffold" / "app.py")]
         assert (tmp_path / "scaffold" / "app.py").exists()
         assert not (tmp_path / "scaffold_log.txt").exists()
+
+    @pytest.mark.asyncio
+    async def test_scaffold_times_out_hung_file_without_wedging(self, tmp_path, monkeypatch):
+        from skyn3t.adapters.llm_client import LLMClient
+        from skyn3t.agents import code_agent as code_agent_module
+        from skyn3t.agents.code_agent import CodeAgent
+
+        class EmptySkillLibrary:
+            def find(self, *args, **kwargs):
+                return []
+
+        class PrimaryBackend:
+            async def complete(self, req):
+                if "Now write the COMPLETE contents of: `src/App.jsx`" in req.prompt:
+                    await asyncio.sleep(0.2)
+                    return "too slow"
+                if "Now write the COMPLETE contents of: `src/styles.css`" in req.prompt:
+                    return "[deterministic-stub]"
+                return "[deterministic-stub]"
+
+        class RetryBackend:
+            async def complete(self, req):
+                if "Now write the COMPLETE contents of: `src/App.jsx`" in req.prompt:
+                    return "export default function App() {\n  return <main>Recovered</main>;\n}\n"
+                if "Now write the COMPLETE contents of: `src/styles.css`" in req.prompt:
+                    return ""
+                return "[deterministic-stub]"
+
+        async def fake_get_impl(self):
+            if "kimi_cli" in self._skip_backends:
+                self._backend_name = "copilot_cli"
+                return RetryBackend()
+            self._backend_name = "kimi_cli"
+            return PrimaryBackend()
+
+        monkeypatch.setattr(LLMClient, "_get_impl", fake_get_impl)
+        monkeypatch.setattr(code_agent_module, "_FILE_BUILD_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(code_agent_module, "_FILE_RETRY_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(
+            "skyn3t.intelligence.skill_library.get_default_library",
+            lambda: EmptySkillLibrary(),
+        )
+        monkeypatch.setattr(
+            "skyn3t.config.settings.get_settings",
+            lambda: SimpleNamespace(vector_db_path=str(tmp_path / "missing-vector-db")),
+        )
+
+        agent = CodeAgent("code", EventBus(), config={"backend": "kimi_cli"})
+        await agent.initialize()
+
+        task = TaskRequest(
+            title="Scaffold app",
+            input_data={
+                "task_type": "scaffold",
+                "brief": "Build a React Vite dashboard",
+                "artifact_dir": str(tmp_path),
+            },
+        )
+        result = await asyncio.wait_for(agent.execute(task), timeout=5.0)
+
+        scaffold_dir = tmp_path / "scaffold"
+        assert result.success is True
+        assert (scaffold_dir / "README.md").exists()
+        assert (scaffold_dir / "package.json").exists()
+        assert "// TODO[skyn3t]" in (scaffold_dir / "src" / "App.jsx").read_text(
+            encoding="utf-8"
+        )
+        assert "// TODO[skyn3t]" in (scaffold_dir / "src" / "styles.css").read_text(
+            encoding="utf-8"
+        )
+
+    @pytest.mark.asyncio
+    async def test_scaffold_uses_architect_handoff_for_generic_dashboard_brief(self, tmp_path, monkeypatch):
+        from skyn3t.agents.code_agent import CodeAgent
+
+        class StubLLM:
+            async def complete(self, *args, **kwargs):
+                return "[deterministic-stub]"
+
+        class EmptySkillLibrary:
+            def find(self, *args, **kwargs):
+                return []
+
+        (tmp_path / "architecture.md").write_text(
+            "A Vite + React SPA frontend with a Node/Express backend, "
+            "persistent config store, CRUD API, and health endpoint.",
+            encoding="utf-8",
+        )
+        (tmp_path / "tech_stack.json").write_text(
+            json.dumps(
+                {
+                    "frontend": "Next.js 15 App Router",
+                    "backend": "Next.js Route Handlers",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(
+            "skyn3t.intelligence.skill_library.get_default_library",
+            lambda: EmptySkillLibrary(),
+        )
+        monkeypatch.setattr(
+            "skyn3t.config.settings.get_settings",
+            lambda: SimpleNamespace(vector_db_path=str(tmp_path / "missing-vector-db")),
+        )
+
+        agent = CodeAgent("code", EventBus())
+        await agent.initialize()
+        monkeypatch.setattr(agent, "get_llm", lambda: StubLLM())
+
+        task = TaskRequest(
+            title="Scaffold service dashboard",
+            input_data={
+                "task_type": "scaffold",
+                "brief": (
+                    "Build a polished dark-mode service dashboard with a "
+                    "persistent backend config store, CRUD API, and health endpoint."
+                ),
+                "artifact_dir": str(tmp_path),
+            },
+        )
+        result = await agent.execute(task)
+
+        scaffold = tmp_path / "scaffold"
+        assert result.success is True
+        assert (scaffold / "server" / "index.js").exists()
+        assert (scaffold / "server" / "config-store.js").exists()
+        assert (scaffold / "server" / "routes" / "config.js").exists()
+        assert (scaffold / "server" / "data" / "user-config.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_scaffold_writes_deterministic_serviceboard_files_for_generic_brief(
+        self, tmp_path, monkeypatch
+    ):
+        from skyn3t.agents.code_agent import CodeAgent
+
+        class StubLLM:
+            async def complete(self, *args, **kwargs):
+                return "[deterministic-stub]"
+
+        class EmptySkillLibrary:
+            def find(self, *args, **kwargs):
+                return []
+
+        monkeypatch.setattr(
+            "skyn3t.intelligence.skill_library.get_default_library",
+            lambda: EmptySkillLibrary(),
+        )
+        monkeypatch.setattr(
+            "skyn3t.config.settings.get_settings",
+            lambda: SimpleNamespace(vector_db_path=str(tmp_path / "missing-vector-db")),
+        )
+
+        agent = CodeAgent("code", EventBus())
+        await agent.initialize()
+        monkeypatch.setattr(agent, "get_llm", lambda: StubLLM())
+
+        brief = (
+            "Build a polished dark-mode service dashboard with a premium glassmorphism feel. "
+            "Scope it to 6-8 integrations and a simple builder/settings flow. "
+            "The app must include a real persistent backend config store from the first boot, "
+            "server-side CRUD for integrations, a health endpoint, and a UI that saves and "
+            "reloads configuration across restarts."
+        )
+        task = TaskRequest(
+            title="Scaffold service dashboard",
+            input_data={
+                "task_type": "scaffold",
+                "brief": brief,
+                "artifact_dir": str(tmp_path),
+            },
+        )
+
+        result = await agent.execute(task)
+
+        scaffold = tmp_path / "scaffold"
+        assert result.success is True
+        assert "TODO[skyn3t]" not in (scaffold / "src" / "App.jsx").read_text(encoding="utf-8")
+        assert "TODO[skyn3t]" not in (scaffold / "src" / "styles.css").read_text(encoding="utf-8")
+        assert "TODO[skyn3t]" not in (
+            scaffold / "server" / "config-store.js"
+        ).read_text(encoding="utf-8")
+        assert "TODO[skyn3t]" not in (scaffold / "server" / "index.js").read_text(encoding="utf-8")
+        assert "TODO[skyn3t]" not in (
+            scaffold / "server" / "routes" / "config.js"
+        ).read_text(encoding="utf-8")
+        assert "TODO[skyn3t]" not in (
+            scaffold / "src" / "components" / "SettingsModal.jsx"
+        ).read_text(encoding="utf-8")
+        assert "TODO[skyn3t]" not in (
+            scaffold / "src" / "components" / "ServiceEditor.jsx"
+        ).read_text(encoding="utf-8")
+        assert "useConfig" in (scaffold / "src" / "App.jsx").read_text(encoding="utf-8")
 
 
     @pytest.mark.slow
@@ -664,3 +859,56 @@ class TestReviewerAgent:
         assert "scaffold/index.html" in review_text
         assert "Score: 90/100" not in review_text
         assert "Verdict: no-go" not in review_text
+
+    @pytest.mark.asyncio
+    async def test_critique_times_out_and_returns_no_issues(
+        self, tmp_path, monkeypatch
+    ):
+        from skyn3t.agents.reviewer import ReviewerAgent
+
+        artifact_dir = tmp_path / "designer-pack"
+        artifact_dir.mkdir()
+        (artifact_dir / "brand.md").write_text(
+            "# Brand\n\nA polished dashboard brand pack with clear hierarchy and palette guidance.\n",
+            encoding="utf-8",
+        )
+        (artifact_dir / "palette.json").write_text(
+            json.dumps(
+                {
+                    "primary": "#112233",
+                    "secondary": "#223344",
+                    "accent": "#334455",
+                    "bg": "#0B1020",
+                    "text": "#F8FAFC",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (artifact_dir / "components.md").write_text(
+            "# Components\n\nUse the palette consistently across the dashboard shell, cards, and settings drawer.\n",
+            encoding="utf-8",
+        )
+
+        calls = {"count": 0}
+
+        class SlowLLMClient:
+            async def complete(self, prompt, max_tokens, temperature):  # noqa: ARG002
+                calls["count"] += 1
+                await asyncio.sleep(1)
+                return "1. brand.md: this should never land"
+
+        agent = ReviewerAgent(event_bus=EventBus())
+        monkeypatch.setattr("skyn3t.adapters.LLMClient", lambda *args, **kwargs: SlowLLMClient())
+        monkeypatch.setattr("skyn3t.agents.reviewer._LLM_CRITIQUE_TIMEOUT_SECONDS", 0.01)
+
+        critique = await agent.critique(
+            brief="Build a polished dashboard.",
+            artifact_dir=artifact_dir,
+            stage_name="designer",
+            produced_files=["brand.md", "palette.json", "components.md"],
+        )
+
+        assert critique["has_issues"] is False
+        assert critique["issues"] == []
+        assert critique["critique_text"] == ""
+        assert calls["count"] == 1

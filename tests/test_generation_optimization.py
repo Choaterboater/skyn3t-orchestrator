@@ -1,3 +1,5 @@
+import pytest
+
 from skyn3t.agents.product_categories import expand_sparse_brief
 from skyn3t.core.events import EventBus
 from skyn3t.studio.runner import StudioRunner
@@ -98,6 +100,61 @@ def test_consistency_fix_target_leaves_other_categories_unchanged(tmp_path) -> N
     assert target == "src/App.jsx"
 
 
+def test_normalize_scaffold_issue_path_trims_section_labels(tmp_path) -> None:
+    runner = StudioRunner(event_bus=EventBus(), projects_root=tmp_path / "projects")
+    scaffold = tmp_path / "scaffold"
+    src = scaffold / "src"
+    src.mkdir(parents=True)
+    (src / "App.jsx").write_text("export default function App() { return null; }\n", encoding="utf-8")
+
+    resolved = runner._normalize_scaffold_issue_path(scaffold, "src/App.jsx Drawer")
+
+    assert resolved == "src/App.jsx"
+
+
+def test_normalize_scaffold_issue_path_resolves_extensionless_server_entry(tmp_path) -> None:
+    runner = StudioRunner(event_bus=EventBus(), projects_root=tmp_path / "projects")
+    scaffold = tmp_path / "scaffold"
+    server = scaffold / "server"
+    server.mkdir(parents=True)
+    (server / "index.js").write_text("export default {};\n", encoding="utf-8")
+
+    resolved = runner._normalize_scaffold_issue_path(scaffold, "server/index")
+
+    assert resolved == "server/index.js"
+
+
+def test_normalize_scaffold_issue_path_returns_none_for_unknown_path(tmp_path) -> None:
+    runner = StudioRunner(event_bus=EventBus(), projects_root=tmp_path / "projects")
+    scaffold = tmp_path / "scaffold"
+    scaffold.mkdir(parents=True)
+
+    resolved = runner._normalize_scaffold_issue_path(scaffold, "src/Missing.jsx Drawer")
+
+    assert resolved is None
+
+
+def test_consistency_fix_action_regenerates_todo_stubs(tmp_path) -> None:
+    runner = StudioRunner(event_bus=EventBus(), projects_root=tmp_path / "projects")
+
+    assert runner._consistency_fix_action("todo_stub") == "regenerate"
+    assert runner._consistency_fix_action("broken_import") == "regenerate"
+    assert runner._consistency_fix_action("missing_mount") == "regenerate"
+    assert runner._consistency_fix_action("design_quality") == "create_placeholder"
+
+
+def test_todo_stub_retry_hint_names_files(tmp_path) -> None:
+    runner = StudioRunner(event_bus=EventBus(), projects_root=tmp_path / "projects")
+
+    hint = runner._todo_stub_retry_hint(
+        ["server/index.js", "src/App.jsx", "src/hooks/useConfig.js"]
+    )
+
+    assert "server/index.js" in hint
+    assert "src/App.jsx" in hint
+    assert "real implementations" in hint
+
+
 def test_integration_fix_targets_prefers_matching_route_module(tmp_path) -> None:
     runner = StudioRunner(event_bus=EventBus(), projects_root=tmp_path / "projects")
     scaffold = tmp_path / "scaffold"
@@ -141,3 +198,148 @@ def test_integration_fix_targets_falls_back_to_server_entry(tmp_path) -> None:
     )
 
     assert targets == ["server/index.js"]
+
+
+def test_code_stage_fast_retry_signals_detect_missing_files(tmp_path) -> None:
+    runner = StudioRunner(event_bus=EventBus(), projects_root=tmp_path / "projects")
+    artifact_dir = tmp_path / "project"
+    scaffold_dir = artifact_dir / "scaffold"
+    scaffold_dir.mkdir(parents=True)
+    (scaffold_dir / "package.json").write_text('{"name":"demo"}\n', encoding="utf-8")
+
+    missing, unresolved = runner._code_stage_fast_retry_signals(
+        artifact_dir=artifact_dir,
+        brief="Build a dashboard",
+        output={
+            "files": [str(scaffold_dir / "package.json")],
+            "missing_files": ["src/App.jsx"],
+        },
+    )
+
+    assert missing == ["src/App.jsx"]
+    assert unresolved == []
+
+
+def test_code_stage_fast_retry_signals_detect_todo_stubs(tmp_path) -> None:
+    runner = StudioRunner(event_bus=EventBus(), projects_root=tmp_path / "projects")
+    artifact_dir = tmp_path / "project"
+    scaffold_dir = artifact_dir / "scaffold"
+    (scaffold_dir / "src").mkdir(parents=True)
+    (scaffold_dir / "src" / "App.jsx").write_text(
+        "// TODO[skyn3t]: unfinished\nexport default function App() { return null; }\n",
+        encoding="utf-8",
+    )
+
+    missing, unresolved = runner._code_stage_fast_retry_signals(
+        artifact_dir=artifact_dir,
+        brief="Build a dashboard",
+        output={"files": [str(scaffold_dir / "src" / "App.jsx")]},
+    )
+
+    assert missing == []
+    assert unresolved == ["src/App.jsx"]
+
+
+@pytest.mark.asyncio
+async def test_run_post_code_checks_bails_on_unresolved_stubs_before_targeted_fix(
+    tmp_path, monkeypatch
+) -> None:
+    from skyn3t.studio.runner import StudioRunner, UnresolvedScaffoldStubError
+
+    runner = StudioRunner(event_bus=EventBus(), projects_root=tmp_path / "projects")
+    artifact_dir = tmp_path / "project"
+    scaffold_dir = artifact_dir / "scaffold"
+    (scaffold_dir / "src").mkdir(parents=True)
+    (scaffold_dir / "src" / "App.jsx").write_text(
+        "// TODO[skyn3t]: unfinished\nexport default function App() { return null; }\n",
+        encoding="utf-8",
+    )
+    manifest = {"history": [], "consistency_check": {}, "benchmark": {}, "artifacts": []}
+
+    async def should_not_run_targeted_fix(*args, **kwargs):
+        raise AssertionError("targeted fix should be skipped for unresolved stubs")
+
+    monkeypatch.setattr(
+        "skyn3t.agents.targeted_fix.apply_targeted_fix",
+        should_not_run_targeted_fix,
+    )
+
+    with pytest.raises(UnresolvedScaffoldStubError):
+        await runner._run_post_code_checks(
+            manifest=manifest,
+            artifact_dir=artifact_dir,
+            brief="Build a dashboard",
+            stage_name="code",
+            stage_output={"files": [str(scaffold_dir / "src" / "App.jsx")]},
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_post_code_checks_bails_on_missing_files_before_targeted_fix(
+    tmp_path, monkeypatch
+) -> None:
+    from skyn3t.studio.runner import MissingPlannedFilesError, StudioRunner
+
+    runner = StudioRunner(event_bus=EventBus(), projects_root=tmp_path / "projects")
+    artifact_dir = tmp_path / "project"
+    scaffold_dir = artifact_dir / "scaffold"
+    scaffold_dir.mkdir(parents=True)
+    (scaffold_dir / "package.json").write_text('{"name":"demo"}\n', encoding="utf-8")
+    manifest = {"history": [], "consistency_check": {}, "benchmark": {}, "artifacts": []}
+
+    async def should_not_run_targeted_fix(*args, **kwargs):
+        raise AssertionError("targeted fix should be skipped for missing planned files")
+
+    monkeypatch.setattr(
+        "skyn3t.agents.targeted_fix.apply_targeted_fix",
+        should_not_run_targeted_fix,
+    )
+
+    with pytest.raises(MissingPlannedFilesError):
+        await runner._run_post_code_checks(
+            manifest=manifest,
+            artifact_dir=artifact_dir,
+            brief="Build a dashboard",
+            stage_name="code",
+            stage_output={
+                "files": [str(scaffold_dir / "package.json")],
+                "missing_files": ["src/App.jsx"],
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_apply_build_fix_round_times_out_whole_scaffold_llm(tmp_path, monkeypatch) -> None:
+    from skyn3t.studio.runner import StudioRunner
+
+    runner = StudioRunner(event_bus=EventBus(), projects_root=tmp_path / "projects")
+    scaffold_dir = tmp_path / "scaffold"
+    src_dir = scaffold_dir / "src"
+    src_dir.mkdir(parents=True)
+    (scaffold_dir / "package.json").write_text('{"name":"demo"}\n', encoding="utf-8")
+    original_body = "export default function App() { return null; }\n"
+    (src_dir / "App.jsx").write_text(original_body, encoding="utf-8")
+
+    class SlowLLM:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def complete(self, *args, **kwargs):
+            assert kwargs["timeout"] == 0.05
+            assert kwargs["_allow_backend_failover"] is False
+            raise TimeoutError("timed out")
+
+    monkeypatch.setattr("skyn3t.adapters.LLMClient", SlowLLM)
+    monkeypatch.setattr("skyn3t.agents.targeted_fix._parse_build_errors", lambda *_args: [])
+    monkeypatch.setattr("skyn3t.studio.runner._BUILD_FIX_LLM_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(runner, "_apply_heuristic_build_fixes", lambda *_args: False)
+
+    result = await runner._apply_build_fix_round(
+        scaffold_dir=scaffold_dir,
+        brief="Build a dashboard",
+        build_result={"stdout": "server exited before binding port", "stderr": "", "stack": "node"},
+        attempt=1,
+    )
+
+    assert result is False
+    assert (src_dir / "App.jsx").read_text(encoding="utf-8") == original_body

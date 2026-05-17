@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from skyn3t.agents.boot_verifier import _named_export_mismatch_hint
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
 
@@ -479,18 +480,55 @@ class IntegrationContractVerifierAgent(BaseAgent):
                     continue
                 for m in fetch_re.finditer(text):
                     path = self._normalize_frontend_path(m.group(2))
+                    if not path:
+                        continue
                     method = self._infer_fetch_method(text, m.end())
                     routes.add(self._format_frontend_route(method, path))
                 for m in fetch_template_re.finditer(text):
                     path = self._normalize_frontend_path(m.group(1))
+                    if not path:
+                        continue
                     method = self._infer_fetch_method(text, m.end())
                     routes.add(self._format_frontend_route(method, path))
                 for m in axios_re.finditer(text):
                     path = self._normalize_frontend_path(m.group(3))
+                    if not path:
+                        continue
                     routes.add(self._format_frontend_route(m.group(1), path))
                 for m in axios_template_re.finditer(text):
                     path = self._normalize_frontend_path(m.group(2))
+                    if not path:
+                        continue
                     routes.add(self._format_frontend_route(m.group(1), path))
+                for helper_name in self._detect_frontend_api_helpers(text):
+                    helper_literal_re = re.compile(
+                        rf"""
+                        \b{re.escape(helper_name)}\s*
+                        \(\s*
+                        (['"])(/api/[^'"]+)\1
+                        """,
+                        re.VERBOSE,
+                    )
+                    helper_template_re = re.compile(
+                        rf"""
+                        \b{re.escape(helper_name)}\s*
+                        \(\s*
+                        `([^`]+)`
+                        """,
+                        re.VERBOSE,
+                    )
+                    for m in helper_literal_re.finditer(text):
+                        path = self._normalize_frontend_path(m.group(2))
+                        if not path:
+                            continue
+                        method = self._infer_callsite_method(text, m.end())
+                        routes.add(self._format_frontend_route(method, path))
+                    for m in helper_template_re.finditer(text):
+                        path = self._normalize_frontend_path(m.group(1))
+                        if not path:
+                            continue
+                        method = self._infer_callsite_method(text, m.end())
+                        routes.add(self._format_frontend_route(method, path))
 
         return sorted(routes)
 
@@ -513,8 +551,26 @@ class IntegrationContractVerifierAgent(BaseAgent):
             return "GET"
         return m.group(1).upper()
 
+    @staticmethod
+    def _infer_callsite_method(source: str, start_index: int) -> str:
+        window = source[start_index:start_index + 240]
+        m = re.search(
+            r"""
+            ^\s*,\s*
+            \{[\s\S]{0,180}?\bmethod\s*:\s*['"]([A-Za-z]+)['"]
+            """,
+            window,
+            re.VERBOSE,
+        )
+        if not m:
+            return "GET"
+        return m.group(1).upper()
+
     def _normalize_frontend_path(self, path: str) -> str:
         """Strip base URL variables and replace template segments with :*."""
+        path = str(path or "").strip()
+        if not path:
+            return ""
         # Strip ${API_BASE}, ${BASE_URL}, etc.
         if path.startswith("${") and "/api/" in path:
             path = path[path.find("/api/") :]
@@ -522,7 +578,56 @@ class IntegrationContractVerifierAgent(BaseAgent):
         path = re.sub(r"\$\{[^}]+\}", ":*", path)
         # Collapse multiple slashes
         path = re.sub(r"/+", "/", path)
-        return path.rstrip("/")
+        normalized = path.rstrip("/")
+        if not normalized:
+            return ""
+        if normalized != "/api" and not normalized.startswith("/api/"):
+            return ""
+        return normalized
+
+    @staticmethod
+    def _detect_frontend_api_helpers(source: str) -> List[str]:
+        helper_names: set[str] = set()
+        function_re = re.compile(
+            r"""
+            (?:async\s+)?function\s+
+            ([A-Za-z_$][A-Za-z0-9_$]*)\s*
+            \(\s*([A-Za-z_$][A-Za-z0-9_$]*)[^)]*\)
+            """,
+            re.VERBOSE,
+        )
+        arrow_re = re.compile(
+            r"""
+            (?:const|let|var)\s+
+            ([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*
+            (?:async\s*)?
+            \(\s*([A-Za-z_$][A-Za-z0-9_$]*)[^)]*\)\s*=>\s*
+            """,
+            re.VERBOSE,
+        )
+
+        def _collect(matches: re.Pattern[str]) -> None:
+            for match in matches.finditer(source):
+                name = match.group(1)
+                path_param = match.group(2)
+                window = source[match.end():match.end() + 2000]
+                if not name or not path_param or not window:
+                    continue
+                template_use = re.search(
+                    rf"""
+                    (?:fetch|axios\.(?:get|post|put|delete|patch))\s*
+                    \(\s*
+                    `[^`]*\$\{{[^}}]*\b{re.escape(path_param)}\b[^}}]*\}}[^`]*`
+                    """,
+                    window,
+                    re.VERBOSE,
+                )
+                if template_use:
+                    helper_names.add(name)
+
+        _collect(function_re)
+        _collect(arrow_re)
+        return sorted(helper_names)
 
     def _extract_backend_routes(self, backend_dir: Path) -> List[str]:
         """Scan backend JS for Express route declarations.
@@ -557,6 +662,7 @@ class IntegrationContractVerifierAgent(BaseAgent):
             app\.use\s*\(\s*
             (['"`])(/[^'"`]+)\1\s*,\s*
             ([A-Za-z_$][A-Za-z0-9_$]*)
+            (?:\.router)?
             """,
             re.VERBOSE,
         )
@@ -569,6 +675,15 @@ class IntegrationContractVerifierAgent(BaseAgent):
               |
               (?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*
                 require\(\s*(['"`])(\.\.?/[^'"`]+)\5\s*\))
+            """,
+            re.VERBOSE,
+        )
+        load_required_router_re = re.compile(
+            r"""
+            (?:const|let|var)\s+
+            ([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*
+            (?:await\s+)?loadRequiredRouter\(\s*
+            (['"`])(\.\.?/[^'"`]+)\2
             """,
             re.VERBOSE,
         )
@@ -597,6 +712,11 @@ class IntegrationContractVerifierAgent(BaseAgent):
                 for m in import_re.finditer(text):
                     name = m.group(1) or m.group(4)
                     spec = m.group(3) or m.group(6)
+                    if name and spec:
+                        imports[name] = spec
+                for m in load_required_router_re.finditer(text):
+                    name = m.group(1)
+                    spec = m.group(3)
                     if name and spec:
                         imports[name] = spec
                 file_routes.append((p, methods))
@@ -722,7 +842,7 @@ class IntegrationContractVerifierAgent(BaseAgent):
                     RouteIssue(
                         frontend_path=fe_path,
                         method=method,
-                        issue="missing",
+                        issue="missing" if self._runtime_404_is_missing(matched) else "wrong_status",
                         backend_match=matched,
                         http_status=404,
                         detail="Backend returned 404 at runtime",
@@ -773,9 +893,10 @@ class IntegrationContractVerifierAgent(BaseAgent):
         method: str,
         backend_matchers: List[Tuple[str, str, bool]],
     ) -> Optional[str]:
-        """Return the first backend route that handles the frontend path."""
+        """Return the most specific backend route that handles the frontend path."""
         fe_segments = fe_path.strip("/").split("/")
         frontend_method = str(method or "GET").upper()
+        candidates: list[tuple[int, str]] = []
         for backend_method, be_path, is_prefix in backend_matchers:
             if backend_method not in {"ALL", "USE", frontend_method}:
                 continue
@@ -787,7 +908,12 @@ class IntegrationContractVerifierAgent(BaseAgent):
                         self._segment_match(fe_segments[i], be_segments[i])
                         for i in range(len(be_segments))
                     ):
-                        return f"{backend_method} {be_path}"
+                        candidates.append(
+                            (
+                                self._route_match_specificity(be_segments, is_prefix=True),
+                                f"{backend_method} {be_path}",
+                            )
+                        )
             else:
                 # Exact-length match.
                 if len(fe_segments) != len(be_segments):
@@ -796,8 +922,26 @@ class IntegrationContractVerifierAgent(BaseAgent):
                     self._segment_match(fe_segments[i], be_segments[i])
                     for i in range(len(be_segments))
                 ):
-                    return f"{backend_method} {be_path}"
-        return None
+                    candidates.append(
+                        (
+                            self._route_match_specificity(be_segments, is_prefix=False),
+                            f"{backend_method} {be_path}",
+                        )
+                    )
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item[0])[1]
+
+    @staticmethod
+    def _route_match_specificity(segments: List[str], *, is_prefix: bool) -> int:
+        literal_segments = sum(1 for segment in segments if not segment.startswith(":") and segment != "*")
+        wildcard_segments = len(segments) - literal_segments
+        return (0 if is_prefix else 1000) + literal_segments * 10 - wildcard_segments
+
+    @staticmethod
+    def _runtime_404_is_missing(matched_route: str) -> bool:
+        method, _, path = matched_route.partition(" ")
+        return method in {"USE", "ALL"} or not path
 
     def _segment_match(self, fe_seg: str, be_seg: str) -> bool:
         """Match a frontend path segment against a backend segment.
@@ -1150,6 +1294,9 @@ class IntegrationContractVerifierAgent(BaseAgent):
                 "Express adapter export shape mismatch. "
                 "Make sure adapters export a Router function."
             )
+        named_export_hint = _named_export_mismatch_hint(s, scaffold_dir)
+        if named_export_hint:
+            return named_export_hint
         if "SyntaxError" in s:
             return (
                 "Runtime syntax error (slipped past `node --check`). "

@@ -1,7 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
-import { api, Proposal } from "../api/client";
+import {
+  api,
+  CortexComponentStatus,
+  CortexStatus,
+  Proposal,
+} from "../api/client";
 
 // Phrases that mean "build a separate program," not "patch SkyN3t
 // itself." Cortex's feature_handler only knows how to patch existing
@@ -39,6 +44,11 @@ export default function CortexPage() {
       api.proposals(filter === "pending" ? { status: "pending" } : undefined),
     refetchInterval: 8_000,
   });
+  const cortexStatus = useQuery({
+    queryKey: ["cortex-status"],
+    queryFn: () => api.cortexStatus(),
+    refetchInterval: 8_000,
+  });
 
   const invalidate = () => qc.invalidateQueries({ queryKey: ["proposals"] });
 
@@ -70,6 +80,11 @@ export default function CortexPage() {
       </header>
 
       <FileIdeaForm onFiled={invalidate} />
+      <CortexStatusPanel
+        data={cortexStatus.data}
+        isLoading={cortexStatus.isLoading}
+        error={cortexStatus.error}
+      />
 
       {isLoading && <p className="text-text-secondary">Loading…</p>}
       {error && (
@@ -104,6 +119,139 @@ export default function CortexPage() {
         </section>
       )}
     </div>
+  );
+}
+
+function CortexStatusPanel({
+  data,
+  isLoading,
+  error,
+}: {
+  data?: CortexStatus;
+  isLoading: boolean;
+  error?: unknown;
+}) {
+  if (isLoading && !data) {
+    return (
+      <section className="rounded-lg border border-border bg-bg-2 p-4">
+        <SectionTitle>Cortex runtime</SectionTitle>
+        <p className="text-text-secondary text-sm">Loading status…</p>
+      </section>
+    );
+  }
+  if (error) {
+    return (
+      <section className="rounded-lg border border-status-red/40 bg-status-red/10 p-4">
+        <SectionTitle>Cortex runtime</SectionTitle>
+        <p className="text-status-red text-sm">
+          {error instanceof Error ? error.message : "status failed"}
+        </p>
+      </section>
+    );
+  }
+  if (!data) return null;
+
+  return (
+    <section className="rounded-lg border border-border bg-bg-2 p-4 space-y-4">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <SectionTitle>Cortex runtime</SectionTitle>
+          <p className="text-xs text-text-secondary mt-1">
+            Which self-improvement components are live, what proposal handlers are
+            registered, and whether anything is currently broken.
+          </p>
+        </div>
+        <div className="flex items-center gap-2 text-xs font-mono">
+          <RuntimeBadge ok={data.running && data.booted}>
+            {data.running && data.booted ? "live" : "degraded"}
+          </RuntimeBadge>
+          <span className="text-text-dim">
+            handlers: {data.proposal_handlers.length}
+          </span>
+        </div>
+      </div>
+
+      <div className="grid gap-3 lg:grid-cols-[1.2fr,1fr]">
+        <div className="space-y-3">
+          <KvLabel>Components</KvLabel>
+          <div className="grid gap-2 sm:grid-cols-2">
+            {data.components.map((component) => (
+              <ComponentCard key={component.name} component={component} />
+            ))}
+          </div>
+        </div>
+
+        <div className="space-y-3">
+          <div>
+            <KvLabel>Proposal handlers</KvLabel>
+            <div className="flex flex-wrap gap-1.5">
+              {data.proposal_handlers.length > 0 ? (
+                data.proposal_handlers.map((kind) => (
+                  <span
+                    key={kind}
+                    className="text-[0.65rem] px-1.5 py-0.5 rounded border border-accent-line text-accent font-mono"
+                  >
+                    {kind}
+                  </span>
+                ))
+              ) : (
+                <span className="text-xs text-status-yellow">No handlers registered.</span>
+              )}
+            </div>
+          </div>
+
+          <div>
+            <KvLabel>Proposal counts</KvLabel>
+            <div className="flex flex-wrap gap-2 text-xs">
+              {Object.keys(data.proposal_counts).length > 0 ? (
+                Object.entries(data.proposal_counts).map(([status, count]) => (
+                  <span
+                    key={status}
+                    className="rounded border border-border bg-bg-3 px-2 py-1 font-mono"
+                  >
+                    {status}: {count}
+                  </span>
+                ))
+              ) : (
+                <span className="text-text-secondary">No proposals yet.</span>
+              )}
+            </div>
+          </div>
+
+          {data.warnings.length > 0 && (
+            <div className="rounded border border-status-yellow/40 bg-status-yellow/10 p-3">
+              <KvLabel>Warnings</KvLabel>
+              <ul className="space-y-1 text-xs text-status-yellow">
+                {data.warnings.map((warning, index) => (
+                  <li key={`${warning}-${index}`}>• {warning}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {data.recent_failures.length > 0 && (
+            <div className="rounded border border-status-red/40 bg-status-red/10 p-3">
+              <KvLabel>Recent failed proposals</KvLabel>
+              <ul className="space-y-2 text-xs">
+                {data.recent_failures.map((failure) => (
+                  <li key={failure.id}>
+                    <div className="font-mono text-status-red">
+                      {failure.kind} · {failure.id}
+                    </div>
+                    <div className="text-text-secondary">{failure.title}</div>
+                    {failure.error && (
+                      <div className="text-status-red whitespace-pre-wrap break-words">
+                        {failure.error}
+                      </div>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -394,6 +542,79 @@ function KvLabel({ children }: { children: React.ReactNode }) {
     <div className="text-[0.65rem] uppercase tracking-wider text-text-secondary mb-1">
       {children}
     </div>
+  );
+}
+
+function ComponentCard({ component }: { component: CortexComponentStatus }) {
+  const healthy = component.started && !component.error;
+  return (
+    <div className="rounded border border-border bg-bg-3 p-3 space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <div>
+          <div className="text-sm font-medium">{component.name}</div>
+          <div className="text-[0.65rem] font-mono text-text-dim">
+            {component.class_name || "component"}
+          </div>
+        </div>
+        <RuntimeBadge ok={healthy}>
+          {healthy ? "started" : "down"}
+        </RuntimeBadge>
+      </div>
+      {component.subscriptions.length > 0 && (
+        <div>
+          <KvLabel>Subscriptions</KvLabel>
+          <div className="text-[0.65rem] font-mono text-text-secondary break-words">
+            {component.subscriptions.join(", ")}
+          </div>
+        </div>
+      )}
+      {(component.creates_proposals.length > 0 || component.handles_proposals.length > 0) && (
+        <div className="text-[0.65rem] text-text-secondary space-y-1">
+          {component.creates_proposals.length > 0 && (
+            <div>
+              creates:{" "}
+              <span className="font-mono">
+                {component.creates_proposals.join(", ")}
+              </span>
+            </div>
+          )}
+          {component.handles_proposals.length > 0 && (
+            <div>
+              handles:{" "}
+              <span className="font-mono">
+                {component.handles_proposals.join(", ")}
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+      {component.error && (
+        <div className="text-xs text-status-red whitespace-pre-wrap break-words">
+          {component.error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RuntimeBadge({
+  ok,
+  children,
+}: {
+  ok: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <span
+      className={[
+        "rounded-full px-2 py-0.5 text-[0.65rem] uppercase tracking-wider border",
+        ok
+          ? "border-status-green/40 bg-status-green/10 text-status-green"
+          : "border-status-yellow/40 bg-status-yellow/10 text-status-yellow",
+      ].join(" ")}
+    >
+      {children}
+    </span>
   );
 }
 

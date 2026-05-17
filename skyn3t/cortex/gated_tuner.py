@@ -6,10 +6,11 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
+from skyn3t.memory.tuner import apply_adjustments_to_config
+
 logger = logging.getLogger("skyn3t.cortex.gated_tuner")
 
-CONFIG_DIR = Path("data/config")
-SNAPSHOTS_DIR = Path("data/config/snapshots")
+DEFAULT_CONFIG_PATH = Path("data/config/runtime.json")
 
 class GatedTuner:
     """Wraps SelfTuningEngine: turns its raw suggestions into review-gated proposals.
@@ -21,11 +22,12 @@ class GatedTuner:
       3. emits TUNING_APPLIED event
     """
 
-    def __init__(self, event_bus, *, config_path: Path | str = "data/config/runtime.json"):
+    def __init__(self, event_bus, *, config_path: Path | str = DEFAULT_CONFIG_PATH):
         self.event_bus = event_bus
         self.config_path = Path(config_path)
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+        self._snapshots_dir = self.config_path.parent / "snapshots"
+        self._snapshots_dir.mkdir(parents=True, exist_ok=True)
         self._wired = False
 
     def start(self) -> None:
@@ -47,14 +49,22 @@ class GatedTuner:
         except Exception:
             logger.exception("could not subscribe to event bus")
 
+    async def stop(self) -> None:
+        if not self._wired:
+            return
+        self._wired = False
+        try:
+            from skyn3t.core.events import EventType
+
+            self.event_bus.unsubscribe(self._on_event, EventType.SYSTEM_ALERT)
+        except Exception:
+            logger.exception("could not unsubscribe from event bus")
+
     def _on_event(self, event) -> None:
         try:
             payload = getattr(event, "payload", {}) or {}
-            etype = getattr(event, "event_type", None)
-            etype_value = getattr(etype, "value", str(etype)) if etype else ""
             kind = payload.get("kind", "")
-            # The known "raw suggestion" channel from SelfTuningEngine — be liberal
-            if "TUNING" in etype_value.upper() or kind in ("tuning_suggestion", "self_tune"):
+            if kind == "tuning_suggestion":
                 self._propose_from_event(payload)
         except Exception:
             logger.exception("on_event error")
@@ -62,22 +72,40 @@ class GatedTuner:
     def _propose_from_event(self, payload: Dict[str, Any]) -> None:
         from skyn3t.cortex import get_store
         agent = payload.get("agent", "?")
-        change = payload.get("change") or payload.get("update") or {}
+        adjustments = payload.get("adjustments") or []
         reason = payload.get("reason") or payload.get("rationale") or "self-tuning suggestion"
-        if not change:
+        if not isinstance(adjustments, list) or not adjustments:
             return
         title = f"Tune {agent}"
         summary = reason
-        detail_lines = ["**proposed config change**", "", "```json", json.dumps(change, indent=2), "```", "", f"_reason_: {reason}"]
-        get_store().create(kind="tuning", title=title, summary=summary,
-                           detail="\n".join(detail_lines),
-                           payload={"agent": agent, "change": change, "reason": reason},
-                           source="self_tuner")
+        detail_lines = [
+            "**proposed tuning adjustments**",
+            "",
+            "```json",
+            json.dumps(adjustments, indent=2),
+            "```",
+            "",
+            f"_reason_: {reason}",
+        ]
+        get_store().create(
+            kind="tuning",
+            title=title,
+            summary=summary,
+            detail="\n".join(detail_lines),
+            payload={
+                "agent": agent,
+                "adjustments": adjustments,
+                "patterns": payload.get("patterns") or [],
+                "reason": reason,
+            },
+            source="self_tuner",
+        )
 
     async def _apply_tuning(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        change: Dict[str, Any] = payload.get("change") or {}
-        if not change:
-            return {"ok": False, "error": "empty change"}
+        adjustments = payload.get("adjustments") or []
+        agent = str(payload.get("agent") or "").strip() or "unknown"
+        if not isinstance(adjustments, list) or not adjustments:
+            return {"ok": False, "error": "empty adjustments"}
         # snapshot current config
         existing: Dict[str, Any] = {}
         if self.config_path.exists():
@@ -85,24 +113,56 @@ class GatedTuner:
                 existing = json.loads(self.config_path.read_text())
             except Exception:
                 existing = {}
-        snap_path = SNAPSHOTS_DIR / f"{int(time.time())}.json"
+        snap_path = self._snapshots_dir / f"{int(time.time())}.json"
         snap_path.write_text(json.dumps(existing, indent=2))
-        # merge: simple key replacement
-        merged = {**existing, **change}
+
+        existing_agents = existing.get("agents") if isinstance(existing.get("agents"), dict) else {}
+        current_agent_config = existing_agents.get(agent) if isinstance(existing_agents, dict) else {}
+        updated_agent_config = apply_adjustments_to_config(
+            current_agent_config if isinstance(current_agent_config, dict) else {},
+            list(adjustments),
+        )
+
+        merged = dict(existing)
+        merged_agents = dict(existing_agents or {})
+        merged_agents[agent] = updated_agent_config
+        merged["agents"] = merged_agents
         self.config_path.write_text(json.dumps(merged, indent=2))
         # publish event
         try:
             from skyn3t.core.events import Event, EventType
-            self.event_bus.publish(Event(event_type=EventType.SYSTEM_ALERT, source="gated_tuner",
-                                         payload={"kind": "TUNING_APPLIED", "change": change,
-                                                  "snapshot": str(snap_path)}))
+            self.event_bus.publish(
+                Event(
+                    event_type=EventType.SYSTEM_ALERT,
+                    source="gated_tuner",
+                    payload={
+                        "kind": "tuning_applied",
+                        "agent": agent,
+                        "adjustments": adjustments,
+                        "snapshot": str(snap_path),
+                    },
+                )
+            )
         except Exception:
             logger.debug("TUNING_APPLIED event publish failed", exc_info=True)
-        return {"applied": True, "snapshot": str(snap_path), "config_path": str(self.config_path)}
+        return {
+            "ok": True,
+            "applied": True,
+            "agent": agent,
+            "snapshot": str(snap_path),
+            "config_path": str(self.config_path),
+        }
 
     def rollback(self, snapshot_name: str) -> Dict[str, Any]:
-        snap = SNAPSHOTS_DIR / snapshot_name
+        snap = self._snapshots_dir / snapshot_name
         if not snap.exists():
             return {"ok": False, "error": "snapshot not found"}
         self.config_path.write_text(snap.read_text())
         return {"ok": True, "restored_from": str(snap)}
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            "wired": self._wired,
+            "config_path": str(self.config_path),
+            "snapshots_dir": str(self._snapshots_dir),
+        }
