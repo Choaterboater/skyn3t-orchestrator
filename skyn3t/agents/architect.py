@@ -337,48 +337,36 @@ class ArchitectAgent(BaseAgent):
     # Architecture sanitizer (deterministic post-LLM cleanup)
     # ------------------------------------------------------------------
 
-    # Tech-name → "what to say instead" when the architecture doc mentions
-    # something the scaffold won't build. Keys are case-insensitive
-    # substrings; values are the replacement noun phrase used in
-    # ``_substitute_in_sentence``.  The empty-string value means "delete
-    # the whole sentence" — used when there is no clean substitute
-    # (Cloudflare, Alembic, AWS-only services).
-    _NODE_STACK_SUBSTITUTIONS: Dict[str, str] = {
-        # Frameworks
-        "FastAPI": "Express",
-        "Flask": "Express",
-        "Django": "Express",
-        "Starlette": "Express",
-        # ORMs / DB layer
-        "SQLAlchemy": "better-sqlite3",
-        "async SQLAlchemy": "better-sqlite3",
-        "Alembic": "",  # no Node equivalent shipped — drop the sentence
-        "Pydantic v2": "JSON schema validation",
-        "Pydantic": "JSON schema validation",
-        # Async runtime / scheduler
-        "Celery": "",
-        "uvicorn": "node",
-        "gunicorn": "node",
-        # Deploy targets we don't ship configs for
-        "Cloudflare": "",
-        "Fly.io": "",
-        "Render": "",
-        "AWS Lambda": "",
-        "Heroku": "",
+    # Tech-name terms that mean the architecture is describing a Python
+    # stack we don't actually scaffold. When ANY of these appears in a
+    # sentence, the ENTIRE sentence gets dropped from the markdown rather
+    # than substituted.
+    #
+    # canary-123 showed why substitution is the wrong approach:
+    # case-insensitive word replacement created franken-prose like "ASGI
+    # app served by node", "better-sqlite3 2.x via asyncpg", and "eslint
+    # + eslint". The reviewer LLM penalized those as harshly as the
+    # original FastAPI mentions, so the sanitizer netted zero gain.
+    #
+    # Sentence-drop is conservative but never invents nonsense. The
+    # reviewer sees a slightly thinner architecture doc rather than a
+    # cross-language word-salad.
+    _NODE_STACK_DROP_TERMS: List[str] = [
+        # Python frameworks
+        "FastAPI", "Flask", "Django", "Starlette",
+        # ORM / migrations / serialization
+        "SQLAlchemy", "Alembic", "Pydantic",
+        # Async runtime / WSGI/ASGI servers
+        "Celery", "uvicorn", "gunicorn", "asgi", "wsgi", "asyncpg",
         # Language / runtime mentions
-        "Python 3.11": "Node 20",
-        "Python 3.12": "Node 20",
-        "Python 3": "Node",
-        "Python": "Node",
-        # Lint/test tooling that doesn't apply
-        "ruff": "eslint",
-        "pytest": "vitest",
-        "mypy": "TypeScript",
+        "Python 3.11", "Python 3.12", "Python 3", "Python ",
+        # Lint/test tooling
+        "ruff", "pytest", "mypy",
         # DBs we don't ship
-        "PostgreSQL 16": "better-sqlite3",
-        "PostgreSQL": "better-sqlite3",
-        "Postgres": "better-sqlite3",
-    }
+        "PostgreSQL", "Postgres", "asyncpg",
+        # Deploy targets we don't ship configs for
+        "Cloudflare", "Fly.io", "Render ", "AWS Lambda", "Heroku",
+    ]
 
     @classmethod
     def _sanitize_architecture_md(cls, body: str, stack: Dict[str, Any]) -> str:
@@ -391,6 +379,14 @@ class ArchitectAgent(BaseAgent):
 
         Conservative: only acts when the stack is clearly Node-backed.
         Python scaffolds (when they exist) pass through unchanged.
+
+        Strategy: drop entire sentences that mention any Python-only
+        tech rather than substituting words. canary-123 proved that
+        case-insensitive substitution creates franken-prose ("ASGI app
+        served by node", "eslint + eslint") that the reviewer LLM
+        penalizes as harshly as the original FastAPI mentions. The
+        sentence-drop approach loses some context but never invents
+        nonsense.
         """
         if not body or not isinstance(stack, dict):
             return body
@@ -404,70 +400,64 @@ class ArchitectAgent(BaseAgent):
             return body  # not a Node stack — don't touch
 
         out = body
-        for needle, replacement in cls._NODE_STACK_SUBSTITUTIONS.items():
-            if needle.lower() not in out.lower():
-                continue
-            if replacement:
-                # Case-preserving substitute: match the original casing
-                # at each hit position. Re.sub with a function handles
-                # this cleanly.
-                pattern = re.compile(re.escape(needle), re.IGNORECASE)
-                out = pattern.sub(replacement, out)
-            else:
-                # Drop any sentence (and its trailing list-item / paren
-                # group) that mentions the term. Conservative: a single
-                # sentence per hit, bounded by `. !? \n` or end of line.
-                out = cls._strip_sentences_mentioning(out, needle)
+        for needle in cls._NODE_STACK_DROP_TERMS:
+            # `_strip_sentences_mentioning` is a no-op if the needle
+            # isn't present, so we don't need an outer guard.
+            out = cls._strip_sentences_mentioning(out, needle)
 
-        # After substitutions, collapse double-blank-lines that the
-        # sentence-strip step might have left behind.
+        # Collapse extra blank lines that the sentence drops leave behind.
         out = re.sub(r"\n{3,}", "\n\n", out)
         return out
 
-    @staticmethod
-    def _strip_sentences_mentioning(body: str, needle: str) -> str:
-        """Remove any sentence containing ``needle`` (case-insensitive).
+    # Sentence end: `.`, `!`, `?` followed by space + capital letter, OR
+    # end of line. Crucially, `Python 3.11` does NOT match this — the
+    # period is inside a version number, not a sentence boundary.
+    _SENTENCE_END_RE = re.compile(r"[.!?](?=\s+[A-Z]|\s*$|\s*\n)")
 
-        A "sentence" here is a stretch up to the next `.`/`!`/`?` followed
-        by whitespace/newline, OR the rest of a list-bullet line, OR the
-        rest of a parenthetical group. Conservative: leaves the rest of
-        the paragraph intact.
+    @classmethod
+    def _strip_sentences_mentioning(cls, body: str, needle: str) -> str:
+        """Drop sentences (NOT lines) containing ``needle``.
+
+        canary-123 lesson: substitution creates franken-prose. Naive
+        period-based sentence drop misfires on ``Python 3.11`` (the
+        version-number dot reads as a sentence end). Line-drop is too
+        aggressive and loses unrelated content on the same line.
+
+        Solution: split on sentence boundaries that REQUIRE space + capital
+        after the punctuation, so version numbers and acronyms don't split
+        the sentence prematurely. Then drop only the sentences containing
+        the needle.
         """
         if not body or not needle:
             return body
-        lower = body.lower()
         nlower = needle.lower()
-        out_chunks: List[str] = []
-        cursor = 0
-        while cursor < len(body):
-            idx = lower.find(nlower, cursor)
-            if idx < 0:
-                out_chunks.append(body[cursor:])
-                break
-            # Find sentence start: previous `.`, `!`, `?`, `\n`, or `(`.
-            start = cursor
-            for boundary_pos in range(idx - 1, cursor - 1, -1):
-                ch = body[boundary_pos]
-                if ch in ".!?\n":
-                    start = boundary_pos + 1
-                    break
-                if ch == "(":
-                    start = boundary_pos
-                    break
-            # Find sentence end: next `.`, `!`, `?`, `\n`, or `)`.
-            end = len(body)
-            for boundary_pos in range(idx + len(needle), len(body)):
-                ch = body[boundary_pos]
-                if ch in ".!?\n":
-                    end = boundary_pos + 1
-                    break
-                if ch == ")":
-                    end = boundary_pos + 1
-                    break
-            # Keep everything before `start`, drop [start:end], continue from `end`.
-            out_chunks.append(body[cursor:start])
-            cursor = end
-        return "".join(out_chunks)
+        # Process paragraph-by-paragraph to preserve markdown structure
+        # (headings, list bullets, blank lines).
+        paragraphs = body.split("\n\n")
+        kept_paragraphs: List[str] = []
+        for para in paragraphs:
+            if nlower not in para.lower():
+                kept_paragraphs.append(para)
+                continue
+            # Split into sentences. _SENTENCE_END_RE matches just the
+            # boundary punctuation, not the following whitespace, so we
+            # use re.split with a capturing group to keep the punctuation
+            # attached to each piece.
+            pieces = re.split(r"(?<=[.!?])(?=\s+[A-Z])", para)
+            kept_pieces = [p for p in pieces if nlower not in p.lower()]
+            # If we dropped everything, leave the paragraph out.
+            if not kept_pieces:
+                continue
+            # If we kept the same number, the needle was inside a piece
+            # that the splitter merged — try a coarser drop: split on
+            # any `. ` boundary and accept the version-number false-pos.
+            if len(kept_pieces) == len(pieces):
+                pieces = re.split(r"(?<=[.!?])\s+", para)
+                kept_pieces = [p for p in pieces if nlower not in p.lower()]
+                if not kept_pieces:
+                    continue
+            kept_paragraphs.append(" ".join(p.strip() for p in kept_pieces if p.strip()))
+        return "\n\n".join(kept_paragraphs)
 
     def _components_for(self, target: str) -> List[Dict[str, str]]:
         if target == "saas":
