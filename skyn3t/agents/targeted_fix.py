@@ -561,7 +561,25 @@ async def apply_targeted_fix(
             continue
 
         if issue.suggested_action == "regenerate":
-            if not target_path.exists():
+            # Treat existing stub placeholders as "missing" so we can
+            # upgrade them to the deterministic manifest body. canary-131
+            # shipped ActivityFeed.jsx / ServiceDetail.jsx as 141-byte
+            # "<div>Placeholder</div>" because target_path.exists() short-
+            # circuited the manifest-first path on the re-run.
+            _file_is_stub = False
+            if target_path.exists():
+                try:
+                    _existing = target_path.read_text(encoding="utf-8")
+                    if (
+                        len(_existing) < 400
+                        and ("Auto-generated placeholder" in _existing
+                             or "Placeholder()" in _existing
+                             or "<div>Placeholder</div>" in _existing)
+                    ):
+                        _file_is_stub = True
+                except OSError:
+                    pass
+            if (not target_path.exists()) or _file_is_stub:
                 # canary-130: stubs render as <Placeholder/> in the UI.
                 # Try deterministic homelab generators (manifest_for)
                 # before falling back to the 5-line _placeholder_for stub.
