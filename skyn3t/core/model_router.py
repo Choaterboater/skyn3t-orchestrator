@@ -224,6 +224,23 @@ _BACKEND_ALTERNATIVES: Dict[str, Tuple[str, Optional[str]]] = {
     "claude_cli":  ("copilot_cli", None),
 }
 
+# Static cost tiers per backend. Values are relative (1.0 = cheap
+# baseline). Used by adaptive routing to optimize "works AND is
+# cheap" — when two backends have a similar win rate on a stack,
+# prefer the cheaper one. Empirical ballpark from observed token
+# spend over the project history; tune via ``SKYN3T_ROUTER_BACKEND_COSTS``
+# env var (JSON dict ``{"backend": cost}``) if these drift.
+_BACKEND_COST: Dict[str, float] = {
+    "kimi_cli":    1.0,     # subscription-backed CLI, effectively free per call
+    "copilot_cli": 1.0,     # GitHub Copilot CLI, included in subscription
+    "claude_cli":  3.0,     # Anthropic API per-token, strong model
+    "openai_cli":  2.5,     # OpenAI API per-token
+}
+
+# Default cost for an unknown backend — pessimistic so the router
+# doesn't accidentally prefer something we haven't priced.
+_UNKNOWN_BACKEND_COST = 2.0
+
 
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name, "").strip()
@@ -252,6 +269,53 @@ def _adaptive_enabled() -> bool:
     if raw in ("0", "off", "false", "no"):
         return False
     return True
+
+
+def _cost_weight_enabled() -> bool:
+    """Cost-weighted routing is opt-in (default ON). Disable when
+    operators want pure-rate decisions for debugging or research."""
+    raw = os.environ.get("SKYN3T_ROUTER_COST_WEIGHTED", "").strip().lower()
+    if raw in ("0", "off", "false", "no"):
+        return False
+    return True
+
+
+def _backend_cost(backend: str) -> float:
+    """Return the relative cost of one call to ``backend``.
+
+    Reads the static ``_BACKEND_COST`` table first, then any env-var
+    override (``SKYN3T_ROUTER_BACKEND_COSTS`` as a JSON dict).
+    Unknown backends fall through to ``_UNKNOWN_BACKEND_COST`` —
+    pessimistic so a new backend isn't accidentally preferred.
+    """
+    override_raw = os.environ.get("SKYN3T_ROUTER_BACKEND_COSTS", "").strip()
+    if override_raw:
+        try:
+            overrides = json.loads(override_raw)
+            if isinstance(overrides, dict) and backend in overrides:
+                return float(overrides[backend])
+        except (ValueError, TypeError):
+            logger.warning(
+                "router: SKYN3T_ROUTER_BACKEND_COSTS=%r is not valid JSON",
+                override_raw,
+            )
+    return float(_BACKEND_COST.get(backend, _UNKNOWN_BACKEND_COST))
+
+
+def _expected_cost_per_success(
+    backend: str, rate: Optional[float],
+) -> Optional[float]:
+    """``cost / win_rate`` — the average cost to get one working file
+    out of this backend on the current stack.
+
+    Returns None when ``rate`` is None (no data yet) or 0 (would
+    divide by zero — treat as "infinite cost"). The caller uses
+    None to mean "no information; don't factor cost into the
+    decision."
+    """
+    if rate is None or rate <= 0.0:
+        return None
+    return _backend_cost(backend) / rate
 
 
 def _maybe_demote(
@@ -327,6 +391,80 @@ def _maybe_demote(
     return alt_backend, alt_model
 
 
+def _maybe_cost_demote(
+    backend: str,
+    model: Optional[str],
+    *,
+    rel_path: str,
+    stack: str,
+    scoreboard: Any,
+    event_bus: Any = None,
+) -> Tuple[str, Optional[str]]:
+    """Prefer a cheaper backend when both are working fine.
+
+    Distinct from ``_maybe_demote`` (which fires on a *losing*
+    backend): this fires when both the static pick and its
+    alternative are above the win-rate threshold but the
+    alternative's cost-per-success is meaningfully lower.
+
+    "Meaningfully" is governed by ``SKYN3T_ROUTER_COST_SAVINGS``
+    (default 0.25 — require 25% relative savings) so the router
+    doesn't flap on small differences. Honors the kill switch
+    ``SKYN3T_ROUTER_COST_WEIGHTED=0``.
+    """
+    if not _cost_weight_enabled():
+        return backend, model
+    min_samples = _env_int("SKYN3T_ROUTER_DEMOTE_AFTER", 5)
+    threshold = _env_float("SKYN3T_ROUTER_DEMOTE_BELOW", 0.4)
+    rate = scoreboard.backend_rate(stack, backend, min_samples=min_samples)
+    # Below threshold (or no data) → defer to _maybe_demote's logic.
+    if rate is None or rate < threshold:
+        return backend, model
+    alt = _BACKEND_ALTERNATIVES.get(backend)
+    if not alt:
+        return backend, model
+    alt_backend, alt_model = alt
+    alt_rate = scoreboard.backend_rate(stack, alt_backend, min_samples=min_samples)
+    if alt_rate is None or alt_rate < threshold:
+        return backend, model
+    cur_cps = _expected_cost_per_success(backend, rate)
+    alt_cps = _expected_cost_per_success(alt_backend, alt_rate)
+    if cur_cps is None or alt_cps is None or cur_cps <= 0:
+        return backend, model
+    relative_savings = (cur_cps - alt_cps) / cur_cps
+    savings_threshold = _env_float("SKYN3T_ROUTER_COST_SAVINGS", 0.25)
+    if relative_savings < savings_threshold:
+        return backend, model
+    logger.info(
+        "router: cost-demoting %s→%s for %s "
+        "(cost/success %.2f→%.2f, savings %.0f%% on stack=%s)",
+        backend, alt_backend, rel_path,
+        cur_cps, alt_cps, relative_savings * 100, stack,
+    )
+    _publish_router_decision(
+        event_bus,
+        action="cost_demote_backend",
+        reason=(
+            f"cost/success {cur_cps:.2f}→{alt_cps:.2f} "
+            f"(savings {relative_savings:.0%}) on stack={stack}"
+        ),
+        input={
+            "rel_path": rel_path,
+            "stack": stack,
+            "from_backend": backend,
+            "from_model": model,
+            "to_backend": alt_backend,
+            "to_model": alt_model,
+            "from_rate": rate,
+            "to_rate": alt_rate,
+            "from_cost_per_success": cur_cps,
+            "to_cost_per_success": alt_cps,
+            "relative_savings": relative_savings,
+        },
+    )
+    return alt_backend, alt_model
+
+
 def _publish_router_decision(event_bus, **kwargs) -> None:
     """Emit a CORTEX_DECISION event for an adaptive routing decision.
 
@@ -383,7 +521,17 @@ def resolve_model_for_file(
         and hasattr(scoreboard, "backend_rate")
     ):
         try:
-            return _maybe_demote(
+            # Failure-driven demote first: if the static pick is
+            # consistently losing, switch regardless of cost.
+            demoted = _maybe_demote(
+                backend, model,
+                rel_path=rel_path, stack=stack, scoreboard=scoreboard,
+                event_bus=event_bus,
+            )
+            if demoted != (backend, model):
+                return demoted
+            # Both backends are working acceptably → consider cost.
+            return _maybe_cost_demote(
                 backend, model,
                 rel_path=rel_path, stack=stack, scoreboard=scoreboard,
                 event_bus=event_bus,
