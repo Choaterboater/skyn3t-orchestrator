@@ -1723,6 +1723,23 @@ class CodeAgent(BaseAgent):
         # expect `styles.css` + `app.js`. Keep both when needed.
         files_written = self._ensure_legacy_frontend_aliases(out_dir, files_written, brief)
 
+        # Backfill any local import targets that the LLM referenced but
+        # never wrote (canary-118/119 pattern: App.jsx imported
+        # CommandPalette/ActivityFeed/ServiceDetail but the planner never
+        # listed them, so the scaffold failed to build with "module not
+        # found"). When a deterministic generator exists for the missing
+        # path, fall back to it; otherwise a placeholder stub avoids the
+        # build break.
+        try:
+            files_written = self._backfill_unresolved_local_imports(
+                out_dir=out_dir,
+                files_written=files_written,
+                stack=template_key,
+                brief=brief,
+            )
+        except Exception:
+            logger.exception("backfill unresolved imports failed (non-fatal)")
+
         try:
             await self.share_learning(
                 f"scaffold: {len(files_written)} files for brief",
@@ -1787,6 +1804,192 @@ class CodeAgent(BaseAgent):
         ):
             return self._write_backend_scaffold(out_dir, brief)
         return self._write_script_scaffold(out_dir, brief)
+
+    # Match `import X from './path'`, `import X from "./path"`,
+    # `from './path' import` (ESM/TS) and `require('./path')`. Captures
+    # ONLY relative paths (./, ../) — bare specifiers are package imports,
+    # not scaffold files, so we never try to manufacture them.
+    _LOCAL_IMPORT_RE = _RE.compile(
+        r"""(?xm)
+        (?:
+            ^\s*import\s+(?:[^'";\n]+?\s+from\s+)?['"](\.{1,2}/[^'"\n]+)['"]
+          | ^\s*export\s+(?:\*|\{[^}]*\})\s+from\s+['"](\.{1,2}/[^'"\n]+)['"]
+          | \brequire\s*\(\s*['"](\.{1,2}/[^'"\n]+)['"]\s*\)
+        )
+        """
+    )
+
+    # Common extensions to try when resolving a bare `./Foo` import.
+    _RESOLVE_EXTS: Tuple[str, ...] = (
+        ".jsx", ".tsx", ".ts", ".js", ".mjs", ".cjs", ".css", ".scss",
+    )
+
+    def _backfill_unresolved_local_imports(
+        self,
+        *,
+        out_dir,
+        files_written: list[str],
+        stack: Optional[str],
+        brief: str,
+    ) -> list[str]:
+        """Scan generated files for relative imports that don't resolve, and
+        backfill from deterministic generators when possible.
+
+        Root cause we're addressing: the LLM's App.jsx imports
+        ``./components/CommandPalette.jsx``, but the planner never put
+        that file in the spec, so it never got written. The scaffold
+        ships with a broken import and Vite/Webpack fail to build.
+
+        Strategy:
+          1. Parse every JS/JSX/TS/TSX file we wrote, extracting relative
+             import targets.
+          2. Resolve each target against the file's directory. Try the
+             literal path, then the path with each common extension, then
+             ``<path>/index.<ext>``.
+          3. For each unresolved target, look up the scaffold-relative
+             path in stack_templates._MANIFEST_GENERATORS. If a
+             deterministic generator exists, write it. Otherwise write a
+             minimal placeholder so the build at least succeeds.
+        """
+        from pathlib import Path as _Path
+        from skyn3t.agents.stack_templates import manifest_for
+
+        out_dir = _Path(out_dir).resolve()
+        # Only scan files we actually emitted, and limit to JS/TS-ish
+        # bodies — backfilling CSS @imports etc. is out of scope.
+        scan_exts = {".jsx", ".tsx", ".js", ".ts", ".mjs", ".cjs"}
+        scanned: int = 0
+        backfilled: list[str] = []
+
+        for written in list(files_written):
+            try:
+                p = _Path(written)
+                if not p.is_absolute():
+                    p = (out_dir / p).resolve()
+                if not p.is_file():
+                    continue
+                if p.suffix.lower() not in scan_exts:
+                    continue
+                text = p.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            scanned += 1
+
+            file_dir = p.parent
+            for match in self._LOCAL_IMPORT_RE.finditer(text):
+                target = match.group(1) or match.group(2) or match.group(3) or ""
+                if not target:
+                    continue
+                # Resolve relative to the importing file's directory.
+                try:
+                    base = (file_dir / target).resolve()
+                except Exception:
+                    continue
+                # Reject anything outside the scaffold (e.g. `../../../etc/passwd`).
+                try:
+                    base.relative_to(out_dir)
+                except ValueError:
+                    continue
+
+                resolved = self._resolve_import_path(base)
+                if resolved is not None:
+                    continue  # already on disk — nothing to do
+
+                # Pick a concrete path for the new file. If the target
+                # ends with an extension we leave it alone; otherwise
+                # tack on `.jsx` for JSX importers, `.js` otherwise.
+                if base.suffix:
+                    target_path = base
+                else:
+                    pick_ext = ".jsx" if p.suffix.lower() in (".jsx", ".tsx") else ".js"
+                    target_path = base.with_suffix(pick_ext)
+
+                # Compute the scaffold-relative path for the dispatch lookup.
+                try:
+                    rel_path = target_path.relative_to(out_dir).as_posix()
+                except ValueError:
+                    continue
+
+                # First try a deterministic generator. Pass stack as-is;
+                # manifest_for() returns None for unknown (stack, path).
+                body: Optional[str] = None
+                if stack:
+                    body = manifest_for(stack, rel_path, brief or "")
+                if body is None:
+                    # Last-resort placeholder so the build doesn't break.
+                    # Cheaper than letting Vite fail, and the reviewer can
+                    # still flag the stub.
+                    body = self._placeholder_local_import(rel_path)
+
+                try:
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    target_path.write_text(body, encoding="utf-8")
+                    backfilled.append(str(target_path))
+                except OSError:
+                    logger.warning("backfill write failed: %s", target_path)
+
+        if backfilled:
+            logger.info(
+                "backfilled %d unresolved import(s) across %d file(s): %s",
+                len(backfilled),
+                scanned,
+                ", ".join(_Path(b).name for b in backfilled[:5])
+                + ("…" if len(backfilled) > 5 else ""),
+            )
+            files_written = files_written + [b for b in backfilled if b not in files_written]
+        return files_written
+
+    @staticmethod
+    def _resolve_import_path(base):
+        """Return the actual file path an import resolves to, or None.
+
+        Tries: the literal path, the path with each common extension,
+        and `<path>/index.<ext>`. Mirrors Node's resolution algorithm
+        for relative specifiers.
+        """
+        from pathlib import Path as _Path
+        if base.is_file():
+            return base
+        for ext in CodeAgent._RESOLVE_EXTS:
+            candidate = _Path(str(base) + ext)
+            if candidate.is_file():
+                return candidate
+        if base.is_dir():
+            for ext in CodeAgent._RESOLVE_EXTS:
+                idx = base / f"index{ext}"
+                if idx.is_file():
+                    return idx
+        return None
+
+    @staticmethod
+    def _placeholder_local_import(rel_path: str) -> str:
+        """Tiny build-valid stub for an unresolved local import.
+
+        Keeps Vite/Webpack from breaking when no deterministic generator
+        applies. The reviewer's `placeholder_leak` check still catches it
+        so the stub never sneaks through to production.
+        """
+        name = rel_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        ext = rel_path.rsplit(".", 1)[-1].lower()
+        if ext in ("jsx", "tsx"):
+            return (
+                f"// TODO[skyn3t]: backfilled stub for missing import.\n"
+                f"export default function {name}() {{\n"
+                f"  return null;\n"
+                f"}}\n"
+            )
+        if ext in ("ts", "tsx"):
+            return (
+                f"// TODO[skyn3t]: backfilled stub for missing import.\n"
+                f"export default {{}};\n"
+            )
+        if ext in ("css", "scss"):
+            return f"/* TODO[skyn3t]: backfilled stub for missing import ({rel_path}) */\n"
+        # js / mjs / cjs / fallback
+        return (
+            f"// TODO[skyn3t]: backfilled stub for missing import.\n"
+            f"export default {{}};\n"
+        )
 
     @staticmethod
     def _ensure_legacy_frontend_aliases(out_dir, files_written: list[str], brief: str) -> list[str]:
