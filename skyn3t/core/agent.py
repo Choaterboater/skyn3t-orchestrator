@@ -15,6 +15,7 @@ from skyn3t.core.event_context import current_event_correlation_id, merge_event_
 from skyn3t.core.events import Event, EventBus, EventType
 from skyn3t.observability.metrics import get_collector
 from skyn3t.observability.tracing import SpanStatus, get_tracer
+from skyn3t.prompt_compression import compress_prompt_context
 
 if TYPE_CHECKING:
     from skyn3t.core.messaging import AgentMessage
@@ -651,8 +652,7 @@ class BaseAgent(ABC):
                 body = (s.body or "").strip()
                 if not body:
                     continue
-                if len(body) > max_chars_per_skill:
-                    body = body[:max_chars_per_skill] + "\n…[truncated]"
+                body = compress_prompt_context(body, max_chars=max_chars_per_skill)
                 lines.append(f"### Skill: {s.name}\n{body}")
                 if len(lines) >= limit:
                     break
@@ -990,6 +990,7 @@ class BaseAgent(ABC):
         if getattr(self, "_llm", None) is None:
             backend = self.config.get("backend")
             model = self.config.get("model")
+            backend_is_policy = False
             # Layer in the routing policy when the agent didn't set
             # an explicit backend. Identify the stage by agent name
             # — agents are named brainstorm / research / architect /
@@ -999,6 +1000,7 @@ class BaseAgent(ABC):
                     from skyn3t.core.model_router import resolve_model
                     policy_backend, policy_model = resolve_model(self.name)
                     backend = policy_backend
+                    backend_is_policy = bool(policy_backend)
                     if model is None:
                         model = policy_model
                 except Exception:
@@ -1013,6 +1015,7 @@ class BaseAgent(ABC):
                     backend=backend,
                     event_bus=self.event_bus,
                     caller_name=self.name,
+                    backend_is_policy=backend_is_policy,
                 )
             except Exception:
                 self._llm = None

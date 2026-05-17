@@ -271,6 +271,41 @@ async def test_proposals_list_filters_system_origin(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_cortex_status_reports_handlers_and_components(monkeypatch):
+    fake_status = {
+        "running": True,
+        "booted": True,
+        "components": [
+            {
+                "name": "gated_tuner",
+                "class_name": "GatedTuner",
+                "started": True,
+                "subscriptions": ["SYSTEM_ALERT:tuning_suggestion"],
+                "creates_proposals": ["tuning"],
+                "handles_proposals": ["tuning"],
+                "details": {"config_path": "data/config/runtime.json"},
+                "error": None,
+            }
+        ],
+        "proposal_handlers": ["feature", "studio_debug", "tuning"],
+        "proposal_counts": {"pending": 2, "failed": 1},
+        "recent_failures": [
+            {"id": "p1", "kind": "tuning", "title": "Tune claude", "error": "boom"}
+        ],
+        "warnings": [],
+    }
+    monkeypatch.setattr(
+        web_app,
+        "orchestrator",
+        SimpleNamespace(get_cortex_status=lambda: fake_status),
+    )
+
+    result = await web_app.cortex_status()
+
+    assert result == fake_status
+
+
+@pytest.mark.asyncio
 async def test_services_reset_restarts_cortex_and_replays_inflight(monkeypatch):
     calls = {"reset": 0, "cancel": 0, "resume": 0}
 

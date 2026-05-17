@@ -79,7 +79,10 @@ class Skill:
 
     name: str
     body: str = ""
+    description: str = ""
+    author: str = ""
     tags: List[str] = field(default_factory=list)
+    triggers: List[str] = field(default_factory=list)
     success_count: int = 0
     failure_count: int = 0
     last_used_at: float = field(default_factory=time.time)
@@ -101,17 +104,30 @@ class Skill:
     def to_markdown(self) -> str:
         """Serialize to the documented skill-file shape."""
         tags_str = "[" + ", ".join(sorted(set(self.tags))) + "]"
-        front = (
-            "---\n"
-            f"name: {self.name}\n"
-            f"tags: {tags_str}\n"
-            f"success_count: {self.success_count}\n"
-            f"failure_count: {self.failure_count}\n"
-            f"last_used_at: {self.last_used_at:.1f}\n"
-            f"source: {self.source}\n"
-            f"created_at: {self.created_at:.1f}\n"
-            "---\n\n"
+        triggers_str = "[" + ", ".join(sorted(set(self.triggers))) + "]"
+        front_lines = [
+            "---",
+            f"name: {self.name}",
+        ]
+        if self.author:
+            front_lines.append(f"author: {self.author}")
+        if self.description:
+            front_lines.append(f"description: {self.description}")
+        front_lines.append(f"tags: {tags_str}")
+        if self.triggers:
+            front_lines.append(f"triggers: {triggers_str}")
+        front_lines.extend(
+            [
+                f"success_count: {self.success_count}",
+                f"failure_count: {self.failure_count}",
+                f"last_used_at: {self.last_used_at:.1f}",
+                f"source: {self.source}",
+                f"created_at: {self.created_at:.1f}",
+                "---",
+                "",
+            ]
         )
+        front = "\n".join(front_lines)
         return front + (self.body or "").rstrip() + "\n"
 
     @classmethod
@@ -121,7 +137,10 @@ class Skill:
         front, body = _split_frontmatter(text)
         return cls(
             name=str(front.get("name") or "untitled"),
+            author=str(front.get("author") or ""),
+            description=str(front.get("description") or ""),
             tags=_parse_list(front.get("tags")),
+            triggers=_parse_list(front.get("triggers")),
             success_count=int(front.get("success_count") or 0),
             failure_count=int(front.get("failure_count") or 0),
             last_used_at=float(front.get("last_used_at") or time.time()),
@@ -129,6 +148,56 @@ class Skill:
             created_at=float(front.get("created_at") or time.time()),
             body=body.strip(),
         )
+
+    @classmethod
+    def from_agent_skill_markdown(
+        cls,
+        text: str,
+        *,
+        source: str = "agent_skills_import",
+        fallback_name: str = "untitled",
+        extra_tags: Optional[Iterable[str]] = None,
+    ) -> "Skill":
+        """Parse an Agent Skills / SKILL.md file into the local Skill shape."""
+        front, body = _split_frontmatter(text)
+        description = str(front.get("description") or "").strip()
+        tags = sorted(set(_parse_list(front.get("tags"))) | set(extra_tags or []))
+        triggers = _parse_list(front.get("triggers"))
+        if not triggers and description:
+            triggers = _extract_triggers_from_description(description)
+        return cls(
+            name=str(front.get("name") or fallback_name or "untitled"),
+            author=str(front.get("author") or ""),
+            description=description,
+            tags=tags,
+            triggers=triggers,
+            source=source,
+            body=body.strip(),
+        )
+
+    def relevance(self, query: str) -> float:
+        """Cheap metadata/body match score for trigger-aware retrieval."""
+        tokens = _query_tokens(query)
+        if not tokens:
+            return self.score
+        score = self.score
+        name_lc = self.name.lower()
+        desc_lc = self.description.lower()
+        body_lc = self.body.lower()
+        tags_lc = {t.lower() for t in self.tags}
+        triggers_lc = [t.lower() for t in self.triggers]
+        for token in tokens:
+            if token in tags_lc:
+                score += 3.0
+            if token in name_lc:
+                score += 2.0
+            if token in desc_lc:
+                score += 1.5
+            if any(token in trig for trig in triggers_lc):
+                score += 2.5
+            if token in body_lc:
+                score += 0.5
+        return score
 
 
 def _split_frontmatter(text: str) -> tuple[Dict[str, str], str]:
@@ -161,6 +230,65 @@ def _parse_list(raw) -> List[str]:
     if not s:
         return []
     return [piece.strip() for piece in s.split(",") if piece.strip()]
+
+
+def _query_tokens(text: str) -> List[str]:
+    return [tok for tok in re.findall(r"[a-z0-9_./+-]{3,}", (text or "").lower())]
+
+
+def _extract_triggers_from_description(description: str) -> List[str]:
+    """Best-effort extraction of trigger phrases from Agent Skills descriptions."""
+    if not description:
+        return []
+    text = description.strip()
+    candidates: List[str] = []
+    patterns = [
+        r"whenever the user mentions (.+?)(?:\.| also trigger|$)",
+        r"also trigger when (.+?)(?:\.|$)",
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, text, flags=re.IGNORECASE):
+            chunk = m.group(1).strip()
+            chunk = re.sub(r"\bor\b", ",", chunk, flags=re.IGNORECASE)
+            for piece in chunk.split(","):
+                cleaned = piece.strip(" `\"'.()")
+                cleaned = re.sub(
+                    r"^(?:the user mentions|user mentions|code imports|imports|references)\s+",
+                    "",
+                    cleaned,
+                    flags=re.IGNORECASE,
+                )
+                if cleaned:
+                    candidates.append(cleaned)
+    seen: set[str] = set()
+    out: List[str] = []
+    for cand in candidates:
+        key = cand.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cand)
+    return out
+
+
+_UNSAFE_SKILL_PATTERNS: tuple[tuple[str, str], ...] = (
+    (r"\bcurl\b[^\n|]{0,200}\|\s*(?:bash|sh)\b", "shell-pipe-download"),
+    (r"\bwget\b[^\n|]{0,200}\|\s*(?:bash|sh)\b", "shell-pipe-download"),
+    (r"\brm\s+-rf\s+/(?:\s|$)", "destructive-rm-root"),
+    (r"\bsudo\s+", "privileged-command"),
+    (r"\beval\s+\$", "dynamic-shell-eval"),
+    (r"\bos\.system\(", "python-os-system"),
+    (r"\bsubprocess\.(?:Popen|run)\([^)]*shell\s*=\s*True", "python-shell-true"),
+)
+
+
+def scan_skill_markdown(text: str) -> List[str]:
+    """Return simple rule ids for dangerous patterns in a skill file."""
+    hits: List[str] = []
+    for pattern, rule_id in _UNSAFE_SKILL_PATTERNS:
+        if re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL):
+            hits.append(rule_id)
+    return hits
 
 
 class SkillLibrary:
@@ -239,6 +367,20 @@ class SkillLibrary:
         candidates.sort(key=lambda s: (s.score, s.last_used_at), reverse=True)
         return candidates[: max(0, int(limit))]
 
+    def find_relevant(
+        self,
+        query: str,
+        *,
+        min_score: float = -1.0,
+        limit: int = 5,
+    ) -> List[Skill]:
+        """Return skills ranked by metadata/body relevance to ``query``."""
+        with self._lock:
+            candidates = self._scan()
+        candidates = [s for s in candidates if s.score >= min_score]
+        candidates.sort(key=lambda s: (s.relevance(query), s.last_used_at), reverse=True)
+        return candidates[: max(0, int(limit))]
+
     def upsert(self, skill: Skill) -> Path:
         """Write a skill atomically. Returns the path written.
 
@@ -314,6 +456,60 @@ class SkillLibrary:
             except Exception:
                 logger.exception("skill delete failed: %s", path)
                 return False
+
+    def import_agent_skill(
+        self,
+        skill_dir: Path | str,
+        *,
+        source: str = "agent_skills_import",
+        reject_unsafe: bool = True,
+    ) -> tuple[Optional[Path], List[str]]:
+        """Import one Agent Skills standard directory containing ``SKILL.md``."""
+        skill_dir = Path(skill_dir)
+        skill_file = skill_dir / "SKILL.md"
+        text = skill_file.read_text(encoding="utf-8")
+        findings = scan_skill_markdown(text)
+        if reject_unsafe and findings:
+            return None, findings
+        extra_tags = {"agent-skill", skill_dir.name}
+        skill = Skill.from_agent_skill_markdown(
+            text,
+            source=source,
+            fallback_name=skill_dir.name,
+            extra_tags=extra_tags,
+        )
+        return self.upsert(skill), findings
+
+    def import_agent_skills(
+        self,
+        root: Path | str,
+        *,
+        source: str = "agent_skills_import",
+        reject_unsafe: bool = True,
+    ) -> Dict[str, List[str]]:
+        """Bulk-import a tree of Agent Skills directories."""
+        root = Path(root)
+        imported: List[str] = []
+        skipped: List[str] = []
+        flagged: List[str] = []
+        for skill_file in sorted(root.rglob("SKILL.md")):
+            try:
+                path, findings = self.import_agent_skill(
+                    skill_file.parent,
+                    source=source,
+                    reject_unsafe=reject_unsafe,
+                )
+            except Exception:
+                logger.exception("agent skill import failed: %s", skill_file)
+                skipped.append(str(skill_file.parent))
+                continue
+            if findings:
+                flagged.append(f"{skill_file.parent.name}: {', '.join(findings)}")
+            if path is None:
+                skipped.append(str(skill_file.parent))
+            else:
+                imported.append(path.stem)
+        return {"imported": imported, "skipped": skipped, "flagged": flagged}
 
     def summary(self) -> Dict:
         """Aggregate stats for the dashboard."""

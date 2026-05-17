@@ -371,10 +371,12 @@ async def test_proposal_store_approve_fails_truthfully_without_handler(tmp_path)
     result = await store.approve(proposal.id)
 
     current = store.get(proposal.id)
-    assert result == {"ok": False, "error": "no handler for kind"}
+    assert result["ok"] is False
+    assert "no handler for kind 'ingest'" in result["error"]
+    assert result["available_handlers"] == []
     assert current is not None
     assert current.status == "failed"
-    assert current.error == "no handler for kind"
+    assert "no handler for kind 'ingest'" in current.error
 
 
 @pytest.mark.asyncio
@@ -473,3 +475,97 @@ async def test_proposal_store_cancel_inflight_allows_resume(tmp_path):
     current = store.get(proposal.id)
     assert current is not None
     assert current.status == "applied"
+
+
+@pytest.mark.asyncio
+async def test_self_tuning_files_review_gated_tuning_proposal(tmp_path, monkeypatch):
+    from skyn3t.core.events import EventBus
+    from skyn3t.cortex.gated_tuner import GatedTuner
+    from skyn3t.memory.tuner import SelfTuningEngine
+
+    store = ProposalStore(root=tmp_path / "proposals")
+    monkeypatch.setattr("skyn3t.cortex.get_store", lambda: store)
+
+    bus = EventBus()
+    gated = GatedTuner(bus, config_path=tmp_path / "config" / "runtime.json")
+    gated.start()
+    tuner = SelfTuningEngine(event_bus=bus)
+
+    await tuner.receive_suggestions(
+        "claude",
+        ["rate_limit"],
+        [{"type": "prompt", "issue": "rate_limit", "advice": "slow down"}],
+    )
+
+    for _ in range(20):
+        proposals = store.list(status="pending")
+        if proposals:
+            break
+        await asyncio.sleep(0)
+
+    proposals = store.list(status="pending")
+    assert len(proposals) == 1
+    proposal = proposals[0]
+    assert proposal.kind == "tuning"
+    assert proposal.payload["agent"] == "claude"
+    assert proposal.payload["adjustments"][0]["parameter"] == "request_interval"
+
+    await gated.stop()
+
+
+@pytest.mark.asyncio
+async def test_gated_tuner_apply_updates_agent_runtime_config(tmp_path, monkeypatch):
+    from skyn3t.core.events import EventBus
+    from skyn3t.cortex.gated_tuner import GatedTuner
+
+    store = ProposalStore(root=tmp_path / "proposals")
+    monkeypatch.setattr("skyn3t.cortex.get_store", lambda: store)
+
+    config_path = tmp_path / "config" / "runtime.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        json.dumps({"agents": {"claude": {"timeout": 30}}}),
+        encoding="utf-8",
+    )
+
+    gated = GatedTuner(EventBus(), config_path=config_path)
+    gated.start()
+
+    proposal = store.create(
+        kind="tuning",
+        title="Tune claude",
+        summary="Increase timeout",
+        detail="detail",
+        payload={
+            "agent": "claude",
+            "adjustments": [
+                {
+                    "parameter": "timeout",
+                    "change": "+10s",
+                    "new_value": "min(previous + 10, 300)",
+                    "reason": "Timeouts detected — increasing patience",
+                }
+            ],
+            "reason": "Timeouts detected",
+        },
+        source="test",
+    )
+
+    result = await store.approve(proposal.id)
+    assert result == {"ok": True, "applied": False, "status": "approved"}
+
+    for _ in range(20):
+        current = store.get(proposal.id)
+        if current is not None and current.status == "applied":
+            break
+        await asyncio.sleep(0)
+
+    current = store.get(proposal.id)
+    assert current is not None
+    assert current.status == "applied"
+    written = json.loads(config_path.read_text(encoding="utf-8"))
+    assert written["agents"]["claude"]["timeout"] == 40
+    snapshots = list((config_path.parent / "snapshots").glob("*.json"))
+    assert snapshots
+
+    await gated.stop()

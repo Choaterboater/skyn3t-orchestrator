@@ -6,7 +6,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Optional, cast
 
 from skyn3t.core.event_context import current_event_context, current_event_correlation_id
 from skyn3t.security.secrets import redact_text
@@ -77,7 +77,28 @@ _COMPLETE_TIMEOUT = 1200.0
 # continuously, so 180s of silence ≈ stuck. This catches hangs much
 # faster than _COMPLETE_TIMEOUT alone, while still letting a slow
 # streamer make progress on a long file.
-_IDLE_TIMEOUT = 180.0
+# Bumped to 240s after repo-side buffering fixes (PYTHONUNBUFFERED)
+# because some CLI runtimes still exhibit occasional multi-minute
+# pauses on very large codegen tasks.
+_IDLE_TIMEOUT = 240.0
+
+_DESIGN_ROUTING_CALLERS = {
+    "brainstorm",
+    "designer",
+    "marketer",
+    "business_analyst",
+    "writer",
+}
+_CODE_ROUTING_CALLERS = {
+    "code",
+    "code_agent",
+    "code_improver",
+    "build_fix",
+    "integration_fix",
+    "consistency_fix",
+    "code_critique_fix",
+    "vite_dryrun_fix",
+}
 
 
 class LLMClient:
@@ -107,7 +128,9 @@ class LLMClient:
                  event_bus: Optional[Any] = None,
                  caller_name: Optional[str] = None,
                  rag: Optional[Any] = None,
-                 skip_backends: Optional[List[str]] = None):
+                 skip_backends: Optional[List[str]] = None,
+                 backend_is_policy: bool = False,
+                 routing_hint: Optional[str] = None):
         self.default_model = default_model or os.environ.get("SKYN3T_LLM_MODEL")
         self._backend_name = (backend or os.environ.get("SKYN3T_LLM_BACKEND") or "auto").lower()
         # Cross-model debate: callers can list backends to skip (e.g. the
@@ -116,7 +139,7 @@ class LLMClient:
         self._skip_backends: set = set(skip_backends or [])
         self._anthropic_key = anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY")
         self._openrouter_key = openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")
-        self._impl = None  # lazy
+        self._impl: Optional[Any] = None  # lazy
         # Seed module fallback if this is the first explicit bus we've seen.
         _try_register_default(event_bus)
         # Same pattern for RAG: first explicit instance becomes the fallback
@@ -131,6 +154,80 @@ class LLMClient:
         # to retrieve provider-aware doc snippets and prepend them to the
         # system prompt.
         self._rag = rag or _default_rag
+        self._last_failed_backend: Optional[str] = None
+        self._backend_is_policy = bool(backend_is_policy)
+        self._routing_hint = self._normalize_routing_hint(routing_hint) or self._infer_routing_hint(
+            caller_name
+        )
+
+    @staticmethod
+    def _normalize_routing_hint(hint: Optional[str]) -> Optional[str]:
+        value = (hint or "").strip().lower()
+        if value in {"design", "code"}:
+            return value
+        return None
+
+    @staticmethod
+    def _infer_routing_hint(caller_name: Optional[str]) -> Optional[str]:
+        caller = (caller_name or "").strip().lower()
+        if caller in _DESIGN_ROUTING_CALLERS:
+            return "design"
+        if caller in _CODE_ROUTING_CALLERS:
+            return "code"
+        return None
+
+    def _auto_cli_order(self) -> list[str]:
+        if self._routing_hint == "design":
+            return ["kimi_cli", "copilot_cli", "claude_cli", "openai_cli"]
+        if self._routing_hint == "code":
+            return ["copilot_cli", "claude_cli", "openai_cli", "kimi_cli"]
+        return ["claude_cli", "copilot_cli", "openai_cli", "kimi_cli"]
+
+    async def _try_named_backend(self, name: str) -> bool:
+        if name in getattr(self, "_skip_backends", ()):
+            return False
+        if name == "claude_cli":
+            return await self._try_cli("claude_cli", _ClaudeCLIBackend)
+        if name == "kimi_cli":
+            return await self._try_cli("kimi_cli", _KimiCLIBackend)
+        if name == "copilot_cli":
+            return await self._try_cli("copilot_cli", _CopilotCLIBackend)
+        if name == "openai_cli":
+            return await self._try_cli("openai_cli", _OpenAICLIBackend)
+        if name == "anthropic":
+            try:
+                self._impl = _AnthropicBackend(self._anthropic_key)
+                self._backend_name = "anthropic"
+                return True
+            except Exception:
+                logger.warning("anthropic backend init failed", exc_info=True)
+                return False
+        if name == "openrouter":
+            try:
+                from skyn3t.adapters.openrouter import OpenRouterBackend
+                self._impl = OpenRouterBackend(self._openrouter_key)
+                self._backend_name = "openrouter"
+                return True
+            except Exception:
+                logger.warning("openrouter backend init failed", exc_info=True)
+                return False
+        if name == "deterministic":
+            self._impl = _DeterministicBackend()
+            self._backend_name = "deterministic"
+            return True
+        return False
+
+    async def _resolve_auto_backend(self):
+        for name in self._auto_cli_order():
+            if await self._try_named_backend(name):
+                return self._impl
+        if self._anthropic_key and await self._try_named_backend("anthropic"):
+            return self._impl
+        if self._openrouter_key and await self._try_named_backend("openrouter"):
+            return self._impl
+        self._impl = _DeterministicBackend()
+        self._backend_name = "deterministic"
+        return self._impl
 
     async def aclose(self) -> None:
         """Release any resources held by the backing implementation.
@@ -152,7 +249,9 @@ class LLMClient:
 
     async def complete(self, prompt: str, *, system: Optional[str] = None,
                        model: Optional[str] = None, max_tokens: int = 4000,
-                       temperature: float = 0.4) -> str:
+                       temperature: float = 0.4, timeout: Optional[float] = None,
+                       _allow_backend_failover: bool = True) -> str:
+        self._last_failed_backend = None
         req = LLMRequest(prompt=prompt, system=system, model=model or self.default_model,
                          max_tokens=max_tokens, temperature=temperature)
         elapsed = 0.0
@@ -171,7 +270,10 @@ class LLMClient:
             except Exception:
                 pass
             start = time.monotonic()
-            out: str = await impl.complete(req)
+            if timeout is not None:
+                out = cast(str, await asyncio.wait_for(impl.complete(req), timeout=timeout))
+            else:
+                out = cast(str, await impl.complete(req))
             elapsed = time.monotonic() - start
         except Exception as e:
             logger.warning(
@@ -180,6 +282,41 @@ class LLMClient:
                 self._backend_name or "unknown",
                 str(e).strip() or type(e).__name__,
             )
+            failed_backend = (self._backend_name or "").strip().lower()
+            self._last_failed_backend = failed_backend or None
+            if (
+                _allow_backend_failover
+                and failed_backend
+                and failed_backend != "deterministic"
+            ):
+                try:
+                    retry_client = LLMClient(
+                        default_model=self.default_model,
+                        backend=None,
+                        anthropic_api_key=self._anthropic_key,
+                        openrouter_api_key=self._openrouter_key,
+                        event_bus=self._event_bus,
+                        caller_name=self._caller_name,
+                        rag=self._rag,
+                        skip_backends=sorted(self._skip_backends | {failed_backend}),
+                        routing_hint=self._routing_hint,
+                    )
+                    logger.info(
+                        "llm failover retry; caller=%s skip_backends=%s",
+                        self._caller_name or "llm",
+                        sorted(self._skip_backends | {failed_backend}),
+                    )
+                    return await retry_client.complete(
+                        prompt,
+                        system=system,
+                        model=model,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        timeout=timeout,
+                        _allow_backend_failover=False,
+                    )
+                except Exception:
+                    logger.warning("llm failover retry failed", exc_info=True)
             return self._fallback(req)
 
         # Publish an LLM_EXCHANGE event for dashboards/observability. We
@@ -272,34 +409,12 @@ class LLMClient:
         # 1. Explicit backend selection — honor exactly what the user asked for.
         # ------------------------------------------------------------------
         if name in self._EXPLICIT_BACKENDS:
-            if name == "claude_cli":
-                if await self._try_cli("claude_cli", _ClaudeCLIBackend):
-                    return self._impl
-            elif name == "kimi_cli":
-                if await self._try_cli("kimi_cli", _KimiCLIBackend):
-                    return self._impl
-            elif name == "copilot_cli":
-                if await self._try_cli("copilot_cli", _CopilotCLIBackend):
-                    return self._impl
-            elif name == "openai_cli":
-                if await self._try_cli("openai_cli", _OpenAICLIBackend):
-                    return self._impl
-            elif name == "anthropic":
-                try:
-                    self._impl = _AnthropicBackend(self._anthropic_key)
-                    self._backend_name = "anthropic"
-                    return self._impl
-                except Exception:
-                    logger.warning("anthropic backend init failed", exc_info=True)
-            elif name == "openrouter":
-                try:
-                    from skyn3t.adapters.openrouter import OpenRouterBackend
-                    self._impl = OpenRouterBackend(self._openrouter_key)
-                    self._backend_name = "openrouter"
-                    return self._impl
-                except Exception:
-                    logger.warning("openrouter backend init failed", exc_info=True)
-            # explicit choice failed → fall through to deterministic
+            if await self._try_named_backend(name):
+                return self._impl
+            if self._backend_is_policy and name != "deterministic":
+                self._skip_backends.add(name)
+                self._backend_name = "auto"
+                return await self._resolve_auto_backend()
             self._impl = _DeterministicBackend()
             self._backend_name = "deterministic"
             return self._impl
@@ -307,39 +422,7 @@ class LLMClient:
         # ------------------------------------------------------------------
         # 2. Auto: subscription-CLIs first, then API keys, then deterministic.
         # ------------------------------------------------------------------
-        # 2a. claude CLI (most common Pro/Max subscription).
-        if await self._try_cli("claude_cli", _ClaudeCLIBackend):
-            return self._impl
-        # 2b. copilot CLI (common coding/general subscription).
-        if await self._try_cli("copilot_cli", _CopilotCLIBackend):
-            return self._impl
-        # 2c. OpenAI CLI (subscription/local auth).
-        if await self._try_cli("openai_cli", _OpenAICLIBackend):
-            return self._impl
-        # 2d. kimi CLI (specialist subscription).
-        if await self._try_cli("kimi_cli", _KimiCLIBackend):
-            return self._impl
-        # 2e. Anthropic API key (metered).
-        if self._anthropic_key:
-            try:
-                self._impl = _AnthropicBackend(self._anthropic_key)
-                self._backend_name = "anthropic"
-                return self._impl
-            except Exception:
-                logger.warning("anthropic backend init failed", exc_info=True)
-        # 2f. OpenRouter API key (metered).
-        if self._openrouter_key:
-            try:
-                from skyn3t.adapters.openrouter import OpenRouterBackend
-                self._impl = OpenRouterBackend(self._openrouter_key)
-                self._backend_name = "openrouter"
-                return self._impl
-            except Exception:
-                logger.warning("openrouter backend init failed", exc_info=True)
-        # 2g. Deterministic stub.
-        self._impl = _DeterministicBackend()
-        self._backend_name = "deterministic"
-        return self._impl
+        return await self._resolve_auto_backend()
 
     def _fallback(self, req: LLMRequest) -> str:
         return _DeterministicBackend.synthesize(req.prompt, req.system)
@@ -472,23 +555,46 @@ async def _run_capture(args: list[str]) -> str:
     """Run a subprocess and return its stdout (raises on non-zero).
 
     Uses two-tier timeout:
-      * IDLE: if no bytes arrive on stdout for _IDLE_TIMEOUT, kill.
+      * IDLE: if no bytes arrive on stdout+stderr for _IDLE_TIMEOUT, kill.
         Real generation emits tokens continuously; long silence ≈ hang.
       * HARD: total wall time can't exceed _COMPLETE_TIMEOUT.
 
     The stream-then-idle pattern matters for Kimi, which can take
     8–15min on a single large file but never stops emitting for more
     than ~30s while it's actually working. A flat 600s cap killed v34.
+
+    Buffering hardening:
+      * PYTHONUNBUFFERED=1 is injected for Python-based CLIs (kimi, openai).
+      * stdbuf -oL -eL is prepended on Unix to force line-buffering at
+        the C stdio level as a safety net for other runtimes.
+      * Idle detection watches BOTH stdout and stderr so progress
+        logged to either stream resets the idle timer.
     """
     import shutil as _sh
+    import sys as _sys
     start_wall = time.time()
     sandbox_cwd = _make_llm_cli_sandbox_cwd()
+
+    # Build subprocess env with Python unbuffered mode — critical for
+    # Python-based CLIs (kimi, openai) that otherwise block-buffer
+    # stdout when connected to a pipe, easily exceeding the idle window.
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+
+    # On Unix, prepend stdbuf to force line-buffering at the C stdio
+    # level. This is a best-effort safety net for non-Python CLIs.
+    exec_args = list(args)
+    if _sys.platform != "win32":
+        exec_args = ["stdbuf", "-oL", "-eL"] + exec_args
+
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
-            *args,
+            *exec_args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=sandbox_cwd,
+            env=env,
         )
 
         stdout_buf: list[bytes] = []
@@ -505,6 +611,9 @@ async def _run_capture(args: list[str]) -> str:
         stdout_task = asyncio.create_task(_drain(proc.stdout, stdout_buf))
         stderr_task = asyncio.create_task(_drain(proc.stderr, stderr_buf))
 
+        def _total_len(bufs):
+            return sum(len(c) for c in bufs)
+
         try:
             while True:
                 elapsed = asyncio.get_event_loop().time() - start
@@ -512,7 +621,7 @@ async def _run_capture(args: list[str]) -> str:
                     raise asyncio.TimeoutError(
                         f"hard timeout after {int(elapsed)}s"
                     )
-                prev_len = sum(len(c) for c in stdout_buf)
+                prev_len = _total_len(stdout_buf) + _total_len(stderr_buf)
                 try:
                     # Wait either for proc to exit or for the idle window
                     # to elapse. We re-check progress each cycle.
@@ -522,7 +631,7 @@ async def _run_capture(args: list[str]) -> str:
                     )
                     break  # process exited
                 except asyncio.TimeoutError:
-                    new_len = sum(len(c) for c in stdout_buf)
+                    new_len = _total_len(stdout_buf) + _total_len(stderr_buf)
                     if new_len == prev_len:
                         # No new bytes in the idle window → hung.
                         raise asyncio.TimeoutError(
@@ -531,16 +640,21 @@ async def _run_capture(args: list[str]) -> str:
                     # Made progress; reset and keep waiting.
                     continue
         except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            # Cancel drain tasks so we don't leak them.
-            for t in (stdout_task, stderr_task):
-                t.cancel()
             raise
         finally:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pass
             # Make sure drains finish flushing whatever's left in the pipes.
+            for t in (stdout_task, stderr_task):
+                if not t.done():
+                    t.cancel()
             try:
                 await asyncio.wait_for(
                     asyncio.gather(stdout_task, stderr_task, return_exceptions=True),

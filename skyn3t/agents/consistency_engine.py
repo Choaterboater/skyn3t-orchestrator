@@ -103,6 +103,12 @@ _APP_USE_REQUIRE_RE = re.compile(
     """,
     re.VERBOSE,
 )
+_ORGANIC_STUB_PATTERNS = (
+    re.compile(r"(?im)^\s*(//|#|/\*)\s*(TODO|FIXME)\b"),
+    re.compile(r"""(?i)throw\s+new\s+Error\s*\(\s*['"][^'"]*not\s+implemented"""),
+    re.compile(r"(?i)raise\s+NotImplementedError\b"),
+    re.compile(r"(?im)^\s*(//|#)\s*replace with real implementation\b"),
+)
 
 
 def _router_var_name(route_file: Path) -> str:
@@ -649,6 +655,36 @@ def check_consistency(scaffold_dir: Path, brief: str = "") -> ConsistencyReport:
                     "has no real implementation."
                 ),
                 suggestion="Regenerate this file with a fresh prompt that includes the file's plan-purpose.",
+            )
+        )
+
+    _seen_organic_stubs: Set[Path] = set()
+    organic_stub_suffixes = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".py"}
+    for rel, path in file_index.items():
+        if path in _seen_organic_stubs:
+            continue
+        if path.suffix not in organic_stub_suffixes:
+            continue
+        try:
+            head = path.read_text(encoding="utf-8", errors="ignore")[:4000]
+        except OSError:
+            continue
+        if _STUB_MARKER in head:
+            continue
+        if not any(pattern.search(head) for pattern in _ORGANIC_STUB_PATTERNS):
+            continue
+        _seen_organic_stubs.add(path)
+        rel_with_ext = path.relative_to(scaffold_dir).as_posix()
+        issues.append(
+            ConsistencyIssue(
+                severity="error",
+                category="todo_stub",
+                file=rel_with_ext,
+                message=(
+                    "File appears to contain an unresolved placeholder implementation "
+                    "(for example TODO/FIXME or not-implemented stub text)."
+                ),
+                suggestion="Replace the placeholder with a real implementation; do not ship TODO stubs.",
             )
         )
 

@@ -168,3 +168,23 @@ def test_consistency_clean_scaffold_has_no_todo_stub_issue(tmp_path: Path) -> No
     )
     report = check_consistency(scaffold, brief="")
     assert not [i for i in report.issues if i.category == "todo_stub"]
+
+
+def test_consistency_flags_organic_todo_stub_files(tmp_path: Path) -> None:
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "src" / "App.jsx",
+        """// TODO: wire the real dashboard state here
+export default function App() {
+  return <div>stub</div>;
+}
+""",
+    )
+
+    report = check_consistency(scaffold, brief="build a react vite app")
+
+    todo_stubs = [i for i in report.issues if i.category == "todo_stub"]
+    assert len(todo_stubs) == 1
+    assert todo_stubs[0].file == "src/App.jsx"
+    assert todo_stubs[0].severity == "error"
+    assert not report.ok

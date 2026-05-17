@@ -14,6 +14,7 @@ import pytest
 from skyn3t.agents.stack_templates import (
     STACK_TEMPLATES,
     detect_stack,
+    detect_stack_from_handoff,
     plan_for_stack,
     template_keys,
 )
@@ -41,6 +42,29 @@ from skyn3t.agents.stack_templates import (
 ])
 def test_detect_stack_picks_expected_template(brief, expected):
     assert detect_stack(brief) == expected, brief
+
+
+def test_detect_stack_from_handoff_uses_architecture_when_brief_is_generic():
+    brief = (
+        "Build a polished dark-mode service dashboard with a persistent backend "
+        "config store and a health endpoint."
+    )
+    architecture = "Vite + React SPA frontend with a Node/Express backend."
+    assert detect_stack_from_handoff(brief, architecture_text=architecture) == "react_vite"
+
+
+def test_detect_stack_from_handoff_prefers_vite_architecture_over_conflicting_tech_stack():
+    brief = "Build a polished dark-mode service dashboard."
+    architecture = "Single-tenant Vite + React SPA with an Express API."
+    tech_stack = {
+        "frontend": "Next.js 15 App Router",
+        "backend": "Next.js Route Handlers on Node.js 20",
+    }
+    assert detect_stack_from_handoff(
+        brief,
+        architecture_text=architecture,
+        tech_stack=tech_stack,
+    ) == "react_vite"
 
 
 def test_ios_template_uses_swiftpm_executable_shape():
@@ -397,3 +421,85 @@ def test_configurable_tier_route_contract_is_consistent():
     assert "/api/config/:slug/test" in backend_desc
     assert "/api/config/test/:slug" not in backend_desc
     assert "/api/config/:slug/test" in frontend_desc
+
+
+def test_backend_and_configurable_tiers_trigger_for_server_side_config_brief():
+    brief = (
+        "Build a React dashboard with a persistent backend config store, "
+        "server-side CRUD API, a health endpoint, and settings that survive restart."
+    )
+
+    plan = plan_for_stack("react_vite", brief)
+    paths = {rel for rel, _ in (plan or [])}
+
+    assert {
+        "server/index.js",
+        "server/routes/config.js",
+        "server/config-store.js",
+        "server/data/user-config.json",
+        ".env.example",
+        "docker-compose.yml",
+    } <= paths
+
+
+def test_generic_serviceboard_brief_triggers_configurable_tier():
+    brief = (
+        "Build a polished dark-mode service dashboard with a premium glassmorphism feel. "
+        "Scope it to 6-8 integrations and a simple builder/settings flow. "
+        "The app must include a real persistent backend config store from the first boot, "
+        "server-side CRUD for integrations, a health endpoint, and a UI that saves and "
+        "reloads configuration across restarts."
+    )
+
+    plan = plan_for_stack("react_vite", brief)
+    paths = {rel for rel, _ in (plan or [])}
+
+    assert {
+        "server/config-store.js",
+        "src/components/SettingsModal.jsx",
+        "src/components/ServiceEditor.jsx",
+        "src/hooks/useConfig.js",
+    } <= paths
+
+
+def test_generic_serviceboard_brief_uses_deterministic_dashboard_generators():
+    from skyn3t.agents.stack_templates import manifest_for
+
+    brief = (
+        "Build a polished dark-mode service dashboard with a premium glassmorphism feel. "
+        "Scope it to 6-8 integrations and a simple builder/settings flow. "
+        "The app must include a real persistent backend config store from the first boot, "
+        "server-side CRUD for integrations, a health endpoint, and a UI that saves and "
+        "reloads configuration across restarts."
+    )
+
+    app_body = manifest_for("react_vite", "src/App.jsx", brief)
+    styles_body = manifest_for("react_vite", "src/styles.css", brief)
+    store_body = manifest_for("react_vite", "server/config-store.js", brief)
+    index_body = manifest_for("react_vite", "server/index.js", brief)
+    route_body = manifest_for("react_vite", "server/routes/config.js", brief)
+    modal_body = manifest_for("react_vite", "src/components/SettingsModal.jsx", brief)
+    editor_body = manifest_for("react_vite", "src/components/ServiceEditor.jsx", brief)
+    hook_body = manifest_for("react_vite", "src/hooks/useConfig.js", brief)
+
+    assert app_body is not None and "useConfig" in app_body and "TODO[skyn3t]" not in app_body
+    assert styles_body is not None and ".dashboard-shell" in styles_body
+    assert store_body is not None and "export async function load()" in store_body
+    assert index_body is not None and "export async function createApp()" in index_body
+    assert route_body is not None and "router.post('/:slug/test'" in route_body
+    assert modal_body is not None and "Service profiles" in modal_body
+    assert editor_body is not None and "Test connection" in editor_body
+    assert hook_body is not None and "export default function useConfig()" in hook_body
+
+
+def test_browser_only_persistence_brief_does_not_trigger_backend_tier():
+    brief = (
+        "Build a React settings panel that saves config to localStorage "
+        "across page refreshes and browser restarts."
+    )
+
+    plan = plan_for_stack("react_vite", brief)
+    paths = {rel for rel, _ in (plan or [])}
+
+    assert "server/index.js" not in paths
+    assert "server/routes/config.js" not in paths
