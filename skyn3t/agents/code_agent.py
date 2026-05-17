@@ -620,6 +620,48 @@ class CodeAgent(BaseAgent):
                 error=str(e),
             )
 
+    async def _collect_ranked_fix_blocks(
+        self, signatures: List[str],
+    ) -> List[str]:
+        """For each error signature, fetch the top-rated historical fixes
+        and format them as prompt-ready blocks.
+
+        Uses ``MemoryStore.rank_fixes_for_signature`` (Phase-2 SQL
+        index). A fresh ``MemoryStore()`` is cheap — it holds only an
+        asyncio.Lock and a session-maker reference. Returns an empty
+        list when the index has nothing for these signatures or when
+        the store is unreachable; the caller falls through to the
+        prose recall path.
+        """
+        blocks: List[str] = []
+        try:
+            from skyn3t.memory.store import MemoryStore
+            store = MemoryStore()
+        except Exception:
+            logger.debug("MemoryStore unavailable for ranked-fix recall", exc_info=True)
+            return blocks
+        for sig in signatures:
+            try:
+                ranked = await asyncio.wait_for(
+                    store.rank_fixes_for_signature(sig, limit=3),
+                    timeout=2.0,
+                )
+            except Exception:
+                logger.debug(
+                    "rank_fixes_for_signature failed for %s", sig, exc_info=True,
+                )
+                continue
+            if not ranked:
+                continue
+            lines = [
+                f"  - `{r['fix_applied']}` "
+                f"(worked {r['wins']}/{r['attempts']}, "
+                f"rate {r['rate']:.0%})"
+                for r in ranked
+            ]
+            blocks.append(f"For signature `{sig}`:\n" + "\n".join(lines))
+        return blocks
+
     def _read_prior_artifacts(self, artifact_dir) -> str:
         """Collect prior-stage .md artifacts so CodeAgent builds on them.
 
@@ -1064,6 +1106,7 @@ class CodeAgent(BaseAgent):
                 )
                 if retrieval.get("documents"):
                     exp_lines: List[str] = []
+                    seen_signatures: list[str] = []
                     for doc in retrieval["documents"][:3]:
                         content = doc.get("content", "").strip()
                         if not content:
@@ -1073,6 +1116,14 @@ class CodeAgent(BaseAgent):
                         if len(para) > 600:
                             para = para[:600] + "…"
                         exp_lines.append(para)
+                        # Phase 2: harvest error_signature from the
+                        # recalled doc's metadata so we can pair the
+                        # similarity-ranked prose with a SQL-ranked
+                        # "fix that worked for this signature" block.
+                        meta = doc.get("metadata") or {}
+                        sig = meta.get("error_signature")
+                        if sig and sig not in seen_signatures:
+                            seen_signatures.append(str(sig))
                     if exp_lines:
                         build_system = (
                             build_system
@@ -1082,6 +1133,24 @@ class CodeAgent(BaseAgent):
                         await self.think(
                             f"injected {len(exp_lines)} RAG experience(s) into prompt"
                         )
+                    # Phase 2: rank fixes by historical win rate for each
+                    # signature surfaced above and inject the top-3 into
+                    # the prompt. The vector store said "this is similar";
+                    # the SQL index says "this is what WORKED."
+                    if seen_signatures:
+                        ranked_blocks = await self._collect_ranked_fix_blocks(
+                            seen_signatures[:3],
+                        )
+                        if ranked_blocks:
+                            build_system = (
+                                build_system
+                                + "\n\nKnown fixes — ranked by historical win rate:\n\n"
+                                + "\n\n".join(ranked_blocks)
+                            )
+                            await self.think(
+                                f"injected ranked fixes for "
+                                f"{len(ranked_blocks)} signature(s)"
+                            )
             except Exception:
                 logger.debug("RAG recall query failed", exc_info=True)
 

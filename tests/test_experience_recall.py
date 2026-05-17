@@ -272,6 +272,63 @@ async def test_ingest_without_structured_fields_still_works():
     assert await store.rank_fixes_for_signature("anything") == []
 
 
+# ---------------------------------------------------------------------
+# CodeAgent ranked-fix prompt injection (Phase 2 last mile)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_code_agent_collects_ranked_fix_blocks():
+    """The injection helper queries MemoryStore for each signature
+    and formats prompt-ready blocks. Signatures with no resolved
+    fixes are silently skipped (no empty block emitted)."""
+    from skyn3t.agents.code_agent import CodeAgent
+    from skyn3t.core.events import EventBus
+
+    store = MemoryStore()
+    # Two resolved fixes for sig-A — winner has more attempts.
+    for i, worked in enumerate([True, True, True, False, False]):
+        await store.record_experience_index(
+            embedding_id=f"emb-A-{i}",
+            task_id="t",
+            stack="react_vite", stage="code",
+            error_signature="sig-A",
+            fix_applied="add_root_div" if worked else "rewrite_main",
+            fix_worked=worked,
+            success=worked,
+        )
+    # sig-B has no recorded fixes at all.
+    agent = CodeAgent("code", EventBus())
+    await agent.initialize()
+
+    blocks = await agent._collect_ranked_fix_blocks(["sig-A", "sig-B"])
+    assert len(blocks) == 1
+    assert "sig-A" in blocks[0]
+    assert "add_root_div" in blocks[0]
+    # Win-rate formatting: 3 wins / 3 attempts = 100%.
+    assert "3/3" in blocks[0]
+    assert "100%" in blocks[0]
+
+
+@pytest.mark.asyncio
+async def test_code_agent_collect_returns_empty_when_store_unreachable(monkeypatch):
+    """If MemoryStore() raises (no DB), the helper returns [] without
+    crashing the scaffold flow."""
+    from skyn3t.agents.code_agent import CodeAgent
+    from skyn3t.core.events import EventBus
+
+    class _BrokenStore:
+        def __init__(self, *_a, **_k):
+            raise RuntimeError("no db today")
+
+    import skyn3t.memory.store as store_module
+    monkeypatch.setattr(store_module, "MemoryStore", _BrokenStore)
+
+    agent = CodeAgent("code", EventBus())
+    await agent.initialize()
+    assert await agent._collect_ranked_fix_blocks(["sig-X"]) == []
+
+
 @pytest.mark.asyncio
 async def test_ingest_index_failure_does_not_drop_embedding(caplog):
     """If MemoryStore.record_experience_index raises, the experience
