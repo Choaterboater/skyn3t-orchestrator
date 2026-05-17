@@ -146,7 +146,7 @@ def install_handlers(orchestrator) -> None:
 
     async def ingest_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
         """User approved an ingest proposal → run github_ingestor."""
-        topic = payload.get("topic") or payload.get("query") or ""
+        topic = (payload.get("topic") or payload.get("query") or "").strip()
         repo = payload.get("repo")
         try:
             ingestor = orchestrator.agents.get("github_ingestor")
