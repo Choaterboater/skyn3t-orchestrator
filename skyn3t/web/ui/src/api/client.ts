@@ -139,6 +139,32 @@ export type Proposal = {
   origin?: string;
 };
 
+export type CortexComponentStatus = {
+  name: string;
+  class_name: string;
+  started: boolean;
+  subscriptions: string[];
+  creates_proposals: string[];
+  handles_proposals: string[];
+  details?: Record<string, unknown>;
+  error?: string | null;
+};
+
+export type CortexStatus = {
+  running: boolean;
+  booted: boolean;
+  components: CortexComponentStatus[];
+  proposal_handlers: string[];
+  proposal_counts: Record<string, number>;
+  recent_failures: Array<{
+    id: string;
+    kind: string;
+    title: string;
+    error?: string | null;
+  }>;
+  warnings: string[];
+};
+
 export type BuildPatternStats = {
   stack: string;
   shape: string[];
@@ -310,6 +336,29 @@ export const api = {
     fetchJson<{ ok: boolean }>(`/api/studio/projects/${encodeURIComponent(slug)}`, {
       method: "DELETE",
     }),
+  // Approval gate (architect handoff): fetch architecture.md as plain
+  // text, then approve / approve-with-edits / reject.
+  fetchArchitecture: (slug: string) =>
+    fetch(
+      `/api/studio/projects/${encodeURIComponent(slug)}/file?path=architecture.md`,
+    ).then((r) =>
+      r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`)),
+    ),
+  approveProject: (slug: string) =>
+    fetchJson<{ ok: boolean }>(
+      `/api/studio/projects/${encodeURIComponent(slug)}/approve`,
+      { method: "POST", body: "{}" },
+    ),
+  approveProjectWithEdits: (slug: string, content: string) =>
+    fetchJson<{ ok: boolean }>(
+      `/api/studio/projects/${encodeURIComponent(slug)}/approve-with-edits`,
+      { method: "POST", body: JSON.stringify({ content }) },
+    ),
+  rejectProject: (slug: string, feedback: string) =>
+    fetchJson<{ ok: boolean }>(
+      `/api/studio/projects/${encodeURIComponent(slug)}/reject`,
+      { method: "POST", body: JSON.stringify({ feedback }) },
+    ),
   templates: () =>
     fetchJson<{ templates: Template[]; mission_setup?: any }>("/api/studio/templates"),
   startStudio: (payload: {
@@ -378,6 +427,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ idea }),
     }),
+  cortexStatus: () => fetchJson<CortexStatus>("/api/cortex/status"),
   traces: (limit = 50) =>
     fetchJson<{ traces: any[] }>(`/traces?limit=${limit}`).then(
       (d) => d.traces ?? [],

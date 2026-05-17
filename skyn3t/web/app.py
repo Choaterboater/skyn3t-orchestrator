@@ -2328,6 +2328,60 @@ async def studio_project_clarify(slug: str, payload: dict):
         return _safe_error_response(e)
 
 
+@app.post("/api/studio/projects/{slug}/approve")
+async def studio_project_approve(slug: str):
+    runner = _get_studio_runner(app)
+    if runner.get_project(slug) is None:
+        return JSONResponse({"error": "project not found"}, status_code=404)
+    task = asyncio.create_task(runner.resume_after_approval(slug, "approve"))
+    _track_studio_task(task, runner=runner, slug=slug, action="approving")
+    return {"ok": True}
+
+
+@app.post("/api/studio/projects/{slug}/approve-with-edits")
+async def studio_project_approve_with_edits(slug: str, payload: dict):
+    runner = _get_studio_runner(app)
+    if runner.get_project(slug) is None:
+        return JSONResponse({"error": "project not found"}, status_code=404)
+    content = str(payload.get("content") or "").strip()
+    if not content:
+        return JSONResponse({"error": "content required"}, status_code=400)
+    task = asyncio.create_task(
+        runner.resume_after_approval(slug, "approve", edited_md=content)
+    )
+    _track_studio_task(task, runner=runner, slug=slug, action="approving with edits")
+    return {"ok": True}
+
+
+@app.post("/api/studio/projects/{slug}/reject")
+async def studio_project_reject(slug: str, payload: dict):
+    runner = _get_studio_runner(app)
+    if runner.get_project(slug) is None:
+        return JSONResponse({"error": "project not found"}, status_code=404)
+    feedback = str(payload.get("feedback") or "").strip()
+    task = asyncio.create_task(
+        runner.resume_after_approval(slug, "reject", feedback=feedback)
+    )
+    _track_studio_task(task, runner=runner, slug=slug, action="rejecting")
+    return {"ok": True}
+
+
+@app.get("/api/studio/approval-config")
+async def studio_approval_config_get():
+    from skyn3t.studio.approval_gate import load_gate_config
+    return load_gate_config()
+
+
+@app.put("/api/studio/approval-config")
+async def studio_approval_config_put(payload: dict):
+    from skyn3t.studio.approval_gate import save_gate_config
+    try:
+        save_gate_config(payload or {})
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------------------
 # Cleanup routes
 # ---------------------------------------------------------------------------
