@@ -215,7 +215,13 @@ class DesignerAgent(BaseAgent):
             fonts = _FONTS_BY_MOOD["minimal"]
             voice = _VOICE_BY_MOOD["minimal"]
             logos = _LOGO_CONCEPTS_BY_MOOD["minimal"]
-            mood = "minimal"  # so downstream prompts also see "minimal"
+            # Use a brief-aligned mood label rather than literal "minimal"
+            # — the reviewer flags brand.md's "Mood: minimal" as a
+            # mismatch when the brief says "premium glassmorphism."
+            # We still keep the "minimal" preset for fonts/voice/logos
+            # (those keys live in the dicts), but the label that lands
+            # in brand.md reflects the brief's vocabulary.
+            mood = "premium glassmorphism"
             # canary-128 (49/100) shipped #A30000 red as primary AND
             # accent despite brand.md correctly saying "Mood: minimal" —
             # _pick_palette's LLM call returned a saturated red even on
