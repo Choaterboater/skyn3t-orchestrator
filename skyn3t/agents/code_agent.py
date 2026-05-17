@@ -1294,7 +1294,19 @@ class CodeAgent(BaseAgent):
                     file_client = client  # default = agent's primary
                     try:
                         from skyn3t.core.model_router import resolve_model_for_file
-                        per_file_backend, per_file_model = resolve_model_for_file(rel)
+                        # Adaptive routing: pass the active stack +
+                        # scoreboard so the router can demote a backend
+                        # that's been losing for this stack. Falls back
+                        # to pure static when scoreboard is unavailable
+                        # or SKYN3T_ROUTER_ADAPTIVE=0.
+                        try:
+                            from skyn3t.intelligence.build_patterns import get_default_scoreboard
+                            _sb = get_default_scoreboard()
+                        except Exception:
+                            _sb = None
+                        per_file_backend, per_file_model = resolve_model_for_file(
+                            rel, stack=stack, scoreboard=_sb,
+                        )
                         # Only construct a new client if the routing
                         # actually differs from the agent's primary
                         # (saves a subprocess + LLMClient roundtrip).
@@ -1526,7 +1538,14 @@ class CodeAgent(BaseAgent):
                     # batch in one coherent pass while the per-file
                     # backend setting stays correct on each file.
                     from skyn3t.core.model_router import resolve_model_for_file
-                    cluster_backend, cluster_model = resolve_model_for_file(cluster_paths[0])
+                    try:
+                        from skyn3t.intelligence.build_patterns import get_default_scoreboard
+                        _sb_cluster = get_default_scoreboard()
+                    except Exception:
+                        _sb_cluster = None
+                    cluster_backend, cluster_model = resolve_model_for_file(
+                        cluster_paths[0], stack=stack, scoreboard=_sb_cluster,
+                    )
                     agent_backend = (self.config or {}).get("backend")
                     if cluster_backend and cluster_backend != agent_backend:
                         from skyn3t.adapters import LLMClient as _LLMC

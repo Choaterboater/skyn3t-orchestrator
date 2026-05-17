@@ -44,8 +44,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger("skyn3t.core.model_router")
 
@@ -198,9 +199,121 @@ _BACKEND_PATH_HINTS: Tuple[str, ...] = (
 )
 
 
+# ── Adaptive routing ────────────────────────────────────────────────
+#
+# The static decisions above encode empirical priors. They DON'T learn.
+# When ``stack`` and a scoreboard are supplied, the router asks the
+# scoreboard whether the statically-picked backend is winning for THIS
+# stack; if it's been losing for ``_MIN_SAMPLES`` graded attempts at a
+# rate below ``_DEMOTE_BELOW``, demote to the next-best alternative.
+#
+# Three env vars tune the behavior:
+#   SKYN3T_ROUTER_ADAPTIVE=0       hard-disable; always return static
+#   SKYN3T_ROUTER_DEMOTE_BELOW=X   demote when win rate < X (default 0.4)
+#   SKYN3T_ROUTER_DEMOTE_AFTER=N   require N graded attempts (default 5)
+#   SKYN3T_ROUTER_EXPLORATION_EPS=Y  with prob Y still try the original
+#                                  (default 0.1, ε-greedy so a demoted
+#                                  backend can recover)
+
+# Per-backend "next best" map. Empirical complement of the static
+# tiers: visual specialist demotes to code specialist (and vice versa);
+# strong reasoner demotes back to code specialist.
+_BACKEND_ALTERNATIVES: Dict[str, Tuple[str, Optional[str]]] = {
+    "kimi_cli":    ("copilot_cli", None),
+    "copilot_cli": ("claude_cli",  "opus"),
+    "claude_cli":  ("copilot_cli", None),
+}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("router: %s=%r not a float; using default %s", name, raw, default)
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("router: %s=%r not an int; using default %s", name, raw, default)
+        return default
+
+
+def _adaptive_enabled() -> bool:
+    raw = os.environ.get("SKYN3T_ROUTER_ADAPTIVE", "").strip().lower()
+    if raw in ("0", "off", "false", "no"):
+        return False
+    return True
+
+
+def _maybe_demote(
+    backend: str,
+    model: Optional[str],
+    *,
+    rel_path: str,
+    stack: str,
+    scoreboard: Any,
+) -> Tuple[str, Optional[str]]:
+    """Demote ``(backend, model)`` if the scoreboard says it's losing.
+
+    Pure function over scoreboard state — same inputs, same decision
+    (except for the ε-greedy coin flip). Logs every demotion so the
+    decision is auditable.
+    """
+    rate = scoreboard.backend_rate(
+        stack, backend, min_samples=_env_int("SKYN3T_ROUTER_DEMOTE_AFTER", 5),
+    )
+    if rate is None:
+        return backend, model
+    threshold = _env_float("SKYN3T_ROUTER_DEMOTE_BELOW", 0.4)
+    if rate >= threshold:
+        return backend, model
+    # ε-greedy: occasionally let the demoted backend try anyway so
+    # it has a chance to recover from a streak of bad luck.
+    epsilon = _env_float("SKYN3T_ROUTER_EXPLORATION_EPS", 0.1)
+    if epsilon > 0 and random.random() < epsilon:
+        logger.info(
+            "router: keeping %s for %s despite low win rate %.2f (ε-greedy explore)",
+            backend, rel_path, rate,
+        )
+        return backend, model
+    alt = _BACKEND_ALTERNATIVES.get(backend)
+    if not alt:
+        return backend, model
+    alt_backend, alt_model = alt
+    # Don't demote to a backend that is ALSO losing on this stack — if
+    # there's no good option, stick with the original so the system
+    # still produces output (even if poorly).
+    alt_rate = scoreboard.backend_rate(
+        stack, alt_backend, min_samples=_env_int("SKYN3T_ROUTER_DEMOTE_AFTER", 5),
+    )
+    if alt_rate is not None and alt_rate < threshold:
+        logger.info(
+            "router: would demote %s→%s for %s but alt rate %.2f also below %.2f; keeping",
+            backend, alt_backend, rel_path, alt_rate, threshold,
+        )
+        return backend, model
+    logger.info(
+        "router: demoting %s→%s for %s (win rate %.2f < %.2f on stack=%s)",
+        backend, alt_backend, rel_path, rate, threshold, stack,
+    )
+    return alt_backend, alt_model
+
+
 def resolve_model_for_file(
     rel_path: str,
     stage_name: Optional[str] = "code",
+    *,
+    stack: Optional[str] = None,
+    scoreboard: Any = None,
 ) -> Tuple[str, Optional[str]]:
     """Pick (backend, model) for a SPECIFIC file inside the code stage.
 
@@ -212,7 +325,34 @@ def resolve_model_for_file(
 
     Everything else → stage-level resolution (config files, top-level
     files, unrecognized paths).
+
+    When ``stack`` and ``scoreboard`` are both supplied AND the
+    ``SKYN3T_ROUTER_ADAPTIVE`` env var is not disabled, the result is
+    additionally filtered through ``_maybe_demote``: a backend that
+    has been losing on the supplied stack falls back to the next
+    alternative. See module-level doc for env-tuning knobs.
     """
+    backend, model = _resolve_static(rel_path, stage_name)
+    if (
+        stack and scoreboard is not None and _adaptive_enabled()
+        and hasattr(scoreboard, "backend_rate")
+    ):
+        try:
+            return _maybe_demote(
+                backend, model,
+                rel_path=rel_path, stack=stack, scoreboard=scoreboard,
+            )
+        except Exception:
+            logger.debug("router: adaptive demote failed; falling back", exc_info=True)
+    return backend, model
+
+
+def _resolve_static(
+    rel_path: str,
+    stage_name: Optional[str] = "code",
+) -> Tuple[str, Optional[str]]:
+    """The pure-static decision (split out so it's unit-testable and
+    so the adaptive path can call it without recursion)."""
     if not rel_path:
         return resolve_model(stage_name)
     rl = rel_path.lower().replace("\\", "/")
