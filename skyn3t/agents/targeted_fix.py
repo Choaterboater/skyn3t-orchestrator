@@ -524,12 +524,8 @@ async def apply_targeted_fix(
             continue
 
         if issue.suggested_action == "create_placeholder":
-            # Refuse extension-less paths: writing `ActivityFeed` (no .jsx)
-            # ships a stub alongside the real `ActivityFeed.jsx` and
-            # confuses both Vite and the reviewer. canary-121 shipped two
-            # such ghost files which the reviewer LLM penalized as
-            # "TODO/placeholder leak."  Infer .jsx for components/* paths,
-            # .js otherwise.
+            # Infer .jsx for component/page paths so we don't ship a
+            # literal extension-less file (canary-121 pattern).
             inferred_path = issue.path
             if not Path(issue.path).suffix:
                 lower = issue.path.lower()
@@ -544,19 +540,31 @@ async def apply_targeted_fix(
                     errors.append(f"Refusing path outside scaffold: {inferred_path!r}")
                     continue
             if not target_path.exists():
+                # canary-130: try the deterministic homelab template
+                # before the 5-line stub. CommandPalette/ActivityFeed/
+                # ServiceDetail all have real 100+ line generators in
+                # stack_templates_homelab; the stub used to win and
+                # then the LLM rendered <Placeholder/> in the UI.
+                body = None
+                if stack:
+                    try:
+                        from skyn3t.agents.stack_templates import manifest_for
+                        body = manifest_for(stack, inferred_path, brief or "")
+                    except Exception:
+                        body = None
+                if body is None:
+                    body = _placeholder_for(inferred_path)
                 target_path.parent.mkdir(parents=True, exist_ok=True)
-                target_path.write_text(_placeholder_for(inferred_path), encoding="utf-8")
+                target_path.write_text(body, encoding="utf-8")
                 created.append(inferred_path)
-                logger.info("Created placeholder: %s", inferred_path)
+                logger.info("Created %s for %s", "from-manifest" if body and "Placeholder" not in body[:200] else "placeholder", inferred_path)
             continue
 
         if issue.suggested_action == "regenerate":
             if not target_path.exists():
-                # Create placeholder instead of failing.
-                # Mirror the create_placeholder branch's extension-inference
-                # so ./components/ActivityFeed (no ext) becomes
-                # ActivityFeed.jsx, not a literal extension-less file.
-                # canary-121/127/128/129 all shipped these ghosts.
+                # canary-130: stubs render as <Placeholder/> in the UI.
+                # Try deterministic homelab generators (manifest_for)
+                # before falling back to the 5-line _placeholder_for stub.
                 inferred_path = issue.path
                 if not Path(issue.path).suffix:
                     lower = issue.path.lower().replace("\\", "/")
@@ -570,9 +578,20 @@ async def apply_targeted_fix(
                     except ValueError:
                         errors.append(f"Refusing path outside scaffold: {inferred_path!r}")
                         continue
-                logger.info("Missing file %s, creating placeholder", inferred_path)
+                body = None
+                if stack:
+                    try:
+                        from skyn3t.agents.stack_templates import manifest_for
+                        body = manifest_for(stack, inferred_path, brief or "")
+                    except Exception:
+                        body = None
+                if body is None:
+                    body = _placeholder_for(inferred_path)
+                    logger.info("Missing file %s, creating placeholder", inferred_path)
+                else:
+                    logger.info("Missing file %s, filled from manifest_for(%s)", inferred_path, stack)
                 target_path.parent.mkdir(parents=True, exist_ok=True)
-                target_path.write_text(_placeholder_for(inferred_path), encoding="utf-8")
+                target_path.write_text(body, encoding="utf-8")
                 created.append(inferred_path)
                 continue
 
