@@ -19,7 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2].resolve()
 def install_handlers(orchestrator) -> None:
     """Register apply-handlers for kind='feature' and kind='ingest'."""
     try:
-        from skyn3t.cortex import get_store
+        from skyn3t.cortex import get_store  # local import to avoid circular dependency
     except Exception:
         logger.exception("cortex store unavailable")
         return
