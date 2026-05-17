@@ -10,13 +10,20 @@ hash-keyed palette table per mood so output remains deterministic.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
+
+logger = logging.getLogger(__name__)
+
+_POST_WRITE_TIMEOUT_SECONDS = 5.0
+_LLM_GENERATE_TIMEOUT_SECONDS = 180.0
 
 # Curated palettes per mood. Each row is a 5-color set ordered as
 # (primary, secondary, accent, bg, text). The hashing step picks one row.
@@ -159,6 +166,8 @@ class DesignerAgent(BaseAgent):
             description="Recommend UI components with Tailwind class hints.",
             parameters={"target": "str"},
         ))
+        self._skip_llm_for_run = False
+        self._run_skip_backends: set[str] = set()
 
     async def initialize(self) -> None:
         self.metadata["initialized"] = True
@@ -168,6 +177,8 @@ class DesignerAgent(BaseAgent):
 
     async def execute(self, task: TaskRequest, stdin_data: str | None = None) -> TaskResult:
         await self.think(f"{self.name} starting on {task.task_id}")
+        self._skip_llm_for_run = False
+        self._run_skip_backends = set()
 
         data = task.input_data or {}
         brief: str = (data.get("brief") or "").strip() or "Untitled project"
@@ -205,6 +216,24 @@ class DesignerAgent(BaseAgent):
         brand_path = artifact_dir / "brand.md"
         brand_path.write_text(brand_md, encoding="utf-8")
         await self.think(f"wrote {brand_path.name}")
+
+        # Deterministic post-LLM sanitizer for brand.md. Every canary's
+        # reviewer LLM has flagged brand.md as ignoring the brief's
+        # "avoid cyberpunk / use Inter / Linear-Vercel reference points"
+        # guidance — DesignerAgent kept shipping Orbitron+Rajdhani fonts
+        # with "clinical, ominous, uncompromising" voice. Prompt rules
+        # are insufficient (same training-data prior problem as the
+        # architect sanitizer). Strip the offending content deterministically.
+        try:
+            sanitized = self._sanitize_brand_md(brand_md, brief)
+            if sanitized != brand_md:
+                brand_path.write_text(sanitized, encoding="utf-8")
+                await self.think(
+                    f"sanitized {brand_path.name}: stripped brief-mismatched mood/fonts"
+                )
+                brand_md = sanitized
+        except Exception:
+            logger.exception("brand.md sanitization failed (non-fatal)")
 
         palette_path = artifact_dir / "palette.json"
         palette_path.write_text(json.dumps(palette_json, indent=2), encoding="utf-8")
@@ -256,18 +285,40 @@ class DesignerAgent(BaseAgent):
         ]
 
         if next_agent:
-            await self.send_message(
-                to=next_agent,
-                kind="info",
-                content=f"{self.name} done; artifacts in {artifact_dir}",
-                payload={"files": files, "palette": palette_json, "mood": mood},
-            )
+            try:
+                await asyncio.wait_for(
+                    self.send_message(
+                        to=next_agent,
+                        kind="info",
+                        content=f"{self.name} done; artifacts in {artifact_dir}",
+                        payload={"files": files, "palette": palette_json, "mood": mood},
+                    ),
+                    timeout=_POST_WRITE_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "designer handoff timed out after %.1fs; continuing with completed artifacts",
+                    _POST_WRITE_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                logger.exception("designer handoff failed after asset writeout")
 
-        await self.share_learning(
-            f"Designer mood='{mood}' palette wired via LLM with deterministic fallback.",
-            scope="global",
-            mood=mood,
-        )
+        try:
+            await asyncio.wait_for(
+                self.share_learning(
+                    f"Designer mood='{mood}' palette wired via LLM with deterministic fallback.",
+                    scope="global",
+                    mood=mood,
+                ),
+                timeout=_POST_WRITE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "designer learning publish timed out after %.1fs; continuing with completed artifacts",
+                _POST_WRITE_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            logger.exception("designer learning publish failed after asset writeout")
 
         return TaskResult(
             task_id=task.task_id,
@@ -292,8 +343,12 @@ class DesignerAgent(BaseAgent):
         max_tokens: int = 2500,
         kind: Optional[str] = None,
     ) -> str:
+        if self._skip_llm_for_run:
+            return fallback
         try:
-            client = self.get_llm() if hasattr(self, "get_llm") else None
+            client = None
+            if hasattr(self, "get_llm") and not self._run_skip_backends:
+                client = self.get_llm()
             if client is None:
                 from skyn3t.adapters import LLMClient
                 client = LLMClient(
@@ -301,6 +356,7 @@ class DesignerAgent(BaseAgent):
                     backend=self.config.get("backend"),
                     event_bus=self.event_bus,
                     caller_name=self.name,
+                    skip_backends=sorted(self._run_skip_backends),
                 )
             cot_preamble = (
                 "Think step-by-step:\n"
@@ -337,11 +393,32 @@ class DesignerAgent(BaseAgent):
                         prompt = shots + "\n\n# Now the new task:\n" + prompt
                 except Exception:
                     pass
-            out = await client.complete(prompt, max_tokens=max_tokens, temperature=0.7)
+            try:
+                out = str(
+                    await asyncio.wait_for(
+                        client.complete(prompt, max_tokens=max_tokens, temperature=0.7),
+                        timeout=_LLM_GENERATE_TIMEOUT_SECONDS,
+                    )
+                )
+            except asyncio.TimeoutError:
+                failed_backend = str(getattr(client, "backend", "") or "").strip().lower()
+                if failed_backend and failed_backend != "deterministic":
+                    self._run_skip_backends.add(failed_backend)
+                logger.warning(
+                    "designer llm_generate timed out after %.1fs for %s; using fallback",
+                    _LLM_GENERATE_TIMEOUT_SECONDS,
+                    kind or "artifact",
+                )
+                self._skip_llm_for_run = True
+                return fallback
+            failed_backend = str(getattr(client, "_last_failed_backend", "") or "").strip().lower()
+            if failed_backend:
+                self._run_skip_backends.add(failed_backend)
             if out and "[deterministic-stub]" not in out and len(out.strip()) > 80:
                 return out.strip()
+            self._skip_llm_for_run = True
         except Exception:
-            pass
+            self._skip_llm_for_run = True
         return fallback
 
     # ------------------------------------------------------------------
@@ -476,6 +553,69 @@ class DesignerAgent(BaseAgent):
             max_tokens=4000,
             kind="brand",
         )
+
+    # Terms that indicate the LLM picked the wrong aesthetic when the
+    # brief explicitly forbids them. Mirrors ArchitectAgent's sentence-
+    # drop sanitizer pattern — every canary 113–125 had brand.md ignoring
+    # the brief's "Linear/Vercel, avoid cyberpunk/NOC console" direction.
+    # Drop sentences mentioning these whenever the brief signals the
+    # warm-minimal aesthetic.
+    _BRAND_CYBER_DROP_TERMS: List[str] = [
+        # Font families the brief calls out as forbidden
+        "Orbitron", "Rajdhani", "Eurostile", "Bank Gothic", "Audiowide",
+        # Mood/voice terms opposite to "warm-minimal"
+        "cyber", "cyberpunk", "tactical", "ominous", "clinical",
+        "uncompromising", "matrix terminal", "NOC console", "HUD",
+        "reticle", "crosshair", "bracket mark", "tactical ops",
+        "warm gunmetal",  # the warm-gunmetal-themed shipment we keep getting
+    ]
+
+    # Brief signals that mean "warm-minimal aesthetic, NOT cyberpunk."
+    # When ANY of these appear in the brief, the cyber-drop terms above
+    # become active. Conservative: silent pass-through when the brief
+    # doesn't signal warm-minimal (e.g. a real cybersecurity-tool brief).
+    _BRAND_WARM_SIGNALS: List[str] = [
+        "linear",       # the Linear app — explicit warm reference
+        "vercel",       # ditto
+        "avoid cyberpunk", "avoid: cyberpunk",
+        "avoid noc", "avoid: noc",
+        "premium glassmorphism", "polished glassmorphism",
+        "warm-minimal", "warm minimal",
+        "homarr", "heimdall",  # the HomeLab Dashboard reference brands
+    ]
+
+    @classmethod
+    def _sanitize_brand_md(cls, body: str, brief: str) -> str:
+        """Strip brief-mismatched mood/font/voice mentions from brand.md.
+
+        Used post-LLM because the DesignerAgent (regardless of model)
+        consistently writes "cyber mood" + Orbitron/Rajdhani + "clinical/
+        ominous" voice for any brief that mentions "homelab" or
+        "service dashboard" — training-data prior dominates the prompt.
+
+        Strategy: sentence-drop (same pattern as the architect sanitizer).
+        Only fires when the brief explicitly signals warm-minimal
+        aesthetic (Linear/Vercel/glassmorphism/Homarr/etc.), so a real
+        cybersecurity-tool brief won't have its aesthetic stripped.
+        """
+        if not body or not brief:
+            return body
+
+        brief_lower = brief.lower()
+        if not any(sig in brief_lower for sig in cls._BRAND_WARM_SIGNALS):
+            return body  # not a warm-minimal brief — leave the design alone
+
+        # Reuse the architect's sentence-drop + empty-section + renumber
+        # passes for consistent behavior across both sanitizers.
+        from skyn3t.agents.architect import ArchitectAgent
+
+        out = body
+        for term in cls._BRAND_CYBER_DROP_TERMS:
+            out = ArchitectAgent._strip_sentences_mentioning(out, term)
+        out = re.sub(r"\n{3,}", "\n\n", out)
+        out = ArchitectAgent._drop_empty_sections(out)
+        out = ArchitectAgent._renumber_lists(out)
+        return out
 
     def _render_brand_md_fallback(
         self,
