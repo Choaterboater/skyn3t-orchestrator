@@ -204,6 +204,19 @@ class DesignerAgent(BaseAgent):
         voice = _VOICE_BY_MOOD.get(mood, _VOICE_BY_MOOD["minimal"])
         logos = _LOGO_CONCEPTS_BY_MOOD.get(mood, _LOGO_CONCEPTS_BY_MOOD["minimal"])
 
+        # Brief-signal override: when the brief explicitly calls for
+        # warm-minimal aesthetic (Linear/Vercel/glassmorphism/Homarr),
+        # FORCE the font/voice/logo set to the minimal preset regardless
+        # of which mood was inferred. canary-126 confirmed that a
+        # "premium glassmorphism homelab dashboard" brief still ended up
+        # shipping Orbitron+Rajdhani+reticle through some path —
+        # forcing here closes the door on all of them at once.
+        if self._brief_signals_warm_minimal(brief):
+            fonts = _FONTS_BY_MOOD["minimal"]
+            voice = _VOICE_BY_MOOD["minimal"]
+            logos = _LOGO_CONCEPTS_BY_MOOD["minimal"]
+            mood = "minimal"  # so downstream prompts also see "minimal"
+
         palette_tuple: Tuple[str, str, str, str, str] = (
             palette_json["primary"],
             palette_json["secondary"],
@@ -424,6 +437,33 @@ class DesignerAgent(BaseAgent):
     # ------------------------------------------------------------------
     # Mood + palette selection
     # ------------------------------------------------------------------
+    # Brief signals that mean "warm-minimal Linear/Vercel aesthetic"
+    # — not "cyber HUD". When ANY of these appears in the brief,
+    # _execute forces fonts/voice/logos to the minimal preset
+    # regardless of what _infer_mood picked. Mirrors the same trigger
+    # list used by _sanitize_brand_md.
+    _BRIEF_WARM_MINIMAL_SIGNALS: Tuple[str, ...] = (
+        "linear",
+        "vercel",
+        "avoid cyberpunk",
+        "avoid: cyberpunk",
+        "avoid noc",
+        "avoid: noc",
+        "premium glassmorphism",
+        "polished glassmorphism",
+        "warm-minimal",
+        "warm minimal",
+        "homarr",
+        "heimdall",
+    )
+
+    @classmethod
+    def _brief_signals_warm_minimal(cls, brief: str) -> bool:
+        if not brief:
+            return False
+        b = brief.lower()
+        return any(sig in b for sig in cls._BRIEF_WARM_MINIMAL_SIGNALS)
+
     def _infer_mood(self, brief: str) -> str:
         b = (brief or "").lower()
         for mood, keywords in _MOOD_KEYWORDS:
