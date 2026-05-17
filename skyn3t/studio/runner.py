@@ -1224,6 +1224,35 @@ class StudioRunner:
                 # apply targeted fixes before the main reviewer runs.
                 if stage.name == "consistency_reviewer":
                     review_output = output if isinstance(output, dict) else {}
+                    # Phase-2 resolution: mirror of the contract_verifier
+                    # path. If the previous pass applied a consistency
+                    # fix, this pass's verdict tells us whether it worked.
+                    pending = (
+                        manifest.pop("_pending_fix", None)
+                        if isinstance(manifest, dict) else None
+                    )
+                    if pending and pending.get("stage") == stage.name:
+                        prior_sig = pending.get("error_signature") or ""
+                        worked = (
+                            review_output.get("verdict") != "needs_fix"
+                            or int(review_output.get("blocker_count", 0)) == 0
+                        )
+                        if prior_sig:
+                            try:
+                                from skyn3t.memory.store import MemoryStore
+                                eid = await MemoryStore().mark_latest_unresolved_fix_worked(
+                                    prior_sig, worked,
+                                )
+                                if eid:
+                                    logger.info(
+                                        "consistency_reviewer: resolved fix %s for %s → worked=%s",
+                                        pending.get("fix_applied"), prior_sig, worked,
+                                    )
+                            except Exception:
+                                logger.debug(
+                                    "mark_latest_unresolved_fix_worked failed (consistency)",
+                                    exc_info=True,
+                                )
                     if review_output.get("verdict") == "needs_fix":
                         blockers = review_output.get("blocker_count", 0)
                         if blockers > 0:
@@ -1244,6 +1273,47 @@ class StudioRunner:
                                 import json as _json
                                 report = _json.loads(report_json)
                                 findings = report.get("findings", [])
+                                # Derive a consistency-scoped signature.
+                                # Source = "consistency" so it doesn't
+                                # collide with contract: signatures even
+                                # when the same category name appears.
+                                try:
+                                    from skyn3t.intelligence.error_signatures import (
+                                        signature_for_findings,
+                                    )
+                                    consistency_signature = signature_for_findings(
+                                        findings, source="consistency",
+                                    )
+                                except Exception:
+                                    consistency_signature = None
+                                # Publish to SYSTEM_ALERT so the ingestor
+                                # picks it up via _on_system_alert →
+                                # ingest_project_event → experience_index
+                                # row. The runner previously only added
+                                # this as a local history entry, so the
+                                # cortex never saw consistency blockers.
+                                try:
+                                    self._publish(
+                                        "CONSISTENCY_REVIEW_BLOCKERS",
+                                        {
+                                            "slug": slug,
+                                            "project_slug": slug,
+                                            "stage": stage.name,
+                                            "findings": [
+                                                f for f in findings
+                                                if isinstance(f, dict)
+                                                and f.get("severity") == "blocker"
+                                            ][:8],
+                                            "stack": manifest.get("stack") or "",
+                                            "verdict": "needs_fix",
+                                            "error_signature": consistency_signature,
+                                        },
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        "publish CONSISTENCY_REVIEW_BLOCKERS failed",
+                                        exc_info=True,
+                                    )
                                 review_issues = []
                                 for f in findings:
                                     if f.get("severity") != "blocker":
@@ -1282,6 +1352,12 @@ class StudioRunner:
                                         llm_client=client,
                                         brief=brief,
                                     )
+                                    if consistency_signature and fix_result.fix_label:
+                                        manifest["_pending_fix"] = {
+                                            "error_signature": consistency_signature,
+                                            "fix_applied": fix_result.fix_label,
+                                            "stage": stage.name,
+                                        }
                                     self._append_history(
                                         manifest,
                                         "CONSISTENCY_FIX_APPLIED",
