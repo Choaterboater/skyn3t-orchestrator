@@ -216,6 +216,21 @@ class DesignerAgent(BaseAgent):
             voice = _VOICE_BY_MOOD["minimal"]
             logos = _LOGO_CONCEPTS_BY_MOOD["minimal"]
             mood = "minimal"  # so downstream prompts also see "minimal"
+            # canary-128 (49/100) shipped #A30000 red as primary AND
+            # accent despite brand.md correctly saying "Mood: minimal" —
+            # _pick_palette's LLM call returned a saturated red even on
+            # the explicit warm-minimal signal. Force the palette to a
+            # known-good slate/indigo/cyan set so the brief's "slate +
+            # cool accent" intent actually ships. Same pattern as the
+            # font/voice/logos override above.
+            palette_json = {
+                "primary":   "#6366F1",   # indigo-500 (Linear-ish primary)
+                "secondary": "#22D3EE",   # cyan-400 (cool secondary)
+                "accent":    "#22D3EE",   # cool accent ≠ primary hue
+                "bg":        "#0B1220",   # slate-950 (deeper than Linear's bg)
+                "text":      "#E2E8F0",   # slate-200 (high-contrast body text)
+            }
+            await self.think("forced palette to warm-minimal slate/indigo/cyan preset")
 
         palette_tuple: Tuple[str, str, str, str, str] = (
             palette_json["primary"],
