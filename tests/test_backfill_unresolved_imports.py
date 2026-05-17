@@ -48,7 +48,7 @@ def test_backfill_writes_command_palette_when_app_imports_it(tmp_path: Path) -> 
     assert target.is_file(), "CommandPalette.jsx should have been backfilled"
     body = target.read_text()
     # Should come from the deterministic generator, not the placeholder.
-    assert "TODO[skyn3t]: backfilled stub" not in body
+    assert "@skyn3t-backfill-stub:" not in body
     assert str(target) in out
 
 
@@ -68,7 +68,7 @@ def test_backfill_falls_back_to_stub_when_no_generator(tmp_path: Path) -> None:
     target = out_dir / "src" / "components" / "Mystery.jsx"
     assert target.is_file()
     body = target.read_text()
-    assert "TODO[skyn3t]: backfilled stub" in body
+    assert "@skyn3t-backfill-stub:" in body
     assert "export default function Mystery" in body
 
 
@@ -183,5 +183,5 @@ def test_backfill_writes_activity_feed_and_service_detail(tmp_path: Path) -> Non
     assert service_detail.is_file()
     # All three should be deterministic, not stubs.
     for f in (cmd_palette, activity, service_detail):
-        assert "TODO[skyn3t]: backfilled stub" not in f.read_text(), \
+        assert "@skyn3t-backfill-stub:" not in f.read_text(), \
             f"{f.name} should be from generator, not placeholder"
