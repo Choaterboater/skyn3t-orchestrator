@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any, AsyncIterator, Dict, List, Optional
 from uuid import uuid4
 
-from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Integer, String, Text, func
+from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, func
 from sqlalchemy.ext.asyncio import AsyncAttrs, AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -141,6 +141,33 @@ class KnowledgeDocument(Base):
     doc_type: Mapped[str] = mapped_column(String(50), default="text")
     meta: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
     embedding_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+
+
+class ExperienceIndex(Base):
+    """Per-experience denormalized row for SQL-ranked fix recall.
+
+    The RAG vector store answers "find experiences similar to this
+    prose." This table answers a tighter question the planner cares
+    about: "for this error_signature, which fix has the best historical
+    win rate?" Append-only on ingest; ``fix_worked`` is updated later
+    when the next verifier pass reports the post-fix outcome.
+
+    Pairs with ``KnowledgeDocument`` via ``embedding_id`` — the same
+    string the vector store hands back. One row per experience.
+    """
+
+    __tablename__ = "experience_index"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    embedding_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    task_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+    stack: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+    stage: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+    error_signature: Mapped[Optional[str]] = mapped_column(String(128), index=True, nullable=True)
+    fix_applied: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    fix_worked: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    success: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
 
 

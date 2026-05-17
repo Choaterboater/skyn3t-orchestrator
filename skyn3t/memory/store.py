@@ -12,6 +12,7 @@ from skyn3t.core.models import (
 )
 from skyn3t.core.models import (
     AgentStatus,
+    ExperienceIndex,
     KnowledgeDocument,
     SystemLog,
     TaskStatus,
@@ -456,6 +457,139 @@ class MemoryStore:
                 }
                 for d in result.scalars().all()
             ]
+
+    # ------------------------------------------------------------------
+    # Experience index (Phase-2 structured fix recall)
+    # ------------------------------------------------------------------
+
+    async def record_experience_index(
+        self,
+        *,
+        embedding_id: str,
+        task_id: Optional[str],
+        stack: Optional[str],
+        stage: Optional[str],
+        error_signature: Optional[str],
+        fix_applied: Optional[str],
+        fix_worked: Optional[bool],
+        success: bool,
+    ) -> None:
+        """Insert one row into the experience index.
+
+        The experience index denormalizes the structured fields of an
+        experience so SQL can rank fixes without materializing the
+        RAG embedding. One row per ``embedding_id``; upserts are
+        silently ignored (defensive: dedup is already handled upstream
+        by the ingestor's content-hash check).
+        """
+        if not embedding_id:
+            return
+        async with self._lock:
+            async with await self._session() as session:
+                async with session.begin():
+                    existing = await session.execute(
+                        select(ExperienceIndex).where(
+                            ExperienceIndex.embedding_id == embedding_id,
+                        )
+                    )
+                    if existing.scalar_one_or_none() is not None:
+                        return
+                    session.add(ExperienceIndex(
+                        embedding_id=embedding_id,
+                        task_id=task_id,
+                        stack=stack,
+                        stage=stage,
+                        error_signature=error_signature,
+                        fix_applied=fix_applied,
+                        fix_worked=fix_worked,
+                        success=success,
+                    ))
+
+    async def mark_fix_worked(
+        self,
+        embedding_id: str,
+        worked: bool,
+    ) -> bool:
+        """Update an experience index row with the post-fix outcome.
+
+        Returns True when the row was found and updated, False when
+        not. Used by the verifier follow-up path: after a targeted
+        fix is applied, the next verifier pass either confirms or
+        invalidates it; that resolution lands here so the next time
+        we recall this signature we know which fix actually worked.
+        """
+        if not embedding_id:
+            return False
+        async with self._lock:
+            async with await self._session() as session:
+                async with session.begin():
+                    result = await session.execute(
+                        select(ExperienceIndex).where(
+                            ExperienceIndex.embedding_id == embedding_id,
+                        )
+                    )
+                    row = result.scalar_one_or_none()
+                    if row is None:
+                        return False
+                    row.fix_worked = bool(worked)
+                    return True
+
+    async def rank_fixes_for_signature(
+        self,
+        error_signature: str,
+        *,
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Rank known fixes for an error signature by historical win rate.
+
+        Aggregates the experience index over ``fix_applied`` for the
+        given signature and returns the top-``limit`` entries sorted
+        by win rate (descending), breaking ties by total attempts so
+        a fix with more samples wins over an under-sampled one at the
+        same rate.
+
+        Only rows with both a ``fix_applied`` AND a non-null
+        ``fix_worked`` are scored — half-resolved fixes (we tried but
+        haven't confirmed) don't move the denominator.
+
+        Returns a list of ``{fix_applied, wins, attempts, rate}``
+        dicts. Empty when the signature has no resolved attempts.
+        """
+        sig = (error_signature or "").strip()
+        if not sig:
+            return []
+        async with self._lock:
+            async with await self._session() as session:
+                result = await session.execute(
+                    select(ExperienceIndex).where(
+                        ExperienceIndex.error_signature == sig,
+                        ExperienceIndex.fix_applied.is_not(None),
+                        ExperienceIndex.fix_worked.is_not(None),
+                    )
+                )
+                rows = result.scalars().all()
+        if not rows:
+            return []
+        tallies: Dict[str, Dict[str, int]] = {}
+        for row in rows:
+            slot = tallies.setdefault(
+                str(row.fix_applied), {"wins": 0, "attempts": 0},
+            )
+            slot["attempts"] += 1
+            if row.fix_worked:
+                slot["wins"] += 1
+        ranked = [
+            {
+                "fix_applied": label,
+                "wins": stats["wins"],
+                "attempts": stats["attempts"],
+                "rate": stats["wins"] / stats["attempts"],
+            }
+            for label, stats in tallies.items()
+            if stats["attempts"] > 0
+        ]
+        ranked.sort(key=lambda r: (r["rate"], r["attempts"]), reverse=True)
+        return ranked[: max(0, int(limit))]
 
     # ------------------------------------------------------------------
     # System logs
