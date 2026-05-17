@@ -436,6 +436,13 @@ class ExperienceIngestor:
         feature_tags = payload.get("feature_tags") or []
         if not isinstance(feature_tags, list):
             feature_tags = []
+        # Phase-2 structured fields, threaded through so the SQL index
+        # can rank fixes for these signatures later. None is a valid
+        # value — the row still anchors the embedding for outcome
+        # updates via mark_fix_worked.
+        error_signature = payload.get("error_signature")
+        fix_applied = payload.get("fix_applied")
+        fix_worked = payload.get("fix_worked")
 
         title = f"Project {kind} — {slug}"
         metadata = {
@@ -446,6 +453,9 @@ class ExperienceIngestor:
             "feature_tags": ", ".join(feature_tags) if feature_tags else "",
             "success": False,
             "content_hash": content_hash,
+            "error_signature": error_signature,
+            "fix_applied": fix_applied,
+            "fix_worked": fix_worked,
         }
         embedding_id = await self.rag.add_knowledge_one(
             content=content,
@@ -457,6 +467,16 @@ class ExperienceIngestor:
         if embedding_id:
             self._record_seen(content_hash)
             await self._persist_doc(title, content, "studio", "experience", metadata, embedding_id)
+            await self._persist_experience_index(
+                embedding_id=embedding_id,
+                task_id=slug,
+                success=False,
+                stack=stack or None,
+                stage=stage if stage != "?" else None,
+                error_signature=error_signature,
+                fix_applied=fix_applied,
+                fix_worked=fix_worked,
+            )
         return embedding_id
 
     # ------------------------------------------------------------------

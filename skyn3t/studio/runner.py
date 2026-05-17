@@ -965,6 +965,37 @@ class StudioRunner:
                 # repaired scaffold.
                 if stage.name == "contract_verifier":
                     contract_output = output if isinstance(output, dict) else {}
+                    # Phase-2 resolution: if a previous pass applied a
+                    # contract fix and stashed the signature on the
+                    # manifest, the outcome of THIS pass tells us
+                    # whether the fix worked. Verdict != "needs_fix"
+                    # (or blocker count 0) → mark the index row True.
+                    # Re-flagged blockers → mark False, then keep going
+                    # to the fix-loop below.
+                    pending = manifest.pop("_pending_fix", None) if isinstance(manifest, dict) else None
+                    if pending and pending.get("stage") == stage.name:
+                        prior_sig = pending.get("error_signature") or ""
+                        worked = (
+                            contract_output.get("verdict") != "needs_fix"
+                            or int(contract_output.get("blocker_count", 0)) == 0
+                        )
+                        if prior_sig:
+                            try:
+                                from skyn3t.memory.store import MemoryStore
+                                store = MemoryStore()
+                                eid = await store.mark_latest_unresolved_fix_worked(
+                                    prior_sig, worked,
+                                )
+                                if eid:
+                                    logger.info(
+                                        "contract_verifier: resolved fix %s for %s → worked=%s",
+                                        pending.get("fix_applied"), prior_sig, worked,
+                                    )
+                            except Exception:
+                                logger.debug(
+                                    "mark_latest_unresolved_fix_worked failed",
+                                    exc_info=True,
+                                )
                     if contract_output.get("verdict") == "needs_fix":
                         blockers = contract_output.get("blocker_count", 0)
                         if blockers > 0:
@@ -991,6 +1022,15 @@ class StudioRunner:
                                 # payload["kind"] (see _on_system_alert).
                                 # This is what makes the next canary smarter.
                                 try:
+                                    # Derive a stable signature so the
+                                    # experience index can rank fixes
+                                    # by this exact failure class later.
+                                    from skyn3t.intelligence.error_signatures import (
+                                        signature_for_findings,
+                                    )
+                                    contract_signature = signature_for_findings(
+                                        findings, source="contract",
+                                    )
                                     self._publish(
                                         "CONTRACT_VERIFIER_BLOCKERS",
                                         {
@@ -1004,6 +1044,7 @@ class StudioRunner:
                                             ][:8],
                                             "stack": manifest.get("stack") or "",
                                             "verdict": "needs_fix",
+                                            "error_signature": contract_signature,
                                         },
                                     )
                                 except Exception:
@@ -1156,6 +1197,17 @@ class StudioRunner:
                                         llm_client=client,
                                         brief=brief,
                                     )
+                                    # Stash the active signature + fix
+                                    # label on the manifest so the next
+                                    # verifier pass can resolve the
+                                    # experience_index row's fix_worked
+                                    # state (mark_latest_unresolved_*).
+                                    if contract_signature and fix_result.fix_label:
+                                        manifest["_pending_fix"] = {
+                                            "error_signature": contract_signature,
+                                            "fix_applied": fix_result.fix_label,
+                                            "stage": stage.name,
+                                        }
                                     self._append_history(
                                         manifest,
                                         "CONTRACT_FIX_APPLIED",

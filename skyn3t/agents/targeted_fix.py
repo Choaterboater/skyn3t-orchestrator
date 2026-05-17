@@ -61,6 +61,12 @@ class FixResult:
     files_changed: List[str]
     files_created: List[str]
     errors: List[str]
+    # A short, stable label describing what the fix did. Used by the
+    # experience-index ranker (memory.store.rank_fixes_for_signature)
+    # to attribute outcomes to a specific fix strategy. Empty when
+    # nothing was applied. Format: "<action>:<path>" for single-issue
+    # fixes, "<action>:N" when N issues shared an action.
+    fix_label: str = ""
 
 
 def _preserve_existing_on_regenerate_failure(issue: FileIssue, reason: str) -> None:
@@ -639,4 +645,35 @@ async def apply_targeted_fix(
         files_changed=changed,
         files_created=created,
         errors=errors,
+        fix_label=_derive_fix_label(issues, changed, created),
     )
+
+
+def _derive_fix_label(
+    issues: List[FileIssue],
+    changed: List[str],
+    created: List[str],
+) -> str:
+    """Pick a short, stable label describing what this fix attempted.
+
+    The label feeds into the experience-index ranker so different
+    fix strategies (regenerate vs patch vs create_placeholder) can be
+    compared by historical win rate. Format:
+      - Single issue: ``"<action>:<basename>"`` (e.g. ``"regenerate:App.jsx"``)
+      - Multiple issues with same action: ``"<action>:N"``
+      - Multiple actions: ``"mixed:N"``
+
+    Empty when nothing was attempted — caller should NOT pass an empty
+    label to the index (the ranker filters those out).
+    """
+    if not issues:
+        return ""
+    actions = {(i.suggested_action or "").strip() or "unknown" for i in issues}
+    total = len(issues)
+    if len(actions) == 1:
+        action = next(iter(actions))
+        if total == 1:
+            basename = (issues[0].path or "").rsplit("/", 1)[-1] or "file"
+            return f"{action}:{basename}"
+        return f"{action}:{total}"
+    return f"mixed:{total}"
