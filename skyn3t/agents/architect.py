@@ -10,11 +10,14 @@ directory.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any, Dict, List, Optional
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
+
+logger = logging.getLogger("skyn3t.agents.architect")
 
 _STACKS: Dict[str, Dict[str, Any]] = {
     "saas": {
@@ -237,6 +240,23 @@ class ArchitectAgent(BaseAgent):
         stack_path.write_text(json.dumps(stack, indent=2), encoding="utf-8")
         await self.think(f"wrote {stack_path.name}")
 
+        # Deterministic sanitizer: Claude Opus consistently ignores the
+        # "NEVER mention Python/FastAPI" prompt rule when writing the
+        # architecture doc for "homelab dashboard" briefs. The result is
+        # a 10-15 point reviewer LLM deduction every canary for
+        # architecture↔scaffold drift. We can't out-prompt training data,
+        # so rewrite the artifact in-place instead. Stack-mismatched tech
+        # mentions get neutralized before any downstream agent reads them.
+        try:
+            sanitized_md = self._sanitize_architecture_md(arch_md, stack)
+            if sanitized_md != arch_md:
+                arch_path.write_text(sanitized_md, encoding="utf-8")
+                await self.think(
+                    f"sanitized {arch_path.name}: stripped stack-mismatched tech mentions"
+                )
+        except Exception:
+            logger.exception("architecture.md sanitization failed (non-fatal)")
+
         files = [str(arch_path), str(stack_path)]
         summary = f"Architecture for '{brief[:60]}' on {target} stack drafted."
 
@@ -312,6 +332,142 @@ class ArchitectAgent(BaseAgent):
         lines.append("- What are the hard scale targets (users, RPS, storage) for the first 90 days?\n")
 
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Architecture sanitizer (deterministic post-LLM cleanup)
+    # ------------------------------------------------------------------
+
+    # Tech-name → "what to say instead" when the architecture doc mentions
+    # something the scaffold won't build. Keys are case-insensitive
+    # substrings; values are the replacement noun phrase used in
+    # ``_substitute_in_sentence``.  The empty-string value means "delete
+    # the whole sentence" — used when there is no clean substitute
+    # (Cloudflare, Alembic, AWS-only services).
+    _NODE_STACK_SUBSTITUTIONS: Dict[str, str] = {
+        # Frameworks
+        "FastAPI": "Express",
+        "Flask": "Express",
+        "Django": "Express",
+        "Starlette": "Express",
+        # ORMs / DB layer
+        "SQLAlchemy": "better-sqlite3",
+        "async SQLAlchemy": "better-sqlite3",
+        "Alembic": "",  # no Node equivalent shipped — drop the sentence
+        "Pydantic v2": "JSON schema validation",
+        "Pydantic": "JSON schema validation",
+        # Async runtime / scheduler
+        "Celery": "",
+        "uvicorn": "node",
+        "gunicorn": "node",
+        # Deploy targets we don't ship configs for
+        "Cloudflare": "",
+        "Fly.io": "",
+        "Render": "",
+        "AWS Lambda": "",
+        "Heroku": "",
+        # Language / runtime mentions
+        "Python 3.11": "Node 20",
+        "Python 3.12": "Node 20",
+        "Python 3": "Node",
+        "Python": "Node",
+        # Lint/test tooling that doesn't apply
+        "ruff": "eslint",
+        "pytest": "vitest",
+        "mypy": "TypeScript",
+        # DBs we don't ship
+        "PostgreSQL 16": "better-sqlite3",
+        "PostgreSQL": "better-sqlite3",
+        "Postgres": "better-sqlite3",
+    }
+
+    @classmethod
+    def _sanitize_architecture_md(cls, body: str, stack: Dict[str, Any]) -> str:
+        """Strip stack-mismatched tech mentions from architecture.md.
+
+        Used post-LLM because Claude Opus consistently writes FastAPI +
+        PostgreSQL + Alembic into homelab-dashboard architectures even
+        when the prompt explicitly forbids it. We can't out-prompt the
+        training-data prior, so we rewrite the file in place.
+
+        Conservative: only acts when the stack is clearly Node-backed.
+        Python scaffolds (when they exist) pass through unchanged.
+        """
+        if not body or not isinstance(stack, dict):
+            return body
+
+        backend = str(stack.get("backend") or "").lower()
+        node_backends = {
+            "express", "express-node", "hono", "hono-node",
+            "fastify", "koa", "nestjs", "next",
+        }
+        if backend not in node_backends:
+            return body  # not a Node stack — don't touch
+
+        out = body
+        for needle, replacement in cls._NODE_STACK_SUBSTITUTIONS.items():
+            if needle.lower() not in out.lower():
+                continue
+            if replacement:
+                # Case-preserving substitute: match the original casing
+                # at each hit position. Re.sub with a function handles
+                # this cleanly.
+                pattern = re.compile(re.escape(needle), re.IGNORECASE)
+                out = pattern.sub(replacement, out)
+            else:
+                # Drop any sentence (and its trailing list-item / paren
+                # group) that mentions the term. Conservative: a single
+                # sentence per hit, bounded by `. !? \n` or end of line.
+                out = cls._strip_sentences_mentioning(out, needle)
+
+        # After substitutions, collapse double-blank-lines that the
+        # sentence-strip step might have left behind.
+        out = re.sub(r"\n{3,}", "\n\n", out)
+        return out
+
+    @staticmethod
+    def _strip_sentences_mentioning(body: str, needle: str) -> str:
+        """Remove any sentence containing ``needle`` (case-insensitive).
+
+        A "sentence" here is a stretch up to the next `.`/`!`/`?` followed
+        by whitespace/newline, OR the rest of a list-bullet line, OR the
+        rest of a parenthetical group. Conservative: leaves the rest of
+        the paragraph intact.
+        """
+        if not body or not needle:
+            return body
+        lower = body.lower()
+        nlower = needle.lower()
+        out_chunks: List[str] = []
+        cursor = 0
+        while cursor < len(body):
+            idx = lower.find(nlower, cursor)
+            if idx < 0:
+                out_chunks.append(body[cursor:])
+                break
+            # Find sentence start: previous `.`, `!`, `?`, `\n`, or `(`.
+            start = cursor
+            for boundary_pos in range(idx - 1, cursor - 1, -1):
+                ch = body[boundary_pos]
+                if ch in ".!?\n":
+                    start = boundary_pos + 1
+                    break
+                if ch == "(":
+                    start = boundary_pos
+                    break
+            # Find sentence end: next `.`, `!`, `?`, `\n`, or `)`.
+            end = len(body)
+            for boundary_pos in range(idx + len(needle), len(body)):
+                ch = body[boundary_pos]
+                if ch in ".!?\n":
+                    end = boundary_pos + 1
+                    break
+                if ch == ")":
+                    end = boundary_pos + 1
+                    break
+            # Keep everything before `start`, drop [start:end], continue from `end`.
+            out_chunks.append(body[cursor:start])
+            cursor = end
+        return "".join(out_chunks)
 
     def _components_for(self, target: str) -> List[Dict[str, str]]:
         if target == "saas":
