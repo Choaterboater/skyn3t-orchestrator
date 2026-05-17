@@ -135,6 +135,11 @@ class CortexBootstrap:
         self._register_default_components()
         for c in self._components:
             if c.skipped_reason is not None:
+                self._publish_cortex_decision(
+                    action="skip_component",
+                    reason=c.skipped_reason,
+                    input={"component": c.name, "error": c.error},
+                )
                 continue
             await self._safe_start(c)
         # Proposal handlers depend on the components being live (so
@@ -411,6 +416,23 @@ class CortexBootstrap:
             ))
         except Exception:
             logger.debug("alert publish failed", exc_info=True)
+
+    def _publish_cortex_decision(
+        self, *, action: str, reason: str = "", input: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Emit a CORTEX_DECISION event for the autonomy audit stream."""
+        try:
+            from skyn3t.intelligence.cortex_decisions import publish_decision
+            publish_decision(
+                self.event_bus,
+                system="cortex",
+                action=action,
+                reason=reason,
+                input=input,
+                source="cortex_bootstrap",
+            )
+        except Exception:
+            logger.debug("cortex decision publish failed", exc_info=True)
 
 
 class _DisabledMarker:
