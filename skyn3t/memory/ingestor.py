@@ -11,7 +11,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from skyn3t.core.events import Event, EventBus, EventType
 from skyn3t.rag.rag_engine import RAGEngine
@@ -84,6 +84,12 @@ class ExperienceIngestor:
             success=True,
             output=payload.get("output", {}),
             execution_time_ms=payload.get("execution_time_ms", 0.0),
+            stack=payload.get("stack"),
+            stage=payload.get("stage"),
+            error_signature=payload.get("error_signature"),
+            fix_applied=payload.get("fix_applied"),
+            fix_worked=payload.get("fix_worked"),
+            brief_shape=payload.get("brief_shape"),
         ))
         t.add_done_callback(_log_task_exception)
 
@@ -99,6 +105,12 @@ class ExperienceIngestor:
             output={},
             error=payload.get("error", "unknown"),
             execution_time_ms=payload.get("execution_time_ms", 0.0),
+            stack=payload.get("stack"),
+            stage=payload.get("stage"),
+            error_signature=payload.get("error_signature"),
+            fix_applied=payload.get("fix_applied"),
+            fix_worked=payload.get("fix_worked"),
+            brief_shape=payload.get("brief_shape"),
         ))
         t.add_done_callback(_log_task_exception)
 
@@ -154,8 +166,24 @@ class ExperienceIngestor:
         output: Dict[str, Any],
         execution_time_ms: float = 0.0,
         error: Optional[str] = None,
+        *,
+        stack: Optional[str] = None,
+        stage: Optional[str] = None,
+        error_signature: Optional[str] = None,
+        fix_applied: Optional[str] = None,
+        fix_worked: Optional[bool] = None,
+        brief_shape: Optional[List[str]] = None,
     ) -> Optional[str]:
-        """Ingest a single task outcome as a knowledge document."""
+        """Ingest a single task outcome as a knowledge document.
+
+        The ``stack``/``stage``/``error_signature``/``fix_applied``/
+        ``fix_worked`` kwargs are Phase-2 structured fields that the
+        planner queries via ``MemoryStore.rank_fixes_for_signature``.
+        All are optional and backward-compatible: pre-existing callers
+        that don't pass them get ``None`` columns in the index table,
+        which is still useful (the row anchors the embedding for later
+        outcome updates).
+        """
         status = "SUCCESS" if success else "FAILURE"
         content = self._format_task_experience(
             task_id, agent_name, status, output, execution_time_ms, error
@@ -176,6 +204,15 @@ class ExperienceIngestor:
             "execution_time_ms": execution_time_ms,
             "content_hash": content_hash,
             "error": error,
+            # Phase-2 structured fields. Stored on the RAG metadata
+            # so the vector store can still filter on them; the SQL
+            # index below is what the ranker actually queries.
+            "stack": stack,
+            "stage": stage,
+            "error_signature": error_signature,
+            "fix_applied": fix_applied,
+            "fix_worked": fix_worked,
+            "brief_shape": list(brief_shape) if brief_shape else None,
         }
         embedding_id = await self.rag.add_knowledge_one(
             content=content,
@@ -187,7 +224,53 @@ class ExperienceIngestor:
         if embedding_id:
             self._record_seen(content_hash)
             await self._persist_doc(title, content, agent_name, doc_type, metadata, embedding_id)
+            await self._persist_experience_index(
+                embedding_id=embedding_id,
+                task_id=task_id,
+                success=success,
+                stack=stack,
+                stage=stage,
+                error_signature=error_signature,
+                fix_applied=fix_applied,
+                fix_worked=fix_worked,
+            )
         return embedding_id
+
+    async def _persist_experience_index(
+        self,
+        *,
+        embedding_id: str,
+        task_id: str,
+        success: bool,
+        stack: Optional[str],
+        stage: Optional[str],
+        error_signature: Optional[str],
+        fix_applied: Optional[str],
+        fix_worked: Optional[bool],
+    ) -> None:
+        """Write the Phase-2 index row paired with this experience.
+
+        Failures here are logged at debug level — the RAG embedding
+        already landed, so missing index row is recoverable later
+        (we can backfill from the embedding metadata if we ever need
+        to). What we don't want is a transient DB hiccup losing the
+        whole experience.
+        """
+        if self._memory is None:
+            return
+        try:
+            await self._memory.record_experience_index(
+                embedding_id=embedding_id,
+                task_id=task_id or None,
+                stack=stack,
+                stage=stage,
+                error_signature=error_signature,
+                fix_applied=fix_applied,
+                fix_worked=fix_worked,
+                success=success,
+            )
+        except Exception:
+            logger.debug("experience_index persist failed for %s", embedding_id, exc_info=True)
 
     async def ingest_lesson(
         self,
