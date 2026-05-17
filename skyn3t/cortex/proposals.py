@@ -48,6 +48,44 @@ class ProposalStore:
     def register_handler(self, kind: str, fn: ApplyFn) -> None:
         self._handlers[kind] = fn
 
+    def registered_handlers(self) -> List[str]:
+        return sorted(self._handlers)
+
+    def counts(self) -> Dict[str, int]:
+        """Return ``{status: count}`` across every proposal on disk.
+
+        Cheap to call (one directory scan); intended for the cortex
+        status endpoint so operators can see at a glance how the
+        proposal queue is moving.
+        """
+        out: Dict[str, int] = {}
+        for p in self.list():
+            out[p.status] = out.get(p.status, 0) + 1
+        return out
+
+    def recent_failures(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """Return the N most recent failed proposals as compact dicts.
+
+        Sorted by decided-at (or created-at fallback), newest first.
+        Each entry has ``id``, ``kind``, ``title``, ``error`` — enough
+        for an at-a-glance failure inspector in the cortex dashboard
+        without dumping the full proposal body.
+        """
+        failed = self.list(status="failed")
+        failed.sort(
+            key=lambda p: (p.decided_at or p.created_at or 0.0),
+            reverse=True,
+        )
+        return [
+            {
+                "id": p.id,
+                "kind": p.kind,
+                "title": p.title,
+                "error": p.error,
+            }
+            for p in failed[: max(0, int(limit))]
+        ]
+
     def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=200)
         self._listeners.append(q)
@@ -126,10 +164,15 @@ class ProposalStore:
         handler = self._handlers.get(p.kind)
         if handler is None:
             p.status = "failed"
-            p.error = "no handler for kind"
+            available = self.registered_handlers()
+            p.error = (
+                f"no handler for kind '{p.kind}'"
+                + (f" (available: {', '.join(available)})" if available else " (available: none)")
+            )
             self._move_decided(p)
             self._emit({"type": "failed", "proposal": p.to_public()})
-            return {"ok": False, "error": p.error}
+            logger.error("proposal %s failed approval: %s", p.id, p.error)
+            return {"ok": False, "error": p.error, "available_handlers": available}
 
         p.status = "approved"
         self._move_decided(p)
@@ -158,7 +201,11 @@ class ProposalStore:
             handler = self._handlers.get(proposal.kind)
             if handler is None:
                 proposal.status = "failed"
-                proposal.error = "no handler for kind"
+                available = self.registered_handlers()
+                proposal.error = (
+                    f"no handler for kind '{proposal.kind}'"
+                    + (f" (available: {', '.join(available)})" if available else " (available: none)")
+                )
                 self._write(proposal, decided=True)
                 self._emit({"type": "failed", "proposal": proposal.to_public()})
                 failed += 1
@@ -221,9 +268,14 @@ class ProposalStore:
         handler = self._handlers.get(p.kind)
         if handler is None:
             p.status = "failed"
-            p.error = "no handler for kind"
+            available = self.registered_handlers()
+            p.error = (
+                f"no handler for kind '{p.kind}'"
+                + (f" (available: {', '.join(available)})" if available else " (available: none)")
+            )
             self._write(p, decided=True)
             self._emit({"type": "failed", "proposal": p.to_public()})
+            logger.error("proposal %s apply failed: %s", p.id, p.error)
             return
         try:
             if p.status != "applying":
