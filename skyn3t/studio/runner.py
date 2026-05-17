@@ -520,6 +520,182 @@ class StudioRunner:
             )
             raise
 
+    async def resume_after_approval(
+        self,
+        slug: str,
+        decision: str,
+        edited_md: Optional[str] = None,
+        feedback: Optional[str] = None,
+    ) -> dict:
+        """Resume a project halted at the human approval gate.
+
+        ``decision`` is one of:
+        * ``approve`` — continue from the next stage. If ``edited_md`` is
+          supplied and differs from the on-disk ``architecture.md``, overwrite
+          the file first.
+        * ``reject`` — prepend ``feedback`` to the brief, drop the gated stage
+          and everything after from the manifest, and re-run from the gated
+          stage so the architect sees the feedback.
+        """
+        artifact_dir = self.projects_root / slug
+        mf_path = artifact_dir / "project.json"
+        if not mf_path.exists():
+            raise FileNotFoundError(slug)
+        manifest_data = json.loads(mf_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest_data, dict):
+            raise ValueError(f"invalid manifest for {slug}")
+        manifest: Dict[str, Any] = self._normalize_manifest(manifest_data)
+        if manifest.get("status") != "awaiting_approval":
+            return manifest  # idempotent — already approved/rejected
+        gate_info = manifest.get("awaiting_approval_for") or {}
+        agent_name = str(gate_info.get("agent") or "")
+        stage_name = str(gate_info.get("stage") or "")
+        try:
+            stage_idx = int(gate_info.get("stage_index", 0))
+        except (TypeError, ValueError):
+            stage_idx = 0
+
+        arch_path = artifact_dir / "architecture.md"
+        original_md = (
+            arch_path.read_text(encoding="utf-8") if arch_path.exists() else ""
+        )
+        edited = bool(edited_md) and (edited_md or "").strip() != original_md.strip()
+
+        try:
+            from skyn3t.studio.approval_gate import record_decision as _record_decision
+            _record_decision(manifest.get("brief", ""), agent_name, decision, edited=edited)
+        except Exception:
+            logger.exception("approval-gate counter update failed")
+
+        manifest.setdefault("approval_history", []).append(
+            {
+                "stage": stage_name,
+                "agent": agent_name,
+                "decision": decision,
+                "edited": edited,
+                "feedback": feedback or None,
+                "decided_at": time.time(),
+                "source": "user",
+            }
+        )
+
+        if decision == "approve":
+            if edited and edited_md is not None:
+                arch_path.write_text(edited_md, encoding="utf-8")
+            manifest["status"] = "running"
+            manifest["awaiting_approval_for"] = None
+            manifest["next_action"] = (
+                f"Resumed after approval of {stage_name}"
+                + (" (with edits)" if edited else "")
+                + "."
+            )
+            self._append_history(
+                manifest,
+                "PROJECT_RESUMED_AFTER_APPROVAL",
+                status="running",
+                stage=stage_name,
+                message=manifest["next_action"],
+            )
+            self._save_manifest(artifact_dir, manifest)
+            self._publish(
+                "PROJECT_RESUMED_AFTER_APPROVAL",
+                {"slug": slug, "stage": stage_name, "edited": edited},
+            )
+            return await self._resume_pipeline_from(slug, stage_idx + 1)
+
+        if decision == "reject":
+            manifest["brief"] = (
+                f"## Reviewer feedback on {stage_name}\n"
+                f"{feedback or '(no feedback)'}\n\n"
+                + str(manifest.get("brief", ""))
+            )
+            # Drop the rejected stage and any later ones from the recorded
+            # history so the stage loop runs them again.
+            manifest["stages"] = manifest.get("stages", [])[:stage_idx]
+            manifest["status"] = "running"
+            manifest["awaiting_approval_for"] = None
+            manifest["next_action"] = (
+                f"Re-running {stage_name} with reviewer feedback."
+            )
+            self._append_history(
+                manifest,
+                "PROJECT_REJECTED_AFTER_APPROVAL",
+                status="running",
+                stage=stage_name,
+                message=manifest["next_action"],
+            )
+            self._save_manifest(artifact_dir, manifest)
+            self._publish(
+                "PROJECT_REJECTED_AFTER_APPROVAL",
+                {"slug": slug, "stage": stage_name},
+            )
+            return await self._resume_pipeline_from(slug, stage_idx)
+
+        return manifest
+
+    async def _resume_pipeline_from(self, slug: str, start_index: int) -> dict:
+        """Re-enter ``_run_pipeline`` skipping the first ``start_index``
+        stages of the project's template. Mirrors how ``resume()`` calls
+        ``_run_pipeline`` directly without re-acquiring the concurrency
+        semaphore."""
+        artifact_dir = self.projects_root / slug
+        mf_path = artifact_dir / "project.json"
+        manifest = self._normalize_manifest(json.loads(mf_path.read_text(encoding="utf-8")))
+        template = get_template(manifest["template"])
+        # Auto-planned templates store no stages on the Template object;
+        # mirror the resume() fallback by replanning from the brief.
+        if not template.stages and manifest["template"] == "auto":
+            from skyn3t.adapters import LLMClient
+            from skyn3t.studio.planner import plan_pipeline
+            from skyn3t.studio.templates import StageSpec, Template
+            llm_client = LLMClient(
+                default_model=None,
+                backend=None,
+                event_bus=self.event_bus,
+                caller_name="planner",
+            )
+            planned = await plan_pipeline(brief=manifest["brief"], llm_client=llm_client)
+            template = Template(
+                key="auto",
+                title="Auto-planned",
+                description=f"Resumed after approval: {manifest['brief'][:80]}",
+                stages=[
+                    StageSpec(
+                        name=p.name,
+                        agent=p.agent,
+                        capability=p.capability,
+                        handoff_to=p.handoff_to,
+                        input_extra={
+                            **p.input_extra,
+                            "expected_artifact": p.expected_artifact,
+                            "planned_rationale": p.rationale,
+                        },
+                    )
+                    for p in planned
+                ],
+            )
+        setup = normalize_mission_setup(manifest.get("mission_setup"))
+        repo = self._resolved_repo_target(manifest.get("repo_target"))
+        effective_brief = augment_brief_with_repo_target(
+            augment_brief_with_mission_setup(manifest["brief"], setup),
+            repo,
+        )
+        extra: Dict[str, Any] = {
+            **mission_setup_stage_hints(setup),
+            **repo_target_stage_hints(repo),
+            "execution_profile": manifest.get("execution_profile") or "balanced",
+        }
+        return await self._run_pipeline(
+            template=template,
+            template_key=manifest["template"],
+            brief=effective_brief,
+            slug=slug,
+            artifact_dir=artifact_dir,
+            manifest=manifest,
+            extra=extra,
+            _start_from_index=start_index,
+        )
+
     async def _run_pipeline(
         self,
         *,
@@ -530,9 +706,14 @@ class StudioRunner:
         artifact_dir: Path,
         manifest: Dict[str, Any],
         extra: Optional[dict],
+        _start_from_index: int = 0,
     ) -> dict:
         """Execute the actual stage loop. Caller has already acquired the
-        concurrency semaphore and set manifest["status"] = "running"."""
+        concurrency semaphore and set manifest["status"] = "running".
+
+        ``_start_from_index`` skips stages that have already run in an earlier
+        invocation; used by ``resume_after_approval`` to continue past an
+        already-approved architect stage without re-executing it."""
         # Defensive: never let a bad artifact_dir leak into agent input_data.
         # This guards against caller bugs, symlink attacks, and env misconfig.
         resolved_art = artifact_dir.resolve()
@@ -609,7 +790,9 @@ class StudioRunner:
             if isinstance(extra, dict):
                 extra = {**extra, "execution_profile": execution_profile}
 
-            for stage in stages:
+            for stage_idx, stage in enumerate(stages):
+                if stage_idx < (_start_from_index or 0):
+                    continue
                 agent = get_agent(stage.agent, event_bus=self.event_bus, rag=self.rag)
                 if hasattr(agent, "initialize"):
                     maybe = agent.initialize()
@@ -1485,6 +1668,66 @@ class StudioRunner:
                         "summary": stage_summary,
                     },
                 )
+
+                # Human approval gate: halt the pipeline after stages
+                # whose agent is listed in approval_gates.json. The user
+                # resumes via runner.resume_after_approval (wired to the
+                # /approve, /approve-with-edits, /reject web endpoints).
+                try:
+                    from skyn3t.studio.approval_gate import (
+                        load_gate_config as _load_gate_cfg,
+                        should_gate as _should_gate,
+                    )
+                    from skyn3t.studio.notify_dispatcher import dispatch as _notify_dispatch
+                except Exception:
+                    _load_gate_cfg = None  # type: ignore[assignment]
+                    _should_gate = None  # type: ignore[assignment]
+                    _notify_dispatch = None  # type: ignore[assignment]
+                if _load_gate_cfg is not None and _should_gate is not None:
+                    _gate_cfg = _load_gate_cfg()
+                    if _should_gate(stage.agent, brief):
+                        manifest["status"] = "awaiting_approval"
+                        manifest["awaiting_approval_for"] = {
+                            "stage": stage.name,
+                            "agent": stage.agent,
+                            "stage_index": stage_idx,
+                            "started_at": time.time(),
+                        }
+                        manifest.setdefault("approval_history", [])
+                        manifest["next_action"] = (
+                            f"Review {stage.name} output and approve to continue."
+                        )
+                        self._append_history(
+                            manifest,
+                            "PROJECT_AWAITING_APPROVAL",
+                            status="awaiting_approval",
+                            stage=stage.name,
+                            agent=stage.agent,
+                            message=manifest["next_action"],
+                        )
+                        self._save_manifest(artifact_dir, manifest)
+                        self._publish(
+                            "PROJECT_AWAITING_APPROVAL",
+                            {
+                                "slug": slug,
+                                "stage": stage.name,
+                                "agent": stage.agent,
+                            },
+                        )
+                        if _notify_dispatch is not None:
+                            try:
+                                notify_task = asyncio.create_task(
+                                    _notify_dispatch(
+                                        slug, stage.agent, f"/studio/{slug}", _gate_cfg,
+                                    )
+                                )
+                                # Stash a strong ref so the task isn't GC'd before it sends.
+                                self._notify_tasks = getattr(self, "_notify_tasks", set())
+                                self._notify_tasks.add(notify_task)
+                                notify_task.add_done_callback(self._notify_tasks.discard)
+                            except Exception:
+                                logger.exception("approval-gate notify dispatch failed")
+                        return manifest
 
             # If no stage failed, derive the final project outcome from the
             # strongest available quality signal instead of always claiming a
@@ -3745,6 +3988,8 @@ class StudioRunner:
         manifest.setdefault("history", [])
         manifest.setdefault("status", "queued")
         manifest.setdefault("execution_profile", "balanced")
+        manifest.setdefault("approval_history", [])
+        manifest.setdefault("awaiting_approval_for", None)
         manifest["quality_summary"] = self._normalize_quality_summary(
             manifest.get("quality_summary")
         )

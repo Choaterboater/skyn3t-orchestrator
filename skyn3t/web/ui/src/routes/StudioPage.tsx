@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, ProjectRow, Template } from "../api/client";
 
@@ -297,6 +297,10 @@ function ProjectDetailView({
           <SectionTitle>Next action</SectionTitle>
           <p className="text-sm text-text-secondary">{data.next_action}</p>
         </section>
+      )}
+
+      {data.status === "awaiting_approval" && (
+        <ApprovalCard slug={slug} data={data} />
       )}
 
       {data.build_verification && (
@@ -642,7 +646,10 @@ function StatusPill({ status }: { status: string }) {
         ? "bg-accent-soft text-accent border-accent-line"
         : s === "failed" || s === "error"
           ? "bg-status-red/20 text-status-red border-status-red/30"
-          : s === "blocked" || s === "needs_input"
+          : s === "blocked" ||
+              s === "needs_input" ||
+              s === "awaiting_approval" ||
+              s === "awaiting_clarification"
             ? "bg-status-yellow/20 text-status-yellow border-status-yellow/30"
             : "bg-bg-3 text-text-dim border-border";
   return (
@@ -651,6 +658,151 @@ function StatusPill({ status }: { status: string }) {
     >
       {s}
     </span>
+  );
+}
+
+// Approval gate UI. Rendered when manifest.status === "awaiting_approval"
+// — fetches architecture.md, lets the user edit in place, and exposes
+// approve / approve-with-edits / reject actions. Mirrors the dashboard's
+// 4s React Query poll so we don't need WebSocket plumbing.
+function ApprovalCard({ slug, data }: { slug: string; data: any }) {
+  const qc = useQueryClient();
+  const arch = useQuery({
+    queryKey: ["architecture_md", slug, data?.updated_at],
+    queryFn: () => api.fetchArchitecture(slug),
+    retry: false,
+  });
+  const [content, setContent] = useState<string>("");
+  const [feedback, setFeedback] = useState<string>("");
+  const [rejectMode, setRejectMode] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (typeof arch.data === "string") {
+      setContent(arch.data);
+    }
+  }, [arch.data]);
+
+  const invalidate = () => {
+    qc.invalidateQueries({ queryKey: ["studio_project", slug] });
+    qc.invalidateQueries({ queryKey: ["studio_projects"] });
+  };
+
+  const approve = useMutation({
+    mutationFn: () => api.approveProject(slug),
+    onSuccess: invalidate,
+  });
+  const approveEdits = useMutation({
+    mutationFn: () => api.approveProjectWithEdits(slug, content),
+    onSuccess: invalidate,
+  });
+  const reject = useMutation({
+    mutationFn: () => api.rejectProject(slug, feedback),
+    onSuccess: () => {
+      invalidate();
+      setRejectMode(false);
+      setFeedback("");
+    },
+  });
+
+  const original = typeof arch.data === "string" ? arch.data : "";
+  const edited = content.trim() !== original.trim();
+  const busy =
+    approve.isPending || approveEdits.isPending || reject.isPending;
+
+  const gateInfo = data?.awaiting_approval_for ?? {};
+  const stageName = gateInfo.stage || "stage";
+  const agentName = gateInfo.agent || "agent";
+
+  return (
+    <section className="border border-status-yellow/40 bg-status-yellow/5 rounded-lg p-4 space-y-3">
+      <div className="flex items-baseline justify-between">
+        <SectionTitle>
+          Approval required · {stageName} ({agentName})
+        </SectionTitle>
+        <span className="text-[0.65rem] uppercase tracking-wider text-status-yellow">
+          Pipeline halted
+        </span>
+      </div>
+      <p className="text-xs text-text-secondary">
+        Review the architecture below. Edit inline to apply changes, or
+        reject to send feedback back to the architect and re-run the stage.
+      </p>
+      {arch.isLoading && (
+        <p className="text-xs text-text-dim">Loading architecture.md…</p>
+      )}
+      {arch.error && (
+        <p className="text-xs text-status-red">
+          Could not load architecture.md:{" "}
+          {arch.error instanceof Error ? arch.error.message : "error"}
+        </p>
+      )}
+      {typeof arch.data === "string" && (
+        <textarea
+          value={content}
+          onChange={(e) => setContent(e.target.value)}
+          rows={20}
+          className="w-full font-mono text-xs bg-bg-2 border border-border rounded p-2 text-text-primary"
+          spellCheck={false}
+        />
+      )}
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          onClick={() => approve.mutate()}
+          disabled={busy || edited}
+          title={
+            edited
+              ? "You have edits — use 'Approve with edits'"
+              : "Approve unchanged and continue to the next stage"
+          }
+          className="rounded bg-status-green/30 border border-status-green/40 text-status-green text-xs px-3 py-1.5 disabled:opacity-50"
+        >
+          {approve.isPending ? "Approving…" : "Approve"}
+        </button>
+        <button
+          onClick={() => approveEdits.mutate()}
+          disabled={busy || !edited}
+          className="rounded bg-accent-soft border border-accent-line text-accent text-xs px-3 py-1.5 disabled:opacity-50"
+        >
+          {approveEdits.isPending ? "Saving…" : "Approve with edits"}
+        </button>
+        <button
+          onClick={() => setRejectMode((v) => !v)}
+          disabled={busy}
+          className="rounded border border-status-red/40 text-status-red text-xs px-3 py-1.5 disabled:opacity-50"
+        >
+          Reject
+        </button>
+      </div>
+      {rejectMode && (
+        <div className="space-y-2 border-t border-border pt-3">
+          <label className="text-xs text-text-secondary">
+            Feedback for the architect (prepended to the brief on re-run):
+          </label>
+          <textarea
+            value={feedback}
+            onChange={(e) => setFeedback(e.target.value)}
+            rows={4}
+            className="w-full text-xs bg-bg-2 border border-border rounded p-2 text-text-primary"
+          />
+          <div className="flex gap-2">
+            <button
+              onClick={() => reject.mutate()}
+              disabled={busy || !feedback.trim()}
+              className="rounded bg-status-red/20 border border-status-red/40 text-status-red text-xs px-3 py-1.5 disabled:opacity-50"
+            >
+              {reject.isPending ? "Rejecting…" : "Send feedback & re-run"}
+            </button>
+            <button
+              onClick={() => setRejectMode(false)}
+              disabled={busy}
+              className="rounded border border-border text-text-secondary text-xs px-3 py-1.5"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+    </section>
   );
 }
 
