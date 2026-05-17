@@ -710,6 +710,29 @@ async def apply_targeted_fix(
         # Unknown action
         errors.append(f"Unknown fix action '{issue.suggested_action}' for {issue.path}")
 
+    # After any new files were written, scan them for unresolved local
+    # imports and backfill via manifest_for. canary-133 (47/100) hit
+    # this: targeted_fix shipped a real ActivityFeed.jsx that imports
+    # `../hooks/usePolling.js`, but the hook wasn't on disk — the
+    # CodeAgent backfill ran once at end-of-scaffold, BEFORE this fix
+    # loop wrote ActivityFeed.jsx. Vite then refused to build.
+    if (changed or created) and stack:
+        try:
+            from skyn3t.agents.code_agent import CodeAgent
+            agent = CodeAgent.__new__(CodeAgent)  # bypass __init__
+            written_abs = [
+                str((scaffold_dir / p).resolve())
+                for p in (changed + created)
+            ]
+            agent._backfill_unresolved_local_imports(
+                out_dir=scaffold_dir,
+                files_written=written_abs,
+                stack=stack,
+                brief=brief or "",
+            )
+        except Exception:
+            logger.debug("post-fix backfill failed (non-fatal)", exc_info=True)
+
     return FixResult(
         ok=len(errors) == 0 and (len(changed) > 0 or len(created) > 0),
         files_changed=changed,
