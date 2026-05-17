@@ -1127,7 +1127,9 @@ class CodeAgent(BaseAgent):
                 # "model pinned react ^17 but used hooks API" failure
                 # class entirely.
                 if stack != "minimal":
-                    body_manifest = manifest_for(stack, rel, brief)
+                    body_manifest = manifest_for(
+                        stack, rel, brief, palette_hexes=_palette_hexes
+                    )
                     if body_manifest:
                         try:
                             target.write_text(body_manifest, encoding="utf-8")
@@ -1755,6 +1757,7 @@ class CodeAgent(BaseAgent):
                 files_written=files_written,
                 stack=template_key,
                 brief=brief,
+                palette_hexes=_palette_hexes,
             )
         except Exception:
             logger.exception("backfill unresolved imports failed (non-fatal)")
@@ -1850,6 +1853,7 @@ class CodeAgent(BaseAgent):
         files_written: list[str],
         stack: Optional[str],
         brief: str,
+        palette_hexes: Optional[List[str]] = None,
     ) -> list[str]:
         """Scan generated files for relative imports that don't resolve, and
         backfill from deterministic generators when possible.
@@ -1933,7 +1937,9 @@ class CodeAgent(BaseAgent):
                 # manifest_for() returns None for unknown (stack, path).
                 body: Optional[str] = None
                 if stack:
-                    body = manifest_for(stack, rel_path, brief or "")
+                    body = manifest_for(
+                        stack, rel_path, brief or "", palette_hexes=palette_hexes
+                    )
                 if body is None:
                     # Last-resort placeholder so the build doesn't break.
                     # Cheaper than letting Vite fail, and the reviewer can

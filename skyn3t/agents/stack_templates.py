@@ -165,6 +165,54 @@ def detect_stack(brief: str) -> Optional[str]:
     return None
 
 
+def detect_stack_from_handoff(
+    brief: str,
+    *,
+    architecture_text: str = "",
+    tech_stack: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Pick a stack template using the brief plus upstream architect hints.
+
+    CodeAgent used to detect the scaffold stack from the raw brief only. That
+    fails on generic product briefs ("service dashboard", "SaaS app") even when
+    ArchitectAgent has already written concrete stack guidance in
+    ``architecture.md`` / ``tech_stack.json``. When the brief itself is too
+    vague, prefer explicit architect handoff before falling back to the LLM
+    planner.
+    """
+    direct = detect_stack(brief)
+    if direct:
+        return direct
+
+    signal_chunks: List[str] = []
+    if architecture_text:
+        signal_chunks.append(architecture_text.lower())
+    if tech_stack:
+        for key in ("frontend", "backend", "db", "infra"):
+            value = tech_stack.get(key)
+            if isinstance(value, str) and value.strip():
+                signal_chunks.append(value.lower())
+    signal_text = "\n".join(signal_chunks)
+    if signal_text:
+        # Prefer the explicit Vite/SPA shape over Next if the architect output
+        # mentions both. This happens when tech_stack.json drifts but the
+        # architecture overview still says "Vite + React SPA + Express".
+        if any(token in signal_text for token in ("vite", "react spa", "single-page app", "single page app")):
+            return "react_vite"
+        if any(token in signal_text for token in ("next.js", "nextjs", "app router", "route handlers")):
+            return "next"
+        inferred = detect_stack(signal_text)
+        if inferred:
+            return inferred
+
+    # Dashboard-class briefs without an explicit framework still map much more
+    # often to a SPA scaffold than to a static site. This keeps the deterministic
+    # browser-first template path available for homelab/service-board briefs.
+    if _needs_design_system(brief):
+        return "react_vite"
+    return None
+
+
 def plan_for_stack(stack: str, brief: str = "") -> Optional[FilePlan]:
     """Return the file plan for ``stack``, augmented for the brief.
 
@@ -274,6 +322,38 @@ _BACKEND_SIGNALS: Tuple[str, ...] = (
     "credentials", "secret", "secrets",
     "proxy", "backend proxy",
     "subscription", "auth header", "bearer token",
+    "backend api", "server-side crud", "crud api",
+    "crud endpoint", "health endpoint", "health check endpoint",
+    "api endpoint", "api route", "api routes", "/health",
+)
+
+_BACKEND_CONTEXT_SIGNALS: Tuple[str, ...] = (
+    "backend",
+    "server-side",
+    "server side",
+    "health endpoint",
+    "health check endpoint",
+    "crud",
+    "api endpoint",
+    "api route",
+    "api routes",
+    "/health",
+)
+
+_BACKEND_PERSISTENCE_SIGNALS: Tuple[str, ...] = (
+    "persistent backend config",
+    "persistent config",
+    "persist config",
+    "persist configuration",
+    "persisted config",
+    "config store",
+    "save configuration",
+    "saved configuration",
+    "survive restart",
+    "survives restart",
+    "across restarts",
+    "persist to disk",
+    "save to disk",
 )
 
 # Named-service triggers → service slug. Slug becomes the adapter
@@ -308,6 +388,11 @@ def _needs_backend(brief: str) -> bool:
     for sig in _BACKEND_SIGNALS:
         if sig in text:
             return True
+    if (
+        any(sig in text for sig in _BACKEND_PERSISTENCE_SIGNALS)
+        and any(sig in text for sig in _BACKEND_CONTEXT_SIGNALS)
+    ):
+        return True
     # Fallback: 2+ named services in a single brief is itself a signal
     # — a real homelab integration UI never talks to one service.
     if len(_detect_services(brief)) >= 2:
@@ -590,6 +675,11 @@ _CONFIGURABLE_SIGNALS: Tuple[str, ...] = (
     "set host", "change host", "set port", "change port",
     "edit url",
     "user configurable", "user-configurable",
+    "persistent backend config", "persistent config",
+    "persist config", "persist configuration", "persisted config",
+    "config store", "save configuration", "saved configuration",
+    "settings saved", "survive restart", "survives restart",
+    "across restarts",
 )
 
 
@@ -607,6 +697,8 @@ def _needs_configurable_ui(brief: str) -> bool:
     for sig in _CONFIGURABLE_SIGNALS:
         if sig in text:
             return True
+    if _needs_backend(brief) and "settings" in text:
+        return True
     return False
 
 
@@ -1544,47 +1636,86 @@ def _homelab_mod() -> Any:
 
 def _component_app_jsx_homelab(brief: str) -> Optional[str]:
     mod = _homelab_mod()
-    if mod is None:
+    if mod is None or not _needs_design_system(brief):
         return None
-    services = _detect_services(brief)
-    if not services:
-        return None
-    return cast(Optional[str], mod.app_jsx(services))
+    return cast(Optional[str], mod.app_jsx(_detect_services(brief)))
 
 
-def _component_styles_css_homelab(brief: str) -> Optional[str]:
+def _component_styles_css_homelab(brief: str, palette_hexes: Optional[List[str]] = None) -> Optional[str]:
     mod = _homelab_mod()
-    if mod is None or not _detect_services(brief):
+    if mod is None or not _needs_design_system(brief):
         return None
-    return cast(Optional[str], mod.styles_css())
+    return cast(Optional[str], mod.styles_css(palette_hexes))
 
 
 def _hook_use_polling(brief: str) -> Optional[str]:
     mod = _homelab_mod()
-    if mod is None or not _detect_services(brief):
+    if mod is None or not _needs_design_system(brief):
         return None
     return cast(Optional[str], mod.use_polling_hook())
 
 
 def _component_command_palette(brief: str) -> Optional[str]:
     mod = _homelab_mod()
-    if mod is None or not _detect_services(brief):
+    if mod is None or not _needs_design_system(brief):
         return None
     return cast(Optional[str], mod.command_palette())
 
 
 def _component_service_detail(brief: str) -> Optional[str]:
     mod = _homelab_mod()
-    if mod is None or not _detect_services(brief):
+    if mod is None or not _needs_design_system(brief):
         return None
     return cast(Optional[str], mod.service_detail())
 
 
 def _component_activity_feed(brief: str) -> Optional[str]:
     mod = _homelab_mod()
-    if mod is None or not _detect_services(brief):
+    if mod is None or not _needs_design_system(brief):
         return None
     return cast(Optional[str], mod.activity_feed())
+
+
+def _server_config_store_homelab(brief: str) -> Optional[str]:
+    mod = _homelab_mod()
+    if mod is None or not _needs_configurable_ui(brief):
+        return None
+    return cast(Optional[str], mod.config_store_js(_detect_services(brief)))
+
+
+def _server_index_homelab(brief: str) -> Optional[str]:
+    mod = _homelab_mod()
+    if mod is None or not _needs_backend(brief):
+        return None
+    return cast(Optional[str], mod.server_index_js())
+
+
+def _server_config_route_homelab(brief: str) -> Optional[str]:
+    mod = _homelab_mod()
+    if mod is None or not _needs_configurable_ui(brief):
+        return None
+    return cast(Optional[str], mod.config_route_js())
+
+
+def _component_settings_modal_homelab(brief: str) -> Optional[str]:
+    mod = _homelab_mod()
+    if mod is None or not _needs_configurable_ui(brief):
+        return None
+    return cast(Optional[str], mod.settings_modal_jsx())
+
+
+def _component_service_editor_homelab(brief: str) -> Optional[str]:
+    mod = _homelab_mod()
+    if mod is None or not _needs_configurable_ui(brief):
+        return None
+    return cast(Optional[str], mod.service_editor_jsx())
+
+
+def _hook_use_config_homelab(brief: str) -> Optional[str]:
+    mod = _homelab_mod()
+    if mod is None or not _needs_configurable_ui(brief):
+        return None
+    return cast(Optional[str], mod.use_config_js())
 
 
 _MANIFEST_GENERATORS = {
@@ -1603,8 +1734,14 @@ _MANIFEST_GENERATORS = {
     ("next", ".env.example"): _env_example_for_services,
     ("react_vite", "docker-compose.yml"): _docker_compose_for_services,
     ("next", "docker-compose.yml"): _docker_compose_for_services,
+    ("react_vite", "server/index.js"): _server_index_homelab,
     ("react_vite", "server/package.json"): _server_package_json_for_services,
     ("next", "server/package.json"): _server_package_json_for_services,
+    ("react_vite", "server/config-store.js"): _server_config_store_homelab,
+    ("react_vite", "server/routes/config.js"): _server_config_route_homelab,
+    ("react_vite", "src/components/SettingsModal.jsx"): _component_settings_modal_homelab,
+    ("react_vite", "src/components/ServiceEditor.jsx"): _component_service_editor_homelab,
+    ("react_vite", "src/hooks/useConfig.js"): _hook_use_config_homelab,
     # Core Vite scaffolding — these are pure boilerplate; letting the
     # LLM regenerate them wastes tokens and creates a vector for stack
     # drift (v37: kimi rewrote the react_vite plan as Next.js). Locking
@@ -1637,13 +1774,25 @@ _MANIFEST_GENERATORS = {
 }
 
 
-def manifest_for(stack: Optional[str], rel_path: str, brief: str = "") -> Optional[str]:
+def manifest_for(
+    stack: Optional[str],
+    rel_path: str,
+    brief: str = "",
+    *,
+    palette_hexes: Optional[List[str]] = None,
+) -> Optional[str]:
     """Return the deterministic manifest body for a (stack, file path)
     combo, or None when no generator applies.
 
     Used by CodeAgent's Phase 2 loop to short-circuit dependency files
     (requirements.txt, package.json, Package.swift) — the LLM keeps
     re-deriving these and sometimes drifts to outdated pins.
+
+    ``palette_hexes`` is an optional list of hex colors read from
+    ``artifact_dir/palette.json``. When provided, palette-aware
+    generators (``styles.css`` today) weave the brand colors into the
+    output so the scaffold doesn't ship the default slate palette
+    regardless of what DesignerAgent picked.
     """
     if not stack or not rel_path:
         return None
@@ -1651,7 +1800,18 @@ def manifest_for(stack: Optional[str], rel_path: str, brief: str = "") -> Option
     # of incoming case/slashes.
     key = (stack, rel_path.lstrip("/").strip())
     gen = _MANIFEST_GENERATORS.get(key)
-    return gen(brief or "") if gen else None
+    if gen is None:
+        return None
+    # Only the palette-aware generators accept the kwarg. Detect by
+    # signature so we don't break the legion of `(brief)` generators.
+    import inspect
+    try:
+        sig = inspect.signature(gen)
+        if "palette_hexes" in sig.parameters:
+            return gen(brief or "", palette_hexes=palette_hexes)
+    except (TypeError, ValueError):
+        pass
+    return gen(brief or "")
 
 
 def readme_for_stack(stack: Optional[str], brief: str) -> Optional[str]:

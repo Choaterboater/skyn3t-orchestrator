@@ -19,7 +19,7 @@ Contract:
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 _TRUE_FALSE_FROM_ENV = "process.env.NODE_ENV !== 'production'"
 
@@ -124,31 +124,108 @@ export default function App() {{
 """
 
 
-def styles_css() -> str:
-    return """:root {
-  color-scheme: dark;
-  --bg: #0b0f1a;
-  --bg-elev: #121826;
-  --text: #e6edf7;
-  --muted: #8a93a8;
-  --accent: #6ea8ff;
-  --accent-soft: rgba(110, 168, 255, 0.12);
-  --danger: #ff6b6b;
-  --ok: #4ade80;
-  --radius: 14px;
-  --blur: blur(18px);
+_DEFAULT_PALETTE: dict = {
+    "bg":      "#0b0f1a",
+    "bg-elev": "#121826",
+    "text":    "#e6edf7",
+    "muted":   "#8a93a8",
+    "accent":  "#6ea8ff",
+    "danger":  "#ff6b6b",
+    "ok":      "#4ade80",
+    "halo":    "#1a2336",  # gradient stop
 }
 
-* { box-sizing: border-box; }
 
-html, body, #root {
-  margin: 0;
-  padding: 0;
-  min-height: 100%;
-  background: radial-gradient(circle at 20% -10%, #1a2336 0%, var(--bg) 60%);
-  color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-}
+def _hex_luminance(hex_str: str) -> float:
+    """0..1 perceived luminance. Used to pick which slot each palette hex fills."""
+    s = (hex_str or "").lstrip("#")
+    if len(s) == 3:
+        s = "".join(c * 2 for c in s)
+    if len(s) < 6:
+        return 0.5
+    try:
+        r, g, b = int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
+    except ValueError:
+        return 0.5
+    return (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+
+
+def _resolve_palette(palette_hexes: Optional[List[str]]) -> dict:
+    """Map a list of raw hex colors into the named slots styles.css needs.
+
+    Without this, every canary shipped the hardcoded slate-blue palette
+    regardless of what DesignerAgent picked — ContractVerifier flagged
+    the same palette_schism on the same 8 hexes every single run, and
+    the RAG-recorded lessons were useless (the source was a constant,
+    not an LLM choice).
+
+    Strategy: sort by luminance, pick darkest for bg, second-darkest for
+    bg-elev, lightest for text, mid for muted, then a saturated mid for
+    accent. Falls back to default when palette is empty or missing.
+    """
+    if not palette_hexes:
+        return dict(_DEFAULT_PALETTE)
+    by_lum = sorted(palette_hexes, key=_hex_luminance)
+    out = dict(_DEFAULT_PALETTE)
+    out["bg"]      = by_lum[0]
+    out["bg-elev"] = by_lum[1] if len(by_lum) > 1 else by_lum[0]
+    out["halo"]    = by_lum[2] if len(by_lum) > 2 else by_lum[-1]
+    out["text"]    = by_lum[-1]
+    # muted = a hex roughly two steps from text
+    mid = max(0, len(by_lum) - 2)
+    out["muted"]   = by_lum[mid]
+    # accent = first non-extreme hex (preserves brand color when available)
+    if len(by_lum) > 2:
+        out["accent"] = by_lum[len(by_lum) // 2]
+    return out
+
+
+def _rgba_from_hex(hex_str: str, alpha: float) -> str:
+    s = hex_str.lstrip("#")
+    if len(s) == 3:
+        s = "".join(c * 2 for c in s)
+    try:
+        r, g, b = int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
+    except ValueError:
+        return f"rgba(110, 168, 255, {alpha})"
+    return f"rgba({r}, {g}, {b}, {alpha})"
+
+
+def styles_css(palette_hexes: Optional[List[str]] = None) -> str:
+    """Return styles.css. When ``palette_hexes`` is given, the brand colors
+    from palette.json are woven into the locked-shape stylesheet so the
+    output matches what DesignerAgent picked. Backward-compatible: zero
+    args returns the default slate palette so existing callers keep
+    working.
+    """
+    p = _resolve_palette(palette_hexes)
+    accent_soft = _rgba_from_hex(p["accent"], 0.12)
+    return (
+        ":root {\n"
+        "  color-scheme: dark;\n"
+        f"  --bg: {p['bg']};\n"
+        f"  --bg-elev: {p['bg-elev']};\n"
+        f"  --text: {p['text']};\n"
+        f"  --muted: {p['muted']};\n"
+        f"  --accent: {p['accent']};\n"
+        f"  --accent-soft: {accent_soft};\n"
+        f"  --danger: {p['danger']};\n"
+        f"  --ok: {p['ok']};\n"
+        "  --radius: 14px;\n"
+        "  --blur: blur(18px);\n"
+        "}\n"
+        "\n"
+        "* { box-sizing: border-box; }\n"
+        "\n"
+        "html, body, #root {\n"
+        "  margin: 0;\n"
+        "  padding: 0;\n"
+        "  min-height: 100%;\n"
+        f"  background: radial-gradient(circle at 20% -10%, {p['halo']} 0%, var(--bg) 60%);\n"
+        "  color: var(--text);\n"
+        "  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;\n"
+        "}"
+    ) + """
 
 .glass {
   background: rgba(255, 255, 255, 0.04);
