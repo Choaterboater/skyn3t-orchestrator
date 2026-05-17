@@ -407,7 +407,93 @@ class ArchitectAgent(BaseAgent):
 
         # Collapse extra blank lines that the sentence drops leave behind.
         out = re.sub(r"\n{3,}", "\n\n", out)
+        # Drop section headers that are now followed by another header or
+        # by end-of-doc — leaves a coherent architecture, not a list of
+        # dangling section titles. canary-124 reviewer flagged "empty
+        # ## APIs and ## Deployment sections" after the sanitizer ran.
+        out = cls._drop_empty_sections(out)
+        # Renumber lists that lost items. canary-124's risks section
+        # ended up as "1, 2, 5" because items 3 and 4 mentioned banned
+        # tech and got dropped. Renumber to "1, 2, 3" so the reviewer
+        # doesn't see the gap.
+        out = cls._renumber_lists(out)
         return out
+
+    @staticmethod
+    def _drop_empty_sections(body: str) -> str:
+        """Remove ## headers whose body is empty after sanitization.
+
+        Walks line by line; for each `## Header`, peek ahead at the
+        non-blank content before the next header. If empty, skip the
+        header line. Preserves all non-section structure.
+        """
+        if not body:
+            return body
+        lines = body.splitlines(keepends=True)
+        out: List[str] = []
+        i = 0
+        header_re = re.compile(r"^\s*(#{2,3})\s+\S")
+        while i < len(lines):
+            line = lines[i]
+            if not header_re.match(line):
+                out.append(line)
+                i += 1
+                continue
+            # Look ahead until the next header at same-or-shallower depth.
+            current_depth = len(line.split()[0]) if line.split() else 2
+            j = i + 1
+            has_body = False
+            while j < len(lines):
+                next_line = lines[j]
+                m = header_re.match(next_line)
+                if m and len(m.group(1)) <= current_depth:
+                    break
+                if next_line.strip():
+                    has_body = True
+                    break
+                j += 1
+            if has_body:
+                out.append(line)
+            # else: skip the header — i moves to next iteration
+            i += 1
+        return "".join(out)
+
+    @staticmethod
+    def _renumber_lists(body: str) -> str:
+        """Walk numbered list runs and renumber them sequentially.
+
+        Conservative: only operates on lines that start with `\\d+\\. `
+        at consistent indentation. Stops/resets at any non-list line
+        (blank, heading, bullet, or different indent).
+        """
+        if not body:
+            return body
+        out_lines: List[str] = []
+        list_re = re.compile(r"^(\s*)(\d+)\.\s")
+        active_indent: Optional[str] = None
+        next_num = 1
+        for line in body.splitlines(keepends=True):
+            m = list_re.match(line)
+            if m:
+                indent = m.group(1)
+                if active_indent is None or indent != active_indent:
+                    active_indent = indent
+                    next_num = 1
+                rest = line[m.end():]
+                out_lines.append(f"{indent}{next_num}. {rest}")
+                next_num += 1
+            else:
+                # Reset list state on any non-list line.
+                if not line.strip():
+                    # Blank line — keep list state alive across short gaps?
+                    # No: too risky for nested lists. Reset.
+                    active_indent = None
+                    next_num = 1
+                else:
+                    active_indent = None
+                    next_num = 1
+                out_lines.append(line)
+        return "".join(out_lines)
 
     # Sentence end: `.`, `!`, `?` followed by space + capital letter, OR
     # end of line. Crucially, `Python 3.11` does NOT match this — the

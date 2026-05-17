@@ -147,3 +147,60 @@ def test_collapses_excess_blank_lines_after_sentence_drops() -> None:
     out = ArchitectAgent._sanitize_architecture_md(body, NODE_STACK)
     # The Alembic sentence dropped, but we shouldn't have 3+ blank lines now.
     assert "\n\n\n" not in out
+
+
+def test_drops_empty_sections() -> None:
+    """canary-124 regression: sanitizer left ## APIs and ## Deployment
+    headers with empty bodies after all their sentences were dropped.
+    """
+    body = (
+        "## Overview\n\n"
+        "A homelab dashboard.\n\n"
+        "## APIs\n\n"
+        "Routes implemented in FastAPI on Python 3.11.\n\n"
+        "## Deployment\n\n"
+        "Hosted on Fly.io with Cloudflare in front.\n"
+    )
+    out = ArchitectAgent._sanitize_architecture_md(body, NODE_STACK)
+    assert "## APIs" not in out, "empty APIs section should be dropped"
+    assert "## Deployment" not in out, "empty Deployment section should be dropped"
+    # Overview survives because it has clean content.
+    assert "## Overview" in out
+    assert "A homelab dashboard" in out
+
+
+def test_keeps_section_with_partial_body() -> None:
+    body = (
+        "## Components\n\n"
+        "Web: React + Vite.\n"
+        "API: FastAPI on Python 3.11.\n"
+        "DB: better-sqlite3 stored in data/app.db.\n"
+    )
+    out = ArchitectAgent._sanitize_architecture_md(body, NODE_STACK)
+    assert "## Components" in out
+    assert "FastAPI" not in out
+    assert "Python" not in out
+    assert "Web: React" in out
+    assert "DB: better-sqlite3" in out
+
+
+def test_renumbers_list_after_drops() -> None:
+    """canary-124 regression: risks were "1, 2, 5" because items 3 and 4
+    mentioned Alembic/Postgres and got dropped, leaving gaps that the
+    reviewer LLM flagged as "looks like content was cut and not
+    renumbered." Renumber sequentially.
+    """
+    body = (
+        "## Risks\n\n"
+        "1. First risk.\n"
+        "2. Second risk.\n"
+        "3. Alembic migration race condition.\n"
+        "4. PostgreSQL connection pool exhaustion.\n"
+        "5. Fifth risk.\n"
+    )
+    out = ArchitectAgent._sanitize_architecture_md(body, NODE_STACK)
+    assert "1. First risk" in out
+    assert "2. Second risk" in out
+    # The original item 5 should now be renumbered to 3.
+    assert "3. Fifth risk" in out
+    assert "5." not in out
