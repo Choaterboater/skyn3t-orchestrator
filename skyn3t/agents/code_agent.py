@@ -660,6 +660,27 @@ class CodeAgent(BaseAgent):
                 for r in ranked
             ]
             blocks.append(f"For signature `{sig}`:\n" + "\n".join(lines))
+            # Audit-stream entry so operators can see the recall
+            # influencing the build prompt, not just the static log.
+            try:
+                from skyn3t.intelligence.cortex_decisions import publish_decision
+                top = ranked[0]
+                publish_decision(
+                    self.event_bus,
+                    system="recall",
+                    action="inject_ranked_fix",
+                    reason=(
+                        f"top fix `{top['fix_applied']}` rated "
+                        f"{top['wins']}/{top['attempts']} for {sig}"
+                    ),
+                    input={
+                        "signature": sig,
+                        "fixes": ranked,
+                    },
+                    source=self.name,
+                )
+            except Exception:
+                logger.debug("recall decision publish failed", exc_info=True)
         return blocks
 
     def _read_prior_artifacts(self, artifact_dir) -> str:
@@ -1377,6 +1398,7 @@ class CodeAgent(BaseAgent):
                             _sb = None
                         per_file_backend, per_file_model = resolve_model_for_file(
                             rel, stack=stack, scoreboard=_sb,
+                            event_bus=self.event_bus,
                         )
                         # Only construct a new client if the routing
                         # actually differs from the agent's primary
@@ -1616,6 +1638,7 @@ class CodeAgent(BaseAgent):
                         _sb_cluster = None
                     cluster_backend, cluster_model = resolve_model_for_file(
                         cluster_paths[0], stack=stack, scoreboard=_sb_cluster,
+                        event_bus=self.event_bus,
                     )
                     agent_backend = (self.config or {}).get("backend")
                     if cluster_backend and cluster_backend != agent_backend:

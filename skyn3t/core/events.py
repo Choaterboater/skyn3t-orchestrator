@@ -59,6 +59,15 @@ class EventType(Enum):
     AGENT_CONVERSATION_STARTED = auto()
     AGENT_CONVERSATION_TURN = auto()
     AGENT_CONVERSATION_ENDED = auto()
+    # Unified stream for "decisions the autonomy system made on its
+    # own." Published by:
+    #   - CortexBootstrap when components are skipped/disabled/failed
+    #   - model_router when adaptive routing demotes a backend
+    #   - code_agent when ranked-fix recall injects a block
+    # Payload shape: {"system": "cortex|recall|router", "action": str,
+    # "reason": str, "input": dict}. Renderable as a single Activity
+    # timeline so operators can audit autonomous behavior in one place.
+    CORTEX_DECISION = auto()
 
 
 @dataclass

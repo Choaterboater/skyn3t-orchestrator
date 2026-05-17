@@ -261,6 +261,7 @@ def _maybe_demote(
     rel_path: str,
     stack: str,
     scoreboard: Any,
+    event_bus: Any = None,
 ) -> Tuple[str, Optional[str]]:
     """Demote ``(backend, model)`` if the scoreboard says it's losing.
 
@@ -305,7 +306,46 @@ def _maybe_demote(
         "router: demoting %s→%s for %s (win rate %.2f < %.2f on stack=%s)",
         backend, alt_backend, rel_path, rate, threshold, stack,
     )
+    _publish_router_decision(
+        event_bus,
+        action="demote_backend",
+        reason=(
+            f"win rate {rate:.2f} < threshold {threshold:.2f} "
+            f"on stack={stack}"
+        ),
+        input={
+            "rel_path": rel_path,
+            "stack": stack,
+            "from_backend": backend,
+            "from_model": model,
+            "to_backend": alt_backend,
+            "to_model": alt_model,
+            "rate": rate,
+            "threshold": threshold,
+        },
+    )
     return alt_backend, alt_model
+
+
+def _publish_router_decision(event_bus, **kwargs) -> None:
+    """Emit a CORTEX_DECISION event for an adaptive routing decision.
+
+    Tolerant of a missing event_bus (no-op) — the router is a pure
+    function in many callsites and shouldn't require the orchestrator
+    to be present just to make a routing decision.
+    """
+    if event_bus is None:
+        return
+    try:
+        from skyn3t.intelligence.cortex_decisions import publish_decision
+        publish_decision(
+            event_bus,
+            system="router",
+            source="model_router",
+            **kwargs,
+        )
+    except Exception:
+        logger.debug("router decision publish failed", exc_info=True)
 
 
 def resolve_model_for_file(
@@ -314,6 +354,7 @@ def resolve_model_for_file(
     *,
     stack: Optional[str] = None,
     scoreboard: Any = None,
+    event_bus: Any = None,
 ) -> Tuple[str, Optional[str]]:
     """Pick (backend, model) for a SPECIFIC file inside the code stage.
 
@@ -331,6 +372,10 @@ def resolve_model_for_file(
     additionally filtered through ``_maybe_demote``: a backend that
     has been losing on the supplied stack falls back to the next
     alternative. See module-level doc for env-tuning knobs.
+
+    ``event_bus`` is optional; when supplied, demotion decisions are
+    published as ``CORTEX_DECISION`` events so the Activity timeline
+    can render them alongside other autonomous-system decisions.
     """
     backend, model = _resolve_static(rel_path, stage_name)
     if (
@@ -341,6 +386,7 @@ def resolve_model_for_file(
             return _maybe_demote(
                 backend, model,
                 rel_path=rel_path, stack=stack, scoreboard=scoreboard,
+                event_bus=event_bus,
             )
         except Exception:
             logger.debug("router: adaptive demote failed; falling back", exc_info=True)
