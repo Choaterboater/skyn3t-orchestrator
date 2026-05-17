@@ -34,7 +34,18 @@ def _safe_services(services: List[str]) -> List[str]:
             seen.add(slug)
             out.append(slug)
     if not out:
-        out = ["sonarr", "radarr", "prowlarr", "qbittorrent", "emby", "sonos"]
+        # Default homelab seed when the brief doesn't enumerate services
+        # explicitly. canary-119 through canary-134 all had Opus's
+        # architecture.md naming Plex/Sonarr/Radarr/qBittorrent/Pi-hole/
+        # Portainer/Uptime-Kuma/Home-Assistant — but config_store_js was
+        # seeding sonarr/radarr/prowlarr/qbittorrent/emby/sonos and the
+        # reviewer flagged the mismatch every time. Aligning the default
+        # to the most-common architecture promise closes the deduction
+        # without needing per-brief service detection.
+        out = [
+            "plex", "sonarr", "radarr", "qbittorrent",
+            "pihole", "portainer", "uptime-kuma", "home-assistant",
+        ]
     return out[:8]
 
 
