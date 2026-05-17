@@ -518,11 +518,30 @@ async def apply_targeted_fix(
             continue
 
         if issue.suggested_action == "create_placeholder":
+            # Refuse extension-less paths: writing `ActivityFeed` (no .jsx)
+            # ships a stub alongside the real `ActivityFeed.jsx` and
+            # confuses both Vite and the reviewer. canary-121 shipped two
+            # such ghost files which the reviewer LLM penalized as
+            # "TODO/placeholder leak."  Infer .jsx for components/* paths,
+            # .js otherwise.
+            inferred_path = issue.path
+            if not Path(issue.path).suffix:
+                lower = issue.path.lower()
+                if "/components/" in lower.replace("\\", "/") or "/pages/" in lower:
+                    inferred_path = issue.path + ".jsx"
+                else:
+                    inferred_path = issue.path + ".js"
+                target_path = (scaffold_dir / inferred_path).resolve()
+                try:
+                    target_path.relative_to(scaffold_root)
+                except ValueError:
+                    errors.append(f"Refusing path outside scaffold: {inferred_path!r}")
+                    continue
             if not target_path.exists():
                 target_path.parent.mkdir(parents=True, exist_ok=True)
-                target_path.write_text(_placeholder_for(issue.path), encoding="utf-8")
-                created.append(issue.path)
-                logger.info("Created placeholder: %s", issue.path)
+                target_path.write_text(_placeholder_for(inferred_path), encoding="utf-8")
+                created.append(inferred_path)
+                logger.info("Created placeholder: %s", inferred_path)
             continue
 
         if issue.suggested_action == "regenerate":
