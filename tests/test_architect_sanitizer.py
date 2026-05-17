@@ -22,19 +22,27 @@ NODE_STACK = {
 }
 
 
-def test_replaces_fastapi_with_express() -> None:
-    body = "A React SPA talks to a FastAPI proxy that holds credentials."
+def test_drops_fastapi_sentence() -> None:
+    body = (
+        "A React SPA talks to a FastAPI proxy that holds credentials. "
+        "Health is exposed at /api/health."
+    )
     out = ArchitectAgent._sanitize_architecture_md(body, NODE_STACK)
     assert "FastAPI" not in out
-    assert "Express" in out
+    # The unrelated sentence about health stays.
+    assert "/api/health" in out
 
 
-def test_replaces_postgres_with_better_sqlite3() -> None:
-    body = "Configuration persists to PostgreSQL from first boot."
+def test_drops_postgres_sentence() -> None:
+    body = (
+        "Configuration persists to PostgreSQL from first boot. "
+        "The store survives restarts."
+    )
     out = ArchitectAgent._sanitize_architecture_md(body, NODE_STACK)
     assert "PostgreSQL" not in out
     assert "Postgres" not in out
-    assert "better-sqlite3" in out
+    # The survival sentence stays.
+    assert "survives restarts" in out
 
 
 def test_drops_alembic_sentence_entirely() -> None:
@@ -49,11 +57,32 @@ def test_drops_alembic_sentence_entirely() -> None:
     assert "Migrations run on boot" in out
 
 
-def test_python_version_becomes_node() -> None:
-    body = "API: FastAPI on Python 3.11 with async handlers."
+def test_drops_python_version_sentence() -> None:
+    body = (
+        "API: FastAPI on Python 3.11 with async handlers. "
+        "Routes are versioned under /api/v1."
+    )
     out = ArchitectAgent._sanitize_architecture_md(body, NODE_STACK)
     assert "Python" not in out
-    assert "Node" in out
+    assert "FastAPI" not in out
+    # Unrelated sentence stays.
+    assert "/api/v1" in out
+
+
+def test_drops_franken_prose_components() -> None:
+    """canary-123 regression: substitutions created 'ASGI app served by
+    node', 'eslint + eslint', etc. The sentence-drop approach must NOT
+    produce those — it drops the whole sentence instead.
+    """
+    body = (
+        "ASGI app served by uvicorn behind nginx. "
+        "Express is the actual runtime."
+    )
+    out = ArchitectAgent._sanitize_architecture_md(body, NODE_STACK)
+    assert "ASGI" not in out.lower()
+    assert "uvicorn" not in out
+    # The clean sentence about Express stays.
+    assert "Express is the actual runtime" in out
 
 
 def test_passes_through_when_stack_is_not_node() -> None:
@@ -86,22 +115,21 @@ def test_case_insensitive_match() -> None:
 def test_canary_122_real_world_case() -> None:
     """The exact pattern that scored 49/100 on carnary-122 — overview
     paragraph promises FastAPI proxy + PostgreSQL persistence + REST API.
-    After sanitization the prose should describe the Node stack instead.
-    """
+    After sanitization the offending sentences should be gone."""
     body = (
         "## Overview\n\n"
-        "A self-hosted homelab status dashboard. A React SPA talks "
-        "exclusively to a FastAPI proxy that holds all integration "
-        "credentials server-side, persists configuration to PostgreSQL "
-        "from first boot, and exposes a normalized REST API. "
+        "A self-hosted homelab status dashboard. "
+        "A React SPA talks exclusively to a FastAPI proxy that holds "
+        "all integration credentials server-side. "
+        "Configuration persists to PostgreSQL from first boot. "
         "Schema migrations are managed via Alembic.\n"
     )
     out = ArchitectAgent._sanitize_architecture_md(body, NODE_STACK)
     assert "FastAPI" not in out
     assert "PostgreSQL" not in out
     assert "Alembic" not in out
-    assert "Express" in out
-    assert "better-sqlite3" in out
+    # The opening intro stays.
+    assert "self-hosted homelab status dashboard" in out
 
 
 def test_drops_cloudflare_deploy_mention() -> None:
