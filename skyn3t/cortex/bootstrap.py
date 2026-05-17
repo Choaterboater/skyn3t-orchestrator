@@ -208,6 +208,14 @@ class CortexBootstrap:
         Each entry is constructed inside its own try block so a broken
         constructor (missing optional dep, bad path) downgrades the
         component to ``skipped_reason`` instead of aborting bootstrap.
+
+        When the orchestrator already has a component instance attached
+        (``orchestrator._feature_suggester`` etc.) — typically because
+        an inline ``_start_cortex`` path constructed it earlier — we
+        reuse that instance instead of building a second one. This
+        avoids duplicate event-bus subscriptions during the transition
+        period where some callers wire the cortex inline and some
+        delegate to this bootstrap.
         """
         disabled = _disabled_set()
         all_disabled = "*" in disabled
@@ -216,9 +224,10 @@ class CortexBootstrap:
         projects_root = repo_root / "data" / "projects"
         proposals_root = repo_root / "data" / "proposals"
 
-        specs: List[Tuple[str, Any, Tuple[str, ...], Tuple[str, ...], Tuple[str, ...]]] = [
+        specs: List[Tuple[str, str, Any, Tuple[str, ...], Tuple[str, ...], Tuple[str, ...]]] = [
             (
                 "gated_tuner",
+                "_gated_tuner",
                 lambda: _import_and_build(
                     "skyn3t.cortex.gated_tuner", "GatedTuner",
                     self.event_bus,
@@ -229,6 +238,7 @@ class CortexBootstrap:
             ),
             (
                 "feature_suggester",
+                "_feature_suggester",
                 lambda: _import_and_build(
                     "skyn3t.cortex.feature_suggester", "FeatureSuggester",
                     event_bus=self.event_bus,
@@ -239,6 +249,7 @@ class CortexBootstrap:
             ),
             (
                 "curiosity",
+                "_curiosity",
                 lambda: _import_and_build(
                     "skyn3t.cortex.curiosity", "CuriosityLoop",
                     orchestrator=self.orchestrator, event_bus=self.event_bus,
@@ -249,6 +260,7 @@ class CortexBootstrap:
             ),
             (
                 "review_watcher",
+                "_review_watcher",
                 lambda: _import_and_build(
                     "skyn3t.cortex.review_watcher", "ReviewWatcher",
                     self.event_bus,
@@ -259,6 +271,7 @@ class CortexBootstrap:
             ),
             (
                 "auto_cleanup",
+                "_auto_cleanup",
                 lambda: _import_and_build(
                     "skyn3t.cortex.auto_cleanup", "AutoCleanup",
                     event_bus=self.event_bus,
@@ -272,12 +285,24 @@ class CortexBootstrap:
             ),
         ]
 
-        for name, factory, creates, handles, subs in specs:
+        for name, orch_attr, factory, creates, handles, subs in specs:
             if all_disabled or name in disabled:
                 self._components.append(_Component(
                     name=name, instance=_DisabledMarker(name),
                     creates=creates, handles=handles, subscriptions=subs,
                     skipped_reason=f"disabled via {_DISABLE_ENV}",
+                ))
+                continue
+            existing = getattr(self.orchestrator, orch_attr, None)
+            if existing is not None:
+                # Reuse the inline-constructed instance so we don't
+                # double-subscribe its event handlers. Idempotency of
+                # the component's own ``start()`` (each has a ``_wired``
+                # check) handles the case where it was already started
+                # by the inline path.
+                self._components.append(_Component(
+                    name=name, instance=existing,
+                    creates=creates, handles=handles, subscriptions=subs,
                 ))
                 continue
             try:
@@ -291,6 +316,14 @@ class CortexBootstrap:
                     skipped_reason="construct failed",
                 ))
                 continue
+            # Park the freshly-built instance on the orchestrator so
+            # later code paths (status endpoints, shutdown handlers,
+            # other tests) see it the same way they'd see an inline-
+            # constructed one.
+            try:
+                setattr(self.orchestrator, orch_attr, instance)
+            except Exception:
+                logger.debug("could not bind %s to orchestrator", orch_attr, exc_info=True)
             self._components.append(_Component(
                 name=name, instance=instance,
                 creates=creates, handles=handles, subscriptions=subs,
