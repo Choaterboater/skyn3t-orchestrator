@@ -1584,6 +1584,31 @@ class StudioRunner:
                                 "verdict": verdict,
                                 "command": build_result.get("command"),
                             })
+                            # Phase-2 resolution: if the previous fix
+                            # round stashed a pending build fix, this
+                            # re-verify tells us whether it worked.
+                            pending_build = getattr(self, "_pending_build_fix", None)
+                            if pending_build:
+                                self._pending_build_fix = None
+                                prior_sig = pending_build.get("error_signature") or ""
+                                if prior_sig:
+                                    try:
+                                        from skyn3t.memory.store import MemoryStore
+                                        eid = await MemoryStore().mark_latest_unresolved_fix_worked(
+                                            prior_sig, verdict == "yes",
+                                        )
+                                        if eid:
+                                            logger.info(
+                                                "build_verifier: resolved fix %s for %s → worked=%s",
+                                                pending_build.get("fix_applied"),
+                                                prior_sig,
+                                                verdict == "yes",
+                                            )
+                                    except Exception:
+                                        logger.debug(
+                                            "mark_latest_unresolved_fix_worked failed (build)",
+                                            exc_info=True,
+                                        )
                             if verdict == "yes":
                                 self._append_history(
                                     manifest,
@@ -2073,6 +2098,38 @@ class StudioRunner:
         # ── Phase 1: targeted fix (preferred) ────────────────────────────
         issues = _parse_build_errors(stderr, stdout)
         if issues:
+            # Derive a stable build-error signature so the experience
+            # index can rank fixes for this exact class of build break.
+            build_signature: Optional[str] = None
+            try:
+                from skyn3t.intelligence.error_signatures import (
+                    signature_for_build_issues,
+                )
+                build_signature = signature_for_build_issues(issues, source="build")
+            except Exception:
+                logger.debug("build signature derivation failed", exc_info=True)
+            # Publish a structured event so the ingestor records this
+            # build-time failure into the experience_index BEFORE the
+            # fix runs. ingest_project_event will write the row with
+            # fix_applied=None; the resolver fills it in below.
+            if build_signature:
+                try:
+                    self._publish(
+                        "PROJECT_STAGE_FAILED",
+                        {
+                            "slug": getattr(self, "_current_slug", "?"),
+                            "project_slug": getattr(self, "_current_slug", "?"),
+                            "stage": "build_verifier",
+                            "stack": stack,
+                            "error_signature": build_signature,
+                            "error": (log_tail or "")[:300],
+                        },
+                    )
+                except Exception:
+                    logger.debug(
+                        "publish PROJECT_STAGE_FAILED for build failed",
+                        exc_info=True,
+                    )
             client = LLMClient(event_bus=self.event_bus, caller_name="build_fix")
             try:
                 result = await apply_targeted_fix(
@@ -2093,6 +2150,17 @@ class StudioRunner:
                     result.files_created,
                     result.errors,
                 )
+                # Record this fix attempt against the build signature
+                # so the resolver (in the build-verifier retry path
+                # below) can mark it worked/didn't on the next pass.
+                if build_signature and result.fix_label:
+                    try:
+                        self._pending_build_fix = {
+                            "error_signature": build_signature,
+                            "fix_applied": result.fix_label,
+                        }
+                    except Exception:
+                        pass
                 return True
             # If targeted fix produced nothing, fall through to heuristic path
 

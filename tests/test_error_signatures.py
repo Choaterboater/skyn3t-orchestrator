@@ -11,6 +11,8 @@ from __future__ import annotations
 import pytest
 
 from skyn3t.intelligence.error_signatures import (
+    signature_for_build_issue,
+    signature_for_build_issues,
     signature_for_finding,
     signature_for_findings,
 )
@@ -92,3 +94,91 @@ def test_findings_empty_list_returns_none():
 def test_findings_all_unnamed_returns_none():
     findings = [{"severity": "blocker"}, {"file": "x.js"}]
     assert signature_for_findings(findings) is None
+
+
+# ---------------------------------------------------------------------
+# Build-error signatures (parsed from build logs, not from findings)
+# ---------------------------------------------------------------------
+
+
+class _BuildIssue:
+    """FileIssue-shaped duck for tests — no need to import the real
+    dataclass since the helper duck-types via getattr."""
+
+    def __init__(self, path, error_message):
+        self.path = path
+        self.error_message = error_message
+
+
+def test_build_signature_missing_module():
+    issue = _BuildIssue(path="src/App.jsx", error_message="Missing module: react-helmet")
+    assert signature_for_build_issue(issue) == "build:missing_module:App.jsx"
+
+
+def test_build_signature_syntax_error():
+    issue = _BuildIssue(
+        path="src/main.jsx",
+        error_message="Line 12, col 3: Unexpected token '}'",
+    )
+    assert signature_for_build_issue(issue) == "build:syntax_error:main.jsx"
+
+
+def test_build_signature_missing_export():
+    issue = _BuildIssue(
+        path="src/components/Foo.jsx",
+        error_message="Missing export (line 4, col 8)",
+    )
+    assert signature_for_build_issue(issue) == "build:missing_export:Foo.jsx"
+
+
+def test_build_signature_type_error():
+    issue = _BuildIssue(
+        path="src/App.tsx",
+        error_message="Cannot find name 'window'",
+    )
+    assert signature_for_build_issue(issue) == "build:type_error:App.tsx"
+
+
+def test_build_signature_unknown_message_returns_none():
+    """Unrecognized error messages must NOT bucket under ``unknown``."""
+    issue = _BuildIssue(path="src/App.jsx", error_message="weird thing happened")
+    assert signature_for_build_issue(issue) is None
+
+
+def test_build_signature_dict_input_supported():
+    """Helper duck-types on getattr OR dict — both must work."""
+    assert (
+        signature_for_build_issue(
+            {"path": "src/App.jsx", "error_message": "Missing module: x"},
+        )
+        == "build:missing_module:App.jsx"
+    )
+
+
+def test_build_signature_no_path_returns_category_only():
+    issue = _BuildIssue(path="", error_message="SyntaxError on something")
+    assert signature_for_build_issue(issue) == "build:syntax_error"
+
+
+def test_build_signatures_picks_first_classifiable():
+    """When the first issue is unclassifiable, fall through to the
+    next — build logs usually have one root cause and several
+    downstream notes."""
+    unclassifiable = _BuildIssue(path="a.js", error_message="weird noise")
+    classifiable = _BuildIssue(path="b.js", error_message="Missing module: foo")
+    assert (
+        signature_for_build_issues([unclassifiable, classifiable])
+        == "build:missing_module:b.js"
+    )
+
+
+def test_build_signatures_returns_none_for_all_unclassifiable():
+    issues = [
+        _BuildIssue(path="a.js", error_message="weird"),
+        _BuildIssue(path="b.js", error_message="more weird"),
+    ]
+    assert signature_for_build_issues(issues) is None
+
+
+def test_build_signatures_empty_input_returns_none():
+    assert signature_for_build_issues([]) is None
