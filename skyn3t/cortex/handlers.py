@@ -156,7 +156,7 @@ def install_handlers(orchestrator) -> None:
             input_data: Dict[str, Any] = {
                 "max_files": max(1, int(payload.get("limit") or 5)),
             }
-            if repo:  # prefer explicit repo over topic-based search
+            if repo:
                 input_data["mode"] = "single_repo"
                 input_data["repo"] = repo
             else:
