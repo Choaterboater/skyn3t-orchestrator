@@ -60,6 +60,13 @@ class BuildPatternStats:
     4}`` means this shape lost the router mount four times). The planner
     reads tags to pre-warn the CodeAgent on shapes that historically fail
     a specific way.
+
+    ``by_backend`` is a per-LLM-backend tally on the same shape — used
+    by the adaptive router in ``model_router`` to demote a backend that
+    keeps losing on a given (stack, shape). Schema:
+    ``{"kimi_cli": {"success": 4, "failure": 6, "skipped": 1}, ...}``.
+    Backward-compatible: rows persisted before this field existed load
+    with an empty dict.
     """
 
     stack: str
@@ -68,6 +75,7 @@ class BuildPatternStats:
     failure: int = 0
     skipped: int = 0
     tags: Dict[str, int] = field(default_factory=dict)
+    by_backend: Dict[str, Dict[str, int]] = field(default_factory=dict)
     last_seen_at: float = field(default_factory=time.time)
 
     @property
@@ -82,6 +90,46 @@ class BuildPatternStats:
             return 0.0
         return self.success / denom
 
+    def record_backend(self, backend: str, verdict: str) -> None:
+        """Tally an outcome for one backend on this (stack, shape).
+
+        ``verdict`` is normalized the same way as the top-level
+        ``record()`` (``yes`` | ``no`` | ``skipped``). Empty/bad
+        verdicts are recorded as ``skipped`` to avoid polluting the
+        success-rate denominator.
+        """
+        b = (backend or "").strip()
+        if not b:
+            return
+        v = (verdict or "").lower().strip()
+        if v not in ("yes", "no", "skipped"):
+            v = "skipped"
+        slot = self.by_backend.setdefault(b, {"success": 0, "failure": 0, "skipped": 0})
+        if v == "yes":
+            slot["success"] = slot.get("success", 0) + 1
+        elif v == "no":
+            slot["failure"] = slot.get("failure", 0) + 1
+        else:
+            slot["skipped"] = slot.get("skipped", 0) + 1
+
+    def backend_success_rate(
+        self, backend: str, *, min_samples: int = 1,
+    ) -> Optional[float]:
+        """Return win rate for ``backend`` on this (stack, shape), or
+        ``None`` when there aren't enough graded samples to make a call.
+
+        ``min_samples`` is the threshold for ``success + failure`` (NOT
+        total) — skipped attempts don't count toward the denominator,
+        same as the top-level ``success_rate`` property.
+        """
+        slot = self.by_backend.get((backend or "").strip())
+        if not slot:
+            return None
+        denom = int(slot.get("success", 0)) + int(slot.get("failure", 0))
+        if denom < max(1, int(min_samples)):
+            return None
+        return slot["success"] / denom
+
     def to_dict(self) -> Dict:
         return {
             "stack": self.stack,
@@ -90,6 +138,7 @@ class BuildPatternStats:
             "failure": self.failure,
             "skipped": self.skipped,
             "tags": dict(self.tags),
+            "by_backend": {b: dict(slot) for b, slot in self.by_backend.items()},
             "last_seen_at": self.last_seen_at,
         }
 
@@ -103,6 +152,19 @@ class BuildPatternStats:
                     tags[str(k)] = int(v)
                 except (TypeError, ValueError):
                     continue
+        raw_by_backend = data.get("by_backend") or {}
+        by_backend: Dict[str, Dict[str, int]] = {}
+        if isinstance(raw_by_backend, dict):
+            for b, slot in raw_by_backend.items():
+                if not isinstance(slot, dict):
+                    continue
+                cleaned: Dict[str, int] = {}
+                for k in ("success", "failure", "skipped"):
+                    try:
+                        cleaned[k] = int(slot.get(k, 0))
+                    except (TypeError, ValueError):
+                        cleaned[k] = 0
+                by_backend[str(b)] = cleaned
         return cls(
             stack=str(data.get("stack", "")),
             shape=[str(p) for p in (data.get("shape") or [])],
@@ -110,6 +172,7 @@ class BuildPatternStats:
             failure=int(data.get("failure", 0)),
             skipped=int(data.get("skipped", 0)),
             tags=tags,
+            by_backend=by_backend,
             last_seen_at=float(data.get("last_seen_at", time.time())),
         )
 
@@ -225,6 +288,43 @@ class BuildPatternScoreboard:
             if self._unflushed >= self._flush_every:
                 self._flush_locked()
 
+    def record_backend(
+        self,
+        stack: str,
+        shape: Iterable[str],
+        backend: str,
+        verdict: str,
+    ) -> None:
+        """Tally an outcome attributed to one LLM backend on this shape.
+
+        Mirrors ``record()`` but partitions by backend so the adaptive
+        router (``model_router.resolve_model_for_file``) can decide
+        whether a backend is winning or losing on a given (stack, shape).
+
+        Independent of the top-level success/failure counters: a build
+        can succeed overall AND have a per-file failure attributed to
+        a specific backend (the one that took the slow path before the
+        retry won). Skipped/unknown verdicts are recorded as ``skipped``
+        and don't move the denominator.
+        """
+        if not stack or not backend:
+            return
+        shape_list = sorted({str(p).strip() for p in shape if str(p).strip()})
+        if not shape_list:
+            return
+        h = self._shape_hash(shape_list)
+        with self._lock:
+            bucket = self._stats.setdefault(stack, {})
+            stats = bucket.get(h)
+            if stats is None:
+                stats = BuildPatternStats(stack=stack, shape=shape_list)
+                bucket[h] = stats
+            stats.record_backend(backend, verdict)
+            stats.last_seen_at = time.time()
+            self._unflushed += 1
+            if self._unflushed >= self._flush_every:
+                self._flush_locked()
+
     def record_tag(self, stack: str, shape: Iterable[str], tag: str) -> None:
         """Increment a named occurrence tag on a (stack, shape) bucket.
 
@@ -279,6 +379,38 @@ class BuildPatternScoreboard:
             if stats is None:
                 return 0
             return int(stats.tags.get(tag, 0))
+
+    def backend_rate(
+        self,
+        stack: str,
+        backend: str,
+        *,
+        min_samples: int = 5,
+    ) -> Optional[float]:
+        """Aggregate win rate for ``backend`` across every shape of ``stack``.
+
+        The adaptive router doesn't care about per-shape granularity —
+        it asks "for THIS stack, is this backend winning more often than
+        not?" Aggregates ``success`` and ``failure`` from every shape's
+        ``by_backend[backend]`` slot, returns ``None`` when fewer than
+        ``min_samples`` graded attempts exist (don't demote on noise).
+        """
+        if not stack or not backend:
+            return None
+        with self._lock:
+            bucket = self._stats.get(stack, {})
+            wins = 0
+            losses = 0
+            for s in bucket.values():
+                slot = s.by_backend.get(backend)
+                if not slot:
+                    continue
+                wins += int(slot.get("success", 0))
+                losses += int(slot.get("failure", 0))
+        denom = wins + losses
+        if denom < max(1, int(min_samples)):
+            return None
+        return wins / denom
 
     def best_shape(self, stack: str, *, min_samples: int = 3) -> Optional[BuildPatternStats]:
         """Return the highest-success-rate shape for the stack with at

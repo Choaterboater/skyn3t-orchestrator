@@ -764,7 +764,25 @@ class StudioRunner:
                                 except Exception:
                                     pass
                                 shape = self._scaffold_shape(scaffold_dir)
-                            get_default_scoreboard().record(stack, shape, "no")
+                            sb = get_default_scoreboard()
+                            sb.record(stack, shape, "no")
+                            # Attribute the failure to the backend the
+                            # code stage was running on so the adaptive
+                            # router (resolve_model_for_file) can demote
+                            # backends that consistently lose for this
+                            # stack. resolve_model honors per-stage env
+                            # overrides — same source of truth used at
+                            # construction time.
+                            try:
+                                from skyn3t.core.model_router import resolve_model
+                                stage_backend, _ = resolve_model("code")
+                                if stage_backend and stack and shape:
+                                    sb.record_backend(stack, shape, stage_backend, "no")
+                            except Exception:
+                                logger.debug(
+                                    "scoreboard record_backend on timeout failed",
+                                    exc_info=True,
+                                )
                         except Exception:
                             logger.exception("scoreboard record on stage timeout failed")
                     break
@@ -825,7 +843,18 @@ class StudioRunner:
                                 except Exception:
                                     pass
                                 shape = self._scaffold_shape(scaffold_dir)
-                            get_default_scoreboard().record(stack, shape, "no")
+                            sb = get_default_scoreboard()
+                            sb.record(stack, shape, "no")
+                            try:
+                                from skyn3t.core.model_router import resolve_model
+                                stage_backend, _ = resolve_model("code")
+                                if stage_backend and stack and shape:
+                                    sb.record_backend(stack, shape, stage_backend, "no")
+                            except Exception:
+                                logger.debug(
+                                    "scoreboard record_backend on error failed",
+                                    exc_info=True,
+                                )
                         except Exception:
                             logger.exception("scoreboard record on stage error failed")
                     break
@@ -1619,6 +1648,23 @@ class StudioRunner:
                         shape = self._scaffold_shape(scaffold_dir)
                         sb = get_default_scoreboard()
                         sb.record(stack, shape, str(verdict or "no"))
+                        # Attribute the verifier verdict to the backend
+                        # that ran the code stage — the same source of
+                        # truth (resolve_model) the agent itself used.
+                        # Lets the adaptive router learn from real
+                        # verifier outcomes, not just stage exceptions.
+                        try:
+                            from skyn3t.core.model_router import resolve_model
+                            stage_backend, _ = resolve_model("code")
+                            if stage_backend and stack and shape:
+                                sb.record_backend(
+                                    stack, shape, stage_backend, str(verdict or "no"),
+                                )
+                        except Exception:
+                            logger.debug(
+                                "scoreboard record_backend on verifier verdict failed",
+                                exc_info=True,
+                            )
                         sb.flush()
                     except Exception:
                         logger.exception("build_pattern record failed")
