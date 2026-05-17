@@ -552,11 +552,28 @@ async def apply_targeted_fix(
 
         if issue.suggested_action == "regenerate":
             if not target_path.exists():
-                # Create placeholder instead of failing
-                logger.info("Missing file %s, creating placeholder", issue.path)
+                # Create placeholder instead of failing.
+                # Mirror the create_placeholder branch's extension-inference
+                # so ./components/ActivityFeed (no ext) becomes
+                # ActivityFeed.jsx, not a literal extension-less file.
+                # canary-121/127/128/129 all shipped these ghosts.
+                inferred_path = issue.path
+                if not Path(issue.path).suffix:
+                    lower = issue.path.lower().replace("\\", "/")
+                    if "/components/" in lower or "/pages/" in lower:
+                        inferred_path = issue.path + ".jsx"
+                    else:
+                        inferred_path = issue.path + ".js"
+                    target_path = (scaffold_dir / inferred_path).resolve()
+                    try:
+                        target_path.relative_to(scaffold_root)
+                    except ValueError:
+                        errors.append(f"Refusing path outside scaffold: {inferred_path!r}")
+                        continue
+                logger.info("Missing file %s, creating placeholder", inferred_path)
                 target_path.parent.mkdir(parents=True, exist_ok=True)
-                target_path.write_text(_placeholder_for(issue.path), encoding="utf-8")
-                created.append(issue.path)
+                target_path.write_text(_placeholder_for(inferred_path), encoding="utf-8")
+                created.append(inferred_path)
                 continue
 
             if llm_client is None:
