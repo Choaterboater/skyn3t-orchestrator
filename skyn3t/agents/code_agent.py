@@ -1973,21 +1973,21 @@ class CodeAgent(BaseAgent):
         ext = rel_path.rsplit(".", 1)[-1].lower()
         if ext in ("jsx", "tsx"):
             return (
-                f"// TODO[skyn3t]: backfilled stub for missing import.\n"
+                f"// @skyn3t-backfill-stub: for missing import.\n"
                 f"export default function {name}() {{\n"
                 f"  return null;\n"
                 f"}}\n"
             )
         if ext in ("ts", "tsx"):
             return (
-                f"// TODO[skyn3t]: backfilled stub for missing import.\n"
+                f"// @skyn3t-backfill-stub: for missing import.\n"
                 f"export default {{}};\n"
             )
         if ext in ("css", "scss"):
-            return f"/* TODO[skyn3t]: backfilled stub for missing import ({rel_path}) */\n"
+            return f"/* @skyn3t-backfill-stub: for missing import ({rel_path}) */\n"
         # js / mjs / cjs / fallback
         return (
-            f"// TODO[skyn3t]: backfilled stub for missing import.\n"
+            f"// @skyn3t-backfill-stub: for missing import.\n"
             f"export default {{}};\n"
         )
 
