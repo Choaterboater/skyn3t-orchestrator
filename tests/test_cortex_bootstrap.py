@@ -238,6 +238,78 @@ async def test_stop_is_idempotent_before_start(monkeypatch):
 
 
 # ---------------------------------------------------------------------
+# Reuse of inline-constructed components
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_register_reuses_existing_orchestrator_attribute(monkeypatch):
+    """If orchestrator already has e.g. ``_feature_suggester`` set by
+    an inline _start_cortex path, the bootstrap must reuse it instead
+    of building a parallel instance that double-subscribes."""
+
+    class _InlineFeatureSuggester:
+        def __init__(self):
+            self.start_calls = 0
+
+        def start(self):
+            self.start_calls += 1
+
+    orch = _fake_orchestrator()
+    orch._feature_suggester = _InlineFeatureSuggester()
+    orch._gated_tuner = None  # explicit None still means "no inline instance"
+
+    # Make the other components no-op so the test focuses on reuse.
+    def _replacement(self):
+        from skyn3t.cortex import bootstrap as bs
+
+        existing = getattr(self.orchestrator, "_feature_suggester", None)
+        self._components.append(bs._Component(
+            name="feature_suggester", instance=existing,
+        ))
+
+    monkeypatch.setattr(CortexBootstrap, "_register_default_components", _replacement)
+    _stub_install_handlers(monkeypatch)
+
+    cb = CortexBootstrap(orch)
+    await cb.start()
+
+    # Started exactly once via the bootstrap call.
+    assert orch._feature_suggester.start_calls == 1
+    # Should still be the same instance — no parallel construction.
+    assert cb._components[0].instance is orch._feature_suggester
+
+
+@pytest.mark.asyncio
+async def test_register_parks_new_instance_on_orchestrator(monkeypatch):
+    """When the bootstrap DOES construct a fresh component, it should
+    bind it to the orchestrator so other code paths can see it."""
+
+    class _NewlyConstructed:
+        def start(self):
+            self.started = True
+
+    def _replacement(self):
+        from skyn3t.cortex import bootstrap as bs
+
+        existing = getattr(self.orchestrator, "_gated_tuner", None)
+        if existing is None:
+            existing = _NewlyConstructed()
+            setattr(self.orchestrator, "_gated_tuner", existing)
+        self._components.append(bs._Component(name="gated_tuner", instance=existing))
+
+    monkeypatch.setattr(CortexBootstrap, "_register_default_components", _replacement)
+    _stub_install_handlers(monkeypatch)
+
+    orch = _fake_orchestrator()
+    assert getattr(orch, "_gated_tuner", None) is None
+
+    cb = CortexBootstrap(orch)
+    await cb.start()
+    assert orch._gated_tuner is cb._components[0].instance
+
+
+# ---------------------------------------------------------------------
 # Status payload
 # ---------------------------------------------------------------------
 
