@@ -637,6 +637,67 @@ class MemoryStore:
         ranked.sort(key=lambda r: (r["rate"], r["attempts"]), reverse=True)
         return ranked[: max(0, int(limit))]
 
+    async def anti_patterns_for_signature(
+        self,
+        error_signature: str,
+        *,
+        min_attempts: int = 2,
+        max_rate: float = 0.34,
+        limit: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """Return fixes that historically FAILED for this signature.
+
+        Symmetric to ``rank_fixes_for_signature`` but reads the loser
+        end of the rank: a fix is an anti-pattern when it has
+        ``>= min_attempts`` graded tries AND a win rate ``<= max_rate``
+        (default thresholds: at least 2 attempts, ≤ 34% success).
+
+        Result entries are sorted by rate ASCENDING (worst first),
+        breaking ties by attempts descending so a much-tried failure
+        wins over a barely-tried one at the same rate.
+
+        Used by the CodeAgent prompt to inject an "avoid these"
+        section paired with the ranked-fix winners — same signature,
+        opposite end of the distribution.
+        """
+        sig = (error_signature or "").strip()
+        if not sig:
+            return []
+        async with self._lock:
+            async with await self._session() as session:
+                result = await session.execute(
+                    select(ExperienceIndex).where(
+                        ExperienceIndex.error_signature == sig,
+                        ExperienceIndex.fix_applied.is_not(None),
+                        ExperienceIndex.fix_worked.is_not(None),
+                    )
+                )
+                rows = result.scalars().all()
+        if not rows:
+            return []
+        tallies: Dict[str, Dict[str, int]] = {}
+        for row in rows:
+            slot = tallies.setdefault(
+                str(row.fix_applied), {"wins": 0, "attempts": 0},
+            )
+            slot["attempts"] += 1
+            if row.fix_worked:
+                slot["wins"] += 1
+        min_a = max(1, int(min_attempts))
+        cap_rate = float(max_rate)
+        losers = []
+        for label, stats in tallies.items():
+            rate = stats["wins"] / stats["attempts"]
+            if stats["attempts"] >= min_a and rate <= cap_rate:
+                losers.append({
+                    "fix_applied": label,
+                    "wins": stats["wins"],
+                    "attempts": stats["attempts"],
+                    "rate": rate,
+                })
+        losers.sort(key=lambda r: (r["rate"], -r["attempts"]))
+        return losers[: max(0, int(limit))]
+
     # ------------------------------------------------------------------
     # System logs
     # ------------------------------------------------------------------

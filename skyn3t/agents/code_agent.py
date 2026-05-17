@@ -646,36 +646,61 @@ class CodeAgent(BaseAgent):
                     store.rank_fixes_for_signature(sig, limit=3),
                     timeout=2.0,
                 )
+                anti = await asyncio.wait_for(
+                    store.anti_patterns_for_signature(sig, limit=3),
+                    timeout=2.0,
+                )
             except Exception:
                 logger.debug(
                     "rank_fixes_for_signature failed for %s", sig, exc_info=True,
                 )
                 continue
-            if not ranked:
+            if not ranked and not anti:
                 continue
-            lines = [
-                f"  - `{r['fix_applied']}` "
-                f"(worked {r['wins']}/{r['attempts']}, "
-                f"rate {r['rate']:.0%})"
-                for r in ranked
-            ]
-            blocks.append(f"For signature `{sig}`:\n" + "\n".join(lines))
+            section_lines: List[str] = [f"For signature `{sig}`:"]
+            if ranked:
+                section_lines.append("  Winners (prefer):")
+                section_lines.extend(
+                    f"    - `{r['fix_applied']}` "
+                    f"(worked {r['wins']}/{r['attempts']}, "
+                    f"rate {r['rate']:.0%})"
+                    for r in ranked
+                )
+            if anti:
+                section_lines.append("  Anti-patterns (avoid):")
+                section_lines.extend(
+                    f"    - `{r['fix_applied']}` "
+                    f"(failed {r['attempts'] - r['wins']}/{r['attempts']}, "
+                    f"rate {r['rate']:.0%})"
+                    for r in anti
+                )
+            blocks.append("\n".join(section_lines))
             # Audit-stream entry so operators can see the recall
             # influencing the build prompt, not just the static log.
             try:
                 from skyn3t.intelligence.cortex_decisions import publish_decision
-                top = ranked[0]
+                top = ranked[0] if ranked else None
+                worst = anti[0] if anti else None
+                reason_parts: List[str] = []
+                if top:
+                    reason_parts.append(
+                        f"top fix `{top['fix_applied']}` rated "
+                        f"{top['wins']}/{top['attempts']}"
+                    )
+                if worst:
+                    reason_parts.append(
+                        f"avoid `{worst['fix_applied']}` "
+                        f"({worst['attempts'] - worst['wins']}/{worst['attempts']} failed)"
+                    )
                 publish_decision(
                     self.event_bus,
                     system="recall",
                     action="inject_ranked_fix",
-                    reason=(
-                        f"top fix `{top['fix_applied']}` rated "
-                        f"{top['wins']}/{top['attempts']} for {sig}"
-                    ),
+                    reason=f"{'; '.join(reason_parts)} for {sig}",
                     input={
                         "signature": sig,
                         "fixes": ranked,
+                        "anti_patterns": anti,
                     },
                     source=self.name,
                 )
