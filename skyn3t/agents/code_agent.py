@@ -1879,6 +1879,16 @@ class CodeAgent(BaseAgent):
         except Exception:
             logger.exception("backfill unresolved imports failed (non-fatal)")
 
+        # Strip declared-but-unused deps from package.json files. Every
+        # canary 119-136 had the reviewer flag "better-sqlite3 declared
+        # but never imported" as architecture-vs-scaffold drift (~5pt).
+        # Rather than retrofit sqlite into config-store.js (heavy lift),
+        # remove the unused declaration so the manifest matches reality.
+        try:
+            self._strip_unused_package_deps(out_dir)
+        except Exception:
+            logger.debug("strip-unused-deps failed (non-fatal)", exc_info=True)
+
         try:
             await self.share_learning(
                 f"scaffold: {len(files_written)} files for brief",
@@ -2132,6 +2142,95 @@ class CodeAgent(BaseAgent):
             f"// @skyn3t-backfill-stub: for missing import.\n"
             f"export default {{}};\n"
         )
+
+    # Packages we WILL strip from a package.json if no source file imports
+    # them. Conservative whitelist: only deps that historically get
+    # declared by ArchitectAgent (via tech_stack.json picks) but
+    # CodeAgent's actual scaffold doesn't use. Frameworks/runtimes are
+    # never stripped — even if not directly imported, build tools may
+    # consume them.
+    _STRIPPABLE_UNUSED_DEPS = frozenset({
+        "better-sqlite3", "sqlite3", "sqlite",
+        "pg", "postgres", "@vercel/postgres",
+        "mongodb", "mongoose",
+        "@prisma/client", "prisma",
+        "drizzle-orm",
+        "node-cron", "croner", "agenda",
+    })
+
+    @classmethod
+    def _strip_unused_package_deps(cls, out_dir) -> None:
+        """Remove declared-but-never-imported deps from package.json.
+
+        Walks each non-vendor package.json under out_dir. For every
+        strippable dep, checks the scaffold's source for an import or
+        require of that package. If absent, removes the dep from
+        dependencies/devDependencies. Leaves package-lock.json
+        untouched — operator can run `npm install` again to reconcile.
+        """
+        from pathlib import Path as _Path
+        import json as _json
+        import re as _RE
+        out_dir = _Path(out_dir).resolve()
+
+        # Build the source body once (skipping node_modules / dist etc.)
+        skip = {"node_modules", "dist", "build", ".next", ".cache", ".git"}
+        source_chunks: list[str] = []
+        for path in out_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            if any(part in skip for part in path.relative_to(out_dir).parts):
+                continue
+            if path.suffix.lower() not in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+                continue
+            try:
+                source_chunks.append(path.read_text(encoding="utf-8", errors="ignore"))
+            except OSError:
+                continue
+        source_blob = "\n".join(source_chunks)
+
+        def _is_imported(pkg: str) -> bool:
+            esc = _RE.escape(pkg)
+            patterns = [
+                rf"require\s*\(\s*['\"]{esc}['\"]",
+                rf"from\s+['\"]{esc}['\"]",
+                rf"import\s*\(\s*['\"]{esc}['\"]",
+            ]
+            return any(_RE.search(p, source_blob) for p in patterns)
+
+        for pkg_path in out_dir.rglob("package.json"):
+            try:
+                if any(part in skip for part in pkg_path.relative_to(out_dir).parts):
+                    continue
+            except ValueError:
+                continue
+            try:
+                with open(pkg_path, "r", encoding="utf-8") as fh:
+                    data = _json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            mutated = False
+            for section_key in ("dependencies", "devDependencies"):
+                section = data.get(section_key)
+                if not isinstance(section, dict):
+                    continue
+                for name in list(section.keys()):
+                    if name in cls._STRIPPABLE_UNUSED_DEPS and not _is_imported(name):
+                        section.pop(name, None)
+                        mutated = True
+                        logger.info(
+                            "Stripped unused dep %s from %s",
+                            name, pkg_path.relative_to(out_dir).as_posix(),
+                        )
+            if mutated:
+                try:
+                    with open(pkg_path, "w", encoding="utf-8") as fh:
+                        _json.dump(data, fh, indent=2)
+                        fh.write("\n")
+                except OSError:
+                    logger.warning("could not write stripped package.json: %s", pkg_path)
 
     @staticmethod
     def _ensure_legacy_frontend_aliases(out_dir, files_written: list[str], brief: str) -> list[str]:
