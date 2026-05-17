@@ -506,6 +506,22 @@ async def apply_targeted_fix(
     # Resolve once so containment checks below have a stable parent.
     scaffold_root = scaffold_dir.resolve()
 
+    # Infer stack from scaffold layout when caller didn't pass one. All
+    # runner callers (consistency_reviewer fix loop, contract_verifier
+    # fix loop, integration fix round) call without `stack`, which made
+    # the manifest_for-first placeholder path silently fall back to the
+    # 141-byte stub for every ActivityFeed/ServiceDetail upgrade.
+    if not stack:
+        try:
+            if (scaffold_dir / "vite.config.js").exists() or (scaffold_dir / "vite.config.ts").exists():
+                stack = "react_vite"
+            elif (scaffold_dir / "next.config.js").exists() or (scaffold_dir / "next.config.ts").exists() or (scaffold_dir / "app").is_dir():
+                stack = "next"
+            elif (scaffold_dir / "package.json").exists():
+                stack = "react_vite"  # node default
+        except OSError:
+            stack = ""
+
     for issue in issues:
         # Defense in depth — the LLM (and upstream regex-based extractors)
         # can return ``../../../repo/app/index.html`` or absolute paths.
