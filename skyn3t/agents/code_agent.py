@@ -1088,6 +1088,50 @@ class CodeAgent(BaseAgent):
             else:
                 file_specs = file_specs[:MAX_FILES]
 
+            # Component breakdown: if Designer produced a structured
+            # component_file_plan.json (#113), merge those component files
+            # into the file_specs list. Small per-file generations succeed
+            # where one massive App.jsx call times out. We extend rather
+            # than replace because the original file_specs still includes
+            # config files (package.json, vite.config.js, etc) that we
+            # need.
+            try:
+                plan_path = artifact_dir / "component_file_plan.json"
+                if plan_path.is_file():
+                    import json as _json_plan
+                    plan_data = _json_plan.loads(plan_path.read_text(encoding="utf-8"))
+                    existing_paths = {
+                        (s.get("path") or "").strip()
+                        for s in file_specs
+                        if isinstance(s, dict)
+                    }
+                    added = 0
+                    for entry in (plan_data.get("files") or []):
+                        if not isinstance(entry, dict):
+                            continue
+                        path = str(entry.get("path") or "").strip()
+                        purpose = str(entry.get("purpose") or "").strip()
+                        if not path or not purpose:
+                            continue
+                        if path in existing_paths:
+                            continue
+                        props = entry.get("props") or []
+                        if isinstance(props, list) and props:
+                            purpose = (
+                                f"{purpose} Props: {', '.join(str(p) for p in props)}."
+                            )
+                        file_specs.append({"path": path, "purpose": purpose})
+                        existing_paths.add(path)
+                        added += 1
+                        if len(file_specs) >= MAX_FILES:
+                            break
+                    if added:
+                        await self.think(
+                            f"merged {added} component file(s) from component_file_plan.json"
+                        )
+            except Exception:
+                logger.debug("component_file_plan merge failed", exc_info=True)
+
             # ── Phase 2: build one file at a time ───────────────────────
             file_index = "\n".join(
                 f"- {(s.get('path') or '').strip()}: {(s.get('purpose') or '').strip()}"
@@ -2047,6 +2091,112 @@ class CodeAgent(BaseAgent):
 
                     return rel, (body_local or ""), target
 
+            async def _build_one_monitored(
+                i: int, rel: str, purpose: str, target: "_Path",
+            ) -> Tuple[str, str, "_Path"]:
+                """MONITOR-wrapped version of _build_one.
+
+                Two protections on top of the existing retry tiers:
+                1. Hard wall-clock timeout — 900s. Even if every CLI
+                   plus every OpenRouter retry hangs, the file
+                   eventually returns (with a placeholder) instead of
+                   stalling the entire stage.
+                2. One per-file final retry via OpenRouter — if
+                   _build_one raises or returns an empty body, we run
+                   ONE more call straight to Owl Alpha with a tight
+                   focused prompt. Cheaper + simpler than letting the
+                   stage timeout cascade.
+
+                Stall detection happens implicitly: when wait_for
+                triggers, _build_one is cancelled and we move to the
+                per-file retry. No "monitor task" needs to poll
+                progress — asyncio handles the cancellation.
+                """
+                import asyncio as _asyncio_mon
+                _STAGE_WALL_CLOCK = 900.0
+                try:
+                    return await _asyncio_mon.wait_for(
+                        _build_one(i, rel, purpose, target),
+                        timeout=_STAGE_WALL_CLOCK,
+                    )
+                except _asyncio_mon.TimeoutError:
+                    logger.warning(
+                        "PER-FILE WALL-CLOCK timeout for %s after %.0fs — "
+                        "running last-resort OpenRouter retry",
+                        rel, _STAGE_WALL_CLOCK,
+                    )
+                except Exception:
+                    logger.warning(
+                        "_build_one raised for %s — running last-resort OpenRouter retry",
+                        rel, exc_info=True,
+                    )
+
+                # Last-resort retry — straight to OpenRouter / Owl Alpha,
+                # short focused prompt. Bypasses the CLI chain entirely
+                # because by this point we know the CLIs aren't getting
+                # this file done. Capped at 60s.
+                import os as _os_lr
+                _or_key_lr = _os_lr.environ.get("OPENROUTER_API_KEY")
+                if not _or_key_lr:
+                    try:
+                        from skyn3t.config.settings import get_settings as _gs_lr
+                        _or_key_lr = getattr(_gs_lr(), "openrouter_api_key", None)
+                        if _or_key_lr:
+                            _os_lr.environ.setdefault("OPENROUTER_API_KEY", _or_key_lr)
+                    except Exception:
+                        _or_key_lr = None
+                if _or_key_lr:
+                    try:
+                        from skyn3t.adapters import LLMClient as _LLMCLR
+                        last_client = _LLMCLR(
+                            default_model="openrouter/owl-alpha",
+                            backend="openrouter",
+                            event_bus=self.event_bus,
+                            caller_name=self.name,
+                        )
+                        last_prompt = (
+                            f"Write the file `{rel}` for this brief:\n\n"
+                            f"BRIEF: {(brief or '').strip()[:1000]}\n\n"
+                            f"PURPOSE: {purpose or 'no purpose specified'}\n"
+                            f"STACK: {stack or 'react_vite'}\n\n"
+                            "Output ONLY the file body — no fences, no commentary. "
+                            "Complete, runnable implementation. No TODO, no stubs."
+                        )
+                        try:
+                            last_body = await last_client.complete(
+                                last_prompt,
+                                system="You write production-grade source code. Output only the file body.",
+                                max_tokens=6000,
+                                temperature=0.2,
+                                timeout=60.0,
+                            )
+                        finally:
+                            try:
+                                await last_client.aclose()
+                            except Exception:
+                                pass
+                        last_body = _strip_cli_prelude((last_body or "").strip(), rel)
+                        last_body = _strip_fences(last_body)
+                        last_body = _strip_copilot_footer(last_body)
+                        if (
+                            last_body
+                            and "[deterministic-stub]" not in last_body
+                            and "TODO[skyn3t]" not in last_body
+                            and _syntax_ok(last_body, rel)
+                        ):
+                            logger.warning(
+                                "PER-FILE LAST-RESORT succeeded for %s (via Owl Alpha)",
+                                rel,
+                            )
+                            return rel, last_body, target
+                    except Exception:
+                        logger.warning(
+                            "per-file last-resort retry failed for %s", rel, exc_info=True
+                        )
+                # Everything failed. Write a placeholder so the stage can
+                # continue and the reviewer sees the gap.
+                return rel, _placeholder_for(rel, purpose, stack), target
+
             async def _build_cluster(
                 cluster: List[Tuple[int, str, str, "_Path"]],
             ) -> List[Tuple[str, str, "_Path"]]:
@@ -2229,8 +2379,14 @@ class CodeAgent(BaseAgent):
                 # return_exceptions=True so one slow/exploded backend
                 # doesn't tank the whole scaffold — surviving jobs still
                 # get written to disk.
+                # Use the monitored wrapper so individual files can fail
+                # or stall without killing the whole stage. Each file
+                # gets up to 900s wall-clock + one last-resort OpenRouter
+                # retry before placeholder. Clusters keep using the
+                # original _build_cluster (they have their own internal
+                # fallback path).
                 coros = [
-                    _build_one(i, rel, purpose, target)
+                    _build_one_monitored(i, rel, purpose, target)
                     for i, rel, purpose, target in solo_jobs
                 ] + [
                     _build_cluster(cluster) for cluster in batch_clusters

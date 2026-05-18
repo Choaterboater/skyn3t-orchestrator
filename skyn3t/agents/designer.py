@@ -299,6 +299,22 @@ class DesignerAgent(BaseAgent):
         components_path.write_text(components_md, encoding="utf-8")
         await self.think(f"wrote {components_path.name}")
 
+        # Structured component file plan — gives CodeAgent a list of
+        # small component files to generate ONE AT A TIME instead of
+        # cramming the whole app into App.jsx. Best-effort: a failure
+        # here just means CodeAgent keeps using its existing stack
+        # template plan (a smaller set of files).
+        try:
+            plan = await self._render_component_file_plan(brief, mood, target, palette_json)
+            if plan and plan.get("files"):
+                plan_path = artifact_dir / "component_file_plan.json"
+                plan_path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
+                await self.think(
+                    f"wrote component_file_plan.json with {len(plan['files'])} component(s)"
+                )
+        except Exception:
+            logger.exception("component_file_plan generation failed (non-fatal)")
+
         # ── Usable code deliverables ────────────────────────────────────
         # Markdown docs are good but not droppable into a project. Generate
         # the assets a developer would actually copy:
@@ -980,6 +996,173 @@ class DesignerAgent(BaseAgent):
             fallback=fallback,
             max_tokens=3500,
         )
+
+    async def _render_component_file_plan(
+        self,
+        brief: str,
+        mood: str,
+        target: str,
+        palette: Dict[str, str],
+    ) -> Optional[Dict[str, Any]]:
+        """Produce a structured component file plan.
+
+        CodeAgent's per-file generation produces better output when
+        each call has a small, focused scope. The default stack
+        template plan for ``react_vite`` only lists App.jsx — which
+        means the LLM has to fit every component, hook, and util into
+        one ~5KB file. Breaking that into 4-6 named component files
+        (HabitCard.jsx, StreakBadge.jsx, AddHabitForm.jsx, ...) lets
+        each generation be 1-2KB instead of 5-8KB. Smaller calls
+        succeed where huge ones time out.
+
+        Returns a dict like::
+
+            {"files": [
+                {"path": "src/components/HabitCard.jsx",
+                 "purpose": "Single habit card with streak badge",
+                 "props": ["habit", "onCheckIn"]},
+                ...
+            ]}
+
+        or ``None`` if generation failed.
+        """
+        # Only emit a plan when the target is a UI build — backend-only
+        # / docs builds don't need component breakdowns.
+        target_norm = (target or "").lower()
+        if target_norm not in ("saas", "site", "app", "spa", "dashboard", ""):
+            return None
+
+        import os as _os_plan
+        api_key = _os_plan.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            try:
+                from skyn3t.config.settings import get_settings
+                api_key = getattr(get_settings(), "openrouter_api_key", None)
+                if api_key:
+                    _os_plan.environ.setdefault("OPENROUTER_API_KEY", api_key)
+            except Exception:  # noqa: BLE001
+                api_key = None
+        if not api_key:
+            return None
+
+        prompt = (
+            f"BRIEF: {(brief or '').strip()[:800]}\n"
+            f"Inferred mood: {mood}\n"
+            f"Target: {target}\n\n"
+            "Break this product into 4-8 small React components. For each, "
+            "give: path (under src/components/), purpose (one sentence), "
+            "and props (list of prop names, NOT types).\n\n"
+            "Rules:\n"
+            "- App.jsx is the shell — DON'T include it in the list. It "
+            "  composes the components you list.\n"
+            "- Each component does ONE thing. If it would be larger than "
+            "  ~80 lines of JSX, break it further.\n"
+            "- Use specific names tied to the product domain "
+            "  (e.g. 'HabitCard' not 'Card', 'StreakBadge' not 'Badge').\n"
+            "- Use src/components/<Name>.jsx paths (PascalCase filenames).\n"
+            "- Include hooks if logic is reused (src/hooks/<useFoo>.js).\n\n"
+            "Return STRICT JSON, no commentary, no fences:\n"
+            "{\n"
+            '  "files": [\n'
+            '    {"path": "src/components/HabitCard.jsx", "purpose": "...", "props": ["habit", "onCheckIn"]}\n'
+            "  ]\n"
+            "}"
+        )
+
+        try:
+            from skyn3t.adapters import LLMClient
+            client = LLMClient(
+                default_model="openrouter/owl-alpha",
+                backend="openrouter",
+                event_bus=self.event_bus,
+                caller_name=self.name,
+            )
+            try:
+                raw = await client.complete(
+                    prompt,
+                    system=(
+                        "You are a React UI architect. Output strict JSON "
+                        "only — no preamble, no fences."
+                    ),
+                    max_tokens=900,
+                    temperature=0.3,
+                    timeout=45.0,
+                )
+            finally:
+                try:
+                    await client.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            logger.debug("component file plan generation failed", exc_info=True)
+            return None
+
+        # Tolerate code fences if the model added them.
+        body = (raw or "").strip()
+        if body.startswith("```"):
+            body = body.strip("`")
+            if body.startswith("json"):
+                body = body[4:]
+            body = body.strip()
+            if body.endswith("```"):
+                body = body[:-3].strip()
+        # Find the first { and last } in case there's lingering prose.
+        start = body.find("{")
+        end = body.rfind("}")
+        if start >= 0 and end > start:
+            body = body[start : end + 1]
+
+        try:
+            parsed = json.loads(body)
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        files = parsed.get("files")
+        if not isinstance(files, list) or not files:
+            return None
+
+        # Validate + normalize entries. Reject anything that doesn't
+        # have a sensible path/purpose pair. Drop dupes.
+        seen_paths: set = set()
+        cleaned: List[Dict[str, Any]] = []
+        for entry in files:
+            if not isinstance(entry, dict):
+                continue
+            path = str(entry.get("path") or "").strip().lstrip("/")
+            purpose = str(entry.get("purpose") or "").strip()
+            if not path or not purpose:
+                continue
+            # Reject paths that try to escape src/ — keep it scoped.
+            if not (
+                path.startswith("src/components/")
+                or path.startswith("src/hooks/")
+                or path.startswith("src/lib/")
+                or path.startswith("src/utils/")
+            ):
+                continue
+            # Reject filename extensions outside our generator scope.
+            if not path.endswith((".jsx", ".tsx", ".js", ".ts")):
+                continue
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            props = entry.get("props") or []
+            if isinstance(props, list):
+                props_clean = [str(p).strip() for p in props if str(p).strip()]
+            else:
+                props_clean = []
+            cleaned.append({
+                "path": path,
+                "purpose": purpose,
+                "props": props_clean,
+            })
+            if len(cleaned) >= 8:
+                break
+
+        if not cleaned:
+            return None
+        return {"files": cleaned}
 
     def _render_components_md_fallback(self, target: str, palette: Dict[str, str]) -> str:
         primary = palette["primary"]

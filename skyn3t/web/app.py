@@ -1702,6 +1702,20 @@ async def usage_for_project(slug: str):
     return data
 
 
+@app.get("/api/usage/stage-latency")
+async def stage_latency_snapshot():
+    """Per-stage wall-clock latency across all runs.
+
+    Returns one entry per stage (brainstorm, architect, code, ...) with
+    count + avg/min/max seconds + a small recent-durations window. The
+    UI uses this to surface "Architect: avg 187s (last 14 runs)" so you
+    can spot the stage that's eating the budget without crawling every
+    project.json.
+    """
+    from skyn3t.intelligence.stage_latency import snapshot
+    return {"stages": snapshot()}
+
+
 @app.get("/api/memory/skills")
 async def get_skills(tag: Optional[str] = None, limit: int = 20):
     """First-class skill library — durable learned-skill files in data/skills/.
