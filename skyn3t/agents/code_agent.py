@@ -1667,16 +1667,24 @@ class CodeAgent(BaseAgent):
                                 "entrypoint fast-path errored for %s; continuing with CLI", rel,
                             )
 
-                    # BULK FAST-PATH: try free OpenRouter Owl Alpha for
-                    # every per-component file before touching the CLI
-                    # ladder. canary-9af578 dashboard showed code_agent
-                    # was logging hits to Owl Alpha but bulk traffic
-                    # was actually landing on kimi_cli — Owl is free,
-                    # produces cleaner React, and dodges the per-file
-                    # CLI timeouts that have been capping scores. CLIs
-                    # remain the fallback when Owl rate-limits or
-                    # returns bad syntax.
-                    _bulk_fp_succeeded = False
+                    # BULK FAST-PATH ladder: try free/cheap OpenRouter
+                    # models for every per-component file before
+                    # touching the CLI chain. Order is free-first:
+                    #   1. openrouter/owl-alpha          (free, 1M ctx)
+                    #   2. nvidia/nemotron-3-super-120b-a12b:free
+                    #                                    (free, 1M ctx)
+                    #   3. tencent/hy3-preview           ($0.066/$0.26
+                    #                                     per 1M, 262K
+                    #                                     ctx, agentic)
+                    # Each try gets a 90s timeout. First valid response
+                    # wins; on failure (timeout / bad syntax / rate
+                    # limit) we fall through to the next rung. CLIs
+                    # remain the final fallback below.
+                    _bulk_ladder = (
+                        ("openrouter/owl-alpha", "free"),
+                        ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
+                        ("tencent/hy3-preview", "paid"),
+                    )
                     if not _is_problem_file:  # entrypoint path above already tried
                         import os as _os_bulk
                         _bulk_or_key = _os_bulk.environ.get("OPENROUTER_API_KEY")
@@ -1688,63 +1696,70 @@ class CodeAgent(BaseAgent):
                                 _bulk_or_key = None
                         if _bulk_or_key:
                             _os_bulk.environ.setdefault("OPENROUTER_API_KEY", _bulk_or_key)
-                            try:
-                                from skyn3t.adapters import LLMClient as _LLMCBulk
-                                bulk_client = _LLMCBulk(
-                                    default_model="openrouter/owl-alpha",
-                                    backend="openrouter",
-                                    event_bus=self.event_bus,
-                                    caller_name=self.name,
-                                )
+                            from skyn3t.adapters import LLMClient as _LLMCBulk
+                            for _bulk_model, _bulk_tier in _bulk_ladder:
                                 try:
-                                    body_local = await bulk_client.complete(
-                                        file_prompt,
-                                        system=build_system,
-                                        max_tokens=8000,
-                                        temperature=0.3,
-                                        timeout=120.0,
-                                        _allow_backend_failover=False,
+                                    bulk_client = _LLMCBulk(
+                                        default_model=_bulk_model,
+                                        backend="openrouter",
+                                        event_bus=self.event_bus,
+                                        caller_name=self.name,
                                     )
+                                    try:
+                                        body_local = await bulk_client.complete(
+                                            file_prompt,
+                                            system=build_system,
+                                            max_tokens=8000,
+                                            temperature=0.3,
+                                            timeout=90.0,
+                                            _allow_backend_failover=False,
+                                        )
+                                    except Exception:
+                                        body_local = ""
+                                    marked_local = _extract_marked_files(body_local or "")
+                                    if marked_local:
+                                        body_match = (
+                                            marked_local.get(rel)
+                                            or marked_local.get(rel.lstrip("/"))
+                                            or marked_local.get(_Path(rel).name)
+                                        )
+                                        if not body_match and len(marked_local) == 1:
+                                            body_match = next(iter(marked_local.values()))
+                                        if body_match:
+                                            body_local = body_match
+                                    body_local = _strip_cli_prelude((body_local or "").strip(), rel)
+                                    body_local = _strip_fences(body_local)
+                                    body_local = _strip_copilot_footer(body_local)
+                                    if (
+                                        body_local
+                                        and "[deterministic-stub]" not in body_local
+                                        and "TODO[skyn3t]" not in body_local
+                                        and _syntax_ok(body_local, rel)
+                                        and _stack_ok(body_local, rel, stack)
+                                    ):
+                                        logger.info(
+                                            "BULK FAST-PATH SUCCESS for %s via %s (%s)",
+                                            rel, _bulk_model, _bulk_tier,
+                                        )
+                                        return rel, body_local, target
+                                    else:
+                                        logger.debug(
+                                            "BULK FAST-PATH failed for %s on %s — trying next rung",
+                                            rel, _bulk_model,
+                                        )
+                                        body_local = ""
                                 except Exception:
-                                    body_local = ""
-                                marked_local = _extract_marked_files(body_local or "")
-                                if marked_local:
-                                    body_match = (
-                                        marked_local.get(rel)
-                                        or marked_local.get(rel.lstrip("/"))
-                                        or marked_local.get(_Path(rel).name)
-                                    )
-                                    if not body_match and len(marked_local) == 1:
-                                        body_match = next(iter(marked_local.values()))
-                                    if body_match:
-                                        body_local = body_match
-                                body_local = _strip_cli_prelude((body_local or "").strip(), rel)
-                                body_local = _strip_fences(body_local)
-                                body_local = _strip_copilot_footer(body_local)
-                                if (
-                                    body_local
-                                    and "[deterministic-stub]" not in body_local
-                                    and "TODO[skyn3t]" not in body_local
-                                    and _syntax_ok(body_local, rel)
-                                    and _stack_ok(body_local, rel, stack)
-                                ):
-                                    logger.info(
-                                        "BULK FAST-PATH SUCCESS for %s via OpenRouter Owl Alpha",
-                                        rel,
-                                    )
-                                    _bulk_fp_succeeded = True
-                                    return rel, body_local, target
-                                else:
                                     logger.debug(
-                                        "BULK FAST-PATH failed for %s — falling back to CLI chain",
-                                        rel,
+                                        "bulk fast-path errored for %s on %s; trying next rung",
+                                        rel, _bulk_model, exc_info=True,
                                     )
-                                    body_local = ""
-                            except Exception:
-                                logger.debug(
-                                    "bulk fast-path errored for %s; continuing with CLI", rel,
-                                    exc_info=True,
-                                )
+                                    continue
+                            # All ladder rungs exhausted — fall through
+                            # to the existing CLI per-file routing below.
+                            logger.debug(
+                                "BULK FAST-PATH ladder exhausted for %s — falling back to CLI",
+                                rel,
+                            )
 
                     # Per-file routing: pick the BACKEND best for THIS
                     # file's type. Frontend (.jsx, components/, pages/,
