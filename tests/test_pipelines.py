@@ -1239,7 +1239,7 @@ class TestStudioRunner:
                 return VerifierStageAgent()
             if name == "ReviewerAgent":
                 return ReviewerStageAgent()
-            if name in ("ConsistencyReviewerAgent", "ContractVerifierAgent"):
+            if name in ("ConsistencyReviewerAgent", "ContractVerifierAgent", "PackagingAgent"):
                 # Pass-through stub: report a clean verdict so the
                 # injected pre-reviewer stages don't change pipeline behavior.
                 class _PassThroughStageAgent:
@@ -1328,7 +1328,7 @@ class TestStudioRunner:
         def fake_get_agent(name, *args, **kwargs):
             if name == "ReviewerAgent":
                 return ReviewerStageAgent()
-            if name in ("ConsistencyReviewerAgent", "ContractVerifierAgent"):
+            if name in ("ConsistencyReviewerAgent", "ContractVerifierAgent", "PackagingAgent"):
                 return ConsistencyReviewerStageAgent()
             raise AssertionError(f"unexpected agent {name}")
 
