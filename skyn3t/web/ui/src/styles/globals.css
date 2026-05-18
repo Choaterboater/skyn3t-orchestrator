@@ -4,8 +4,8 @@
 
 /* ============================================================
    SkyN3t — Global Styles
-   Tactical Ops (warm) machine-room aesthetic.
-   Deep graphite browns + ember-orange accent.
+   Brand: cyan-on-black with brushed silver chrome + cyan glow.
+   Source: canonical logo at data/design_references/canonical_brand.png.
    Fonts: Orbitron (display), Rajdhani (body), JetBrains Mono (data).
    ============================================================ */
 
@@ -13,7 +13,7 @@
 .display {
   font-family: var(--font-display, "Orbitron", system-ui, sans-serif);
   font-weight: 500;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.04em;
   line-height: 1.1;
 }
 
@@ -25,10 +25,10 @@ pre,
   font-variant-numeric: tabular-nums;
 }
 
-/* ---------- Atelier background: warm bloom + dot grain ---------- */
+/* ---------- Atelier background: cyan bloom + circuit grid ---------- */
 .bg-atelier {
   position: relative;
-  background-color: #0F0D0A;
+  background-color: #000000;
 }
 
 .bg-atelier::before {
@@ -36,10 +36,12 @@ pre,
   position: fixed;
   inset: 0;
   background:
-    radial-gradient(ellipse 1200px 800px at 10% -10%,
-      rgba(224, 92, 26, 0.08), transparent 60%),
+    /* top-left cyan glow halo */
+    radial-gradient(ellipse 1400px 900px at 8% -10%,
+      rgba(15, 240, 252, 0.10), transparent 62%),
+    /* bottom-right chrome shadow */
     radial-gradient(ellipse 900px 700px at 100% 110%,
-      rgba(40, 28, 20, 0.55), transparent 70%);
+      rgba(20, 32, 44, 0.55), transparent 70%);
   pointer-events: none;
   z-index: 0;
 }
@@ -48,13 +50,26 @@ pre,
   content: "";
   position: fixed;
   inset: 0;
+  /* faint circuit-board dot grid in cyan */
   background-image:
-    radial-gradient(circle at 1px 1px, rgba(224, 92, 26, 0.03) 1px, transparent 0);
+    radial-gradient(circle at 1px 1px, rgba(15, 240, 252, 0.045) 1px, transparent 0);
   background-size: 22px 22px;
-  opacity: 0.5;
-  mix-blend-mode: overlay;
+  opacity: 0.55;
+  mix-blend-mode: screen;
   pointer-events: none;
   z-index: 0;
+}
+
+/* ---------- Glow utility for active / focused states ---------- */
+.glow-accent {
+  box-shadow: 0 0 12px rgba(15, 240, 252, 0.35),
+              0 0 24px rgba(15, 240, 252, 0.18);
+}
+
+/* Wordmark with cyan glow halo (matches the logo) */
+.wordmark-glow {
+  text-shadow: 0 0 6px rgba(15, 240, 252, 0.5),
+               0 0 18px rgba(15, 240, 252, 0.25);
 }
 
 /* ---------- Scrollbar styling (WebKit) ---------- */
@@ -63,18 +78,18 @@ pre,
   height: 8px;
 }
 ::-webkit-scrollbar-track {
-  background: #0F0D0A;
+  background: #000000;
 }
 ::-webkit-scrollbar-thumb {
-  background: #3B3429;
+  background: #1E2A38;
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #4A4337;
+  background: #2B3D52;
 }
 
 /* ---------- Selection ---------- */
 ::selection {
-  background: rgba(224, 92, 26, 0.25);
-  color: #E8DDCB;
+  background: rgba(15, 240, 252, 0.25);
+  color: #E6F6FA;
 }

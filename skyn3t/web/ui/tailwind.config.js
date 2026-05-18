@@ -1,44 +1,54 @@
 /** @type {import('tailwindcss').Config} */
-// Tailwind config aligned with the Tactical Ops (warm) machine-room palette.
-// Deep graphite browns + ember-orange accent. Fonts: Orbitron (display),
-// Rajdhani (body), JetBrains Mono (data). This is the "warm atelier"
-// aesthetic — a server closet that has been humming in the dark for years.
+// Tailwind config aligned with the SkyN3t / ChoateLabs brand:
+// cyan-on-black with brushed silver chrome and a cyan glow halo.
+// Fonts: Orbitron (display headings), Rajdhani (body), JetBrains Mono (data).
+// The aesthetic is "autonomous machine / circuit luxe" — taken from the
+// canonical logo at data/design_references/canonical_brand.png.
 export default {
   content: ["./index.html", "./src/**/*.{ts,tsx,js,jsx}"],
   theme: {
     extend: {
       colors: {
         bg: {
-          0: "#0F0D0A",
-          1: "#1A1714",
-          2: "#24201A",
-          3: "#2E2920",
+          0: "#000000",   // pure black — matches logo
+          1: "#070A0E",   // near-black slab
+          2: "#0E141B",   // chrome shadow
+          3: "#16202B",   // raised panel
         },
         border: {
-          DEFAULT: "#3B3429",
-          strong: "#4A4337",
+          DEFAULT: "#1E2A38",
+          strong: "#2B3D52",
         },
         text: {
-          primary: "#E8DDCB",
-          secondary: "#8C8270",
-          dim: "#5C5448",
+          primary: "#E6F6FA",
+          secondary: "#8FA8B5",
+          dim: "#56717F",
         },
         accent: {
-          DEFAULT: "#E05C1A",
-          strong: "#F06E2E",
-          soft: "rgba(224, 92, 26, 0.08)",
-          line: "rgba(224, 92, 26, 0.22)",
+          DEFAULT: "#0FF0FC",        // cyan glow — primary accent
+          strong: "#26F5FF",         // hover/active state, slightly brighter
+          soft: "rgba(15, 240, 252, 0.08)",
+          line: "rgba(15, 240, 252, 0.24)",
+        },
+        chrome: {
+          DEFAULT: "#A8B0B8",        // brushed silver — bezel highlights
+          dim: "#6F7A85",
+          bright: "#D7DCE2",
         },
         status: {
-          green: "#7A9E6A",
-          yellow: "#C49A3A",
-          red: "#B05040",
+          green: "#3DDC97",
+          yellow: "#FFCB47",
+          red: "#FF5C5C",
         },
       },
       fontFamily: {
         display: ['"Orbitron"', "system-ui", "sans-serif"],
         sans: ['"Rajdhani"', "system-ui", "sans-serif"],
         mono: ['"JetBrains Mono"', "ui-monospace", "monospace"],
+      },
+      boxShadow: {
+        glow: "0 0 24px rgba(15, 240, 252, 0.35)",
+        "glow-sm": "0 0 12px rgba(15, 240, 252, 0.25)",
       },
     },
   },
