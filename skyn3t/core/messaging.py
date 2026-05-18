@@ -10,8 +10,9 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+import weakref
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
+from typing import Any, Awaitable, Callable, Dict, List, MutableMapping, Optional, Union
 
 from skyn3t.core.events import Event, EventBus, EventType
 
@@ -51,6 +52,7 @@ class MessageBus:
         self.event_bus = event_bus
         self._inboxes: Dict[str, "asyncio.Queue[AgentMessage]"] = {}
         self._handlers: Dict[str, List[MessageHandler]] = {}
+        self._pending: Dict[str, "asyncio.Future[AgentMessage]"] = {}
 
     # ------------------------------------------------------------------
     # Inbox management
@@ -108,6 +110,13 @@ class MessageBus:
             await self._deliver(recipient, msg)
 
     async def _deliver(self, recipient: str, msg: AgentMessage) -> None:
+        # Route responses to pending request futures first.
+        if msg.correlation_id and msg.kind == "response":
+            future = self._pending.get(msg.correlation_id)
+            if future is not None and not future.done():
+                future.set_result(msg)
+                return
+
         inbox = self._inbox(recipient)
         await inbox.put(msg)
 
@@ -146,11 +155,63 @@ class MessageBus:
         except asyncio.TimeoutError:
             return None
 
+    async def request(
+        self,
+        from_agent: str,
+        to_agent: str,
+        content: str,
+        payload: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = 60.0,
+    ) -> Optional[AgentMessage]:
+        """Send a request message and await a matching response.
+
+        Returns the response ``AgentMessage`` or ``None`` on timeout.
+        """
+        correlation_id = str(uuid.uuid4())
+        msg = AgentMessage(
+            from_agent=from_agent,
+            to_agent=to_agent,
+            kind="request",
+            content=content,
+            payload=payload or {},
+            correlation_id=correlation_id,
+        )
+        loop = asyncio.get_running_loop()
+        future: "asyncio.Future[AgentMessage]" = loop.create_future()
+        self._pending[correlation_id] = future
+        try:
+            await self.send(msg)
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            self._pending.pop(correlation_id, None)
+
+    async def respond(
+        self,
+        original_msg: AgentMessage,
+        content: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Send a response message matching ``original_msg`` correlation_id."""
+        msg = AgentMessage(
+            from_agent=original_msg.to_agent,
+            to_agent=original_msg.from_agent,
+            kind="response",
+            content=content,
+            payload=payload or {},
+            correlation_id=original_msg.correlation_id,
+        )
+        await self.send(msg)
+
 
 # ----------------------------------------------------------------------
 # Default-bus singleton (keyed by EventBus identity)
 # ----------------------------------------------------------------------
-_default_buses: Dict[int, MessageBus] = {}
+# Use a WeakKeyDictionary so an EventBus that goes out of scope can be GC'd
+# along with its MessageBus. The previous int-keyed dict stored stale entries
+# whose id() could be reused for a different EventBus, returning the wrong bus.
+_default_buses: "MutableMapping[EventBus, MessageBus]" = weakref.WeakKeyDictionary()
 
 
 def get_default_bus(event_bus: EventBus) -> MessageBus:
@@ -159,9 +220,8 @@ def get_default_bus(event_bus: EventBus) -> MessageBus:
     The same EventBus instance always yields the same MessageBus so that
     every agent sharing that event bus also shares its messaging fabric.
     """
-    key = id(event_bus)
-    bus = _default_buses.get(key)
+    bus = _default_buses.get(event_bus)
     if bus is None:
         bus = MessageBus(event_bus)
-        _default_buses[key] = bus
+        _default_buses[event_bus] = bus
     return bus

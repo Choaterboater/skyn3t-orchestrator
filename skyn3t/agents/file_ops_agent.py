@@ -17,14 +17,14 @@ class FileOpsAgent(BaseAgent):
     def __init__(
         self,
         name: str = "file_ops_agent",
-        event_bus: EventBus = None,
+        event_bus: EventBus | None = None,
         config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             name=name,
             agent_type="file_ops",
             provider="local",
-            event_bus=event_bus,
+            event_bus=event_bus or EventBus(),
             config=config,
         )
         self.add_capability(
@@ -62,7 +62,7 @@ class FileOpsAgent(BaseAgent):
                 parameters={"paths": "list", "events": "list"},
             )
         )
-        self._base_dir = Path(self.config.get("base_dir", os.getcwd())).resolve()
+        self._base_dir = self.resolve_artifact_dir(self.config.get("base_dir"))
         self._watched_paths: Dict[str, Dict[str, Any]] = {}
         self._max_file_size = self.config.get("max_file_size", 10 * 1024 * 1024)  # 10MB
 
@@ -84,7 +84,7 @@ class FileOpsAgent(BaseAgent):
         except Exception:
             return False
 
-    async def execute(self, task: TaskRequest) -> TaskResult:
+    async def execute(self, task: TaskRequest, stdin_data: str | None = None) -> TaskResult:
         """Execute a file operations task."""
         task_type = task.input_data.get("task_type", "file_read")
 
@@ -216,7 +216,7 @@ class FileOpsAgent(BaseAgent):
         if not target_dir.exists():
             return {"success": False, "error": f"Directory not found: {search_path}"}
 
-        matches = []
+        matches: List[Dict[str, Any]] = []
         try:
             for root, dirs, files in os.walk(target_dir):
                 # Respect max_results

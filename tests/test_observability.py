@@ -2,7 +2,6 @@
 
 import asyncio
 import time
-from datetime import datetime, timezone
 
 import pytest
 
@@ -22,21 +21,17 @@ from skyn3t.observability.logging import (
     log_task_event,
 )
 from skyn3t.observability.metrics import (
-    AgentMetricsCollector,
     generate_metrics,
     get_collector,
     reset_collector,
-    set_metrics_registry,
     timed,
 )
 from skyn3t.observability.tracing import (
     ConsoleExporter,
     SpanStatus,
     TraceContext,
-    TraceSpan,
     Tracer,
-    get_tracer,
-    set_tracer,
+    TraceSpan,
     trace_task,
 )
 
@@ -178,14 +173,14 @@ class TestTracing:
 
         assert await do_work() == 456
 
-    def test_console_exporter(self, capsys):
+    def test_console_exporter(self, caplog):
         tracer = Tracer()
         span = tracer.start_span("exported")
         tracer.end_span(span)
         exporter = ConsoleExporter(tracer)
-        exporter.export(span)
-        captured = capsys.readouterr()
-        assert "exported" in captured.out
+        with caplog.at_level("INFO", logger="skyn3t.observability.tracing"):
+            exporter.export(span)
+        assert "exported" in caplog.text
 
 
 # ---------------------------------------------------------------------------

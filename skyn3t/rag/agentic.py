@@ -1,7 +1,8 @@
 from __future__ import annotations
+
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol
 
 if TYPE_CHECKING:
     from skyn3t.adapters.llm_client import LLMClient
@@ -71,8 +72,10 @@ class AgenticRAG:
         deduped = []
         for h in result.answer_context:
             key = h.get("id") or h.get("content", "")[:120]
-            if key in seen: continue
-            seen.add(key); deduped.append(h)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(h)
         result.answer_context = deduped
         return result
 
@@ -84,7 +87,8 @@ class AgenticRAG:
         return " ".join(toks)[:300] or question
 
     def _score(self, hits: List[Dict[str, Any]], question: str) -> float:
-        if not hits: return 0.0
+        if not hits:
+            return 0.0
         # if hits already carry "score" use the top one's score; else use saturation by count
         top = hits[0].get("score")
         if isinstance(top, (int, float)):
@@ -101,8 +105,10 @@ class AgenticRAG:
                 return (await self.llm.complete(prompt, max_tokens=120, temperature=0.0)).strip()
             except Exception:
                 logger.exception("agentic_rag llm critique failed")
-        if not hits:   return "no results — broaden query"
-        if confidence < self.min_confidence: return "low confidence — try alternative phrasing"
+        if not hits:
+            return "no results — broaden query"
+        if confidence < self.min_confidence:
+            return "low confidence — try alternative phrasing"
         return "sufficient coverage"
 
     async def _reformulate(self, original: str, last: str, hits, critique: str) -> str:
@@ -126,11 +132,13 @@ class AgenticRAG:
         return original
 
     def _publish(self, event_name: str, payload: Dict[str, Any]) -> None:
-        if not self.event_bus: return
+        if not self.event_bus:
+            return
         try:
             from skyn3t.core.events import Event, EventType
             et = getattr(EventType, event_name, None)
-            if et is None: return
+            if et is None:
+                return
             self.event_bus.publish(Event(event_type=et, source="agentic_rag", payload=payload))
         except Exception:
             logger.exception("agentic_rag publish failed")

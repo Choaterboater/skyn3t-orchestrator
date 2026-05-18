@@ -1,13 +1,12 @@
 """Tests for the SkyN3t brain/memory layer."""
 
 import asyncio
-import pytest
 
-from skyn3t.memory.store import MemoryStore
+from skyn3t.core.events import EventBus
 from skyn3t.memory.consciousness import CollectiveConsciousness
-from skyn3t.memory.tuner import SelfTuningEngine
 from skyn3t.memory.meta_agent import MetaAgent
-from skyn3t.core.events import EventBus, EventType
+from skyn3t.memory.store import MemoryStore
+from skyn3t.memory.tuner import SelfTuningEngine
 
 
 def run_async(coro):
@@ -76,7 +75,7 @@ class TestMemoryStore:
         ))
         assert doc_id is not None
         lessons = run_async(store.get_lessons(doc_type="lesson"))
-        titles = [l["title"] for l in lessons]
+        titles = [lesson["title"] for lesson in lessons]
         assert f"Lesson {unique}" in titles
 
     def test_stats(self):

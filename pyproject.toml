@@ -59,20 +59,35 @@ dependencies = [
     "discord.py>=2.3.0",
     "aioimaplib>=1.0.0",
     "aiosmtplib>=3.0.0",
+    "cryptography>=42.0.0",
+    "beautifulsoup4>=4.12.0",
+    "prompt_toolkit>=3.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.1.0",
+    "respx>=0.20.0",
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.5.0",
     "httpx>=0.26.0",
 ]
+# Headless browser smoke test for static-site scaffolds. BuildVerifier
+# treats Playwright as optional — when missing, the static verify gate
+# falls back to the html.parser strict-feed pass. Install with:
+#   pip install -e ".[smoke]" && playwright install chromium
+smoke = [
+    "playwright>=1.40.0",
+]
 
 [project.scripts]
 skyn3t = "skyn3t.cli.main:app"
+# Agent Client Protocol entry point — IDE registry manifests point at
+# this so Zed/JetBrains can spawn us as an ACP subprocess.
+skyn3t-acp = "skyn3t.integrations.acp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -85,6 +100,8 @@ target-version = ['py310']
 
 [tool.ruff]
 line-length = 100
+
+[tool.ruff.lint]
 select = ["E", "F", "W", "I"]
 ignore = ["E501"]
 
@@ -93,3 +110,10 @@ python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["data", ".git", ".venv"]
+markers = [
+    "slow: marks tests as slower-running integration/e2e checks",
+]

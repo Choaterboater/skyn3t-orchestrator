@@ -1,6 +1,7 @@
 """OpenTelemetry-style tracing for SkyN3t (zero external dependencies)."""
 
 import asyncio
+import logging
 from collections import deque
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -8,7 +9,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
-from uuid import UUID, uuid4
+from uuid import uuid4
+
+logger = logging.getLogger("skyn3t.observability.tracing")
 
 
 # ---------------------------------------------------------------------------
@@ -260,23 +263,33 @@ def set_tracer(tracer: Tracer) -> None:
 # Console exporter
 # ---------------------------------------------------------------------------
 class ConsoleExporter:
-    """Prints traces to stdout in a readable format."""
+    """Logs traces in a readable format."""
 
     def __init__(self, tracer: Optional[Tracer] = None):
         self.tracer = tracer or get_tracer()
 
     def export(self, span: TraceSpan) -> None:
-        """Export a single span to the console."""
+        """Export a single span via the tracing logger."""
         depth = span.depth if span.depth else self._depth(span)
         prefix = "  " * depth
         duration = span.duration_ms
         dur_str = f"{duration:.2f}ms" if duration is not None else "incomplete"
         status_icon = "✓" if span.status == SpanStatus.OK else "✗" if span.status == SpanStatus.ERROR else "?"
-        print(
-            f"{prefix}[{status_icon}] {span.name}  ({dur_str})  trace={span.trace_id[:8]}…"
+        logger.info(
+            "%s[%s] %s  (%s)  trace=%s…",
+            prefix,
+            status_icon,
+            span.name,
+            dur_str,
+            span.trace_id[:8],
         )
         for event in span.events:
-            print(f"{prefix}  ▸ {event['name']} @ {event['timestamp']}")
+            logger.info(
+                "%s  ▸ %s @ %s",
+                prefix,
+                event["name"],
+                event["timestamp"],
+            )
 
     def export_recent(self, limit: int = 20) -> None:
         """Export the most recently finished spans."""

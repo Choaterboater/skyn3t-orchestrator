@@ -8,11 +8,10 @@ import logging
 import os
 import re
 import ssl
-from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
-from skyn3t.core.events import Event, EventBus, EventType
+from skyn3t.core.events import EventBus
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +31,7 @@ class EmailAgent(BaseAgent):
             name=name,
             agent_type="integration",
             provider="email",
-            event_bus=event_bus,
+            event_bus=event_bus or EventBus(),
             config=config or {},
         )
         self.add_capability(
@@ -54,12 +53,12 @@ class EmailAgent(BaseAgent):
 
         # IMAP config
         self.imap_host = self.config.get("imap_host") or os.getenv("EMAIL_IMAP_HOST")
-        self.imap_port = int(self.config.get("imap_port") or os.getenv("EMAIL_IMAP_PORT", "993"))
+        self.imap_port = int(str(self.config.get("imap_port") or os.getenv("EMAIL_IMAP_PORT", "993")))
         self.imap_ssl = self.config.get("imap_ssl", True)
 
         # SMTP config
         self.smtp_host = self.config.get("smtp_host") or os.getenv("EMAIL_SMTP_HOST")
-        self.smtp_port = int(self.config.get("smtp_port") or os.getenv("EMAIL_SMTP_PORT", "587"))
+        self.smtp_port = int(str(self.config.get("smtp_port") or os.getenv("EMAIL_SMTP_PORT", "587")))
         self.smtp_tls = self.config.get("smtp_tls", True)
         self.smtp_ssl = self.config.get("smtp_ssl", False)
 
@@ -68,7 +67,7 @@ class EmailAgent(BaseAgent):
         self.email_password = self.config.get("email_password") or os.getenv("EMAIL_PASSWORD")
 
         # Behavior
-        self.poll_interval = int(self.config.get("poll_interval", 60))
+        self.poll_interval = int(str(self.config.get("poll_interval", 60)))
         self.inbox_folder = self.config.get("inbox_folder", "INBOX")
         self.processed_folder = self.config.get("processed_folder", "SkyN3t_Processed")
         self.max_email_size = int(self.config.get("max_email_size", 5_000_000))
@@ -96,6 +95,11 @@ class EmailAgent(BaseAgent):
             raise RuntimeError(
                 "EmailAgent requires EMAIL_IMAP_HOST, EMAIL_SMTP_HOST, EMAIL_ADDRESS, EMAIL_PASSWORD"
             )
+        if not self.smtp_ssl and not self.smtp_tls:
+            raise RuntimeError(
+                "EmailAgent refuses SMTP login without TLS or SSL. "
+                "Enable smtp_tls or smtp_ssl before starting the agent."
+            )
 
     async def health_check(self) -> bool:
         """Check email connectivity."""
@@ -105,7 +109,7 @@ class EmailAgent(BaseAgent):
         except Exception:
             return False
 
-    async def execute(self, task: TaskRequest) -> TaskResult:
+    async def execute(self, task: TaskRequest, stdin_data: str | None = None) -> TaskResult:
         """Execute an email-related task."""
         task_type = task.input_data.get("task_type", "send_email")
 
@@ -148,6 +152,30 @@ class EmailAgent(BaseAgent):
         """Attach the main orchestrator for task routing."""
         self._orchestrator = orchestrator
 
+    def _get_imap_settings(self) -> tuple[str, int, str, str]:
+        """Return validated IMAP connection settings."""
+        if not isinstance(self.imap_host, str) or not self.imap_host:
+            raise RuntimeError("EMAIL_IMAP_HOST is not configured")
+        if not isinstance(self.email_address, str) or not self.email_address:
+            raise RuntimeError("EMAIL_ADDRESS is not configured")
+        if not isinstance(self.email_password, str) or not self.email_password:
+            raise RuntimeError("EMAIL_PASSWORD is not configured")
+        return self.imap_host, self.imap_port, self.email_address, self.email_password
+
+    @staticmethod
+    def _extract_email_bytes(fetch_data: Any) -> bytes | None:
+        """Extract the raw RFC822 payload from an IMAP fetch result."""
+        if not isinstance(fetch_data, list) or not fetch_data:
+            return None
+        first = fetch_data[0]
+        if (
+            isinstance(first, tuple)
+            and len(first) > 1
+            and isinstance(first[1], (bytes, bytearray))
+        ):
+            return bytes(first[1])
+        return None
+
     # ------------------------------------------------------------------
     # IMAP monitoring loop
     # ------------------------------------------------------------------
@@ -181,9 +209,10 @@ class EmailAgent(BaseAgent):
         """Synchronously connect, fetch unread messages, mark as read, and disconnect."""
         import imaplib
 
+        host, port, email_address, email_password = self._get_imap_settings()
         ctx = ssl.create_default_context()
-        client = imaplib.IMAP4_SSL(self.imap_host, self.imap_port, ssl_context=ctx)
-        client.login(self.email_address, self.email_password)
+        client = imaplib.IMAP4_SSL(host, port, ssl_context=ctx)
+        client.login(email_address, email_password)
         client.select(self.inbox_folder)
 
         results: List[Tuple[Dict[str, Any], str]] = []
@@ -198,7 +227,9 @@ class EmailAgent(BaseAgent):
                     fstatus, fdata = client.fetch(msg_id, "(RFC822)")
                     if fstatus != "OK":
                         continue
-                    raw_email = fdata[0][1]
+                    raw_email = self._extract_email_bytes(fdata)
+                    if raw_email is None:
+                        continue
                     msg = email.message_from_bytes(raw_email, policy=email.policy.default)
                     parsed = self._parse_email(msg)
                     client.store(msg_id, "+FLAGS", "\\Seen")
@@ -234,12 +265,13 @@ class EmailAgent(BaseAgent):
         if status != "OK":
             return
 
-        raw_email = data[0][1]
+        raw_email = self._extract_email_bytes(data)
+        if raw_email is None:
+            return
         msg = email.message_from_bytes(raw_email, policy=email.policy.default)
 
         parsed = self._parse_email(msg)
         sender = parsed["from"]
-        subject = parsed["subject"]
 
         # Filtering
         if self._is_blocked(sender):
@@ -276,10 +308,27 @@ class EmailAgent(BaseAgent):
         }
 
     def _extract_body(self, msg) -> Tuple[str, str, List[Dict[str, Any]]]:
-        """Extract text, html, and attachments from a message."""
-        text_parts = []
-        html_parts = []
-        attachments = []
+        """Extract text, html, and attachments from a message.
+
+        Aggregate body size is capped at ``max_email_size`` across all parts
+        combined; without this cap a malicious mail with many small parts
+        could OOM the process even though no individual part trips the limit.
+        """
+        text_parts: List[str] = []
+        html_parts: List[str] = []
+        attachments: List[Dict[str, Any]] = []
+        body_budget = int(self.max_email_size)
+        consumed = 0
+
+        def _take(decoded: str, into: List[str]) -> None:
+            nonlocal consumed
+            remaining = body_budget - consumed
+            if remaining <= 0:
+                return
+            if len(decoded) > remaining:
+                decoded = decoded[:remaining] + "\n... [truncated: aggregate body cap]"
+            into.append(decoded)
+            consumed += len(decoded)
 
         if msg.is_multipart():
             for part in msg.walk():
@@ -298,19 +347,19 @@ class EmailAgent(BaseAgent):
                 elif content_type == "text/plain" and "attachment" not in content_disposition:
                     payload = part.get_payload(decode=True)
                     if payload:
-                        text_parts.append(payload.decode("utf-8", errors="replace"))
+                        _take(payload.decode("utf-8", errors="replace"), text_parts)
                 elif content_type == "text/html" and "attachment" not in content_disposition:
                     payload = part.get_payload(decode=True)
                     if payload:
-                        html_parts.append(payload.decode("utf-8", errors="replace"))
+                        _take(payload.decode("utf-8", errors="replace"), html_parts)
         else:
             payload = msg.get_payload(decode=True)
             if payload:
                 decoded = payload.decode("utf-8", errors="replace")
                 if msg.get_content_type() == "text/html":
-                    html_parts.append(decoded)
+                    _take(decoded, html_parts)
                 else:
-                    text_parts.append(decoded)
+                    _take(decoded, text_parts)
 
         return "\n".join(text_parts), "\n".join(html_parts), attachments
 
@@ -428,12 +477,22 @@ class EmailAgent(BaseAgent):
             msg.add_alternative(html, subtype="html")
 
         def _send():
+            if not self.smtp_ssl and not self.smtp_tls:
+                raise RuntimeError(
+                    "SMTP login requires TLS or SSL. "
+                    "Enable smtp_tls or smtp_ssl before sending mail."
+                )
             if self.smtp_ssl:
-                server = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port)
+                server = smtplib.SMTP_SSL(
+                    self.smtp_host,
+                    self.smtp_port,
+                    context=ssl.create_default_context(),
+                )
             else:
                 server = smtplib.SMTP(self.smtp_host, self.smtp_port)
-                if self.smtp_tls:
-                    server.starttls()
+                server.ehlo()
+                server.starttls(context=ssl.create_default_context())
+                server.ehlo()
             server.login(self.email_address, self.email_password)
             server.send_message(msg)
             server.quit()
@@ -486,14 +545,15 @@ class EmailAgent(BaseAgent):
             return TaskResult(task_id=task.task_id, success=False, error=str(e))
 
     async def _fetch_unread_task(self, task: TaskRequest) -> TaskResult:
-        folder = task.input_data.get("folder", self.inbox_folder)
+        folder = str(task.input_data.get("folder", self.inbox_folder))
         limit = task.input_data.get("limit", 10)
 
         def _sync_fetch_unread() -> List[Dict[str, Any]]:
             import imaplib
+            host, port, email_address, email_password = self._get_imap_settings()
             ctx = ssl.create_default_context()
-            client = imaplib.IMAP4_SSL(self.imap_host, self.imap_port, ssl_context=ctx)
-            client.login(self.email_address, self.email_password)
+            client = imaplib.IMAP4_SSL(host, port, ssl_context=ctx)
+            client.login(email_address, email_password)
             client.select(folder)
             try:
                 status, data = client.search(None, "UNSEEN")
@@ -502,7 +562,9 @@ class EmailAgent(BaseAgent):
                     msg_ids = data[0].split()[-limit:]
                     for msg_id in msg_ids:
                         _, d = client.fetch(msg_id, "(RFC822)")
-                        raw = d[0][1]
+                        raw = self._extract_email_bytes(d)
+                        if raw is None:
+                            continue
                         msg = email.message_from_bytes(raw, policy=email.policy.default)
                         parsed = self._parse_email(msg)
                         messages.append(parsed)
@@ -528,16 +590,17 @@ class EmailAgent(BaseAgent):
             return TaskResult(task_id=task.task_id, success=False, error=str(e))
 
     async def _mark_read_task(self, task: TaskRequest) -> TaskResult:
-        folder = task.input_data.get("folder", self.inbox_folder)
+        folder = str(task.input_data.get("folder", self.inbox_folder))
         msg_ids = task.input_data.get("msg_ids", [])
         if not msg_ids:
             return TaskResult(task_id=task.task_id, success=False, error="msg_ids required")
 
         def _sync_mark_read() -> int:
             import imaplib
+            host, port, email_address, email_password = self._get_imap_settings()
             ctx = ssl.create_default_context()
-            client = imaplib.IMAP4_SSL(self.imap_host, self.imap_port, ssl_context=ctx)
-            client.login(self.email_address, self.email_password)
+            client = imaplib.IMAP4_SSL(host, port, ssl_context=ctx)
+            client.login(email_address, email_password)
             client.select(folder)
             try:
                 for m in msg_ids:
@@ -561,6 +624,10 @@ class EmailAgent(BaseAgent):
 
     @staticmethod
     async def _run_sync(fn, *args, **kwargs):
-        """Run a synchronous function in a thread pool."""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: fn(*args, **kwargs))
+        """Run a synchronous function in a thread pool.
+
+        Uses asyncio.to_thread which is the supported replacement for
+        ``get_event_loop().run_in_executor`` (the latter is deprecated and
+        raises in 3.12+ when called from an async context with no running loop).
+        """
+        return await asyncio.to_thread(fn, *args, **kwargs)

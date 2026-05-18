@@ -12,6 +12,8 @@ import importlib
 import inspect
 from typing import Any
 
+from skyn3t.registry.catalog import build_agent_override
+
 
 def get_agent(name: str, *, event_bus: Any = None, rag: Any = None, **kw: Any) -> Any:
     """Resolve ``name`` to an agent class and return an instance.
@@ -39,4 +41,26 @@ def get_agent(name: str, *, event_bus: Any = None, rag: Any = None, **kw: Any) -
     if "rag" in sig.parameters:
         kwargs["rag"] = rag
     kwargs.update(kw)
-    return cls(**kwargs)
+    agent = cls(**kwargs)
+
+    # Apply persisted per-agent overrides (backend/model/system_prompt/etc.)
+    # so the LLM client this agent constructs uses the user's configured
+    # routing — not vanilla defaults.
+    try:
+        from skyn3t.config.agent_overrides import get_override_store
+        store = get_override_store()
+        cls_patch = store.get(getattr(cls, "__name__", "")) or {}
+        name_patch = store.get(getattr(agent, "name", "")) or {}
+        merged = build_agent_override(
+            class_name=getattr(cls, "__name__", ""),
+            runtime_name=getattr(agent, "name", ""),
+            class_patch=cls_patch,
+            name_patch=name_patch,
+        )
+        if merged and hasattr(agent, "apply_override"):
+            agent.apply_override(merged)
+    except Exception:
+        import logging
+        logging.getLogger("skyn3t.studio.registry").exception(
+            "could not apply overrides to %s", name)
+    return agent

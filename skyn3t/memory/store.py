@@ -1,21 +1,27 @@
 """Persistent memory store for SkyN3t — the swarm's long-term memory."""
 
 import asyncio
-import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select, desc, func
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyn3t.core.models import (
     Agent as AgentModel,
-    Task as TaskModel,
-    Message as MessageModel,
+)
+from skyn3t.core.models import (
+    AgentStatus,
+    ExperienceIndex,
     KnowledgeDocument,
     SystemLog,
-    AgentStatus,
     TaskStatus,
+)
+from skyn3t.core.models import (
+    Message as MessageModel,
+)
+from skyn3t.core.models import (
+    Task as TaskModel,
 )
 from skyn3t.memory.database import get_session_maker
 
@@ -33,7 +39,8 @@ class MemoryStore:
 
     async def _session(self) -> AsyncSession:
         """Get a new database session."""
-        return self._session_maker()
+        session: AsyncSession = self._session_maker()
+        return session
 
     # ------------------------------------------------------------------
     # Agent state
@@ -41,7 +48,10 @@ class MemoryStore:
 
     async def save_agent(self, agent_id: str, name: str, agent_type: str,
                          provider: str, status: str, capabilities: List[str],
-                         config: Dict[str, Any], meta: Dict[str, Any]) -> None:
+                         config: Dict[str, Any], meta: Dict[str, Any],
+                         role: Optional[str] = None,
+                         reports_to: Optional[str] = None,
+                         lifecycle: Optional[str] = None) -> None:
         """Upsert an agent record."""
         async with self._lock:
             async with await self._session() as session:
@@ -54,6 +64,9 @@ class MemoryStore:
                         existing.agent_type = agent_type
                         existing.provider = provider
                         existing.status = AgentStatus(status) if status in [s.value for s in AgentStatus] else AgentStatus.IDLE
+                        existing.role = role
+                        existing.reports_to = reports_to
+                        existing.lifecycle = lifecycle
                         existing.capabilities = capabilities
                         existing.config = config
                         existing.meta = meta
@@ -65,6 +78,9 @@ class MemoryStore:
                             agent_type=agent_type,
                             provider=provider,
                             status=AgentStatus(status) if status in [s.value for s in AgentStatus] else AgentStatus.IDLE,
+                            role=role,
+                            reports_to=reports_to,
+                            lifecycle=lifecycle,
                             capabilities=capabilities,
                             config=config,
                             meta=meta,
@@ -85,6 +101,9 @@ class MemoryStore:
                     "agent_type": agent.agent_type,
                     "provider": agent.provider,
                     "status": agent.status.value,
+                    "role": agent.role,
+                    "reports_to": agent.reports_to,
+                    "lifecycle": agent.lifecycle,
                     "capabilities": agent.capabilities,
                     "config": agent.config,
                     "meta": agent.meta,
@@ -104,6 +123,9 @@ class MemoryStore:
                     "agent_type": a.agent_type,
                     "provider": a.provider,
                     "status": a.status.value,
+                    "role": a.role,
+                    "reports_to": a.reports_to,
+                    "lifecycle": a.lifecycle,
                     "capabilities": a.capabilities,
                     "last_heartbeat": a.last_heartbeat.isoformat() if a.last_heartbeat else None,
                 }
@@ -225,35 +247,62 @@ class MemoryStore:
                 )
                 tasks = [self._task_to_dict(t) for t in sql_result.scalars().all()]
             except Exception:
-                fallback = await session.execute(
+                task_fallback_result = await session.execute(
                     select(TaskModel).order_by(desc(TaskModel.created_at)).limit(1000)
                 )
-                for t in fallback.scalars().all():
+                for t in task_fallback_result.scalars().all():
                     sid = t.input_data.get("_meta", {}).get("session_id") if t.input_data else None
                     if sid == session_id:
                         tasks.append(self._task_to_dict(t))
                         if len(tasks) >= limit:
                             break
 
-            # Also get messages
-            msg_result = await session.execute(
-                select(MessageModel)
-                .where(MessageModel.context.contains({"session_id": session_id}))
-                .order_by(desc(MessageModel.created_at))
-                .limit(limit)
-            )
-            messages = [
-                {
-                    "id": m.id,
-                    "source_agent": m.source_agent,
-                    "target_agent": m.target_agent,
-                    "content": m.content,
-                    "message_type": m.message_type,
-                    "context": m.context,
-                    "created_at": m.created_at.isoformat(),
-                }
-                for m in msg_result.scalars().all()
-            ]
+            # Also get messages. ``context.contains()`` works on
+            # PostgreSQL JSONB but is fragile on SQLite's JSON1 backend
+            # — fall back to a bounded Python-side scan whenever the
+            # SQL-level filter errors or yields nothing.
+            messages: List[Dict[str, Any]] = []
+            try:
+                msg_result = await session.execute(
+                    select(MessageModel)
+                    .where(MessageModel.context.contains({"session_id": session_id}))
+                    .order_by(desc(MessageModel.created_at))
+                    .limit(limit)
+                )
+                messages = [
+                    {
+                        "id": m.id,
+                        "source_agent": m.source_agent,
+                        "target_agent": m.target_agent,
+                        "content": m.content,
+                        "message_type": m.message_type,
+                        "context": m.context,
+                        "created_at": m.created_at.isoformat(),
+                    }
+                    for m in msg_result.scalars().all()
+                ]
+            except Exception:
+                messages = []
+            if not messages:
+                message_fallback_result = await session.execute(
+                    select(MessageModel)
+                    .order_by(desc(MessageModel.created_at))
+                    .limit(1000)
+                )
+                for m in message_fallback_result.scalars().all():
+                    ctx = m.context or {}
+                    if isinstance(ctx, dict) and ctx.get("session_id") == session_id:
+                        messages.append({
+                            "id": m.id,
+                            "source_agent": m.source_agent,
+                            "target_agent": m.target_agent,
+                            "content": m.content,
+                            "message_type": m.message_type,
+                            "context": m.context,
+                            "created_at": m.created_at.isoformat(),
+                        })
+                        if len(messages) >= limit:
+                            break
 
             # Merge and sort by created_at
             combined = [{"type": "task", **t} for t in tasks[:limit]]
@@ -287,10 +336,21 @@ class MemoryStore:
 
     async def save_message(self, source_agent: str, target_agent: Optional[str],
                            content: str, message_type: str = "chat",
-                           context: Optional[Dict[str, Any]] = None) -> str:
-        """Save an inter-agent message."""
+                           context: Optional[Dict[str, Any]] = None,
+                           session_id: Optional[str] = None) -> str:
+        """Save an inter-agent message.
+
+        ``session_id`` is hoisted into the stored ``context`` so
+        ``get_recent_context(session_id=...)`` can find the message
+        later. Without this hoist, callers that pass only
+        ``context=None`` (or context without a session_id) make
+        session-scoped recall return zero rows.
+        """
         from uuid import uuid4
         msg_id = str(uuid4())
+        merged_context: Dict[str, Any] = dict(context or {})
+        if session_id and "session_id" not in merged_context:
+            merged_context["session_id"] = session_id
         async with self._lock:
             async with await self._session() as session:
                 async with session.begin():
@@ -300,7 +360,7 @@ class MemoryStore:
                         target_agent=target_agent,
                         content=content,
                         message_type=message_type,
-                        context=context or {},
+                        context=merged_context,
                     ))
         return msg_id
 
@@ -399,6 +459,246 @@ class MemoryStore:
             ]
 
     # ------------------------------------------------------------------
+    # Experience index (Phase-2 structured fix recall)
+    # ------------------------------------------------------------------
+
+    async def record_experience_index(
+        self,
+        *,
+        embedding_id: str,
+        task_id: Optional[str],
+        stack: Optional[str],
+        stage: Optional[str],
+        error_signature: Optional[str],
+        fix_applied: Optional[str],
+        fix_worked: Optional[bool],
+        success: bool,
+    ) -> None:
+        """Insert one row into the experience index.
+
+        The experience index denormalizes the structured fields of an
+        experience so SQL can rank fixes without materializing the
+        RAG embedding. One row per ``embedding_id``; upserts are
+        silently ignored (defensive: dedup is already handled upstream
+        by the ingestor's content-hash check).
+        """
+        if not embedding_id:
+            return
+        async with self._lock:
+            async with await self._session() as session:
+                async with session.begin():
+                    existing = await session.execute(
+                        select(ExperienceIndex).where(
+                            ExperienceIndex.embedding_id == embedding_id,
+                        )
+                    )
+                    if existing.scalar_one_or_none() is not None:
+                        return
+                    session.add(ExperienceIndex(
+                        embedding_id=embedding_id,
+                        task_id=task_id,
+                        stack=stack,
+                        stage=stage,
+                        error_signature=error_signature,
+                        fix_applied=fix_applied,
+                        fix_worked=fix_worked,
+                        success=success,
+                    ))
+
+    async def mark_fix_worked(
+        self,
+        embedding_id: str,
+        worked: bool,
+    ) -> bool:
+        """Update an experience index row with the post-fix outcome.
+
+        Returns True when the row was found and updated, False when
+        not. Used by the verifier follow-up path: after a targeted
+        fix is applied, the next verifier pass either confirms or
+        invalidates it; that resolution lands here so the next time
+        we recall this signature we know which fix actually worked.
+        """
+        if not embedding_id:
+            return False
+        async with self._lock:
+            async with await self._session() as session:
+                async with session.begin():
+                    result = await session.execute(
+                        select(ExperienceIndex).where(
+                            ExperienceIndex.embedding_id == embedding_id,
+                        )
+                    )
+                    row = result.scalar_one_or_none()
+                    if row is None:
+                        return False
+                    row.fix_worked = bool(worked)
+                    return True
+
+    async def mark_latest_unresolved_fix_worked(
+        self,
+        error_signature: str,
+        worked: bool,
+    ) -> Optional[str]:
+        """Resolve the most-recent unresolved fix row for a signature.
+
+        Used by the post-fix verifier path: after applying a targeted
+        fix, the next verifier pass either confirms or invalidates it.
+        That outcome lands here as a True/False on the index row whose
+        ``error_signature`` matches and whose ``fix_applied`` is set
+        but ``fix_worked`` is still None.
+
+        Returns the ``embedding_id`` of the updated row, or None when
+        no unresolved row exists for this signature.
+        """
+        sig = (error_signature or "").strip()
+        if not sig:
+            return None
+        async with self._lock:
+            async with await self._session() as session:
+                async with session.begin():
+                    # Sort by created_at + auto-increment id. SQLite's
+                    # CURRENT_TIMESTAMP has 1-second resolution; two
+                    # rows inserted in the same second tie on
+                    # created_at and need the PK as the tiebreaker
+                    # so "newest" is unambiguous.
+                    result = await session.execute(
+                        select(ExperienceIndex)
+                        .where(
+                            ExperienceIndex.error_signature == sig,
+                            ExperienceIndex.fix_applied.is_not(None),
+                            ExperienceIndex.fix_worked.is_(None),
+                        )
+                        .order_by(
+                            desc(ExperienceIndex.created_at),
+                            desc(ExperienceIndex.id),
+                        )
+                        .limit(1)
+                    )
+                    row = result.scalar_one_or_none()
+                    if row is None:
+                        return None
+                    row.fix_worked = bool(worked)
+                    return row.embedding_id
+
+    async def rank_fixes_for_signature(
+        self,
+        error_signature: str,
+        *,
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Rank known fixes for an error signature by historical win rate.
+
+        Aggregates the experience index over ``fix_applied`` for the
+        given signature and returns the top-``limit`` entries sorted
+        by win rate (descending), breaking ties by total attempts so
+        a fix with more samples wins over an under-sampled one at the
+        same rate.
+
+        Only rows with both a ``fix_applied`` AND a non-null
+        ``fix_worked`` are scored — half-resolved fixes (we tried but
+        haven't confirmed) don't move the denominator.
+
+        Returns a list of ``{fix_applied, wins, attempts, rate}``
+        dicts. Empty when the signature has no resolved attempts.
+        """
+        sig = (error_signature or "").strip()
+        if not sig:
+            return []
+        async with self._lock:
+            async with await self._session() as session:
+                result = await session.execute(
+                    select(ExperienceIndex).where(
+                        ExperienceIndex.error_signature == sig,
+                        ExperienceIndex.fix_applied.is_not(None),
+                        ExperienceIndex.fix_worked.is_not(None),
+                    )
+                )
+                rows = result.scalars().all()
+        if not rows:
+            return []
+        tallies: Dict[str, Dict[str, int]] = {}
+        for row in rows:
+            slot = tallies.setdefault(
+                str(row.fix_applied), {"wins": 0, "attempts": 0},
+            )
+            slot["attempts"] += 1
+            if row.fix_worked:
+                slot["wins"] += 1
+        ranked = [
+            {
+                "fix_applied": label,
+                "wins": stats["wins"],
+                "attempts": stats["attempts"],
+                "rate": stats["wins"] / stats["attempts"],
+            }
+            for label, stats in tallies.items()
+            if stats["attempts"] > 0
+        ]
+        ranked.sort(key=lambda r: (r["rate"], r["attempts"]), reverse=True)
+        return ranked[: max(0, int(limit))]
+
+    async def anti_patterns_for_signature(
+        self,
+        error_signature: str,
+        *,
+        min_attempts: int = 2,
+        max_rate: float = 0.34,
+        limit: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """Return fixes that historically FAILED for this signature.
+
+        Symmetric to ``rank_fixes_for_signature`` but reads the loser
+        end of the rank: a fix is an anti-pattern when it has
+        ``>= min_attempts`` graded tries AND a win rate ``<= max_rate``
+        (default thresholds: at least 2 attempts, ≤ 34% success).
+
+        Result entries are sorted by rate ASCENDING (worst first),
+        breaking ties by attempts descending so a much-tried failure
+        wins over a barely-tried one at the same rate.
+
+        Used by the CodeAgent prompt to inject an "avoid these"
+        section paired with the ranked-fix winners — same signature,
+        opposite end of the distribution.
+        """
+        sig = (error_signature or "").strip()
+        if not sig:
+            return []
+        async with self._lock:
+            async with await self._session() as session:
+                result = await session.execute(
+                    select(ExperienceIndex).where(
+                        ExperienceIndex.error_signature == sig,
+                        ExperienceIndex.fix_applied.is_not(None),
+                        ExperienceIndex.fix_worked.is_not(None),
+                    )
+                )
+                rows = result.scalars().all()
+        if not rows:
+            return []
+        tallies: Dict[str, Dict[str, int]] = {}
+        for row in rows:
+            slot = tallies.setdefault(
+                str(row.fix_applied), {"wins": 0, "attempts": 0},
+            )
+            slot["attempts"] += 1
+            if row.fix_worked:
+                slot["wins"] += 1
+        min_a = max(1, int(min_attempts))
+        cap_rate = float(max_rate)
+        losers = []
+        for label, stats in tallies.items():
+            rate = stats["wins"] / stats["attempts"]
+            if stats["attempts"] >= min_a and rate <= cap_rate:
+                losers.append({
+                    "fix_applied": label,
+                    "wins": stats["wins"],
+                    "attempts": stats["attempts"],
+                    "rate": rate,
+                })
+        losers.sort(key=lambda r: (r["rate"], -r["attempts"]))
+        return losers[: max(0, int(limit))]
+
+    # ------------------------------------------------------------------
     # System logs
     # ------------------------------------------------------------------
 
@@ -430,14 +730,14 @@ class MemoryStore:
             result = await session.execute(query)
             return [
                 {
-                    "id": l.id,
-                    "level": l.level,
-                    "source": l.source,
-                    "message": l.message,
-                    "meta": l.meta,
-                    "created_at": l.created_at.isoformat(),
+                    "id": log_entry.id,
+                    "level": log_entry.level,
+                    "source": log_entry.source,
+                    "message": log_entry.message,
+                    "meta": log_entry.meta,
+                    "created_at": log_entry.created_at.isoformat(),
                 }
-                for l in result.scalars().all()
+                for log_entry in result.scalars().all()
             ]
 
     # ------------------------------------------------------------------

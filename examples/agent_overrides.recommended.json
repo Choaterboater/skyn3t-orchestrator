@@ -1,0 +1,124 @@
+{
+  "architect": {
+    "backend": "claude_cli",
+    "model": "opus",
+    "temperature": 0.3,
+    "max_tokens": 4000
+  },
+  "brainstorm": {
+    "backend": "claude_cli",
+    "model": "opus",
+    "temperature": 0.7,
+    "max_tokens": 4000,
+    "capabilities": ["brainstorm", "problem_framing"],
+    "enabled": true,
+    "provider": "local",
+    "system_prompt": ""
+  },
+  "build_verifier": {
+    "backend": "claude_cli",
+    "model": "haiku",
+    "temperature": 0.0,
+    "max_tokens": 2000
+  },
+  "business_analyst": {
+    "backend": "claude_cli",
+    "model": "sonnet",
+    "temperature": 0.3,
+    "max_tokens": 4000
+  },
+  "code_agent": {
+    "backend": "copilot_cli",
+    "model": "gpt-5.3-codex",
+    "temperature": 0.2,
+    "max_tokens": 8000
+  },
+  "code_improver": {
+    "backend": "kimi_cli",
+    "model": "kimi-code/kimi-for-coding",
+    "temperature": 0.2,
+    "max_tokens": 8000
+  },
+  "designer": {
+    "backend": "claude_cli",
+    "model": "opus",
+    "temperature": 0.6,
+    "max_tokens": 4000
+  },
+  "docs_ingestor": {
+    "backend": "claude_cli",
+    "model": "haiku",
+    "temperature": 0.2,
+    "max_tokens": 2000
+  },
+  "explorer": {
+    "backend": "claude_cli",
+    "model": "haiku",
+    "temperature": 0.4,
+    "max_tokens": 2000
+  },
+  "file_ops_agent": {
+    "backend": "claude_cli",
+    "model": "haiku",
+    "temperature": 0.0,
+    "max_tokens": 1500
+  },
+  "github_explorer": {
+    "backend": "copilot_cli",
+    "model": "gpt-5.4-mini",
+    "temperature": 0.2,
+    "max_tokens": 3000
+  },
+  "github_ingestor": {
+    "backend": "copilot_cli",
+    "model": "gpt-5.4-mini",
+    "temperature": 0.2,
+    "max_tokens": 3000
+  },
+  "marketer": {
+    "backend": "claude_cli",
+    "model": "sonnet",
+    "temperature": 0.6,
+    "max_tokens": 4000
+  },
+  "project_memory": {
+    "backend": "copilot_cli",
+    "model": "gpt-5.4-mini",
+    "temperature": 0.2,
+    "max_tokens": 2000
+  },
+  "research_agent": {
+    "backend": "copilot_cli",
+    "model": "gpt-5.4",
+    "temperature": 0.2,
+    "max_tokens": 8000
+  },
+  "reviewer": {
+    "backend": "kimi_cli",
+    "model": "kimi-code/kimi-for-coding",
+    "temperature": 0.2,
+    "max_tokens": 6000
+  },
+  "scheduler_agent": {
+    "backend": "claude_cli",
+    "model": "haiku",
+    "enabled": false,
+    "temperature": 0.0,
+    "max_tokens": 1500,
+    "capabilities": ["schedule_task", "cron_management", "reminder"],
+    "provider": "local",
+    "system_prompt": ""
+  },
+  "verifier": {
+    "backend": "claude_cli",
+    "model": "haiku",
+    "temperature": 0.0,
+    "max_tokens": 2000
+  },
+  "writer": {
+    "backend": "kimi_cli",
+    "model": "kimi-code/kimi-for-coding",
+    "temperature": 0.5,
+    "max_tokens": 4000
+  }
+}

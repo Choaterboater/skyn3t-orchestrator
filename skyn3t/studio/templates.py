@@ -59,7 +59,7 @@ TEMPLATES: List[Template] = [
         stages=_wire_handoffs(
             [
                 StageSpec(name="brainstorm", agent="BrainstormAgent", capability="brainstorm"),
-                StageSpec(name="research", agent="ResearcherAgent", capability="research"),
+                StageSpec(name="research", agent="ResearchAgent", capability="research"),
                 StageSpec(name="architecture", agent="ArchitectAgent", capability="architecture"),
                 StageSpec(
                     name="code",
@@ -88,7 +88,7 @@ TEMPLATES: List[Template] = [
         stages=_wire_handoffs(
             [
                 StageSpec(name="brainstorm", agent="BrainstormAgent", capability="brainstorm"),
-                StageSpec(name="research", agent="ResearcherAgent", capability="research"),
+                StageSpec(name="research", agent="ResearchAgent", capability="research"),
                 StageSpec(
                     name="business_analyst",
                     agent="BusinessAnalystAgent",
@@ -116,7 +116,7 @@ TEMPLATES: List[Template] = [
         stages=_wire_handoffs(
             [
                 StageSpec(name="brainstorm", agent="BrainstormAgent", capability="brainstorm"),
-                StageSpec(name="research", agent="ResearcherAgent", capability="research"),
+                StageSpec(name="research", agent="ResearchAgent", capability="research"),
                 StageSpec(
                     name="designer",
                     agent="DesignerAgent",
@@ -155,7 +155,7 @@ TEMPLATES: List[Template] = [
         stages=_wire_handoffs(
             [
                 StageSpec(name="brainstorm", agent="BrainstormAgent", capability="brainstorm"),
-                StageSpec(name="research", agent="ResearcherAgent", capability="research"),
+                StageSpec(name="research", agent="ResearchAgent", capability="research"),
                 StageSpec(name="designer", agent="DesignerAgent", capability="design"),
                 StageSpec(
                     name="writer",
@@ -177,7 +177,7 @@ TEMPLATES: List[Template] = [
         stages=_wire_handoffs(
             [
                 StageSpec(name="brainstorm", agent="BrainstormAgent", capability="brainstorm"),
-                StageSpec(name="research", agent="ResearcherAgent", capability="research"),
+                StageSpec(name="research", agent="ResearchAgent", capability="research"),
                 StageSpec(
                     name="business_analyst",
                     agent="BusinessAnalystAgent",
@@ -205,7 +205,7 @@ TEMPLATES: List[Template] = [
         stages=_wire_handoffs(
             [
                 StageSpec(name="brainstorm", agent="BrainstormAgent", capability="brainstorm"),
-                StageSpec(name="research", agent="ResearcherAgent", capability="research"),
+                StageSpec(name="research", agent="ResearchAgent", capability="research"),
                 StageSpec(
                     name="business_analyst",
                     agent="BusinessAnalystAgent",
@@ -248,6 +248,17 @@ TEMPLATES: List[Template] = [
         ),
     ),
 ]
+
+
+TEMPLATES.append(Template(
+    key="auto",
+    title="Auto (planner picks agents)",
+    description=(
+        "The planner reads your brief and chooses which agents to run. "
+        "Use this for any free-form project that doesn't fit a fixed template."
+    ),
+    stages=[],   # empty signals dynamic mode
+))
 
 
 def get_template(key: str) -> Template:

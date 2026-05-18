@@ -26,8 +26,8 @@ from skyn3t.observability.tracing import (
     ConsoleExporter,
     SpanStatus,
     TraceContext,
-    TraceSpan,
     Tracer,
+    TraceSpan,
     get_tracer,
     trace_task,
 )

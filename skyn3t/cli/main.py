@@ -7,8 +7,7 @@ import json
 import os
 import shlex
 import time as time_mod
-from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 import typer
@@ -20,6 +19,8 @@ from rich.syntax import Syntax
 from rich.table import Table
 
 from skyn3t.config.settings import get_settings
+from skyn3t.studio.mission_setup import mission_setup_labels, normalize_mission_setup
+from skyn3t.studio.repo_target import normalize_repo_target, resolve_repo_target
 
 API_BASE = os.environ.get("SKYN3T_API_URL", "http://localhost:6660")
 
@@ -32,12 +33,32 @@ app = typer.Typer(
 )
 
 
+def _print_getting_started() -> None:
+    """Show a compact first-run path instead of dropping into the REPL."""
+    quickstart = Table(show_header=False, box=box.SIMPLE, pad_edge=False)
+    quickstart.add_row("[bold cyan]skyn3t init[/bold cyan]", "Initialize data directories and the database")
+    quickstart.add_row("[bold cyan]skyn3t start[/bold cyan]", "Start the API and dashboard on localhost:6660")
+    quickstart.add_row("[bold cyan]skyn3t status[/bold cyan]", "Check whether the system is up")
+    quickstart.add_row("[bold cyan]skyn3t project \"build a habit tracker\"[/bold cyan]", "Start a Studio run from one brief")
+    quickstart.add_row("[bold cyan]skyn3t repl[/bold cyan]", "Open the interactive console when you want it")
+
+    console.print(
+        Panel.fit(
+            quickstart,
+            title="[bold cyan]SkyN3t Getting Started[/bold cyan]",
+            border_style="cyan",
+        )
+    )
+    console.print(
+        "[dim]Need the full command list? Run [bold]skyn3t --help[/bold].[/dim]"
+    )
+
+
 @app.callback(invoke_without_command=True)
 def _default(ctx: typer.Context) -> None:
-    """Drop into the interactive REPL when invoked with no subcommand."""
+    """Show a guided entry screen when invoked with no subcommand."""
     if ctx.invoked_subcommand is None:
-        from skyn3t.cli.repl import run as run_repl
-        run_repl()
+        _print_getting_started()
 
 
 @app.command()
@@ -46,17 +67,119 @@ def repl() -> None:
     from skyn3t.cli.repl import run as run_repl
     run_repl()
 
+
+@app.command()
+def project(
+    brief: str = typer.Argument(..., help="Describe the project you want SkyN3t to build"),
+    template: str = typer.Option("auto", "--template", "-t", help="Studio template key; defaults to auto"),
+    audience: str = typer.Option(
+        "auto",
+        "--audience",
+        help="Mission audience: auto, general, builders, team, leaders, investors",
+    ),
+    autonomy: str = typer.Option(
+        "move_fast",
+        "--autonomy",
+        help="Mission mode: balanced, confirm_first, move_fast",
+    ),
+    repo_path: str = typer.Option(
+        "",
+        "--repo-path",
+        help="Optional local git repo path or GitHub repo URL to target for code work",
+    ),
+    focus_file: str = typer.Option(
+        "",
+        "--focus-file",
+        help="Optional repo-relative file path to focus code changes on",
+    ),
+) -> None:
+    """🚀 Start a Studio project from one brief."""
+    audience_map = {
+        "auto": "",
+        "general": "general",
+        "builders": "builders",
+        "team": "team",
+        "leaders": "leaders",
+        "investors": "investors",
+    }
+    audience = str(audience or "auto").strip().lower()
+    autonomy = str(autonomy or "move_fast").strip().lower()
+    allowed_autonomy = {"balanced", "confirm_first", "move_fast"}
+    if audience not in audience_map:
+        _error("Unknown audience. Use one of: auto, general, builders, team, leaders, investors.")
+        raise typer.Exit(1)
+    if autonomy not in allowed_autonomy:
+        _error("Unknown autonomy mode. Use one of: balanced, confirm_first, move_fast.")
+        raise typer.Exit(1)
+    mission_setup = normalize_mission_setup(
+        {
+            "audience": audience_map.get(audience, audience),
+            "autonomy": autonomy,
+        }
+    )
+    try:
+        repo_target = resolve_repo_target(
+            {"local_path": repo_path, "focus_file": focus_file}
+        )
+    except ValueError as exc:
+        _error(str(exc))
+        raise typer.Exit(1)
+    labels = mission_setup_labels(mission_setup)
+    try:
+        with _client() as client:
+            resp = client.post(
+                "/api/studio/start",
+                json={
+                    "template": template,
+                    "brief": brief,
+                    "mission_setup": mission_setup,
+                    "repo_target": repo_target,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    if not data.get("accepted"):
+        _error(data.get("error") or "Project could not be queued.")
+        raise typer.Exit(1)
+
+    slug = data.get("slug") or "(pending)"
+    title = data.get("title") or "Studio project"
+    repo_target = normalize_repo_target(data.get("repo_target") or repo_target)
+    next_action = data.get("next_action") or "Queued — waiting for a worker slot."
+    _success(
+        "Project queued\n"
+        f"• Slug: [bold]{slug}[/bold]\n"
+        f"• Template: {template}\n"
+        f"• Title: {title}\n"
+        f"• Next: {next_action}\n"
+        f"• Audience: {labels['audience'] or 'Auto / infer from brief'}\n"
+        f"• Mode: {labels['autonomy']}\n"
+        f"• Repo: {repo_target['local_path'] or 'Current SkyN3t workspace'}\n"
+        + (f"• Focus file: {repo_target['focus_file']}\n" if repo_target["focus_file"] else "")
+        + "\n"
+        "Watch it in the dashboard or use [bold]skyn3t repl[/bold] to keep chatting."
+    )
+
 agent_app = typer.Typer(help="Agent management commands", no_args_is_help=True)
 task_app = typer.Typer(help="Task management commands", no_args_is_help=True)
 pipeline_app = typer.Typer(help="Pipeline management commands", no_args_is_help=True)
 rag_app = typer.Typer(help="RAG knowledge base commands", no_args_is_help=True)
 github_app = typer.Typer(help="GitHub exploration commands", no_args_is_help=True)
+proposal_app = typer.Typer(help="Self-update proposal review", no_args_is_help=True)
 
 app.add_typer(agent_app, name="agent")
 app.add_typer(task_app, name="task")
 app.add_typer(pipeline_app, name="pipeline")
 app.add_typer(rag_app, name="rag")
 app.add_typer(github_app, name="github")
+app.add_typer(proposal_app, name="proposal")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -82,11 +205,243 @@ def _server_unavailable() -> None:
     )
 
 
-def _extract_text(out) -> str:
+def _extract_text(out: Any) -> str:
     """Extract a text payload from a task output (dict or scalar)."""
     if isinstance(out, dict):
-        return out.get("response", str(out))
+        response = out.get("response")
+        return str(response) if response is not None else str(out)
     return str(out) if out is not None else ""
+
+
+def _proposal_rel_time(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    now = time_mod.time()
+    diff = max(0, now - timestamp)
+    if diff < 60:
+        return f"{int(diff)}s ago"
+    if diff < 3600:
+        return f"{int(diff // 60)}m ago"
+    if diff < 86400:
+        return f"{int(diff // 3600)}h ago"
+    return f"{int(diff // 86400)}d ago"
+
+
+def _load_local_proposals(
+    *, status: Optional[str], origin: Optional[str]
+) -> List[Dict[str, Any]]:
+    from skyn3t.cortex.proposals import ProposalStore
+
+    store = ProposalStore()
+    return [p.to_public() for p in store.list(status=status, origin=origin)]
+
+
+def _load_local_proposal(pid: str) -> Optional[Dict[str, Any]]:
+    from skyn3t.cortex.proposals import ProposalStore
+
+    proposal = ProposalStore().get(pid)
+    return proposal.to_public() if proposal else None
+
+
+def _proposal_status_filter(status: str) -> Optional[str]:
+    normalized = str(status or "pending").strip().lower()
+    allowed = {"pending", "approved", "rejected", "applied", "failed", "all"}
+    if normalized not in allowed:
+        _error(
+            "Unknown proposal status. Use one of: pending, approved, rejected, applied, failed, all."
+        )
+        raise typer.Exit(1)
+    return None if normalized == "all" else normalized
+
+
+@proposal_app.command("list")
+def proposal_list(
+    status: str = typer.Option("pending", "--status", help="pending, approved, rejected, applied, failed, all"),
+    all_origins: bool = typer.Option(
+        False, "--all", help="Include user-filed ideas instead of only SkyN3t self-update proposals"
+    ),
+) -> None:
+    """📥 List pending self-update proposals."""
+    status_filter = _proposal_status_filter(status)
+    origin_filter = None if all_origins else "system"
+    source_label = "server"
+    try:
+        with _client() as client:
+            params: Dict[str, Any] = {}
+            if status_filter is not None:
+                params["status"] = status_filter
+            if origin_filter is not None:
+                params["origin"] = origin_filter
+            resp = client.get(
+                "/api/proposals",
+                params=params,
+            )
+            resp.raise_for_status()
+            proposals = resp.json().get("proposals", [])
+    except httpx.ConnectError:
+        proposals = _load_local_proposals(status=status_filter, origin=origin_filter)
+        source_label = "local"
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    if source_label == "local":
+        console.print(
+            "[dim]Server unavailable — showing local proposal files only.[/dim]"
+        )
+
+    if not proposals:
+        scope = "self-update" if not all_origins else "proposal"
+        typer.echo(f"No {scope} proposals found.")
+        return
+
+    table = Table(
+        title="[bold]Proposal Inbox[/bold]",
+        box=box.ROUNDED,
+        header_style="bold magenta",
+    )
+    table.add_column("ID", style="cyan")
+    table.add_column("Kind", style="blue")
+    table.add_column("Origin", style="yellow")
+    table.add_column("Title", style="white")
+    table.add_column("When", style="green")
+    table.add_column("Summary", style="dim")
+
+    for proposal in proposals:
+        summary = str(proposal.get("summary") or "")
+        table.add_row(
+            str(proposal.get("id") or ""),
+            str(proposal.get("kind") or "—"),
+            str(proposal.get("origin") or "system"),
+            str(proposal.get("title") or "(untitled)"),
+            _proposal_rel_time(proposal.get("created_at") or proposal.get("decided_at")),
+            summary if len(summary) <= 80 else summary[:80] + "…",
+        )
+
+    console.print(table)
+
+
+@proposal_app.command("show")
+def proposal_show(
+    proposal_id: str = typer.Argument(..., help="Proposal ID"),
+    all_origins: bool = typer.Option(
+        False, "--all", help="Allow viewing user-filed ideas as well as system proposals"
+    ),
+) -> None:
+    """🔎 Show full details for one proposal."""
+    source_label = "server"
+    try:
+        with _client() as client:
+            resp = client.get(f"/api/proposals/{proposal_id}")
+            resp.raise_for_status()
+            proposal = resp.json()
+    except httpx.ConnectError:
+        proposal = _load_local_proposal(proposal_id)
+        source_label = "local"
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    if not proposal:
+        _error(f"Proposal not found: {proposal_id}")
+        raise typer.Exit(1)
+
+    if not all_origins and str(proposal.get("origin") or "system") != "system":
+        _error("That proposal is a user-filed idea. Re-run with --all to inspect it.")
+        raise typer.Exit(1)
+
+    if source_label == "local":
+        console.print(
+            "[dim]Server unavailable — showing local proposal file only.[/dim]"
+        )
+
+    meta_lines = [
+        f"ID: {proposal.get('id') or '—'}",
+        f"Kind: {proposal.get('kind') or '—'}",
+        f"Origin: {proposal.get('origin') or 'system'}",
+        f"Status: {proposal.get('status') or '—'}",
+        f"Source: {proposal.get('source') or '—'}",
+        f"Created: {_proposal_rel_time(proposal.get('created_at'))}",
+        f"Summary: {proposal.get('summary') or '—'}",
+    ]
+    detail = str(proposal.get("detail") or "(no detail)")
+    console.print(
+        Panel(
+            "\n".join(meta_lines) + f"\n\nDetail\n{detail}",
+            title=f"[bold cyan]{proposal.get('title') or 'Proposal'}[/bold cyan]",
+            border_style="cyan",
+        )
+    )
+
+
+@proposal_app.command("approve")
+def proposal_approve(proposal_id: str = typer.Argument(..., help="Proposal ID")) -> None:
+    """✅ Approve and apply a proposal."""
+    try:
+        with _client() as client:
+            resp = client.post(f"/api/proposals/{proposal_id}/approve")
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _error(
+            "Proposal approval needs the SkyN3t server running so handlers are wired.\n"
+            "Start it with [bold]skyn3t start[/bold] and try again."
+        )
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    if not data.get("ok", True):
+        _error(data.get("error") or "Proposal approval failed.")
+        raise typer.Exit(1)
+
+    result = data.get("result") or {}
+    _success(
+        "Proposal approved\n"
+        f"• ID: [bold]{proposal_id}[/bold]\n"
+        f"• Applied: {'yes' if data.get('applied') else 'no'}\n"
+        f"• Result: {json.dumps(result, indent=2) if result else 'No handler output'}"
+    )
+
+
+@proposal_app.command("reject")
+def proposal_reject(
+    proposal_id: str = typer.Argument(..., help="Proposal ID"),
+    reason: str = typer.Option("", "--reason", help="Optional rejection reason"),
+) -> None:
+    """🛑 Reject a proposal."""
+    try:
+        with _client() as client:
+            resp = client.post(
+                f"/api/proposals/{proposal_id}/reject",
+                json={"reason": reason},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _error(
+            "Proposal rejection needs the SkyN3t server running.\n"
+            "Start it with [bold]skyn3t start[/bold] and try again."
+        )
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    if not data.get("ok", True):
+        _error(data.get("error") or "Proposal rejection failed.")
+        raise typer.Exit(1)
+
+    _success(
+        "Proposal rejected\n"
+        f"• ID: [bold]{proposal_id}[/bold]\n"
+        + (f"• Reason: {reason}" if reason else "• Reason: (none)")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +508,47 @@ def init() -> None:
 
 
 @app.command()
+def cleanup(
+    projects: bool = typer.Option(True, "--projects/--no-projects", help="Clean project artifact directories"),
+    proposals: bool = typer.Option(True, "--proposals/--no-proposals", help="Clean decided proposals"),
+    branches: bool = typer.Option(True, "--branches/--no-branches", help="Delete auto branches"),
+    all_: bool = typer.Option(False, "--all", help="All three (overrides defaults)"),
+    older_than_days: Optional[int] = typer.Option(None, "--older-than-days", help="Only items older than N days"),
+    keep_last: Optional[int] = typer.Option(None, "--keep-last", help="Keep the N most-recent items"),
+    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Preview only by default; pass --apply to actually delete"),
+) -> None:
+    """🧹 Clean up project artifacts, decided proposals, and auto-branches."""
+    from skyn3t.cli.cleanup import execute as exec_plan
+    from skyn3t.cli.cleanup import preview
+    if all_:
+        projects = proposals = branches = True
+    plan = preview(projects=projects, proposals=proposals, branches=branches,
+                    older_than_days=older_than_days, keep_last=keep_last)
+    typer.echo(f"Projects:  {plan['total_projects']}")
+    typer.echo(f"Proposals: {plan['total_proposals']}")
+    typer.echo(f"Branches:  {plan['total_branches']}")
+    typer.echo(f"Total size: {plan['total_bytes']/1024:.1f} KB")
+    if not (plan["total_projects"] or plan["total_proposals"] or plan["total_branches"]):
+        typer.echo("Nothing to clean.")
+        return
+    if dry_run:
+        typer.echo("\n(dry-run — pass --apply to actually delete)")
+        return
+    typer.confirm(
+        f"Delete {plan['total_projects']} projects, "
+        f"{plan['total_proposals']} proposals, "
+        f"{plan['total_branches']} branches?",
+        abort=True,
+    )
+    res = exec_plan(plan)
+    typer.echo(f"\nRemoved: {res['projects']} projects, {res['proposals']} proposals, {res['branches']} branches")
+    if res["errors"]:
+        typer.echo("Errors:")
+        for e in res["errors"]:
+            typer.echo(f"  - {e}")
+
+
+@app.command()
 def status() -> None:
     """📊 Show system status."""
     try:
@@ -168,7 +564,6 @@ def status() -> None:
         raise typer.Exit(1)
 
     system_running = data.get("running", False)
-    status_color = "green" if system_running else "red"
     status_text = "[bold green]Online[/bold green]" if system_running else "[bold red]Offline[/bold red]"
 
     info = Table(show_header=False, box=box.SIMPLE)
@@ -274,11 +669,14 @@ def agent_list() -> None:
 @agent_app.command("add")
 def agent_add(
     name: str = typer.Argument(..., help="Unique agent name"),
-    provider: str = typer.Option("anthropic", "--provider", "-p", help="Provider (anthropic, github)"),
+    provider: str = typer.Option("claude", "--provider", "-p", help="Provider (claude, github)"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Model name (Claude only)"),
     local: bool = typer.Option(False, "--local", "-l", help="Run locally without server"),
 ) -> None:
     """➕ Add a new agent dynamically."""
+    provider = (provider or "claude").lower()
+    if provider == "anthropic":
+        provider = "claude"
     payload = {
         "name": name,
         "provider": provider,
@@ -307,19 +705,21 @@ def agent_add(
             raise typer.Exit(1)
 
     # Local mode -----------------------------------------------------------
+    from skyn3t.adapters.claude_cli import ClaudeCLIAgent
     from skyn3t.core.events import EventBus
     from skyn3t.core.orchestrator import Orchestrator
 
-    async def _add() -> None:
+    async def _add() -> dict[str, Any]:
+        from skyn3t.core.agent import BaseAgent
         event_bus = EventBus()
         orchestrator = Orchestrator(event_bus)
+        agent: BaseAgent
 
-        if provider in ("anthropic", "claude"):
-            from skyn3t.adapters.anthropic_adapter import ClaudeAgent
-            agent = ClaudeAgent(
+        if provider == "claude":
+            agent = ClaudeCLIAgent(
                 name=name,
                 event_bus=event_bus,
-                model=model or "claude-3-opus-20240229",
+                config={"model": model} if model else {},
             )
         elif provider == "github":
             from skyn3t.agents.github_explorer import GitHubExplorerAgent
@@ -327,7 +727,7 @@ def agent_add(
         else:
             _error(
                 f"Provider '[bold]{provider}[/bold]' not fully implemented.\n"
-                "Supported: [cyan]anthropic[/cyan], [cyan]github[/cyan]"
+                "Supported: [cyan]claude[/cyan], [cyan]github[/cyan]"
             )
             raise typer.Exit(1)
 
@@ -431,9 +831,11 @@ def _add_cli_agent(
     from skyn3t.core.events import EventBus
     from skyn3t.core.orchestrator import Orchestrator
 
-    async def _add() -> dict:
+    async def _add() -> dict[str, Any]:
+        from skyn3t.core.agent import BaseAgent
         event_bus = EventBus()
         orchestrator = Orchestrator(event_bus)
+        agent: BaseAgent
         if provider == "claude":
             agent = ClaudeCLIAgent(
                 name=name,
@@ -608,11 +1010,12 @@ def task_status(
 ) -> None:
     """🔍 Check task status and results."""
 
-    def _fetch() -> dict:
+    def _fetch() -> dict[str, Any]:
         with _client() as client:
             resp = client.get(f"/api/tasks/{task_id}/result")
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            return data if isinstance(data, dict) else {}
 
     try:
         data = _fetch()

@@ -3,15 +3,19 @@
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from enum import Enum, auto
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 from uuid import uuid4
 
-from skyn3t.core.agent import BaseAgent, TaskRequest, TaskResult
+from skyn3t.core.agent import BaseAgent, TaskRequest
 from skyn3t.core.events import Event, EventBus, EventType
 
 logger = logging.getLogger("skyn3t.intelligence.planner")
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class MilestoneStatus(Enum):
@@ -58,7 +62,7 @@ class Milestone:
     def duration_seconds(self) -> Optional[float]:
         if not self.started_at:
             return None
-        end = self.completed_at or datetime.utcnow()
+        end = self.completed_at or _utcnow()
         return (end - self.started_at).total_seconds()
 
 
@@ -71,7 +75,7 @@ class Plan:
     goal: str = ""
     status: PlanStatus = PlanStatus.DRAFT
     milestones: List[Milestone] = field(default_factory=list)
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     context: Dict[str, Any] = field(default_factory=dict)
@@ -135,9 +139,9 @@ class ProgressTracker:
                 old_status = m.status
                 m.status = status
                 if status == MilestoneStatus.IN_PROGRESS and not m.started_at:
-                    m.started_at = datetime.utcnow()
+                    m.started_at = _utcnow()
                 if status == MilestoneStatus.COMPLETED and not m.completed_at:
-                    m.completed_at = datetime.utcnow()
+                    m.completed_at = _utcnow()
                 for k, v in kwargs.items():
                     setattr(m, k, v)
 
@@ -182,7 +186,12 @@ class ProgressTracker:
         }
 
     def get_all_summaries(self) -> List[Dict[str, Any]]:
-        return [self.get_plan_summary(pid) for pid in self._plans]
+        summaries: List[Dict[str, Any]] = []
+        for plan_id in self._plans:
+            summary = self.get_plan_summary(plan_id)
+            if summary is not None:
+                summaries.append(summary)
+        return summaries
 
 
 class ResourceAllocator:
@@ -218,7 +227,7 @@ class ResourceAllocator:
         chosen = min(candidates, key=lambda a: a._task_queue.qsize())
         self._allocations[milestone.milestone_id] = {
             "agent": chosen.name,
-            "allocated_at": datetime.utcnow().isoformat(),
+            "allocated_at": _utcnow().isoformat(),
         }
         return chosen.name
 
@@ -249,7 +258,7 @@ class PriorityManager:
         boost = self._boosts.get(plan_id, 0)
         deadline_urgency = 0
         if plan_id in self._deadlines:
-            remaining = (self._deadlines[plan_id] - datetime.utcnow()).total_seconds()
+            remaining = (self._deadlines[plan_id] - _utcnow()).total_seconds()
             if remaining < 300:
                 deadline_urgency = 10
             elif remaining < 900:
@@ -285,10 +294,49 @@ class Planner:
         self._plans: Dict[str, Plan] = {}
         self._running = False
         self._planner_task: Optional[asyncio.Task] = None
-        self._task_executor: Optional[Callable[[TaskRequest, Optional[str]], asyncio.Future]] = None
+        self._task_executor: Optional[Callable[[TaskRequest, Optional[str]], Awaitable[str]]] = None
+        # Per-task completion signals. Populated when a milestone task is
+        # submitted; resolved by _on_task_completed/_on_task_failed listeners.
+        # Without this the planner used to mark milestones COMPLETED as soon as
+        # submit_task returned a task id, regardless of actual outcome.
+        self._task_outcomes: Dict[str, "tuple[asyncio.Event, dict]"] = {}
+        if event_bus is not None:
+            event_bus.subscribe(self._on_task_completed, EventType.TASK_COMPLETED)
+            event_bus.subscribe(self._on_task_failed, EventType.TASK_FAILED_FINAL)
+            event_bus.subscribe(self._on_task_failed, EventType.TASK_FAILED)
+
+    def _on_task_completed(self, event: Event) -> None:
+        task_id = event.payload.get("task_id")
+        if not task_id:
+            return
+        slot = self._task_outcomes.get(task_id)
+        if slot is None:
+            return
+        signal, state = slot
+        state["success"] = True
+        state["error"] = None
+        signal.set()
+
+    def _on_task_failed(self, event: Event) -> None:
+        task_id = event.payload.get("task_id")
+        if not task_id:
+            return
+        slot = self._task_outcomes.get(task_id)
+        if slot is None:
+            return
+        signal, state = slot
+        # TASK_FAILED can fire while fallback is still attempting; only treat
+        # TASK_FAILED_FINAL (or a TASK_FAILED with no further fallback) as terminal.
+        # We rely on the orchestrator publishing TASK_FAILED_FINAL when retries
+        # are exhausted; intermediate TASK_FAILED events will be superseded by
+        # a later TASK_COMPLETED if fallback succeeds.
+        if event.event_type == EventType.TASK_FAILED_FINAL:
+            state["success"] = False
+            state["error"] = event.payload.get("error", "task failed")
+            signal.set()
 
     def set_task_executor(
-        self, executor: Callable[[TaskRequest, Optional[str]], asyncio.Future]
+        self, executor: Callable[[TaskRequest, Optional[str]], Awaitable[str]]
     ) -> None:
         """Set the function used to execute tasks (e.g., orchestrator.submit_task)."""
         self._task_executor = executor
@@ -323,7 +371,7 @@ class Planner:
     async def _execute_plan_step(self, plan: Plan) -> None:
         if plan.status == PlanStatus.DRAFT:
             plan.status = PlanStatus.ACTIVE
-            plan.started_at = datetime.utcnow()
+            plan.started_at = _utcnow()
 
         ready = plan.get_ready_milestones()
         if not ready and not any(
@@ -335,10 +383,10 @@ class Planner:
                 for m in plan.milestones
             ):
                 plan.status = PlanStatus.COMPLETED
-                plan.completed_at = datetime.utcnow()
+                plan.completed_at = _utcnow()
             elif plan.get_blocked_milestones():
                 plan.status = PlanStatus.FAILED
-                plan.completed_at = datetime.utcnow()
+                plan.completed_at = _utcnow()
             return
 
         # Sort by priority
@@ -374,11 +422,49 @@ class Planner:
                 task.input_data["plan_id"] = plan.plan_id
                 task.input_data["milestone_id"] = milestone.milestone_id
 
-            result = await self._task_executor(task, milestone.assigned_agents[0] if milestone.assigned_agents else None)
-            milestone.task_ids.append(task.task_id)
-            self.progress.update_milestone(
-                plan.plan_id, milestone.milestone_id, MilestoneStatus.COMPLETED
-            )
+            # Register outcome slot before submitting so we can't miss a fast
+            # completion event that fires before we await the signal.
+            signal = asyncio.Event()
+            state: Dict[str, Any] = {"success": None, "error": None}
+            self._task_outcomes[task.task_id] = (signal, state)
+            try:
+                submitted_id = await self._task_executor(
+                    task,
+                    milestone.assigned_agents[0] if milestone.assigned_agents else None,
+                )
+                # If the executor renamed the task (e.g. via decomposition) we
+                # need to track the new id instead.
+                if submitted_id and submitted_id != task.task_id:
+                    self._task_outcomes.pop(task.task_id, None)
+                    self._task_outcomes[submitted_id] = (signal, state)
+                    milestone.task_ids.append(submitted_id)
+                else:
+                    milestone.task_ids.append(task.task_id)
+
+                # Wait for actual completion (or hard timeout from milestone metadata).
+                timeout = float(
+                    milestone.metadata.get("task_timeout_seconds", 600.0)
+                )
+                try:
+                    await asyncio.wait_for(signal.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    state["success"] = False
+                    state["error"] = f"milestone task timed out after {int(timeout)}s"
+            finally:
+                # Drop the slot from both possible keys.
+                self._task_outcomes.pop(task.task_id, None)
+
+            if state["success"]:
+                self.progress.update_milestone(
+                    plan.plan_id, milestone.milestone_id, MilestoneStatus.COMPLETED
+                )
+            else:
+                err = state["error"] or "task failed"
+                milestone.metadata["last_error"] = err
+                self.progress.update_milestone(
+                    plan.plan_id, milestone.milestone_id, MilestoneStatus.BLOCKED
+                )
+                await self._adapt_plan(plan, milestone, err)
         except Exception as e:
             milestone.metadata["last_error"] = str(e)
             self.progress.update_milestone(

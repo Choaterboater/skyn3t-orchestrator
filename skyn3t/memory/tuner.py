@@ -1,4 +1,4 @@
-"""Self-Tuning Engine — automatically applies reflection suggestions to agent configs.
+"""Self-Tuning Engine — turns reflection suggestions into review-gated tuning proposals.
 
 The ReflectionEngine detects patterns and generates tuning suggestions, but those
 suggestions sit in memory until someone acts on them. This bridge watches for
@@ -12,6 +12,36 @@ from typing import Any, Dict, List, Optional
 
 from skyn3t.core.events import Event, EventBus, EventType
 from skyn3t.memory.store import MemoryStore
+
+
+def apply_adjustments_to_config(
+    agent_config: Dict[str, Any],
+    adjustments: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Apply safe tuning adjustments to an agent config dict."""
+    config = dict(agent_config)
+    for adj in adjustments:
+        param = adj["parameter"]
+        if param == "request_interval":
+            config["request_interval"] = config.get("request_interval", 0) + 0.5
+        elif param == "timeout":
+            config["timeout"] = min(config.get("timeout", 30) + 10, 300)
+        elif param == "max_tokens":
+            config["max_tokens"] = min(config.get("max_tokens", 4096) + 1024, 8192)
+        elif param == "prompt_suffix":
+            existing = config.get("prompt_suffix", "")
+            new_suffix = adj["new_value"]
+            if new_suffix not in existing:
+                config["prompt_suffix"] = existing + "\n" + new_suffix if existing else new_suffix
+        elif param == "auth_retry":
+            config["auth_retry"] = True
+
+    config["timeout"] = max(config.get("timeout", 30), 5)
+    if "temperature" in config:
+        config["temperature"] = min(max(config["temperature"], 0.0), 1.0)
+    if "max_retries" in config:
+        config["max_retries"] = min(config["max_retries"], 5)
+    return config
 
 
 class SelfTuningEngine:
@@ -39,6 +69,7 @@ class SelfTuningEngine:
 
         # Applied history per agent
         self._applied: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        self._suggested: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
         # Urgent patterns that apply immediately
         self._urgent_patterns = {"rate_limit", "auth_error"}
@@ -101,7 +132,7 @@ class SelfTuningEngine:
             urgent = bool(set(current_patterns) & self._urgent_patterns)
 
             # Count similar suggestions
-            suggestion_counts = defaultdict(int)
+            suggestion_counts: Dict[tuple[Any, Any, Any], int] = defaultdict(int)
             for p in pending:
                 sugg = p["suggestion"]
                 key = (sugg.get("type"), sugg.get("issue"), sugg.get("advice"))
@@ -119,43 +150,49 @@ class SelfTuningEngine:
             await self._apply_tuning(agent_name, current_patterns, pending_copy)
 
     async def _apply_tuning(self, agent_name: str, patterns: List[str], pending_copy: list) -> None:
-        """Generate and apply safe config adjustments."""
+        """Generate a review-gated tuning suggestion event."""
         # Derive adjustments from patterns
         adjustments = self._derive_adjustments(agent_name, patterns)
         if not adjustments:
             return
 
-        # Record what we applied
+        # Record what we suggested. Actual application happens later,
+        # after a tuning proposal is approved.
         record = {
             "agent": agent_name,
             "patterns": patterns,
             "adjustments": adjustments,
+            "suggestion_count": len(pending_copy),
             "timestamp": asyncio.get_event_loop().time(),
         }
         async with self._lock:
-            self._applied[agent_name].append(record)
+            self._suggested[agent_name].append(record)
 
-        # Publish alert
+        reason = "; ".join(adj["reason"] for adj in adjustments)
+
+        # Publish a proposal-friendly signal for GatedTuner.
         if self.event_bus:
             self.event_bus.publish(
                 Event(
                     event_type=EventType.SYSTEM_ALERT,
                     source="self_tuning",
                     payload={
-                        "alert_type": "auto_tuning_applied",
+                        "kind": "tuning_suggestion",
                         "agent": agent_name,
                         "adjustments": adjustments,
-                        "trigger_patterns": patterns,
+                        "patterns": patterns,
+                        "reason": reason,
                     },
                 )
             )
 
-        # Persist to memory
+        # Persist the suggestion so operators can see it even if it is
+        # later rejected at the proposal layer.
         if self._memory:
             await self._memory.save_log(
                 level="INFO",
                 source="self_tuning",
-                message=f"Auto-tuning applied to {agent_name}",
+                message=f"Tuning suggestion emitted for {agent_name}",
                 meta=record,
             )
 
@@ -163,7 +200,7 @@ class SelfTuningEngine:
         self, agent_name: str, patterns: List[str]
     ) -> List[Dict[str, Any]]:
         """Derive safe config adjustments from patterns."""
-        adjustments = []
+        adjustments: List[Dict[str, Any]] = []
         pattern_set = set(patterns)
 
         if "rate_limit" in pattern_set:
@@ -231,31 +268,17 @@ class SelfTuningEngine:
                 all_patterns.extend(p.get("patterns", []))
             self._pending[agent_name] = []
 
-        config = dict(agent_config)
         adjustments = self._derive_adjustments(agent_name, all_patterns)
-
-        for adj in adjustments:
-            param = adj["parameter"]
-            if param == "request_interval":
-                config["request_interval"] = config.get("request_interval", 0) + 0.5
-            elif param == "timeout":
-                config["timeout"] = min(config.get("timeout", 30) + 10, 300)
-            elif param == "max_tokens":
-                config["max_tokens"] = min(config.get("max_tokens", 4096) + 1024, 8192)
-            elif param == "prompt_suffix":
-                existing = config.get("prompt_suffix", "")
-                new_suffix = adj["new_value"]
-                if new_suffix not in existing:
-                    config["prompt_suffix"] = existing + "\n" + new_suffix if existing else new_suffix
-            elif param == "auth_retry":
-                config["auth_retry"] = True
-
-        # Safety bounds
-        config["timeout"] = max(config.get("timeout", 30), 5)
-        if "temperature" in config:
-            config["temperature"] = min(max(config["temperature"], 0.0), 1.0)
-        if "max_retries" in config:
-            config["max_retries"] = min(config["max_retries"], 5)
+        config = apply_adjustments_to_config(agent_config, adjustments)
+        if adjustments:
+            record = {
+                "agent": agent_name,
+                "patterns": all_patterns,
+                "adjustments": adjustments,
+                "timestamp": asyncio.get_event_loop().time(),
+            }
+            async with self._lock:
+                self._applied[agent_name].append(record)
 
         return config
 
@@ -268,6 +291,9 @@ class SelfTuningEngine:
         return {
             "pending_suggestions": {
                 k: len(v) for k, v in self._pending.items()
+            },
+            "suggested_batches": {
+                k: len(v) for k, v in self._suggested.items()
             },
             "applied_adjustments": {
                 k: len(v) for k, v in self._applied.items()

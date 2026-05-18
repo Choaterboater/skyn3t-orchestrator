@@ -5,14 +5,18 @@ import logging
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from uuid import uuid4
 
-from skyn3t.core.agent import BaseAgent, TaskRequest, TaskResult
+from skyn3t.core.agent import TaskResult
 from skyn3t.core.events import Event, EventBus, EventType
 
 logger = logging.getLogger("skyn3t.intelligence.reflection")
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @dataclass
@@ -25,8 +29,8 @@ class FailurePattern:
     regex: str = ""
     affected_agents: List[str] = field(default_factory=list)
     occurrence_count: int = 0
-    first_seen: datetime = field(default_factory=datetime.utcnow)
-    last_seen: datetime = field(default_factory=datetime.utcnow)
+    first_seen: datetime = field(default_factory=_utcnow)
+    last_seen: datetime = field(default_factory=_utcnow)
     example_errors: List[str] = field(default_factory=list)
     suggested_fix: Optional[str] = None
 
@@ -48,7 +52,7 @@ class Lesson:
     insight: str = ""
     action_taken: str = ""
     outcome: bool = True
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
     relevance_score: float = 1.0
 
 
@@ -87,18 +91,18 @@ class LessonsLearnedKB:
         async with self._lock:
             candidates = self._lessons.copy()
             if agent_name:
-                candidates = [l for l in candidates if l.agent_name == agent_name]
+                candidates = [lesson for lesson in candidates if lesson.agent_name == agent_name]
             if capability:
-                candidates = [l for l in candidates if l.capability == capability]
+                candidates = [lesson for lesson in candidates if lesson.capability == capability]
             if context_query:
                 candidates = [
-                    l
-                    for l in candidates
-                    if context_query.lower() in l.context.lower()
-                    or context_query.lower() in l.insight.lower()
+                    lesson
+                    for lesson in candidates
+                    if context_query.lower() in lesson.context.lower()
+                    or context_query.lower() in lesson.insight.lower()
                 ]
-            candidates = [l for l in candidates if l.relevance_score >= min_relevance]
-            candidates.sort(key=lambda l: l.relevance_score, reverse=True)
+            candidates = [lesson for lesson in candidates if lesson.relevance_score >= min_relevance]
+            candidates.sort(key=lambda lesson: lesson.relevance_score, reverse=True)
             return candidates[:limit]
 
     async def update_relevance(self, lesson_id: str, delta: float) -> None:
@@ -111,16 +115,16 @@ class LessonsLearnedKB:
     def export(self) -> List[Dict[str, Any]]:
         return [
             {
-                "lesson_id": l.lesson_id,
-                "agent": l.agent_name,
-                "capability": l.capability,
-                "insight": l.insight,
-                "action": l.action_taken,
-                "outcome": l.outcome,
-                "relevance": l.relevance_score,
-                "created_at": l.created_at.isoformat(),
+                "lesson_id": lesson.lesson_id,
+                "agent": lesson.agent_name,
+                "capability": lesson.capability,
+                "insight": lesson.insight,
+                "action": lesson.action_taken,
+                "outcome": lesson.outcome,
+                "relevance": lesson.relevance_score,
+                "created_at": lesson.created_at.isoformat(),
             }
-            for l in self._lessons
+            for lesson in self._lessons
         ]
 
 
@@ -178,7 +182,7 @@ class FailurePatternAnalyzer:
         for pattern in self.patterns:
             if pattern.matches(error):
                 pattern.occurrence_count += 1
-                pattern.last_seen = datetime.utcnow()
+                pattern.last_seen = _utcnow()
                 pattern.affected_agents = list(set(pattern.affected_agents + [agent_name]))
                 if len(pattern.example_errors) < 5:
                     pattern.example_errors.append(error[:500])
@@ -440,7 +444,7 @@ class ReflectionEngine:
             "task_id": result.task_id,
             "agent": agent_name,
             "success": result.success,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": _utcnow().isoformat(),
         }
 
         if not result.success and error:
@@ -512,6 +516,26 @@ class ReflectionEngine:
         if not task_id:
             logger.warning("Skipping task_failed event missing task_id")
             return
+        # Only learn from TERMINAL failures. Intermediate failures
+        # (retries are still available, fallback agent is about to be
+        # tried, etc) shouldn't be treated as ground-truth "this agent
+        # failed" — they pollute the lessons store with noise that a
+        # successful retry would have erased. We treat an event as
+        # terminal when retry_count >= max_retries, OR when neither
+        # field is present (older publishers we shouldn't assume are
+        # retryable). When `terminal: True` is explicitly set, honor it.
+        retry_count = payload.get("retry_count")
+        max_retries = payload.get("max_retries")
+        is_terminal = payload.get("terminal")
+        if is_terminal is None and retry_count is not None and max_retries is not None:
+            try:
+                is_terminal = int(retry_count) >= int(max_retries)
+            except (TypeError, ValueError):
+                is_terminal = True  # malformed → assume terminal
+        if is_terminal is False:
+            # Mid-retry — skip. The next attempt may succeed and the
+            # reflection store should reflect outcome, not transient state.
+            return
         result = TaskResult(
             task_id=task_id,
             success=False,
@@ -544,12 +568,12 @@ class ReflectionEngine:
             ],
             "lessons": [
                 {
-                    "insight": l.insight,
-                    "action": l.action_taken,
-                    "outcome": l.outcome,
-                    "relevance": l.relevance_score,
+                    "insight": lesson.insight,
+                    "action": lesson.action_taken,
+                    "outcome": lesson.outcome,
+                    "relevance": lesson.relevance_score,
                 }
-                for l in lessons
+                for lesson in lessons
             ],
             "tuning_suggestions": [],
         }

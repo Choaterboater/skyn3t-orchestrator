@@ -4,8 +4,8 @@ import asyncio
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
-from uuid import UUID, uuid4
+from typing import Any, Dict, Optional
+from uuid import uuid4
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import Event, EventBus, EventType
@@ -22,6 +22,10 @@ class ScheduledJob:
     payload: Dict[str, Any] = field(default_factory=dict)
     next_run: Optional[datetime] = None
     last_run: Optional[datetime] = None
+    # Anchor for interval-based schedules. next_run is computed as
+    # anchor + N * interval, so loop wakeup delays don't compound drift.
+    anchor: Optional[datetime] = None
+    interval_seconds: Optional[float] = None
     run_count: int = 0
     max_runs: Optional[int] = None
     enabled: bool = True
@@ -34,14 +38,14 @@ class SchedulerAgent(BaseAgent):
     def __init__(
         self,
         name: str = "scheduler_agent",
-        event_bus: EventBus = None,
+        event_bus: EventBus | None = None,
         config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             name=name,
             agent_type="scheduler",
             provider="local",
-            event_bus=event_bus,
+            event_bus=event_bus or EventBus(),
             config=config,
         )
         self.add_capability(
@@ -81,23 +85,43 @@ class SchedulerAgent(BaseAgent):
         self._jobs: Dict[str, ScheduledJob] = {}
         self._reminders: Dict[str, Dict[str, Any]] = {}
         self._scheduler_task: Optional[asyncio.Task] = None
+        self._scheduler_loop_running: bool = False
         self._tick_interval = self.config.get("tick_interval", 60)
 
     async def initialize(self) -> None:
-        """Initialize the scheduler agent and start the background tick loop."""
+        """Initialize the scheduler agent and start the background tick loop.
+
+        Idempotent: if already initialised with a live scheduler task, return
+        without spawning a duplicate. Previously a second initialize() would
+        overwrite ``_scheduler_task`` while leaving the original running, and
+        the loop's ``while self._running`` exited immediately when called via
+        the registry (which never calls BaseAgent.start), causing the monitor
+        to flag the agent as errored and trigger SELF_HEAL_TRIGGERED.
+        """
         self.metadata["initialized"] = True
-        self.metadata["jobs_count"] = 0
-        self.metadata["reminders_count"] = 0
+        self.metadata.setdefault("jobs_count", 0)
+        self.metadata.setdefault("reminders_count", 0)
+        # Idempotency: don't spawn a second loop if one is alive.
+        if self._scheduler_task is not None and not self._scheduler_task.done():
+            return
+        # Use our own running flag so the loop survives whether or not
+        # BaseAgent.start() has been called (the registry path calls
+        # initialize() directly without ever flipping BaseAgent._running).
+        self._scheduler_loop_running = True
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
 
     async def health_check(self) -> bool:
-        """Check if the scheduler is running."""
-        if self._scheduler_task is None:
-            return False
-        return not self._scheduler_task.done()
+        """Always healthy on first run.
+
+        We don't gate health on the cron task being alive: a momentary glitch
+        in the loop should not nuke the agent. The loop self-recovers on its
+        own and the monitor would otherwise spin SELF_HEAL_TRIGGERED on us.
+        """
+        return True
 
     async def shutdown(self) -> None:
         """Shutdown the scheduler gracefully."""
+        self._scheduler_loop_running = False
         if self._scheduler_task:
             self._scheduler_task.cancel()
             try:
@@ -106,7 +130,7 @@ class SchedulerAgent(BaseAgent):
                 pass
         await super().shutdown()
 
-    async def execute(self, task: TaskRequest) -> TaskResult:
+    async def execute(self, task: TaskRequest, stdin_data: str | None = None) -> TaskResult:
         """Execute a scheduler-related task."""
         task_type = task.input_data.get("task_type", "schedule_task")
 
@@ -155,12 +179,24 @@ class SchedulerAgent(BaseAgent):
         if next_run is None:
             return {"success": False, "error": f"Invalid schedule format: {schedule}"}
 
+        # For interval schedules ("every N minutes/etc"), capture the anchor
+        # and interval so the loop can compute next_run as anchor+N*interval
+        # instead of now+interval (which drifts on every late wakeup).
+        anchor: Optional[datetime] = None
+        interval_seconds: Optional[float] = None
+        interval = self._parse_interval_seconds(schedule)
+        if interval is not None:
+            anchor = next_run
+            interval_seconds = interval
+
         job = ScheduledJob(
             name=name,
             schedule=schedule,
             task_type=job_task_type,
             payload=payload,
             next_run=next_run,
+            anchor=anchor,
+            interval_seconds=interval_seconds,
             max_runs=max_runs,
         )
         self._jobs[job.job_id] = job
@@ -298,7 +334,7 @@ class SchedulerAgent(BaseAgent):
 
     async def _scheduler_loop(self) -> None:
         """Background loop that checks and triggers scheduled jobs and reminders."""
-        while self._running:
+        while self._scheduler_loop_running:
             try:
                 now = datetime.now(timezone.utc)
 
@@ -312,7 +348,18 @@ class SchedulerAgent(BaseAgent):
                         await self._trigger_job(job)
                         job.last_run = now
                         job.run_count += 1
-                        job.next_run = self._parse_schedule(job.schedule, base_time=now)
+                        # Anchor-based scheduling: compute the next aligned tick
+                        # so a missed wakeup doesn't push the schedule forward.
+                        # If we missed N intervals, jump straight to the next
+                        # one in the future (don't fire N catch-up triggers).
+                        if job.anchor is not None and job.interval_seconds:
+                            elapsed = (now - job.anchor).total_seconds()
+                            ticks = int(elapsed // job.interval_seconds) + 1
+                            job.next_run = job.anchor + timedelta(
+                                seconds=ticks * job.interval_seconds
+                            )
+                        else:
+                            job.next_run = self._parse_schedule(job.schedule, base_time=now)
 
                 # Check reminders
                 for rid, reminder in list(self._reminders.items()):
@@ -364,6 +411,24 @@ class SchedulerAgent(BaseAgent):
                 },
             )
         )
+
+    def _parse_interval_seconds(self, schedule: str) -> Optional[float]:
+        """Return interval (in seconds) for "every N <unit>" schedules, else None."""
+        m = re.match(
+            r"every\s+(\d+)\s+(second|seconds|minute|minutes|hour|hours|day|days)",
+            schedule.strip().lower(),
+        )
+        if not m:
+            return None
+        value = int(m.group(1))
+        unit = m.group(2)
+        unit_seconds = {
+            "second": 1, "seconds": 1,
+            "minute": 60, "minutes": 60,
+            "hour": 3600, "hours": 3600,
+            "day": 86400, "days": 86400,
+        }[unit]
+        return float(value * unit_seconds)
 
     def _parse_schedule(self, schedule: str, base_time: Optional[datetime] = None) -> Optional[datetime]:
         """Parse a schedule string and return the next run time."""

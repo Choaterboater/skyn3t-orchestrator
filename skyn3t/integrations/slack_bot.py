@@ -1,12 +1,13 @@
 """Slack bot integration for SkyN3t."""
 
-import asyncio
+import logging
 import os
+import re
 from typing import Any, Dict, Optional
 
-from skyn3t.config.settings import get_settings
-from skyn3t.core.agent import TaskRequest
 from skyn3t.core.events import EventBus
+
+logger = logging.getLogger("skyn3t.integrations.slack_bot")
 
 
 class SlackBot:
@@ -18,6 +19,10 @@ class SlackBot:
         self.app_token = os.getenv("SLACK_APP_TOKEN")
         self.client = None
         self._running = False
+        # Resolved at initialize() via auth.test(); used to strip mentions of
+        # *this* bot (event.bot_id is the *sender*, not us, so it can't be used
+        # to strip our own @mention).
+        self._self_user_id: Optional[str] = None
 
     async def initialize(self) -> None:
         """Initialize Slack connection."""
@@ -25,10 +30,16 @@ class SlackBot:
             raise ValueError("SLACK_BOT_TOKEN not configured")
 
         try:
-            from slack_sdk.web.async_client import AsyncWebClient
             from slack_sdk.socket_mode.aiohttp import SocketModeClient
+            from slack_sdk.web.async_client import AsyncWebClient
 
             self.web_client = AsyncWebClient(token=self.bot_token)
+            # Resolve our own user_id so _handle_event can strip mentions of us.
+            try:
+                auth = await self.web_client.auth_test()
+                self._self_user_id = auth.get("user_id")
+            except Exception as exc:
+                logger.warning("Slack auth.test failed: %s", exc)
             if self.app_token:
                 self.socket_client = SocketModeClient(
                     app_token=self.app_token, web_client=self.web_client
@@ -76,15 +87,24 @@ class SlackBot:
         event_type = event.get("type")
 
         if event_type == "app_mention":
-            text = event.get("text", "").replace(f"<@{event.get('bot_id')}>", "").strip()
-            channel = event.get("channel")
-            thread_ts = event.get("thread_ts") or event.get("ts")
+            raw_text = event.get("text", "")
+            # Strip the mention of *our* user_id (resolved via auth.test in
+            # initialize). event.get('bot_id') is the *sender's* bot id, so
+            # using it here was a no-op and the mention text was never removed.
+            if self._self_user_id:
+                raw_text = raw_text.replace(f"<@{self._self_user_id}>", "")
+            else:
+                # Fallback: drop any leading user mention.
+                raw_text = re.sub(r"^\s*<@[A-Z0-9]+>\s*", "", raw_text)
+            text = raw_text.strip()
+            channel = str(event.get("channel") or "")
+            thread_ts = str(event.get("thread_ts") or event.get("ts") or "")
             await self._process_message(text, channel, thread_ts)
 
         elif event_type == "message" and not event.get("bot_id"):
             text = event.get("text", "")
-            channel = event.get("channel")
-            thread_ts = event.get("thread_ts") or event.get("ts")
+            channel = str(event.get("channel") or "")
+            thread_ts = str(event.get("thread_ts") or event.get("ts") or "")
             # Only respond to DMs
             if event.get("channel_type") == "im":
                 await self._process_message(text, channel, thread_ts)
