@@ -146,6 +146,12 @@ class TelegramBot:
         self.allowed_user_id = str(allowed_user_id or "").strip()
         self.studio_runner = studio_runner
         self._offset = 0
+        # On the first poll after process restart we ask Telegram for
+        # the latest update_id and advance past it. Without this, every
+        # restart replays the ~24h backlog because Telegram retains
+        # un-acked updates until offset advances past them — user sees
+        # duplicate approval prompts and old commands re-fire.
+        self._skip_backlog_on_first_poll = True
         self._stop = False
         self._pending_reject_slugs: dict[str, str] = {}  # user_id → slug awaiting reject feedback
 
@@ -180,6 +186,17 @@ class TelegramBot:
             except asyncio.CancelledError:
                 logger.info("Telegram bot cancelled")
                 raise
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 409:
+                    logger.warning(
+                        "telegram poll conflict; another process is already consuming getUpdates. "
+                        "Retrying in %.1fs.",
+                        backoff,
+                    )
+                else:
+                    logger.exception("telegram poll failed; sleeping %.1fs", backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, _RECONNECT_BACKOFF_MAX)
             except Exception:
                 logger.exception("telegram poll failed; sleeping %.1fs", backoff)
                 await asyncio.sleep(backoff)
@@ -190,6 +207,42 @@ class TelegramBot:
 
     async def _poll(self) -> list[dict]:
         url = f"{_API_BASE}{self.token}/getUpdates"
+        # First-poll backlog skip: ask Telegram for ONLY the latest
+        # update by passing offset=-1 + limit=1 + short timeout. We
+        # ack that update_id by advancing _offset past it, then drop
+        # into normal long-poll mode. Net effect: never replay any
+        # message that arrived while the bot was offline.
+        if self._skip_backlog_on_first_poll:
+            self._skip_backlog_on_first_poll = False
+            skip_payload = {
+                "timeout": 0,
+                "offset": -1,
+                "limit": 1,
+                "allowed_updates": ["message", "callback_query"],
+            }
+            try:
+                async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_SECONDS) as client:
+                    skip_resp = await client.post(url, json=skip_payload)
+                    skip_resp.raise_for_status()
+                    skip_data = skip_resp.json()
+                if skip_data.get("ok"):
+                    for u in (skip_data.get("result") or []):
+                        uid = int(u.get("update_id") or 0)
+                        if uid >= self._offset:
+                            self._offset = uid + 1
+                    logger.info(
+                        "telegram backlog skipped; resuming at offset=%d",
+                        self._offset,
+                    )
+            except Exception:
+                # If the skip fails for any reason, fall through to a
+                # normal poll — at worst the user sees one replay,
+                # which is much better than crashing the bot loop.
+                logger.warning(
+                    "telegram backlog skip failed; falling through to normal poll",
+                    exc_info=True,
+                )
+
         payload = {
             "timeout": _LONG_POLL_TIMEOUT_SECONDS,
             "offset": self._offset,
@@ -310,27 +363,30 @@ class TelegramBot:
             await self._do_start(chat_id, brief, intent.slug)
             return
         if intent.action == "status":
-            slug = intent.slug or _most_recent_slug(self.studio_runner)
-            await self._do_status(chat_id, slug)
+            status_slug = intent.slug or _most_recent_slug(self.studio_runner)
+            await self._do_status(chat_id, status_slug)
             return
         if intent.action == "approve":
-            slug = intent.slug or _most_recent_awaiting_slug(self.studio_runner)
-            if not slug:
+            approve_slug = intent.slug or _most_recent_awaiting_slug(self.studio_runner)
+            if not approve_slug:
                 await self._reply(chat_id, "No project is awaiting approval right now.")
                 return
-            await self._do_approve(chat_id, slug)
+            await self._do_approve(chat_id, approve_slug)
             return
         if intent.action == "reject":
-            slug = intent.slug or _most_recent_awaiting_slug(self.studio_runner)
+            reject_slug = intent.slug or _most_recent_awaiting_slug(self.studio_runner)
             feedback = (intent.feedback or "").strip()
-            if not slug:
+            if not reject_slug:
                 await self._reply(chat_id, "No project is awaiting approval right now.")
                 return
             if not feedback:
-                await self._reply(chat_id, f"Reply with feedback for `{slug}` and I'll send it back to the architect.")
-                self._pending_reject_slugs[user_key] = slug
+                await self._reply(
+                    chat_id,
+                    f"Reply with feedback for `{reject_slug}` and I'll send it back to the architect.",
+                )
+                self._pending_reject_slugs[user_key] = reject_slug
                 return
-            await self._do_reject(chat_id, slug, feedback)
+            await self._do_reject(chat_id, reject_slug, feedback)
             return
 
         # Unknown — show help.
@@ -608,7 +664,7 @@ class TelegramBot:
         # Tell the user it landed, then run vision extraction in
         # background; the bot will edit/append once it's done.
         tag_hint = f" Tags: `{', '.join(entry.tags)}`" if entry.tags else ""
-        msg = await self._reply(
+        await self._reply(
             chat_id,
             f"📸 Saved reference *{entry.id}*.{tag_hint}\n"
             "Running design analysis…",
