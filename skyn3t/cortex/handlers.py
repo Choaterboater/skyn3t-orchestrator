@@ -16,18 +16,25 @@ logger = logging.getLogger("skyn3t.cortex.handlers")
 REPO_ROOT = Path(__file__).resolve().parents[2].resolve()
 
 
-def _resolve_repo_file(target_file: Any) -> str:
+def _normalize_repo_relative_path(target_file: Any, *, require_exists: bool = False) -> str:
     candidate = str(target_file or "").strip()
     if not candidate:
         return ""
-    target_path = (REPO_ROOT / candidate).resolve()
+    target_path = Path(candidate)
+    if not target_path.is_absolute():
+        target_path = REPO_ROOT / target_path
+    target_path = target_path.resolve()
     try:
         relative_path = target_path.relative_to(REPO_ROOT)
     except ValueError:
         return ""
-    if not target_path.exists() or not target_path.is_file():
+    if require_exists and (not target_path.exists() or not target_path.is_file()):
         return ""
     return relative_path.as_posix()
+
+
+def _resolve_repo_file(target_file: Any) -> str:
+    return _normalize_repo_relative_path(target_file, require_exists=True)
 
 
 def install_handlers(orchestrator) -> None:
@@ -59,19 +66,24 @@ def install_handlers(orchestrator) -> None:
             if not target_file:
                 return {"ok": False, "error": "could not infer a starting file for this idea"}
 
+            proposals = store.list()
             current_created_at = getattr(current_proposal, "created_at", None)
             if current_created_at is not None:
                 older_feature = next(
                     (
                         proposal
-                        for proposal in store.list()
+                        for proposal in proposals
                         if proposal.kind == "feature"
                         and proposal.status in {"approved", "applying"}
                         and proposal.id != proposal_id
+                        and getattr(proposal, "created_at", None) is not None
                         and proposal.created_at <= current_created_at
                         and str((proposal.payload or {}).get("repo_root") or str(REPO_ROOT))
                         == str(REPO_ROOT)
-                        and str((proposal.payload or {}).get("target_file") or "") == target_file
+                        and _normalize_repo_relative_path(
+                            (proposal.payload or {}).get("target_file")
+                        )
+                        == target_file
                     ),
                     None,
                 )
@@ -87,11 +99,13 @@ def install_handlers(orchestrator) -> None:
             active_patch = next(
                 (
                     proposal
-                    for proposal in store.list()
+                    for proposal in proposals
                     if proposal.kind == "code_patch"
                     and proposal.status in {"pending", "approved", "applying"}
                     and str((proposal.payload or {}).get("repo_root") or REPO_ROOT) == str(REPO_ROOT)
-                    and str((proposal.payload or {}).get("target_file") or "") == target_file
+                    and _normalize_repo_relative_path(
+                        (proposal.payload or {}).get("target_file")
+                    ) == target_file
                 ),
                 None,
             )
