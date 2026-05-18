@@ -100,32 +100,34 @@ def install_handlers(orchestrator) -> None:
 
             proposals = store.list()
             current_created_at = getattr(current_proposal, "created_at", None)
-            if current_created_at is not None:
-                older_feature = next(
-                    (
-                        proposal
-                        for proposal in proposals
-                        if proposal.kind == "feature"
-                        and proposal.status in {"approved", "applying"}
-                        and proposal.id != proposal_id
-                        and getattr(proposal, "created_at", None) is not None
-                        and proposal.created_at <= current_created_at
-                        and _is_current_repo_root((proposal.payload or {}).get("repo_root"))
-                        and _normalize_repo_relative_path(
-                            (proposal.payload or {}).get("target_file")
-                        )
-                        == target_file
-                    ),
-                    None,
-                )
-                if older_feature is not None:
-                    return {
-                        "ok": True,
-                        "status": "already-running",
-                        "target_file": target_file,
-                        "feature_proposal_id": older_feature.id,
-                        "details": "An older approved feature proposal is already running for that file.",
-                    }
+            blocking_feature = next(
+                (
+                    proposal
+                    for proposal in proposals
+                    if proposal.kind == "feature"
+                    and proposal.status in {"approved", "applying"}
+                    and proposal.id != proposal_id
+                    and _is_current_repo_root((proposal.payload or {}).get("repo_root"))
+                    and _normalize_repo_relative_path(
+                        (proposal.payload or {}).get("target_file")
+                    )
+                    == target_file
+                    and (
+                        current_created_at is None
+                        or getattr(proposal, "created_at", None) is None
+                        or proposal.created_at <= current_created_at
+                    )
+                ),
+                None,
+            )
+            if blocking_feature is not None:
+                return {
+                    "ok": True,
+                    "status": "already-running",
+                    "target_file": target_file,
+                    "feature_proposal_id": blocking_feature.id,
+                    "details": "An approved feature proposal is already running for that file.",
+                }
 
             active_patch = next(
                 (
