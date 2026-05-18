@@ -57,6 +57,13 @@ def _resolve_repo_file(target_file: Any) -> str:
     return _normalize_repo_relative_path(target_file, require_exists=True)
 
 
+def _proposal_payload(proposal: Any) -> Mapping[str, Any]:
+    payload = getattr(proposal, "payload", None)
+    if isinstance(payload, Mapping):
+        return payload
+    return {}
+
+
 def _result_output(result: Any) -> Dict[str, Any]:
     output = getattr(result, "output", None)
     if isinstance(output, Mapping):
@@ -107,9 +114,11 @@ def install_handlers(orchestrator) -> None:
                     if proposal.kind == "feature"
                     and proposal.status in {"approved", "applying"}
                     and proposal.id != proposal_id
-                    and _is_current_repo_root((proposal.payload or {}).get("repo_root"))
+                    and _is_current_repo_root(
+                        _proposal_payload(proposal).get("repo_root")
+                    )
                     and _normalize_repo_relative_path(
-                        (proposal.payload or {}).get("target_file")
+                        _proposal_payload(proposal).get("target_file")
                     )
                     == target_file
                     and (
@@ -126,7 +135,7 @@ def install_handlers(orchestrator) -> None:
                     "status": "already-running",
                     "target_file": target_file,
                     "feature_proposal_id": blocking_feature.id,
-                    "details": "An approved feature proposal is already running for that file.",
+                    "details": "An older approved feature proposal is already running for that file.",
                 }
 
             active_patch = next(
@@ -135,9 +144,11 @@ def install_handlers(orchestrator) -> None:
                     for proposal in proposals
                     if proposal.kind == "code_patch"
                     and proposal.status in {"pending", "approved", "applying"}
-                    and _is_current_repo_root((proposal.payload or {}).get("repo_root"))
+                    and _is_current_repo_root(
+                        _proposal_payload(proposal).get("repo_root")
+                    )
                     and _normalize_repo_relative_path(
-                        (proposal.payload or {}).get("target_file")
+                        _proposal_payload(proposal).get("target_file")
                     ) == target_file
                 ),
                 None,
