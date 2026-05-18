@@ -267,6 +267,11 @@ class ConsistencyReviewerAgent(BaseAgent):
             "You are a senior code reviewer doing a CROSS-FILE consistency check. "
             "Your job is NOT to grade prose or aesthetics — it is to find places where "
             "the code contradicts itself, the brief, or common sense.\n\n"
+            "IMPORTANT: All file contents you need are inlined in this prompt under "
+            "'KEY FILES'. DO NOT use Read, Search, glob, or any filesystem tool — "
+            "those paths refer to a project directory that is not your current working "
+            "directory and you will see 'Path does not exist' errors. Work ONLY from "
+            "the inlined text below.\n\n"
             "BRIEF:\n"
             f"{brief[:4000]}\n\n"
         )
