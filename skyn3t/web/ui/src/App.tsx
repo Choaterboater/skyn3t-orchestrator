@@ -52,7 +52,10 @@ function BackendStatusBanner() {
     queryFn: api.status,
     retry: false,
     refetchOnWindowFocus: false,
-    refetchInterval: 5_000,
+    // Only keep polling once the backend is already unhealthy. When the
+    // app is healthy, the rest of the UI's data queries are enough signal
+    // and this avoids noisy /api/status traffic every 5s forever.
+    refetchInterval: (query) => (query.state.error ? 5_000 : false),
   });
 
   if (!error) return null;

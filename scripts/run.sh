@@ -22,6 +22,17 @@ if [[ -d "$VENV_DIR" ]]; then
     source "$VENV_DIR/bin/activate"
 fi
 
+if [[ -x "$VENV_DIR/bin/python" ]]; then
+    PYTHON_BIN="$VENV_DIR/bin/python"
+elif command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python)"
+elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+else
+    echo "Python interpreter not found."
+    exit 127
+fi
+
 # Ensure PYTHONPATH includes the project root
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
 
@@ -30,15 +41,15 @@ cd "$PROJECT_DIR"
 case "$MODE" in
     web)
         echo "🌐 Starting SkyN3t web server..."
-        exec python -m skyn3t.cli.main start "$@"
+        exec "$PYTHON_BIN" -m skyn3t.cli.main start "$@"
         ;;
     cli)
         echo "💬 Starting SkyN3t CLI..."
-        exec python -m skyn3t.cli.main "$@"
+        exec "$PYTHON_BIN" -m skyn3t.cli.main "$@"
         ;;
     init)
         echo "🔧 Initializing SkyN3t..."
-        exec python -m skyn3t.cli.main init
+        exec "$PYTHON_BIN" -m skyn3t.cli.main init
         ;;
     *)
         echo "Unknown mode: $MODE"

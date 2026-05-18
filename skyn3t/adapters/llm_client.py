@@ -155,6 +155,7 @@ class LLMClient:
         # system prompt.
         self._rag = rag or _default_rag
         self._last_failed_backend: Optional[str] = None
+        self._last_error_type: Optional[str] = None
         self._backend_is_policy = bool(backend_is_policy)
         self._routing_hint = self._normalize_routing_hint(routing_hint) or self._infer_routing_hint(
             caller_name
@@ -256,6 +257,7 @@ class LLMClient:
                        temperature: float = 0.4, timeout: Optional[float] = None,
                        _allow_backend_failover: bool = True) -> str:
         self._last_failed_backend = None
+        self._last_error_type = None
         req = LLMRequest(prompt=prompt, system=system, model=model or self.default_model,
                          max_tokens=max_tokens, temperature=temperature)
         elapsed = 0.0
@@ -288,6 +290,7 @@ class LLMClient:
             )
             failed_backend = (self._backend_name or "").strip().lower()
             self._last_failed_backend = failed_backend or None
+            self._last_error_type = type(e).__name__
             if (
                 _allow_backend_failover
                 and failed_backend

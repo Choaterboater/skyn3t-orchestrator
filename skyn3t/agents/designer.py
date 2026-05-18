@@ -15,10 +15,14 @@ import hashlib
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
+
+if TYPE_CHECKING:
+    from skyn3t.agents.design_vision import DesignReference, PaletteEntry
 
 logger = logging.getLogger(__name__)
 
@@ -534,14 +538,14 @@ class DesignerAgent(BaseAgent):
     # Design references (user-attached photos)
     # ------------------------------------------------------------------
 
-    def _load_attached_references(self, artifact_dir: Path) -> list:
+    def _load_attached_references(self, artifact_dir: Path) -> list["DesignReference"]:
         """Read ``<artifact_dir>/design_references.md`` and resolve back
         to the source DesignReference objects via the persistent cache.
         Returns a list of ``DesignReference`` objects (possibly empty).
         """
         try:
-            from skyn3t.integrations.telegram_photos import _load_library
             from skyn3t.agents.design_vision import load_by_sha
+            from skyn3t.integrations.telegram_photos import _load_library
         except Exception:  # noqa: BLE001
             return []
         refs_md = artifact_dir / "design_references.md"
@@ -557,7 +561,7 @@ class DesignerAgent(BaseAgent):
         if not ids:
             return []
         library = _load_library()
-        out: list = []
+        out: list["DesignReference"] = []
         for ref_id in ids:
             entry = library.get(ref_id)
             if entry is None:
@@ -567,7 +571,7 @@ class DesignerAgent(BaseAgent):
                 out.append(extraction)
         return out
 
-    def _mood_from_references(self, references: list) -> str:
+    def _mood_from_references(self, references: list["DesignReference"]) -> str:
         """Derive a designer mood label from the extracted reference
         mood adjectives. We use simple keyword overlap against the
         existing ``_MOOD_KEYWORDS`` table — whatever mood has the most
@@ -575,7 +579,7 @@ class DesignerAgent(BaseAgent):
         nothing matches."""
         if not references:
             return ""
-        adjectives = []
+        adjectives: List[str] = []
         for ref in references:
             adjectives.extend(getattr(ref, "mood", []) or [])
             adjectives.extend(getattr(ref, "notable_elements", []) or [])
@@ -589,7 +593,9 @@ class DesignerAgent(BaseAgent):
                 best = (mood, score)
         return best[0]
 
-    def _palette_from_references(self, references: list) -> Optional[Dict[str, str]]:
+    def _palette_from_references(
+        self, references: list["DesignReference"]
+    ) -> Optional[Dict[str, str]]:
         """Build a palette dict from the first reference that has a
         usable palette. The DesignerAgent's downstream code expects
         keys (primary, secondary, accent, bg, text) — NOT the vision
@@ -599,13 +605,13 @@ class DesignerAgent(BaseAgent):
         secondary. Returns None if the reference can't satisfy the
         minimum required keys."""
         for ref in references:
-            palette_entries = getattr(ref, "palette", []) or []
+            palette_entries: List["PaletteEntry"] = ref.palette or []
             if not palette_entries:
                 continue
             by_role: Dict[str, str] = {}
             for entry in palette_entries:
-                role = (getattr(entry, "role", "") or "").lower()
-                hex_code = getattr(entry, "hex", "") or ""
+                role = entry.role.lower()
+                hex_code = entry.hex
                 if not hex_code.startswith("#") or len(hex_code) not in (4, 7):
                     continue
                 if role and role not in by_role:
@@ -613,10 +619,9 @@ class DesignerAgent(BaseAgent):
 
             # Backfill any missing required roles from unused entries.
             unused = [
-                getattr(e, "hex", "")
+                e.hex
                 for e in palette_entries
-                if (getattr(e, "role", "") or "").lower() not in by_role
-                and getattr(e, "hex", "")
+                if e.role.lower() not in by_role and e.hex
             ]
             for needed in ("bg", "accent", "text", "surface", "muted"):
                 if needed not in by_role and unused:

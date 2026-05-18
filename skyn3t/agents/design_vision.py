@@ -22,7 +22,7 @@ import shutil
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 logger = logging.getLogger(__name__)
 
@@ -242,7 +242,7 @@ def _strip_json_fences(text: str) -> str:
     return text
 
 
-async def _try_claude_cli(image_path: Path) -> Optional[dict]:
+async def _try_claude_cli(image_path: Path) -> Optional[Dict[str, Any]]:
     """Use Claude CLI to read the image and return JSON. Returns parsed
     dict on success, ``None`` on any failure. Claude CLI in
     non-interactive (``-p``) mode uses subscription auth — no API key
@@ -264,13 +264,17 @@ async def _try_claude_cli(image_path: Path) -> Optional[dict]:
         return None
     raw = _strip_json_fences(out)
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return cast(Dict[str, Any], parsed)
     except Exception:  # noqa: BLE001
         logger.warning("claude CLI returned non-JSON for %s: %s", image_path.name, out[:200])
         return None
+    logger.warning("claude CLI returned non-object JSON for %s: %s", image_path.name, out[:200])
+    return None
 
 
-async def _try_copilot_cli(image_path: Path) -> Optional[dict]:
+async def _try_copilot_cli(image_path: Path) -> Optional[Dict[str, Any]]:
     """Use the Copilot CLI as a vision fallback. Same subscription model."""
     if not shutil.which("copilot"):
         return None
@@ -289,13 +293,17 @@ async def _try_copilot_cli(image_path: Path) -> Optional[dict]:
         return None
     raw = _strip_json_fences(out)
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return cast(Dict[str, Any], parsed)
     except Exception:  # noqa: BLE001
         logger.warning("copilot CLI returned non-JSON for %s: %s", image_path.name, out[:200])
         return None
+    logger.warning("copilot CLI returned non-object JSON for %s: %s", image_path.name, out[:200])
+    return None
 
 
-async def _try_kimi_cli(image_path: Path) -> Optional[dict]:
+async def _try_kimi_cli(image_path: Path) -> Optional[Dict[str, Any]]:
     """Kimi CLI fallback. Note: Kimi may or may not support images in
     its CLI — we try and silently fall through if it can't."""
     if not shutil.which("kimi"):
@@ -309,10 +317,14 @@ async def _try_kimi_cli(image_path: Path) -> Optional[dict]:
         return None
     raw = _strip_json_fences(out)
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return cast(Dict[str, Any], parsed)
     except Exception:  # noqa: BLE001
         logger.warning("kimi CLI returned non-JSON for %s: %s", image_path.name, out[:200])
         return None
+    logger.warning("kimi CLI returned non-object JSON for %s: %s", image_path.name, out[:200])
+    return None
 
 
 def _parse_response(data: dict, image_path: Path, sha: str) -> DesignReference:

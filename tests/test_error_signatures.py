@@ -8,8 +8,6 @@ change later doesn't silently re-bucket every fix.
 
 from __future__ import annotations
 
-import pytest
-
 from skyn3t.intelligence.error_signatures import (
     signature_for_build_issue,
     signature_for_build_issues,
