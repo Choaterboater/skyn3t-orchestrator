@@ -2524,6 +2524,17 @@ class CodeAgent(BaseAgent):
         except Exception:
             logger.debug("strip-unused-deps failed (non-fatal)", exc_info=True)
 
+        # Inverse: add declared-by-imports-but-missing deps. Counter to
+        # canary-cf9270 where StreakCalendar.jsx imported date-fns +
+        # lucide-react but the architect's tech_stack.json never
+        # declared them. vite build then failed with
+        # "Could not resolve 'date-fns'". This scan keeps the manifest
+        # in sync with what the LLM actually wrote.
+        try:
+            self._add_missing_package_deps(out_dir)
+        except Exception:
+            logger.debug("add-missing-deps failed (non-fatal)", exc_info=True)
+
         try:
             await self.share_learning(
                 f"scaffold: {len(files_written)} files for brief",
@@ -2680,6 +2691,28 @@ class CodeAgent(BaseAgent):
                 if resolved is not None:
                     continue  # already on disk — nothing to do
 
+                # Before backfilling a stub, see if a file with the same
+                # basename already lives elsewhere in the scaffold. The
+                # component-breakdown path (#113) puts hooks in
+                # `src/hooks/`, components in `src/components/`, etc.,
+                # but App.jsx may have imported `./useHabits` instead of
+                # `./hooks/useHabits`. Rewriting the import is cheaper
+                # and produces a working build vs. shipping a stub.
+                rewritten = self._rewrite_import_to_existing_file(
+                    importing_file=p,
+                    out_dir=out_dir,
+                    target_spec=target,
+                    text=text,
+                )
+                if rewritten is not None:
+                    text = rewritten
+                    try:
+                        p.write_text(text, encoding="utf-8")
+                        backfilled.append(str(p))
+                    except OSError:
+                        logger.warning("import-rewrite write failed: %s", p)
+                    continue
+
                 # Pick a concrete path for the new file. If the target
                 # ends with an extension we leave it alone; otherwise
                 # tack on `.jsx` for JSX importers, `.js` otherwise.
@@ -2747,6 +2780,86 @@ class CodeAgent(BaseAgent):
                 if idx.is_file():
                     return idx
         return None
+
+    def _rewrite_import_to_existing_file(
+        self,
+        *,
+        importing_file,
+        out_dir,
+        target_spec: str,
+        text: str,
+    ) -> Optional[str]:
+        """If `target_spec` can't be resolved but a file with the same
+        basename exists elsewhere in the scaffold, rewrite every import
+        of `target_spec` in `text` to point at that file's actual path.
+
+        Returns the rewritten text, or None if no match is found (or
+        the match is ambiguous — multiple basename hits means we
+        can't safely pick one and the caller should fall back to a
+        stub).
+        """
+        from pathlib import Path as _Path
+        import re as _re
+
+        basename = target_spec.rsplit("/", 1)[-1]
+        if not basename or basename in (".", ".."):
+            return None
+        stem = basename.rsplit(".", 1)[0] if "." in basename else basename
+
+        # Find every file under out_dir whose stem matches. Skip
+        # node_modules and the importing file itself.
+        candidates: list[_Path] = []
+        for ext in (".jsx", ".tsx", ".js", ".ts", ".mjs", ".cjs"):
+            for hit in out_dir.rglob(f"{stem}{ext}"):
+                if "node_modules" in hit.parts:
+                    continue
+                if hit.resolve() == importing_file.resolve():
+                    continue
+                candidates.append(hit)
+
+        if len(candidates) != 1:
+            # Zero hits: nothing to rewrite. Multiple hits: ambiguous —
+            # don't guess; let the stub path take over.
+            return None
+
+        match_path = candidates[0]
+        try:
+            new_rel = _Path(
+                "./" + str(_Path(*match_path.relative_to(importing_file.parent).parts))
+            ).as_posix()
+        except ValueError:
+            # Different drive / outside out_dir. Skip.
+            return None
+
+        # Strip the trailing extension to mirror the LLM's import
+        # style (most generated imports omit extensions).
+        for ext in (".jsx", ".tsx", ".js", ".ts", ".mjs", ".cjs"):
+            if new_rel.endswith(ext):
+                new_rel = new_rel[: -len(ext)]
+                break
+        # Normalize: never leave a bare "filename" — keep the leading "./".
+        if not new_rel.startswith((".", "/")):
+            new_rel = "./" + new_rel
+
+        # Replace the target_spec in import / require / dynamic-import
+        # statements only. Use a narrow regex so we don't substitute
+        # the same string inside a regular string literal that happens
+        # to share the path.
+        spec_escaped = _re.escape(target_spec)
+        new_text, n = _re.subn(
+            rf"((?:from\s+|import\s*\(\s*|require\s*\(\s*)['\"]){spec_escaped}(['\"])",
+            rf"\g<1>{new_rel}\g<2>",
+            text,
+        )
+        if n == 0:
+            return None
+        logger.info(
+            "import-rewrite in %s: '%s' -> '%s'",
+            importing_file.name,
+            target_spec,
+            new_rel,
+        )
+        return new_text
 
     @staticmethod
     def _placeholder_local_import(rel_path: str) -> str:
@@ -2866,6 +2979,161 @@ class CodeAgent(BaseAgent):
                         fh.write("\n")
                 except OSError:
                     logger.warning("could not write stripped package.json: %s", pkg_path)
+
+    # Curated versions for packages we commonly see imported but missing
+    # from generated package.json. Conservative — we only add packages
+    # we recognize. Unknown packages get "latest" so the build doesn't
+    # break, but operators should pin them properly.
+    _DEFAULT_DEP_VERSIONS = {
+        "date-fns": "^3.6.0",
+        "lucide-react": "^0.460.0",
+        "clsx": "^2.1.1",
+        "classnames": "^2.5.1",
+        "uuid": "^10.0.0",
+        "axios": "^1.7.0",
+        "zustand": "^4.5.0",
+        "react-router-dom": "^6.26.0",
+        "@tanstack/react-query": "^5.50.0",
+        "framer-motion": "^11.3.0",
+        "recharts": "^2.12.0",
+        "chart.js": "^4.4.0",
+        "react-chartjs-2": "^5.2.0",
+        "tailwindcss": "^3.4.0",
+        "react-icons": "^5.2.0",
+    }
+
+    @classmethod
+    def _add_missing_package_deps(cls, out_dir) -> None:
+        """Add bare-package imports that are missing from package.json.
+
+        Walks each non-vendor source file under out_dir, extracts every
+        bare-package specifier (`import x from 'date-fns'`,
+        `require('lodash')`, etc.), and ensures each one is declared in
+        the nearest enclosing package.json's dependencies.
+
+        Counter to `_strip_unused_package_deps`: that strips declared-
+        but-unused; this adds used-but-undeclared. Both run after the
+        scaffold so the manifest stays in sync with what the LLM wrote.
+        """
+        from pathlib import Path as _Path
+        import json as _json
+        import re as _RE
+
+        out_dir = _Path(out_dir).resolve()
+        skip = {"node_modules", "dist", "build", ".next", ".cache", ".git"}
+
+        # Bare-package regex: matches `from "pkg"`, `from "pkg/sub"`,
+        # `from "@scope/pkg"`. Excludes relative paths (starting with
+        # `.` or `/`).
+        bare_re = _RE.compile(
+            r"""(?:from|require\(|import\()\s*['"]"""
+            r"""(@?[a-z0-9][a-z0-9._\-]*(?:/[a-z0-9._\-]+)*)"""
+            r"""['"]""",
+            _RE.IGNORECASE,
+        )
+
+        # node:* (e.g. "node:fs"), and Node built-ins shouldn't be
+        # declared as deps. Vite's externalization handles them.
+        BUILTINS = frozenset({
+            "fs", "path", "os", "url", "util", "crypto", "http", "https",
+            "stream", "buffer", "zlib", "querystring", "child_process",
+            "events", "assert", "net", "dns", "tls", "process",
+            "module", "v8", "vm", "worker_threads", "timers", "string_decoder",
+            "punycode", "readline", "tty", "perf_hooks", "constants",
+        })
+
+        # Collect imports per source file, grouped by their nearest
+        # package.json ancestor.
+        imports_by_pkg: dict[_Path, set[str]] = {}
+
+        # Cache: pkg.json found per directory walked-up. None means none found.
+        pkg_cache: dict[_Path, _Path | None] = {}
+
+        def _nearest_pkg(start: _Path) -> _Path | None:
+            cur = start
+            while True:
+                if cur in pkg_cache:
+                    return pkg_cache[cur]
+                candidate = cur / "package.json"
+                if candidate.is_file():
+                    pkg_cache[cur] = candidate
+                    return candidate
+                if cur == out_dir or cur.parent == cur:
+                    pkg_cache[cur] = None
+                    return None
+                cur = cur.parent
+
+        for path in out_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                rel_parts = path.relative_to(out_dir).parts
+            except ValueError:
+                continue
+            if any(part in skip for part in rel_parts):
+                continue
+            if path.suffix.lower() not in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+                continue
+            try:
+                body = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+
+            target_pkg = _nearest_pkg(path.parent)
+            if target_pkg is None:
+                continue
+
+            for match in bare_re.finditer(body):
+                spec = match.group(1)
+                if spec.startswith("node:"):
+                    continue
+                # Extract the package name proper: for `@scope/pkg/sub`,
+                # the package is `@scope/pkg`. For `pkg/sub`, it's `pkg`.
+                if spec.startswith("@"):
+                    parts = spec.split("/", 2)
+                    pkg_name = "/".join(parts[:2]) if len(parts) >= 2 else spec
+                else:
+                    pkg_name = spec.split("/", 1)[0]
+                if pkg_name in BUILTINS:
+                    continue
+                imports_by_pkg.setdefault(target_pkg, set()).add(pkg_name)
+
+        # Now reconcile each package.json
+        for pkg_path, used in imports_by_pkg.items():
+            try:
+                with open(pkg_path, "r", encoding="utf-8") as fh:
+                    data = _json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            deps = data.setdefault("dependencies", {})
+            dev_deps = data.get("devDependencies") or {}
+            if not isinstance(deps, dict):
+                continue
+
+            added: list[str] = []
+            for pkg_name in sorted(used):
+                if pkg_name in deps or pkg_name in dev_deps:
+                    continue
+                version = cls._DEFAULT_DEP_VERSIONS.get(pkg_name, "latest")
+                deps[pkg_name] = version
+                added.append(f"{pkg_name}@{version}")
+
+            if added:
+                try:
+                    with open(pkg_path, "w", encoding="utf-8") as fh:
+                        _json.dump(data, fh, indent=2)
+                        fh.write("\n")
+                    logger.info(
+                        "Added %d missing dep(s) to %s: %s",
+                        len(added),
+                        pkg_path.relative_to(out_dir).as_posix(),
+                        ", ".join(added[:5])
+                        + ("…" if len(added) > 5 else ""),
+                    )
+                except OSError:
+                    logger.warning("could not write updated package.json: %s", pkg_path)
 
     @staticmethod
     def _ensure_legacy_frontend_aliases(out_dir, files_written: list[str], brief: str) -> list[str]:

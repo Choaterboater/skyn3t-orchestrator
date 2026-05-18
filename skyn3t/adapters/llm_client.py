@@ -293,9 +293,25 @@ class LLMClient:
                 and failed_backend
                 and failed_backend != "deterministic"
             ):
+                # Model names are backend-specific. The model that the
+                # original backend (e.g. openrouter/owl-alpha) accepted
+                # is not a model name another backend (copilot_cli,
+                # claude_cli, ...) knows about. Passing it through
+                # produces "Model 'openrouter/owl-alpha' from --model
+                # flag is not available" or similar. Drop the
+                # default_model on failover so the next backend uses
+                # its own default.
+                failover_default_model = (
+                    self.default_model
+                    if self.default_model and "/" not in self.default_model
+                    else None
+                )
+                failover_explicit_model = (
+                    model if model and "/" not in model else None
+                )
                 try:
                     retry_client = LLMClient(
-                        default_model=self.default_model,
+                        default_model=failover_default_model,
                         backend=None,
                         anthropic_api_key=self._anthropic_key,
                         openrouter_api_key=self._openrouter_key,
@@ -313,7 +329,7 @@ class LLMClient:
                     return await retry_client.complete(
                         prompt,
                         system=system,
-                        model=model,
+                        model=failover_explicit_model,
                         max_tokens=max_tokens,
                         temperature=temperature,
                         timeout=timeout,

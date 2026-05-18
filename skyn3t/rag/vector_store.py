@@ -98,6 +98,29 @@ class VectorStore:
         if metadatas is None:
             metadatas = [{} for _ in documents]
 
+        # Chroma only accepts str/int/float/bool for metadata values.
+        # Lists, dicts, and None raise "Cannot convert Python object to
+        # MetadataValue". Coerce everything else to JSON strings so the
+        # ingest path never crashes on a tag list or nested struct.
+        import json as _json
+        sanitized = []
+        for m in metadatas:
+            clean = {}
+            for k, v in (m or {}).items():
+                if isinstance(v, (str, int, float, bool)) and not isinstance(v, bool):
+                    clean[str(k)] = v
+                elif isinstance(v, bool):
+                    clean[str(k)] = v
+                elif v is None:
+                    continue
+                else:
+                    try:
+                        clean[str(k)] = _json.dumps(v, default=str)
+                    except (TypeError, ValueError):
+                        clean[str(k)] = str(v)
+            sanitized.append(clean)
+        metadatas = sanitized
+
         collection = self._require_collection()
         collection.add(
             documents=documents,

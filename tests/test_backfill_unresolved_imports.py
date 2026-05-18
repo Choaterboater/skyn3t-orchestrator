@@ -185,3 +185,118 @@ def test_backfill_writes_activity_feed_and_service_detail(tmp_path: Path) -> Non
     for f in (cmd_palette, activity, service_detail):
         assert "@skyn3t-backfill-stub:" not in f.read_text(), \
             f"{f.name} should be from generator, not placeholder"
+
+
+def test_backfill_rewrites_import_when_file_exists_elsewhere(tmp_path: Path) -> None:
+    """canary-cf9270: App.jsx imported './useHabits' but the hook was
+    written to src/hooks/useHabits.js by the component-breakdown path.
+    Backfill should REWRITE the App.jsx import to point at the actual
+    file rather than stub a new one.
+    """
+    out_dir = tmp_path / "scaffold"
+    _write(
+        out_dir / "src" / "App.jsx",
+        "import useHabits from './useHabits';\n"
+        "export default function App(){return null;}\n",
+    )
+    _write(
+        out_dir / "src" / "hooks" / "useHabits.js",
+        "export function useHabits(){return [];}\n",
+    )
+    agent = _new_agent()
+    agent._backfill_unresolved_local_imports(
+        out_dir=out_dir,
+        files_written=[
+            str(out_dir / "src" / "App.jsx"),
+            str(out_dir / "src" / "hooks" / "useHabits.js"),
+        ],
+        stack="react_vite",
+        brief="habit tracker",
+    )
+    app_body = (out_dir / "src" / "App.jsx").read_text()
+    assert "from './hooks/useHabits'" in app_body, (
+        f"expected import rewritten to './hooks/useHabits', got: {app_body!r}"
+    )
+    # The original stub path should NOT have been created.
+    assert not (out_dir / "src" / "useHabits.js").exists()
+    assert not (out_dir / "src" / "useHabits.jsx").exists()
+
+
+def test_backfill_skips_rewrite_when_basename_ambiguous(tmp_path: Path) -> None:
+    """If two files share the same basename, the rewriter can't safely
+    pick one. Fall back to the stub-or-generator path instead.
+    """
+    out_dir = tmp_path / "scaffold"
+    _write(
+        out_dir / "src" / "App.jsx",
+        "import Helper from './Helper';\nexport default Helper;\n",
+    )
+    _write(out_dir / "src" / "utils" / "Helper.jsx", "export default null;\n")
+    _write(out_dir / "src" / "lib" / "Helper.jsx", "export default null;\n")
+    agent = _new_agent()
+    agent._backfill_unresolved_local_imports(
+        out_dir=out_dir,
+        files_written=[
+            str(out_dir / "src" / "App.jsx"),
+            str(out_dir / "src" / "utils" / "Helper.jsx"),
+            str(out_dir / "src" / "lib" / "Helper.jsx"),
+        ],
+        stack="react_vite",
+        brief="",
+    )
+    # Ambiguous → don't rewrite; original import stays as-is and a stub
+    # gets written at the target.
+    app_body = (out_dir / "src" / "App.jsx").read_text()
+    assert "from './Helper'" in app_body
+
+
+def test_add_missing_deps_picks_up_date_fns(tmp_path: Path) -> None:
+    """canary-cf9270: StreakCalendar.jsx imported date-fns but it was
+    never declared in package.json, causing vite to fail with
+    'Could not resolve "date-fns"'. _add_missing_package_deps should
+    detect the bare-package import and add it.
+    """
+    import json
+    out_dir = tmp_path / "scaffold"
+    _write(
+        out_dir / "package.json",
+        json.dumps({
+            "name": "x",
+            "version": "0.1.0",
+            "type": "module",
+            "dependencies": {"react": "^18.3.0"},
+        }, indent=2),
+    )
+    _write(
+        out_dir / "src" / "components" / "StreakCalendar.jsx",
+        "import { format } from 'date-fns';\n"
+        "import { Calendar } from 'lucide-react';\n"
+        "import { useState } from 'react';\n"
+        "export default function X(){return null;}\n",
+    )
+    CodeAgent._add_missing_package_deps(out_dir)
+    data = json.loads((out_dir / "package.json").read_text())
+    deps = data["dependencies"]
+    assert "date-fns" in deps
+    assert "lucide-react" in deps
+    # react was already there — don't disturb its version.
+    assert deps["react"] == "^18.3.0"
+
+
+def test_add_missing_deps_ignores_node_builtins(tmp_path: Path) -> None:
+    import json
+    out_dir = tmp_path / "scaffold"
+    _write(
+        out_dir / "package.json",
+        json.dumps({"name": "x", "dependencies": {}}, indent=2),
+    )
+    _write(
+        out_dir / "server" / "index.js",
+        "import fs from 'node:fs';\n"
+        "import path from 'path';\n"
+        "import crypto from 'crypto';\n",
+    )
+    CodeAgent._add_missing_package_deps(out_dir)
+    data = json.loads((out_dir / "package.json").read_text())
+    # No builtins should leak in as deps
+    assert data["dependencies"] == {}
