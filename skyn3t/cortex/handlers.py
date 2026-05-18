@@ -225,7 +225,7 @@ def install_handlers(orchestrator) -> None:
             f"Address Reviewer's critique on `{target}`.\n\n"
             f"Verdict: {verdict}\n\n"
             "Risks to address:\n"
-            + "\n".join(f"- {r}" for r in risks if r)
+            + "\n".join(f"- {r}" for r in risks if r and str(r).strip())
             + "\n\nProduce a unified diff that resolves these risks while keeping existing structure."
         )
         try:
