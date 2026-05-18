@@ -61,51 +61,168 @@ class FixRunSummary:
     skipped_reason: str = ""
 
 
-# Regex catches issues of the form:
-#   "src/App.jsx" - issue text
-#   `src/App.jsx`: issue text
-#   App.jsx imports nonexistent ...
-# We're conservative — only act when the file path is unambiguously named.
-_FILE_REF_RE = re.compile(
-    r"""(?:^|[\s\(\[])
-        (?:`|"|')?
-        (
-          (?:src/|server/|app/|pages/|components/|hooks/|adapters/|lib/)
-          [\w\-/]+\.(?:jsx?|tsx?|css|json|md)
-        )
-        (?:`|"|')?
-        (?:\s*[—:\-]\s*|\s+)
-        ([^\n]+)
+# Match any filename-ish token that ends in a known code/asset extension.
+# Permissive — picks up `App.jsx`, src/App.jsx, "tokens.css", brand.md, etc.
+_FILE_TOKEN_RE = re.compile(
+    r"""(?:^|[\s\(\[\`'"\*])
+        ((?:[\w\-]+/)*[\w\-]+\.(?:jsx?|tsx?|css|scss|json|md|html|svg|svelte|vue))
+        (?=[\s\)\]\.,;:\`'"\*]|$)
     """,
     re.MULTILINE | re.VERBOSE,
 )
+
+# Files we don't try to fix because they're either deterministic
+# manifests, documentation, or not actually code the LLM should rewrite.
+_UNFIXABLE_NAMES: set = {
+    "package.json", "tsconfig.json", "vite.config.js", "vite.config.ts",
+    "tokens.json", "palette.json", "tech_stack.json",
+    "project.json", "brainstorm.md", "research.md",
+    "architecture.md",  # architect's output — don't let the fix loop rewrite
+    "review.md",        # don't recurse on the reviewer's own output
+    "index.html",       # deterministic manifest
+    "logo.svg",         # designer's asset
+}
+
+
+# Section headers that signal POSITIVE content (praise, file lists, summaries).
+# We skip chunks under these headings so the parser doesn't try to "fix"
+# a strength or a metadata listing.
+_POSITIVE_HEADER_RE = re.compile(
+    r"^#+\s+(?:\d+\.\s*)?(?:strengths?|files\s+reviewed|completeness|summary)\b",
+    re.IGNORECASE,
+)
+
+# Section headers that signal ACTIONABLE complaints. Chunks under these
+# headings are the ones we try to fix. Everything else: ignored.
+_NEGATIVE_HEADER_RE = re.compile(
+    r"^#+\s+(?:\d+\.\s*)?(?:gaps?|inconsistenc|weak\s+claims?|risks?|issues?|problems?|fixes?\s+needed|bugs?)",
+    re.IGNORECASE,
+)
+
+# Lines that are pure file metadata (e.g. "`README.md` (1312 bytes)").
+# These show up in the "Files reviewed" list and are never complaints.
+_FILE_METADATA_RE = re.compile(
+    r"^[`'\"\*]*[\w\-/]+\.\w+[`'\"\*]*\s*\(\s*\d[\d,]*\s*bytes\s*\)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _split_into_bullets(text: str) -> List[str]:
+    """Split a review.md body into individual complaint chunks.
+
+    Walks the document section by section. Only emits chunks that live
+    under a "complaint" header (Gaps, Inconsistencies, Weak claims,
+    Risks). Skips Strengths and file metadata lists entirely.
+    """
+    chunks: List[str] = []
+    current: List[str] = []
+    in_complaint_section = False
+
+    def flush():
+        if not in_complaint_section:
+            current.clear()
+            return
+        if current:
+            joined = " ".join(s.strip() for s in current if s.strip()).strip()
+            if joined and not _FILE_METADATA_RE.match(joined):
+                chunks.append(joined)
+            current.clear()
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        # Header — possibly a section switch.
+        if stripped.startswith("#"):
+            flush()
+            if _NEGATIVE_HEADER_RE.match(stripped):
+                in_complaint_section = True
+            elif _POSITIVE_HEADER_RE.match(stripped):
+                in_complaint_section = False
+            # Other headers don't change state — they may be sub-headers
+            # within the active section.
+            continue
+        if not stripped:
+            flush()
+            continue
+        if not in_complaint_section:
+            continue
+        if stripped.startswith(("- ", "* ", "+ ")) or re.match(r"^\d+[\.\)]\s", stripped):
+            # New bullet — flush prior, start fresh with the bullet body.
+            flush()
+            body = re.sub(r"^[-*+]\s+|^\d+[\.\)]\s+", "", stripped)
+            current.append(body)
+        else:
+            current.append(stripped)
+    flush()
+    return chunks
+
+
+def _resolve_to_scaffold(rel_or_name: str, scaffold_dir: Path) -> str:
+    """Given a filename token from the reviewer (which may be a bare
+    name like 'App.jsx' or a path like 'src/App.jsx'), find the actual
+    file in scaffold_dir and return its scaffold-relative path.
+
+    Returns "" when no match exists.
+    """
+    candidate = rel_or_name.strip("`'\"*").strip()
+    # Exact relative path match
+    direct = scaffold_dir / candidate
+    if direct.is_file():
+        return candidate
+    # Try with leading slash stripped
+    if candidate.startswith("/"):
+        return _resolve_to_scaffold(candidate.lstrip("/"), scaffold_dir)
+    # Otherwise do a name lookup across the scaffold tree
+    name_only = Path(candidate).name
+    matches: List[Path] = []
+    for p in scaffold_dir.rglob(name_only):
+        if p.is_file():
+            matches.append(p)
+        if len(matches) > 2:
+            break
+    if len(matches) == 1:
+        return str(matches[0].relative_to(scaffold_dir))
+    # Multiple matches → ambiguous, skip to avoid fixing the wrong one.
+    return ""
 
 
 def parse_review_for_fixes(review_md_text: str, scaffold_dir: Path) -> List[FixCandidate]:
     """Pull (file, issue) pairs out of a review.md.
 
-    Returns at most ``MAX_FILES_FIXED`` candidates — picks the FIRST
-    occurrence of each unique file path so we don't try to fix the same
-    file 5 times in one pass.
+    Walks the review prose, splits into bullet/paragraph chunks. For
+    each chunk, finds the file token(s) mentioned. Pairs the file with
+    its chunk as the issue. Deduplicates by file (first match wins).
+    Caps at ``MAX_FILES_FIXED`` so a noisy reviewer can't blow the budget.
     """
     if not review_md_text:
         return []
+
+    chunks = _split_into_bullets(review_md_text)
+    if not chunks:
+        return []
+
     seen_files: set = set()
     out: List[FixCandidate] = []
-    for match in _FILE_REF_RE.finditer(review_md_text):
-        rel = match.group(1).strip()
-        issue = match.group(2).strip()
-        if rel in seen_files:
+    for chunk in chunks:
+        # Skip preamble headers / summary lines that mention many files
+        # at once — they aren't actionable per-file complaints.
+        if chunk.lower().startswith(("summary", "files reviewed", "completeness")):
             continue
-        target = scaffold_dir / rel
-        # Only act on files we can actually load + rewrite.
-        if not target.is_file():
-            continue
-        # Cap issue length so the prompt doesn't get huge.
-        if len(issue) > 400:
-            issue = issue[:400] + "…"
-        out.append(FixCandidate(file_path=rel, issue=issue))
-        seen_files.add(rel)
+        for match in _FILE_TOKEN_RE.finditer(chunk):
+            token = match.group(1).strip()
+            name_only = Path(token).name
+            if name_only.lower() in _UNFIXABLE_NAMES:
+                continue
+            resolved = _resolve_to_scaffold(token, scaffold_dir)
+            if not resolved:
+                continue
+            if resolved in seen_files:
+                continue
+            issue = chunk
+            if len(issue) > 400:
+                issue = issue[:400].rstrip() + "…"
+            out.append(FixCandidate(file_path=resolved, issue=issue))
+            seen_files.add(resolved)
+            break  # one file per chunk — don't burn a chunk on 3 files
         if len(out) >= MAX_FILES_FIXED:
             break
     return out

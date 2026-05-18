@@ -624,7 +624,18 @@ class DesignerAgent(BaseAgent):
         return None
 
     async def _pick_palette(self, brief: str, mood: str) -> Dict[str, str]:
-        """LLM-first palette picker. Falls back to hashed curated table."""
+        """Palette picker with three tiers:
+
+        1. **OpenRouter (Owl Alpha)** — free, fast, fresh inference per
+           project. Picks colors from the brief, not from memorized
+           tables. This is the new primary path — fixes the bug where
+           every habit/finance/notes project shipped the same warm
+           amber palette regardless of context.
+        2. **Agent CLI** — original path. Uses whatever backend the
+           agent was configured with. Often hangs.
+        3. **Deterministic hashed table** — pre-curated 5-color sets
+           keyed by `(brief, mood)`. Same fallback as before.
+        """
         fallback_palette = self._fallback_palette(brief, mood)
         fallback_json = json.dumps({
             "primary": fallback_palette[0],
@@ -634,6 +645,15 @@ class DesignerAgent(BaseAgent):
             "text": fallback_palette[4],
         })
 
+        # Tier 1: OpenRouter palette inference.
+        or_palette = await self._pick_palette_openrouter(brief, mood)
+        if or_palette is not None:
+            await self.think(
+                f"palette inferred via OpenRouter Owl Alpha for mood='{mood}'"
+            )
+            return or_palette
+
+        # Tier 2: existing agent-CLI path (LLM-first via configured backend).
         role = (
             "You are a brand designer. Given the user's brief, infer the "
             "aesthetic intent (cyberpunk HUD, minimal SaaS, warm/organic, "
@@ -655,7 +675,7 @@ class DesignerAgent(BaseAgent):
         if parsed is not None:
             return parsed
 
-        # If parse failed, fall back to deterministic table.
+        # Tier 3: deterministic hashed table.
         return {
             "primary": fallback_palette[0],
             "secondary": fallback_palette[1],
@@ -663,6 +683,74 @@ class DesignerAgent(BaseAgent):
             "bg": fallback_palette[3],
             "text": fallback_palette[4],
         }
+
+    async def _pick_palette_openrouter(
+        self, brief: str, mood: str,
+    ) -> Optional[Dict[str, str]]:
+        """OpenRouter-driven palette inference. Returns ``None`` on any
+        failure so the caller can fall through to the next tier."""
+        import os as _os
+        api_key = _os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            try:
+                from skyn3t.config.settings import get_settings
+                api_key = getattr(get_settings(), "openrouter_api_key", None)
+                if api_key:
+                    _os.environ.setdefault("OPENROUTER_API_KEY", api_key)
+            except Exception:  # noqa: BLE001
+                api_key = None
+        if not api_key:
+            return None
+
+        prompt = (
+            f"BRIEF FROM USER: {brief.strip()[:600]}\n\n"
+            f"Mood hint (rough): {mood}\n\n"
+            "Pick a 5-color palette that fits the brief's product domain "
+            "and emotional tone. Habit trackers, finance apps, and todo "
+            "apps each have distinct conventions — match the convention.\n\n"
+            "Return ONLY this JSON shape, no commentary, no fences:\n"
+            "{\n"
+            '  "primary":   "#RRGGBB",\n'
+            '  "secondary": "#RRGGBB",\n'
+            '  "accent":    "#RRGGBB",\n'
+            '  "bg":        "#RRGGBB",\n'
+            '  "text":      "#RRGGBB"\n'
+            "}\n\n"
+            "Rules:\n"
+            "- bg + text must have 4.5:1 contrast minimum.\n"
+            "- accent should pop against bg but not overwhelm text.\n"
+            "- secondary should harmonize with primary (analogous or muted variant).\n"
+            "- AVOID generic 'warm amber on graphite' unless the brief specifically "
+            "calls for that aesthetic — pick a fresh palette per project."
+        )
+        try:
+            from skyn3t.adapters import LLMClient
+            client = LLMClient(
+                default_model="openrouter/owl-alpha",
+                backend="openrouter",
+                event_bus=self.event_bus,
+                caller_name=self.name,
+            )
+            try:
+                raw = await client.complete(
+                    prompt,
+                    system=(
+                        "You are a senior brand designer. Read the brief, "
+                        "match the convention, output strict JSON only."
+                    ),
+                    max_tokens=300,
+                    temperature=0.4,
+                    timeout=30.0,
+                )
+            finally:
+                try:
+                    await client.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            logger.debug("openrouter palette inference failed", exc_info=True)
+            return None
+        return self._parse_palette_json(raw)
 
     def _fallback_palette(self, brief: str, mood: str) -> Tuple[str, str, str, str, str]:
         rows = _PALETTES.get(mood, _PALETTES["minimal"])
