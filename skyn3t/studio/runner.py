@@ -776,10 +776,23 @@ class StudioRunner:
                     name="contract_verifier",
                     agent="ContractVerifierAgent",
                     capability="review",
+                    handoff_to="packaging_agent",
+                    input_extra={},
+                )
+                # PackagingAgent runs between contract_verifier and
+                # consistency_reviewer so packaging artifacts (Settings.jsx,
+                # README.md, etc.) exist by the time the reviewer scores
+                # the project. Feature-flagged via extra={"packaging_enabled": False}.
+                packaging_stage = StageSpec(
+                    name="packaging_agent",
+                    agent="PackagingAgent",
+                    capability="packaging",
                     handoff_to="consistency_reviewer",
                     input_extra={},
                 )
                 stages.insert(reviewer_idx, consistency_stage)
+                if not (isinstance(extra, dict) and extra.get("packaging_enabled") is False):
+                    stages.insert(reviewer_idx, packaging_stage)
                 stages.insert(reviewer_idx, contract_stage)
 
             execution_profile = self._infer_execution_profile(
