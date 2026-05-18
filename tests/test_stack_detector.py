@@ -146,19 +146,19 @@ django = "^5.0"
 
 class TestFullstack:
     def test_react_plus_fastapi(self, tmp_path: Path) -> None:
+        # The monorepo layout: react in scaffold/, fastapi at root. The
+        # detector peeks at both so this classifies as fullstack — which
+        # is what PackagingAgent needs to pick the combo strategy.
         _write_pkg_nested(tmp_path, react="^18", vite="^5")
         _write(tmp_path, "requirements.txt", "fastapi==0.110\nuvicorn[standard]==0.27\n")
-        # Note: pyproject/requirements at root means the python side is the
-        # "monorepo backend" — common pattern for react+fastapi setups.
         result = detect(tmp_path)
-        # The scan looks at scaffold/ first and finds react_vite. Then sees
-        # requirements.txt at root (since scaffold has no python markers)
-        # — but right now we only scan scaffold once chosen. So this test
-        # actually exposes a real behavioral question.
-        # For now: react_vite was found in scaffold/, so family is "web".
-        # When PackagingAgent runs, it'll see the requirements.txt at root
-        # via its own scan. Document the current behavior.
-        assert result.family == "web"
+        assert result.family == "fullstack"
+        # Stack name stays as the web framework (server is implicit
+        # in the runtimes + service detection).
+        assert result.stack == "react_vite"
+        # Both runtimes detected.
+        runtime_names = {r.name for r in result.runtimes}
+        assert {"node", "python"} <= runtime_names
 
     def test_react_plus_express_in_same_pkg(self, tmp_path: Path) -> None:
         # Single package.json with both — the simplest fullstack case.
