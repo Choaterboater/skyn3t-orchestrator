@@ -240,7 +240,7 @@ def install_handlers(orchestrator) -> None:
             result = await ingestor.execute(req)
             ok = bool(getattr(result, "success", False))
             out = _result_output(result)
-            return {"ok": ok, "ingested": len(out.get("ingested") or []),
+            return {"ok": ok, "ingested": len(out.get("ingested") or ()),
                     "summary": out.get("summary", ""),
                     "errors": out.get("errors", [])}
         except Exception as e:
