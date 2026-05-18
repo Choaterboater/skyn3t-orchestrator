@@ -1942,20 +1942,27 @@ class CodeAgent(BaseAgent):
                                 # deepseek-v3.2 is ~$0.25/M in, $0.38/M out;
                                 # a typical 5KB file uses ~2K in + 2K out
                                 # ≈ $0.001/call. A full build is ~$0.02.
-                                # Free first, paid only if free fails.
-                                # Owl Alpha is free, 1M context, designed
-                                # for agentic + code workloads — empirically
-                                # produced clean 4KB JSX on a habit-tracker
-                                # test prompt. Mimo Flash is cheap paid
-                                # fallback ($0.10/$0.30 per M). DeepSeek
-                                # v3.2 is reliable third. Premium models
-                                # only when everything else fails.
-                                _model_ladder = [
-                                    "openrouter/owl-alpha",
-                                    "xiaomi/mimo-v2-flash",
-                                    "deepseek/deepseek-v3.2",
-                                    "xiaomi/mimo-v2.5-pro",
-                                ]
+                                # Project-type aware ladder. UI files
+                                # get Mimo Flash second; backend files
+                                # get Qwen3-Coder second; games get
+                                # Hunyuan-3 second. Free Owl Alpha is
+                                # always the first try regardless of
+                                # type. See skyn3t/core/project_type_router
+                                # for the full mapping.
+                                try:
+                                    from skyn3t.core.project_type_router import (
+                                        ladder_for_file_and_brief,
+                                    )
+                                    _model_ladder = list(
+                                        ladder_for_file_and_brief(rel, brief or "")
+                                    )
+                                except Exception:
+                                    _model_ladder = [
+                                        "openrouter/owl-alpha",
+                                        "xiaomi/mimo-v2-flash",
+                                        "deepseek/deepseek-v3.2",
+                                        "xiaomi/mimo-v2.5-pro",
+                                    ]
                                 _focused_prompt_or = (
                                     f"Implement the file `{rel}` for this product brief:\n\n"
                                     f"BRIEF:\n{(brief or '').strip()[:1500]}\n\n"
