@@ -2704,6 +2704,7 @@ class CodeAgent(BaseAgent):
             ^\s*import\s+(?:[^'";\n]+?\s+from\s+)?['"](\.{1,2}/[^'"\n]+)['"]
           | ^\s*export\s+(?:\*|\{[^}]*\})\s+from\s+['"](\.{1,2}/[^'"\n]+)['"]
           | \brequire\s*\(\s*['"](\.{1,2}/[^'"\n]+)['"]\s*\)
+          | \bimport\s*\(\s*['"](\.{1,2}/[^'"\n]+)['"]\s*\)
         )
         """
     )
@@ -2767,7 +2768,10 @@ class CodeAgent(BaseAgent):
 
             file_dir = p.parent
             for match in self._LOCAL_IMPORT_RE.finditer(text):
-                target = match.group(1) or match.group(2) or match.group(3) or ""
+                target = (
+                    match.group(1) or match.group(2)
+                    or match.group(3) or match.group(4) or ""
+                )
                 if not target:
                     continue
                 # Resolve relative to the importing file's directory.
@@ -2917,13 +2921,21 @@ class CodeAgent(BaseAgent):
             return None
 
         match_path = candidates[0]
+        # Use os.path.relpath so parent traversals (../) work — the
+        # naive `Path.relative_to` only works when match_path is a
+        # descendant of importing_file.parent. Real scaffolds put
+        # hooks/, components/, lib/ as siblings, so going from
+        # src/hooks/useThing.js to src/lib/format.js needs "../lib/...".
+        import os.path as _osp
         try:
-            new_rel = _Path(
-                "./" + str(_Path(*match_path.relative_to(importing_file.parent).parts))
-            ).as_posix()
+            new_rel = _osp.relpath(
+                str(match_path), start=str(importing_file.parent)
+            )
         except ValueError:
-            # Different drive / outside out_dir. Skip.
+            # Different drive on Windows. Skip.
             return None
+        # Normalize separators to POSIX (Vite/Webpack want forward slashes).
+        new_rel = new_rel.replace("\\", "/")
 
         # Strip the trailing extension to mirror the LLM's import
         # style (most generated imports omit extensions).
