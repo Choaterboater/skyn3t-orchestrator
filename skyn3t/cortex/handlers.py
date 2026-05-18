@@ -16,8 +16,22 @@ logger = logging.getLogger("skyn3t.cortex.handlers")
 REPO_ROOT = Path(__file__).resolve().parents[2].resolve()
 
 
+def _resolve_repo_file(target_file: Any) -> str:
+    candidate = str(target_file or "").strip()
+    if not candidate:
+        return ""
+    target_path = (REPO_ROOT / candidate).resolve()
+    try:
+        relative_path = target_path.relative_to(REPO_ROOT)
+    except ValueError:
+        return ""
+    if not target_path.exists() or not target_path.is_file():
+        return ""
+    return relative_path.as_posix()
+
+
 def install_handlers(orchestrator) -> None:
-    """Register apply-handlers for kind='feature' and kind='ingest'."""
+    """Register apply-handlers for kind='feature', 'ingest', and 'studio_debug'."""
     try:
         from skyn3t.cortex import get_store  # local import to avoid circular dependency
     except Exception:
@@ -34,18 +48,11 @@ def install_handlers(orchestrator) -> None:
                 return {"ok": False, "error": "code_improver agent not registered"}
             proposal_id = str(payload.get("_proposal_id") or "").strip()
             current_proposal = store.get(proposal_id) if proposal_id else None
-            target_file = str(payload.get("target_file") or "").strip()
-            if target_file:
-                target_path = (REPO_ROOT / target_file).resolve()
-                try:
-                    target_path.relative_to(REPO_ROOT)
-                except ValueError:
-                    target_file = ""
-                else:
-                    if not target_path.exists() or not target_path.is_file():
-                        target_file = ""
+            target_file = _resolve_repo_file(payload.get("target_file"))
             if not target_file:
-                inferred_target = infer_feature_target_file(str(idea), repo_root=REPO_ROOT)
+                inferred_target = _resolve_repo_file(
+                    infer_feature_target_file(str(idea), repo_root=REPO_ROOT)
+                )
                 if inferred_target:
                     target_file = inferred_target
             if not target_file:
@@ -174,9 +181,11 @@ def install_handlers(orchestrator) -> None:
 
     async def studio_debug_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
         """Approved studio_debug → run CodeImproverAgent on target_file with verdict+risks as rationale."""
-        target = payload.get("target_file") or ""
+        target = _resolve_repo_file(payload.get("target_file"))
         risks = normalize_review_risks(payload.get("risks") or [])
         verdict = payload.get("verdict") or ""
+        if not target:
+            return {"ok": False, "error": "invalid or missing target_file"}
         if not risks:
             return {"ok": True, "status": "noop", "details": "review flagged no actionable risks"}
         rationale = (
@@ -194,6 +203,7 @@ def install_handlers(orchestrator) -> None:
                 title="studio_debug retry",
                 input_data={
                     "target_file": target,
+                    "repo_root": str(REPO_ROOT),
                     "rationale": rationale,
                     "intent": "studio_debug",
                     "review_risks": risks,
