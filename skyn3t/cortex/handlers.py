@@ -221,7 +221,7 @@ def install_handlers(orchestrator) -> None:
                 return {"ok": False, "error": "github_ingestor agent not registered"}
             raw_limit = payload.get("limit")
             try:
-                max_files = max(1, min(int(raw_limit or 5), 100))
+                max_files = max(1, min(int(raw_limit) if raw_limit is not None else 5, 100))
             except (TypeError, ValueError):
                 return {"ok": False, "error": f"invalid ingest limit: {raw_limit!r}"}
             input_data: Dict[str, Any] = {
