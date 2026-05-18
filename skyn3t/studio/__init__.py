@@ -7,9 +7,9 @@ Re-exports the core entry points so callers can do::
 
 from skyn3t.studio.runner import StudioRunner
 from skyn3t.studio.templates import (
-    Template,
-    StageSpec,
     TEMPLATES,
+    StageSpec,
+    Template,
     get_template,
     list_templates,
 )

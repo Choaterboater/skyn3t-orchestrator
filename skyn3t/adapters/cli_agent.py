@@ -131,7 +131,7 @@ class CLIAgent(BaseAgent):
         stats["sandboxed"] = True
         return stats
 
-    async def execute(self, task: TaskRequest) -> TaskResult:
+    async def execute(self, task: TaskRequest, stdin_data: str | None = None) -> TaskResult:
         """Execute a task by shelling out to the CLI via the sandbox."""
         args = self.build_args(task)
         stdin = task.input_data.get("stdin")

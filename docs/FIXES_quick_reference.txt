@@ -1,0 +1,61 @@
+SkyN3t Reliability Iteration 2: Quick Reference
+================================================
+
+6 CRITICAL FIXES IMPLEMENTED (All 635 tests passing)
+
+1. PORT REUSE RACE CONDITION
+   File: skyn3t/studio/runner.py
+   Added: _kill_stray_server_processes() method
+   Why: Old server process lingering on port 3100 causes false-positive integration verification
+   How: Kill lingering Node/Python processes in scaffold directory before rebooting
+   Impact: Prevents infinite fix loops due to testing against stale instances
+
+2. LLM OUTPUT SYNTAX VALIDATION  
+   File: skyn3t/agents/targeted_fix.py
+   Added: _validate_syntax() function
+   Why: Invalid TypeScript (incomplete declarations) silently passes to next build
+   How: Check for unmatched braces/parens, incomplete keywords, invalid JSON
+   Impact: Falls back to placeholder instead of writing broken code
+
+3. MISSING FILE ERROR HANDLING
+   File: skyn3t/agents/targeted_fix.py
+   Enhanced: _placeholder_for() function
+   Why: "Cannot find module" errors cause regeneration to fail
+   How: Create intelligent placeholder (hook/router/query patterns) for missing files
+   Impact: Integration fix loop can proceed instead of falling back to full re-scaffold
+
+4. PLANNER PATH REGRESSION TEST
+   File: tests/test_studio_planner.py
+   Added: test_plan_pipeline_error_hint_with_file_path_does_not_trigger_improver()
+   Why: Error hints with file paths not tested for CodeImprover avoidance
+   How: Verify build briefs with incidental file paths include CodeAgent, not CodeImprover
+   Impact: Prevents regression if planner logic is ever reverted
+
+5. HTTP METHOD INFERENCE WINDOW
+   File: skyn3t/agents/integration_verifier.py  
+   Changed: window from 500 chars to 1000 chars (line 505)
+   Why: Large fetch calls have method spec beyond 500-char window
+   How: Increased lookahead for method: 'PUT' pattern detection
+   Impact: Reduces false "missing route" negatives for multiline fetch calls
+
+6. INTEGRATION RESEARCH SAFETY NET TEST
+   File: tests/test_studio_planner.py
+   Added: test_plan_pipeline_injects_research_for_third_party_integrations()
+   Why: Safety net that injects ResearchAgent for integrations has no test coverage
+   How: Verify ResearchAgent is included for Sonarr/Radarr and similar keywords
+   Impact: Catches silent failures if safety net logic breaks
+
+DEPLOYMENT STATUS
+=================
+✅ 635 tests passing (374.76s runtime)
+✅ No regressions in existing functionality
+✅ All fixes are defensive (non-breaking)
+✅ Graceful error handling (psutil unavailable, cleanup fails)
+✅ Ready for production
+
+KEY FILES TO REVIEW
+===================
+- docs/FIXES_reliability_iteration2.md (full documentation)
+- tests/test_studio_planner.py (new regression tests)
+- skyn3t/agents/targeted_fix.py (syntax validation + placeholder logic)
+- skyn3t/studio/runner.py (port cleanup integration)

@@ -4,14 +4,21 @@ import asyncio
 import inspect
 import logging
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
-from uuid import UUID, uuid4
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from uuid import uuid4
 
+from skyn3t.core.event_context import current_event_correlation_id, merge_event_payload
 from skyn3t.core.events import Event, EventBus, EventType
 from skyn3t.observability.metrics import get_collector
 from skyn3t.observability.tracing import SpanStatus, get_tracer
+from skyn3t.prompt_compression import compress_prompt_context
+
+if TYPE_CHECKING:
+    from skyn3t.core.messaging import AgentMessage
 
 logger = logging.getLogger("skyn3t.core.agent")
 
@@ -43,6 +50,10 @@ class TaskRequest:
     session_id: Optional[str] = None
     context_id: Optional[str] = None
     required_memory: List[str] = field(default_factory=list)
+    # Optional caller-supplied key for deduping retried submissions. If set,
+    # the orchestrator will return the prior task_id when it sees the same
+    # key within the dedup TTL instead of starting a duplicate task.
+    idempotency_key: Optional[str] = None
 
 
 @dataclass
@@ -69,6 +80,8 @@ class BaseAgent(ABC):
         provider: str,
         event_bus: EventBus,
         config: Optional[Dict[str, Any]] = None,
+        role: Optional[str] = None,
+        reports_to: Optional[str] = None,
     ):
         self.id = str(uuid4())
         self.name = name
@@ -76,25 +89,38 @@ class BaseAgent(ABC):
         self.provider = provider
         self.event_bus = event_bus
         self.config = config or {}
+        self.role = role
+        self.reports_to = reports_to
+        self.lifecycle = "manual"  # "manual" | "auto" — auto agents may be terminated
+        self.last_active_at: Optional[datetime] = None
         self.capabilities: List[AgentCapability] = []
         self.status = "idle"
         self.metadata: Dict[str, Any] = {}
         self._lazy_task_queue: Optional[asyncio.Queue[TaskRequest]] = None
         self._current_task: Optional[TaskRequest] = None
+        self._current_task_started_at: Optional[datetime] = None
         self._running = False
         self._task_processor: Optional[asyncio.Task] = None
         self._health_checks: int = 0
         self._errors: List[Dict[str, Any]] = []
         self._max_errors = 10
         self.last_output: str = ""
-        self._results: Dict[str, TaskResult] = {}
+        # Bounded LRU. Without a cap, an agent that has run for weeks holds
+        # every result it has ever produced in memory.
+        self._results: "OrderedDict[str, TaskResult]" = OrderedDict()
+        self._results_max = 200
         self._enabled: bool = True
         self._llm = None
 
     @property
     def _task_queue(self) -> "asyncio.Queue[TaskRequest]":
         if self._lazy_task_queue is None:
-            self._lazy_task_queue = asyncio.Queue()
+            try:
+                from skyn3t.config.settings import get_settings
+                maxsize = int(get_settings().max_queue_depth or 0)
+            except Exception:
+                maxsize = 0
+            self._lazy_task_queue = asyncio.Queue(maxsize=maxsize)
         return self._lazy_task_queue
 
     @abstractmethod
@@ -121,6 +147,12 @@ class BaseAgent(ABC):
     async def shutdown(self) -> None:
         """Shutdown the agent gracefully."""
         self._running = False
+        # Wake the processor immediately so it observes _running=False
+        # without waiting for a queue item or timeout.
+        try:
+            self._task_queue.put_nowait(None)  # type: ignore[arg-type]
+        except Exception:
+            pass
         if self._task_processor:
             self._task_processor.cancel()
             try:
@@ -156,7 +188,39 @@ class BaseAgent(ABC):
                 )
             )
             return
-        await self._task_queue.put(task)
+        # Backpressure: if the queue has a maxsize and is full, reject rather
+        # than buffer (which can OOM under a flood). The orchestrator's
+        # fallback path can pick a different agent.
+        q = self._task_queue
+        if q.maxsize and q.full():
+            self.event_bus.publish(
+                Event(
+                    event_type=EventType.QUEUE_BACKPRESSURE_REJECT,
+                    source=self.name,
+                    payload={
+                        "task_id": task.task_id,
+                        "queue_size": q.qsize(),
+                        "queue_max": q.maxsize,
+                    },
+                    correlation_id=task.task_id,
+                )
+            )
+            self.event_bus.publish(
+                Event(
+                    event_type=EventType.TASK_FAILED,
+                    source=self.name,
+                    payload={
+                        "task_id": task.task_id,
+                        "error": (
+                            f"agent '{self.name}' queue full "
+                            f"({q.qsize()}/{q.maxsize})"
+                        ),
+                    },
+                    correlation_id=task.task_id,
+                )
+            )
+            return
+        await q.put(task)
         collector = get_collector()
         collector.record_task_submitted(self.name, self.agent_type)
         collector.set_queue_depth(self.name, self.agent_type, self._task_queue.qsize())
@@ -176,8 +240,15 @@ class BaseAgent(ABC):
     async def start(self) -> None:
         """Start the agent's task processing loop."""
         self._running = True
-        await self.initialize()
-        self._task_processor = asyncio.create_task(self._process_tasks())
+        try:
+            await self.initialize()
+            self._task_processor = asyncio.create_task(self._process_tasks())
+        except Exception as exc:
+            self._running = False
+            self._task_processor = None
+            self.status = "offline"
+            self._record_error(str(exc), {"phase": "start"})
+            raise
         self.status = "idle"
         self.event_bus.publish(
             Event(
@@ -198,8 +269,14 @@ class BaseAgent(ABC):
         tracer = get_tracer()
         while self._running:
             try:
-                task = await asyncio.wait_for(self._task_queue.get(), timeout=1.0)
+                # Block until a task arrives (or shutdown sentinel `None` is enqueued).
+                # Using bare get() avoids the per-second wait_for cancellation that
+                # races with put_nowait and silently drops messages.
+                task = await self._task_queue.get()
+                if task is None or not self._running:
+                    break
                 self._current_task = task
+                self._current_task_started_at = datetime.now(timezone.utc)
                 self.status = "busy"
                 collector.set_active_tasks(self.name, 1)
                 collector.set_queue_depth(self.name, self.agent_type, self._task_queue.qsize())
@@ -249,6 +326,9 @@ class BaseAgent(ABC):
                                 result.output.get("stdout", result.output)
                             )
                             self._results[task.task_id] = result
+                            # Evict oldest entries when over the cap.
+                            while len(self._results) > self._results_max:
+                                self._results.popitem(last=False)
                             collector.record_task_completed(
                                 self.name, self.agent_type, execution_time_sec
                             )
@@ -277,7 +357,15 @@ class BaseAgent(ABC):
                                     payload={
                                         "task_id": task.task_id,
                                         "error": result.error,
-                                        "retry_count": task.max_retries,
+                                        # ACTUAL attempts so far (was
+                                        # incorrectly publishing the
+                                        # configured ceiling, which
+                                        # made every failure look
+                                        # like a max-retries
+                                        # exhaustion to downstream
+                                        # telemetry).
+                                        "retry_count": getattr(task, "retry_count", 0),
+                                        "max_retries": task.max_retries,
                                     },
                                     correlation_id=task.task_id,
                                 )
@@ -285,9 +373,24 @@ class BaseAgent(ABC):
 
                         if task.callback:
                             try:
-                                task.callback(result.output if result.success else {"error": result.error})
+                                cb_arg = result.output if result.success else {"error": result.error}
+                                cb_ret = task.callback(cb_arg)
+                                # If the callback is async, await it; otherwise the
+                                # coroutine would just leak as an unawaited object.
+                                if inspect.isawaitable(cb_ret):
+                                    await cb_ret
                             except Exception as e:
-                                print(f"Callback error: {e}")
+                                logger.exception(
+                                    "Callback error for task %s on agent %s",
+                                    task.task_id,
+                                    self.name,
+                                )
+                                result.metadata["callback_failed"] = True
+                                result.metadata["callback_error"] = str(e)
+                                self._record_error(
+                                    str(e),
+                                    {"task_id": task.task_id, "phase": "callback"},
+                                )
 
                     except Exception as e:
                         execution_time_sec = (
@@ -311,12 +414,11 @@ class BaseAgent(ABC):
                         )
 
                 self._current_task = None
+                self._current_task_started_at = None
                 self.status = "idle"
                 collector.set_active_tasks(self.name, 0)
                 collector.set_queue_depth(self.name, self.agent_type, self._task_queue.qsize())
 
-            except asyncio.TimeoutError:
-                continue
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -350,6 +452,12 @@ class BaseAgent(ABC):
             "name": self.name,
             "type": self.agent_type,
             "provider": self.provider,
+            # Expose backend + model so the Agents UI can show which
+            # LLM each agent is actually wired to. Without these the
+            # dashboard looked like everything was running on the
+            # default backend even when overrides were applied.
+            "backend": self.config.get("backend"),
+            "model": self.config.get("model"),
             "status": self.status,
             "capabilities": [c.name for c in self.capabilities],
             "current_task": self._current_task.task_id if self._current_task else None,
@@ -357,6 +465,10 @@ class BaseAgent(ABC):
             "health_checks": self._health_checks,
             "recent_errors": len(self._errors),
             "metadata": self.metadata,
+            "role": self.role,
+            "reports_to": self.reports_to,
+            "lifecycle": self.lifecycle,
+            "last_active_at": self.last_active_at.isoformat() if self.last_active_at else None,
         }
 
     async def send_message(
@@ -381,11 +493,177 @@ class BaseAgent(ABC):
             to_agent=to,
             kind=kind,
             content=content,
-            payload=payload or {},
-            correlation_id=correlation_id,
+            payload=merge_event_payload(payload),
+            correlation_id=current_event_correlation_id(correlation_id),
         )
         bus = get_default_bus(self.event_bus)
         await bus.send(msg)
+
+    async def request(
+        self,
+        to_agent: str,
+        content: str,
+        payload: Optional[Dict[str, Any]] = None,
+        timeout: float = 60.0,
+    ) -> Optional["AgentMessage"]:
+        """Send a request to another agent and await a response.
+
+        Returns the response ``AgentMessage`` or ``None`` on timeout.
+        """
+        from skyn3t.core.messaging import get_default_bus
+
+        bus = get_default_bus(self.event_bus)
+        return await bus.request(
+            from_agent=self.name,
+            to_agent=to_agent,
+            content=content,
+            payload=merge_event_payload(payload),
+            timeout=timeout,
+        )
+
+    def on_message(self, msg: "AgentMessage") -> Optional["AgentMessage"]:
+        """Handle an incoming A2A message.
+
+        Subclasses may override this to respond to ``request`` messages.
+        The default implementation returns ``None`` (no auto-response).
+        If a non-None message is returned, it is sent back as a response
+        via the MessageBus.
+        """
+        return None
+
+    def resolve_artifact_dir(self, raw: Any) -> "Path":
+        """Centralized artifact-dir resolution to stop leaks into the repo root.
+
+        Agents used to do `Path(data.get("artifact_dir") or ".")` which silently
+        wrote to CWD when called outside a Studio pipeline (Chat, direct API
+        exec, scripts). That was the root cause of stray architecture.md /
+        brainstorm.md / tech_stack.json files accumulating in the repo root.
+
+        Resolution order:
+          1. Caller-provided path (Studio pipeline path) — validated to
+             reject repo-root, CWD, and other dangerous locations.
+          2. Per-agent scratch under <projects_dir>/_agent_scratch/<agent>/<ts>/
+             when no path provided or validation fails. Keeps files in the
+             configured projects root, never the repo root.
+        """
+        import time as _t
+        from pathlib import Path as _PP
+
+        # Whitelist: if a `projects_dir` is configured, paths inside
+        # that tree are always allowed even if the tree happens to
+        # live inside the SkyN3t repo (common dev setup). Without this
+        # whitelist, a developer running `projects_dir=./data/projects`
+        # sees every caller-supplied path silently fall back to the
+        # scratch dir.
+        projects_root: Optional["Path"] = None
+        try:
+            from skyn3t.config import get_settings as _get_settings
+            cfg = _get_settings()
+            pd = getattr(cfg, "projects_dir", None)
+            if pd:
+                projects_root = _PP(str(pd)).expanduser().resolve()
+        except Exception:
+            projects_root = None
+
+        def _is_dangerous(path: "Path") -> bool:
+            """Reject paths that look like the repo root, CWD, or system dirs."""
+            try:
+                resolved = path.resolve()
+                # Configured projects root is always safe, even if it's
+                # inside the repo.
+                if projects_root is not None:
+                    try:
+                        resolved.relative_to(projects_root)
+                        return False
+                    except ValueError:
+                        pass
+                cwd = _PP.cwd().resolve()
+                # Never write to CWD if CWD is the SkyN3t repo root
+                if resolved == cwd:
+                    return True
+                # Never write to the repo root OR any subdirectory of it.
+                # Walk up the directory tree looking for SkyN3t repo markers.
+                for parent in [resolved, *resolved.parents]:
+                    if (parent / "skyn3t" / "core" / "agent.py").exists():
+                        return True
+                    # Alternative marker combo for robustness
+                    if (parent / ".git").exists() and (parent / "AGENTS.md").exists():
+                        return True
+                # Never write to common system dirs
+                for bad in ("/", "/tmp", "/var", "/usr", "/home", "~"):
+                    if resolved == _PP(bad).expanduser().resolve():
+                        return True
+            except Exception:
+                return True
+            return False
+
+        if raw:
+            candidate = _PP(str(raw)).expanduser()
+            if not _is_dangerous(candidate):
+                return candidate
+            logger.warning(
+                "resolve_artifact_dir: rejecting dangerous path %s for agent %s; "
+                "falling back to scratch.",
+                candidate, self.name,
+            )
+        try:
+            from skyn3t.config.settings import get_settings
+            base = _PP(str(get_settings().projects_dir)).expanduser()
+        except Exception:
+            # Last resort if settings can't load — write to user's home,
+            # NOT to cwd. This is the anti-leak invariant.
+            base = _PP("~/.skyn3t/scratch").expanduser()
+        scratch = base / "_agent_scratch" / self.name / str(int(_t.time()))
+        scratch.mkdir(parents=True, exist_ok=True)
+        return scratch
+
+    def load_skills_for_prompt(
+        self,
+        *,
+        tags: List[str],
+        limit: int = 4,
+        max_chars_per_skill: int = 1200,
+    ) -> str:
+        """Return a system-prompt-ready block of learned skills for the
+        agent. Pulls top-scored skills matching any of ``tags``, dedup
+        by skill name, truncates each to ``max_chars_per_skill``.
+
+        Returns "" if no skills found or the library is unavailable —
+        callers should always be safe to append the result directly.
+        """
+        try:
+            from skyn3t.intelligence.skill_library import get_default_library
+            lib = get_default_library()
+        except Exception:
+            return ""
+        seen: set[str] = set()
+        lines: List[str] = []
+        for tag in tags:
+            if not tag:
+                continue
+            try:
+                hits = lib.find(tag=tag, min_score=0.0, limit=limit)
+            except Exception:
+                continue
+            for s in hits:
+                if s.name in seen:
+                    continue
+                seen.add(s.name)
+                body = (s.body or "").strip()
+                if not body:
+                    continue
+                body = compress_prompt_context(body, max_chars=max_chars_per_skill)
+                lines.append(f"### Skill: {s.name}\n{body}")
+                if len(lines) >= limit:
+                    break
+            if len(lines) >= limit:
+                break
+        if not lines:
+            return ""
+        return (
+            "\n\nLearned skills — apply when relevant:\n\n"
+            + "\n\n".join(lines)
+        )
 
     async def think(self, line: str) -> None:
         """Stream a "thinking" line to the dashboard."""
@@ -393,7 +671,8 @@ class BaseAgent(ABC):
             Event(
                 event_type=EventType.AGENT_THOUGHT,
                 source=self.name,
-                payload={"line": line, "agent": self.name},
+                payload=merge_event_payload({"line": line, "agent": self.name}),
+                correlation_id=current_event_correlation_id(),
             )
         )
 
@@ -405,7 +684,8 @@ class BaseAgent(ABC):
             Event(
                 event_type=EventType.AGENT_LEARNING,
                 source=self.name,
-                payload={"lesson": lesson, "scope": scope, **meta},
+                payload=merge_event_payload({"lesson": lesson, "scope": scope, **meta}),
+                correlation_id=current_event_correlation_id(),
             )
         )
 
@@ -420,6 +700,9 @@ class BaseAgent(ABC):
             "agent_type": self.agent_type,
             "provider": self.provider,
             "enabled": getattr(self, "_enabled", True),
+            "role": self.role,
+            "reports_to": self.reports_to,
+            "lifecycle": self.lifecycle,
             "capabilities": [c.name for c in self.capabilities],
             "config": {
                 "backend": self.config.get("backend"),
@@ -443,6 +726,9 @@ class BaseAgent(ABC):
             known_keys = {
                 "provider",
                 "enabled",
+                "role",
+                "reports_to",
+                "lifecycle",
                 "capabilities",
                 "backend",
                 "model",
@@ -450,6 +736,42 @@ class BaseAgent(ABC):
                 "temperature",
                 "max_tokens",
             }
+
+            # role: empty string is valid; None → skip
+            if "role" in patch:
+                try:
+                    val = patch["role"]
+                    if val is None:
+                        logger.debug("apply_override: role is None, skipping")
+                    else:
+                        self.role = str(val) if not isinstance(val, str) else val
+                        changed.append("role")
+                except Exception:
+                    logger.exception("apply_override: failed to set role")
+
+            # reports_to: empty string means "no manager"; None → skip
+            if "reports_to" in patch:
+                try:
+                    val = patch["reports_to"]
+                    if val is None:
+                        logger.debug("apply_override: reports_to is None, skipping")
+                    else:
+                        self.reports_to = str(val) if not isinstance(val, str) else val
+                        changed.append("reports_to")
+                except Exception:
+                    logger.exception("apply_override: failed to set reports_to")
+
+            # lifecycle: must be "manual" or "auto"
+            if "lifecycle" in patch:
+                try:
+                    val = patch["lifecycle"]
+                    if val in ("manual", "auto"):
+                        self.lifecycle = val
+                        changed.append("lifecycle")
+                    else:
+                        logger.debug("apply_override: lifecycle must be manual|auto, got %r", val)
+                except Exception:
+                    logger.exception("apply_override: failed to set lifecycle")
 
             # provider: skip if empty/None
             if "provider" in patch:
@@ -652,13 +974,48 @@ class BaseAgent(ABC):
 
     @property
     def llm(self):
-        """Lazy LLMClient bound to this agent's overrides."""
+        """Lazy LLMClient bound to this agent's overrides.
+
+        Resolution order (first non-None wins):
+          1. Explicit config (per-agent ``backend`` / ``model`` in
+             ``data/agent_overrides.json`` or set via the dashboard).
+          2. Model-routing policy by stage name (``cheap``/``strong``
+             tier from ``core/model_router.py``).
+          3. LLMClient's own auto-discovery default.
+
+        Operators wanting to flip every cheap stage to balanced can
+        point ``SKYN3T_MODEL_ROUTING`` at a JSON file; see
+        ``core/model_router.py``.
+        """
         if getattr(self, "_llm", None) is None:
+            backend = self.config.get("backend")
+            model = self.config.get("model")
+            backend_is_policy = False
+            # Layer in the routing policy when the agent didn't set
+            # an explicit backend. Identify the stage by agent name
+            # — agents are named brainstorm / research / architect /
+            # designer / code_agent / reviewer in the runner.
+            if not backend:
+                try:
+                    from skyn3t.core.model_router import resolve_model
+                    policy_backend, policy_model = resolve_model(self.name)
+                    backend = policy_backend
+                    backend_is_policy = bool(policy_backend)
+                    if model is None:
+                        model = policy_model
+                except Exception:
+                    logger.debug(
+                        "model router lookup failed for %s",
+                        self.name, exc_info=True,
+                    )
             try:
                 from skyn3t.adapters import LLMClient
                 self._llm = LLMClient(
-                    default_model=self.config.get("model"),
-                    backend=self.config.get("backend"),
+                    default_model=model,
+                    backend=backend,
+                    event_bus=self.event_bus,
+                    caller_name=self.name,
+                    backend_is_policy=backend_is_policy,
                 )
             except Exception:
                 self._llm = None
@@ -667,3 +1024,84 @@ class BaseAgent(ABC):
     def get_llm(self):
         """Backward-compat accessor for ``self.llm``."""
         return self.llm
+
+    async def llm_complete(
+        self,
+        prompt: str,
+        *,
+        system: Optional[str] = None,
+        max_tokens: int = 4000,
+        temperature: float = 0.4,
+        timeout: Optional[float] = 60.0,
+        retries: int = 1,
+        fallback: str = "",
+    ) -> str:
+        """Run an LLM completion with shared retry+timeout policy.
+
+        Most agents had a near-identical block:
+
+            client = self.get_llm() or LLMClient(...)
+            try:
+                out = await client.complete(prompt, ...)
+                if out and "[deterministic-stub]" not in out:
+                    return out
+            except Exception:
+                pass
+            return fallback
+
+        That copy lived in ~10 files, each with a slightly different timeout
+        / retry / stub-detection policy. This helper centralizes it so an
+        agent that just wants "give me a real LLM response, else fall back"
+        can call ``await self.llm_complete(prompt, system=..., fallback=...)``.
+
+        On any failure (no client, exception, deterministic stub, empty,
+        timeout) returns ``fallback``. ``retries`` covers transient errors
+        only — a deterministic-stub response short-circuits without retry
+        because retrying won't change the outcome.
+        """
+        client = self.get_llm()
+        if client is None:
+            try:
+                from skyn3t.adapters import LLMClient
+                client = LLMClient(
+                    default_model=self.config.get("model"),
+                    backend=self.config.get("backend"),
+                    event_bus=self.event_bus,
+                    caller_name=self.name,
+                )
+            except Exception:
+                return fallback
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(max(1, retries + 1)):
+            try:
+                if timeout is not None:
+                    out = await asyncio.wait_for(
+                        client.complete(
+                            prompt,
+                            system=system,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                        ),
+                        timeout=timeout,
+                    )
+                else:
+                    out = await client.complete(
+                        prompt,
+                        system=system,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                    )
+                if not out or "[deterministic-stub]" in out:
+                    return fallback
+                return str(out)
+            except asyncio.TimeoutError as exc:
+                last_exc = exc
+            except Exception as exc:
+                last_exc = exc
+            # transient error — sleep with mild backoff before retrying
+            if attempt < retries:
+                await asyncio.sleep(min(2 ** attempt, 4))
+        if last_exc is not None:
+            logger.debug("llm_complete failed after retries: %s", last_exc)
+        return fallback

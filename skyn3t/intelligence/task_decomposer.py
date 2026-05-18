@@ -1,13 +1,20 @@
 """Automatic task decomposition with pattern matching, dependency graphs, and parallel execution."""
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from uuid import uuid4
 
 from skyn3t.core.agent import BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import Event, EventBus, EventType
+
+logger = logging.getLogger("skyn3t.intelligence.task_decomposer")
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @dataclass
@@ -61,7 +68,7 @@ class DependencyGraph:
         self._completed.add(subtask_id)
         if subtask_id in self.subtasks:
             self.subtasks[subtask_id].status = "completed"
-            self.subtasks[subtask_id].completed_at = datetime.utcnow()
+            self.subtasks[subtask_id].completed_at = _utcnow()
 
     def mark_failed(self, subtask_id: str) -> None:
         self._failed.add(subtask_id)
@@ -352,7 +359,7 @@ class TaskDecomposer:
         async def run_subtask(st: SubTask) -> TaskResult:
             async with semaphore:
                 st.status = "running"
-                st.started_at = datetime.utcnow()
+                st.started_at = _utcnow()
 
                 if self.event_bus:
                     self.event_bus.publish(
@@ -392,7 +399,23 @@ class TaskDecomposer:
                     return result
 
                 task_req = st.to_task_request()
-                result = await agent.execute(task_req)
+                # Protective try/except — an agent crash used to bubble
+                # out of execute_decomposed and abort the WHOLE
+                # decomposition run, killing sibling subtasks too.
+                # Treat a raised exception as a failed result for this
+                # subtask only.
+                try:
+                    result = await agent.execute(task_req)
+                except Exception as exc:
+                    logger.exception(
+                        "subtask %s on agent %s raised; treating as failed",
+                        st.subtask_id, agent.name,
+                    )
+                    result = TaskResult(
+                        task_id=getattr(task_req, "task_id", st.subtask_id),
+                        success=False,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
                 st.result = result
 
                 if result.success:
@@ -401,6 +424,10 @@ class TaskDecomposer:
                     graph.mark_failed(st.subtask_id)
 
                 if self.event_bus:
+                    # Always publish `task_id` (downstream listeners
+                    # like ReflectionAgent index on it and silently
+                    # skip events that lack it). Keep `subtask_id` for
+                    # decomposition-graph consumers.
                     self.event_bus.publish(
                         Event(
                             event_type=(
@@ -410,9 +437,16 @@ class TaskDecomposer:
                             ),
                             source="decomposer",
                             payload={
+                                "task_id": getattr(task_req, "task_id", st.subtask_id),
                                 "subtask_id": st.subtask_id,
                                 "success": result.success,
                                 "agent": agent.name,
+                                "error": result.error if not result.success else None,
+                                # Subtasks are leaves of a decomposition;
+                                # there's no retry inside the decomposer.
+                                # Mark terminal so ReflectionAgent learns
+                                # from real failures, not transient ones.
+                                "terminal": True,
                             },
                         )
                     )

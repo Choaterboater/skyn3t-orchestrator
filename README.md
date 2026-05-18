@@ -4,6 +4,21 @@
 
 A multi-agent orchestrator with a **persistent collective brain**: self-healing, Retrieval-Augmented Generation (RAG), autonomous task execution, and a shared consciousness that lets agents think, learn, and remember together.
 
+## Moving to another computer?
+
+See [PORTABILITY.md](PORTABILITY.md) for one-command setup on a fresh machine.
+
+## First Run
+
+```bash
+./scripts/setup.sh
+source .venv/bin/activate
+skyn3t init
+skyn3t start
+```
+
+Then open http://localhost:6660, describe what you want in the dashboard brief box, and let the swarm choose a starting workflow for you. Use `skyn3t status` or `skyn3t repl` from another terminal when you want the CLI view.
+
 ## Features
 
 - **Multi-Agent Orchestration** — Register and coordinate heterogeneous agents (Claude, Kimi, Copilot, OpenAI, GitHub, Slack, Discord, Email)
@@ -107,6 +122,7 @@ Key settings:
 ```bash
 DEBUG=false
 SECRET_KEY=change-me-in-production
+PROJECTS_DIR=~/Documents/Skyn3t/Projects
 
 # At least one API key (for non-CLI adapters)
 OPENAI_API_KEY=sk-...
@@ -118,13 +134,17 @@ USE_REDIS=false
 REDIS_URL=redis://localhost:6379/0
 ```
 
+`PROJECTS_DIR` controls where Studio writes project folders and demo artifacts. Point it at an external location like `~/Documents/Skyn3t/Projects` if you want generated work to live outside the repo checkout.
+
 ## Quick Start
 
 ### Start the Web Server
 
 ```bash
+skyn3t start
+# Optional convenience wrapper:
 ./scripts/run.sh web
-# Or directly:
+# Module entrypoint if you prefer:
 python -m skyn3t.cli.main start
 ```
 
@@ -132,27 +152,18 @@ Open http://localhost:6660 for the cyberpunk dashboard.
 
 ### Register Agents
 
-Via dashboard or API:
+Via the CLI:
 ```bash
-curl -X POST http://localhost:6660/api/agents \
-  -H "Content-Type: application/json" \
-  -d '{"name": "claude", "provider": "claude"}'
-
-curl -X POST http://localhost:6660/api/agents \
-  -H "Content-Type: application/json" \
-  -d '{"name": "kimi", "provider": "kimi"}'
-
-curl -X POST http://localhost:6660/api/agents \
-  -H "Content-Type: application/json" \
-  -d '{"name": "copilot", "provider": "copilot"}'
+skyn3t agent add claude --provider anthropic
+skyn3t agent list
 ```
 
 ### Submit a Task
 
 ```bash
-curl -X POST http://localhost:6660/api/agents/claude/task \
-  -H "Content-Type: application/json" \
-  -d '{"title": "Hello", "input": {"message": "Say hello"}}'
+skyn3t task submit claude "Say hello"
+# Or use the one-off exec shortcut:
+skyn3t exec claude "Say hello"
 ```
 
 ### Run a Pipeline
@@ -170,12 +181,9 @@ curl -X POST http://localhost:6660/api/pipeline \
 ### CLI Mode
 
 ```bash
-# Start interactive CLI
-./scripts/run.sh cli
-
-# Or use Typer commands
-python -m skyn3t.cli.main status
-python -m skyn3t.cli.main exec claude "Explain quantum computing"
+skyn3t repl
+skyn3t status
+skyn3t exec claude "Explain quantum computing"
 ```
 
 ## Brain API Endpoints
@@ -218,6 +226,14 @@ ruff check skyn3t tests
 # Type check
 mypy skyn3t
 ```
+
+### CI quality gate
+
+Every push/PR to `main` runs the same baseline checks in GitHub Actions:
+
+- `ruff check skyn3t tests`
+- `mypy skyn3t`
+- `pytest tests/ --ignore=tests/test_observability.py -q`
 
 ## Project Structure
 

@@ -1,8 +1,7 @@
 """Vector store for RAG using ChromaDB."""
 
 import logging
-import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from skyn3t.config.settings import get_settings
 
@@ -14,10 +13,16 @@ class VectorStore:
 
     def __init__(self, collection_name: str = "skyn3t_knowledge"):
         self.collection_name = collection_name
-        self.client = None
-        self.collection = None
-        self.embedding_function = None
+        self.client: Any = None
+        self.collection: Any = None
+        self.embedding_function: Any = None
         self._initialized = False
+
+    def _require_collection(self) -> Any:
+        """Return the active collection or raise if initialization failed."""
+        if self.collection is None:
+            raise RuntimeError("Vector store collection is not initialized")
+        return self.collection
 
     async def initialize(self) -> None:
         """Initialize ChromaDB and embedding model."""
@@ -41,11 +46,31 @@ class VectorStore:
                 )
             )
 
+            # Embed the model name in collection metadata so we detect
+            # accidental embedding-model swaps. ChromaDB doesn't store the
+            # embedder anywhere persistent; without this, a model change
+            # silently corrupts cosine similarity (vectors mix dimensions
+            # / spaces from two different models).
             self.collection = self.client.get_or_create_collection(
                 name=self.collection_name,
                 embedding_function=self.embedding_function,
-                metadata={"hnsw:space": "cosine"},
+                metadata={
+                    "hnsw:space": "cosine",
+                    "embedding_model": model_name,
+                    "schema_version": "1",
+                },
             )
+
+            existing_meta = getattr(self.collection, "metadata", None) or {}
+            stored_model = existing_meta.get("embedding_model")
+            if stored_model and stored_model != model_name:
+                raise RuntimeError(
+                    f"Vector collection '{self.collection_name}' was built with "
+                    f"embedding model '{stored_model}' but current settings "
+                    f"point to '{model_name}'. Either revert the setting or "
+                    f"reindex the collection (delete + re-add); silent "
+                    f"querying across mismatched models corrupts similarity."
+                )
 
             self._initialized = True
 
@@ -73,7 +98,8 @@ class VectorStore:
         if metadatas is None:
             metadatas = [{} for _ in documents]
 
-        self.collection.add(
+        collection = self._require_collection()
+        collection.add(
             documents=documents,
             ids=ids,
             metadatas=metadatas,
@@ -93,9 +119,10 @@ class VectorStore:
 
         settings = get_settings()
         n_results = min(n_results, settings.top_k_retrieval)
+        collection = self._require_collection()
 
         try:
-            results = self.collection.query(
+            results = collection.query(
                 query_texts=[query_text],
                 n_results=n_results,
                 where=filter_dict,
@@ -117,12 +144,41 @@ class VectorStore:
 
         return documents
 
+    def all_documents(self) -> List[Dict[str, Any]]:
+        """Return the full corpus for hybrid indexing."""
+        if not self._initialized:
+            return []
+        collection = self.collection
+        if collection is None:
+            return []
+
+        try:
+            results = collection.get(include=["documents", "metadatas"])
+        except Exception as e:
+            _logger.warning("chroma get failed: %s", e)
+            return []
+
+        ids = results.get("ids") or []
+        documents = results.get("documents") or []
+        metadatas = results.get("metadatas") or []
+        corpus: List[Dict[str, Any]] = []
+
+        for index, doc_id in enumerate(ids):
+            corpus.append({
+                "id": doc_id,
+                "content": documents[index] if index < len(documents) else "",
+                "metadata": metadatas[index] if index < len(metadatas) else {},
+            })
+
+        return corpus
+
     async def delete(self, ids: List[str]) -> None:
         """Delete documents by ID."""
         if not self._initialized:
             await self.initialize()
 
-        self.collection.delete(ids=ids)
+        collection = self._require_collection()
+        collection.delete(ids=ids)
 
     async def update(
         self,
@@ -134,7 +190,8 @@ class VectorStore:
         if not self._initialized:
             await self.initialize()
 
-        self.collection.update(
+        collection = self._require_collection()
+        collection.update(
             ids=ids,
             documents=documents,
             metadatas=metadatas,
@@ -144,21 +201,23 @@ class VectorStore:
         """Get collection statistics."""
         if not self._initialized:
             await self.initialize()
+        collection = self._require_collection()
 
         return {
             "name": self.collection_name,
-            "count": self.collection.count(),
+            "count": collection.count(),
             "embedding_model": get_settings().embedding_model,
         }
 
     async def reset(self) -> None:
         """Reset the collection."""
-        if self.client:
+        client = self.client
+        if client:
             try:
-                self.client.delete_collection(self.collection_name)
+                client.delete_collection(self.collection_name)
             except Exception:
                 pass
-            self.collection = self.client.get_or_create_collection(
+            self.collection = client.get_or_create_collection(
                 name=self.collection_name,
                 embedding_function=self.embedding_function,
             )

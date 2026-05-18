@@ -1,10 +1,10 @@
 """Fallback and circuit breaker system for agent resilience."""
 
 import asyncio
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum, auto
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 from skyn3t.core.agent import BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import Event, EventBus, EventType

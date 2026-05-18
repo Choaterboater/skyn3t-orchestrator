@@ -85,6 +85,15 @@ class AgentMetricsCollector:
 
     def __init__(self, registry: Optional[Any] = None):
         self.registry = registry or get_metrics_registry()
+        self.tasks_submitted: Any
+        self.tasks_completed: Any
+        self.tasks_failed: Any
+        self.active_agents: Any
+        self.active_tasks: Any
+        self.queue_depth: Any
+        self.task_execution_time: Any
+        self.cli_execution_time: Any
+        self.system_info: Any
         if Counter is None:
             # prometheus_client not installed — create no-op stubs
             self._noop = True

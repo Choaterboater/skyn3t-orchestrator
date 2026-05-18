@@ -56,6 +56,91 @@ class TestRAGEngine:
         assert "query" in result
         assert "documents" in result
 
+    @pytest.mark.asyncio
+    async def test_query_hybrid_uses_current_rag_api_and_filters(self):
+        from skyn3t.rag.rag_engine import RAGEngine
+
+        engine = RAGEngine()
+        engine.vector_store = MockVectorStore()
+        engine._initialized = True
+
+        await engine.add_knowledge(
+            content="Python powers async orchestration.",
+            title="Python Guide",
+            source="docs",
+            metadata={"topic": "python"},
+        )
+        await engine.add_knowledge(
+            content="Rust focuses on ownership and memory safety.",
+            title="Rust Guide",
+            source="docs",
+            metadata={"topic": "rust"},
+        )
+
+        results = await engine.query_hybrid(
+            "Python orchestration",
+            top_k=3,
+            where={"topic": "python"},
+        )
+
+        assert results
+        assert all(doc["metadata"]["topic"] == "python" for doc in results)
+        assert any("Python" in doc["content"] for doc in results)
+
+    @pytest.mark.asyncio
+    async def test_answer_includes_source_content_for_frontend(self):
+        from skyn3t.rag.rag_engine import RAGEngine
+
+        engine = RAGEngine()
+        engine.vector_store = MockVectorStore()
+        engine._initialized = True
+
+        await engine.add_knowledge(
+            content="SkyN3t stores retrieval snippets for the dashboard.",
+            title="Frontend contract",
+            source="docs",
+            metadata={"topic": "rag-ui"},
+        )
+
+        result = await engine.answer("What does the dashboard show?")
+
+        assert result["sources"]
+        assert result["sources"][0]["title"] == "Frontend contract"
+        assert result["sources"][0]["source"] == "docs"
+        assert result["sources"][0]["content"] == "SkyN3t stores retrieval snippets for the dashboard."
+        assert result["sources"][0]["snippet"] == "SkyN3t stores retrieval snippets for the dashboard."
+        assert result["sources"][0]["metadata"]["topic"] == "rag-ui"
+
+    @pytest.mark.asyncio
+    async def test_answer_uses_llm_provider_when_available(self):
+        from skyn3t.rag.rag_engine import RAGEngine
+
+        class FakeLLM:
+            def __init__(self):
+                self.calls = []
+
+            async def complete(self, prompt, **kwargs):
+                self.calls.append({"prompt": prompt, **kwargs})
+                return "Synthesized answer from retrieval."
+
+        engine = RAGEngine()
+        engine.vector_store = MockVectorStore()
+        engine._initialized = True
+
+        await engine.add_knowledge(
+            content="SkyN3t can answer from retrieved context.",
+            title="Knowledge note",
+            source="docs",
+        )
+        llm = FakeLLM()
+
+        result = await engine.answer("What can SkyN3t do?", llm_provider=llm)
+
+        assert result["answer"] == "Synthesized answer from retrieval."
+        assert llm.calls
+        assert "Retrieved context" in llm.calls[0]["prompt"]
+        assert llm.calls[0]["temperature"] == 0.2
+
 
 class MockVectorStore:
     """Mock vector store for testing."""
@@ -67,16 +152,33 @@ class MockVectorStore:
         pass
 
     async def add_documents(self, documents, ids=None, metadatas=None):
-        return ids or [f"id_{i}" for i in range(len(documents))]
+        ids = ids or [f"id_{len(self.docs) + i}" for i in range(len(documents))]
+        for index, doc in enumerate(documents):
+            self.docs.append({
+                "id": ids[index],
+                "content": doc,
+                "metadata": metadatas[index] if metadatas else {},
+                "distance": 0.1,
+            })
+        return ids
 
     async def query(self, query_text, n_results=5, filter_dict=None):
+        results = self.docs
+        if filter_dict:
+            results = [
+                doc for doc in results
+                if all(doc["metadata"].get(key) == value for key, value in filter_dict.items())
+            ]
+        return results[:n_results]
+
+    def all_documents(self):
         return [
             {
-                "id": "id_1",
-                "content": "Python is a programming language.",
-                "metadata": {"title": "About Python"},
-                "distance": 0.1,
+                "id": doc["id"],
+                "content": doc["content"],
+                "metadata": doc["metadata"],
             }
+            for doc in self.docs
         ]
 
     async def get_collection_stats(self):

@@ -5,16 +5,11 @@ network controls, and syscall logging for agent command execution.
 """
 
 import asyncio
-import fcntl
-import hashlib
 import logging
 import os
 import platform
-import re
 import resource
 import shutil
-import signal
-import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -209,6 +204,10 @@ class Sandbox:
                 del env[key]
         # Apply overrides
         env.update(self.config.env_vars)
+        # Force unbuffered output for Python-based CLIs (kimi, openai, etc.)
+        # so they flush stdout/stderr promptly instead of block-buffering
+        # when connected to a pipe.
+        env.setdefault("PYTHONUNBUFFERED", "1")
         # Strip PATH to safe directories on Linux
         if self._linux:
             safe_path = "/usr/local/bin:/usr/bin:/bin"
@@ -411,7 +410,7 @@ class Sandbox:
                 "file_size_mb": self.config.max_file_size_mb,
             }
 
-        except Exception as e:
+        except Exception:
             execution_time_ms = (time.monotonic() - start_time) * 1000
             raise
         finally:

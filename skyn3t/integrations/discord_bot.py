@@ -1,10 +1,8 @@
 """Discord bot integration."""
 
-import asyncio
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
-from skyn3t.config.settings import get_settings
 from skyn3t.core.events import Event, EventBus, EventType
 
 
@@ -14,7 +12,7 @@ class DiscordBot:
     def __init__(self, event_bus: EventBus, token: Optional[str] = None):
         self.event_bus = event_bus
         self.token = token or os.getenv("DISCORD_TOKEN")
-        self._client = None
+        self._client: Any = None
         self._running = False
 
     async def initialize(self) -> None:

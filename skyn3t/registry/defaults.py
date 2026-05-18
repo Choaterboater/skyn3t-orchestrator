@@ -19,6 +19,8 @@ import logging
 import os
 from typing import Any, Callable, Dict, List, Tuple
 
+from skyn3t.registry.catalog import build_agent_override
+
 logger = logging.getLogger("skyn3t.registry.defaults")
 
 
@@ -48,6 +50,9 @@ DEFAULT_ROSTER: List[Tuple[str, Callable[[Any], Dict[str, Any]]]] = [
     ("CodeImproverAgent", _kw_eb),
     ("SchedulerAgent", _kw_eb),
     ("ProjectMemoryAgent", _kw_rag),
+    ("DocsIngestorAgent", _kw_rag),
+    ("VerifierAgent", _kw_eb),
+    ("BuildVerifierAgent", _kw_eb),
 ]
 
 
@@ -81,9 +86,14 @@ async def register_default_roster(orchestrator) -> Dict[str, Any]:
                 store = get_override_store()
                 # By class name (e.g. "WriterAgent") and by instance name
                 # (preferred — what the user types in the UI).
-                cls_patch = store.get(getattr(cls, "__name__", ""))
-                name_patch = store.get(getattr(agent, "name", ""))
-                merged = {**cls_patch, **name_patch}
+                cls_patch = store.get(getattr(cls, "__name__", "")) or {}
+                name_patch = store.get(getattr(agent, "name", "")) or {}
+                merged = build_agent_override(
+                    class_name=getattr(cls, "__name__", ""),
+                    runtime_name=getattr(agent, "name", ""),
+                    class_patch=cls_patch,
+                    name_patch=name_patch,
+                )
                 if merged and hasattr(agent, "apply_override"):
                     agent.apply_override(merged)
             except Exception:
@@ -100,19 +110,19 @@ async def register_default_roster(orchestrator) -> Dict[str, Any]:
 
     # Instantiate persisted custom agents
     try:
-        from skyn3t.config.custom_agents import get_custom_store
         from skyn3t.agents.research_agent import ResearchAgent as _BlankBase
+        from skyn3t.config.custom_agents import get_custom_store
         BLANK_BASES = {
             # Use ResearchAgent as a flexible blank slate (simple BaseAgent subclass).
             "blank": _BlankBase,
         }
         for spec in get_custom_store().list():
-            cname = spec.get("name")
+            cname = str(spec.get("name") or "")
             try:
                 base_type = spec.get("base_type") or "blank"
                 cls = getattr(mod, base_type, None) or BLANK_BASES.get(base_type)
                 if cls is None:
-                    skipped.append({"name": cname, "reason": f"unknown base_type {base_type}"})
+                    skipped.append({"name": cname or "?", "reason": f"unknown base_type {base_type}"})
                     continue
                 sig = inspect.signature(cls)
                 kwargs = {}

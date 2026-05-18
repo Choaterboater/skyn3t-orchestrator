@@ -6,13 +6,12 @@ import hmac
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Optional, Set
 
 from fastapi import APIRouter, Header, HTTPException, Request
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import Event, EventBus, EventType
-
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +31,10 @@ def verify_signature(payload: bytes, signature: str, secret: str) -> bool:
     if not secret:
         if not _unsigned_warning_emitted:
             logger.warning(
-                "GITHUB_WEBHOOK_SECRET is not configured; webhook signature verification is DISABLED."
+                "GITHUB_WEBHOOK_SECRET is not configured; unsigned webhooks are rejected."
             )
             _unsigned_warning_emitted = True
-        return True  # Skip verification if no secret configured
+        return False
     if not signature:
         return False
 
@@ -64,7 +63,7 @@ class GitHubWebhookAgent(BaseAgent):
             name=name,
             agent_type="integration",
             provider="github",
-            event_bus=event_bus,
+            event_bus=event_bus or EventBus(),
             config=config or {},
         )
         self.add_capability(
@@ -111,7 +110,7 @@ class GitHubWebhookAgent(BaseAgent):
         """Check webhook handler health."""
         return True
 
-    async def execute(self, task: TaskRequest) -> TaskResult:
+    async def execute(self, task: TaskRequest, stdin_data: str | None = None) -> TaskResult:
         """Execute a GitHub webhook task."""
         task_type = task.input_data.get("task_type", "process_webhook")
 
@@ -338,7 +337,7 @@ class GitHubWebhookAgent(BaseAgent):
                 "issue_number": issue_number,
                 "title": issue.get("title"),
                 "body": issue.get("body"),
-                "labels": [l.get("name") for l in issue.get("labels", [])],
+                "labels": [label.get("name") for label in issue.get("labels", [])],
             },
             priority=2,
         )
@@ -465,7 +464,7 @@ class GitHubWebhookAgent(BaseAgent):
                 "issue_number": issue_number,
                 "title": issue_obj.title,
                 "body": issue_obj.body,
-                "labels": [l.name for l in issue_obj.labels],
+                "labels": [label.name for label in issue_obj.labels],
                 "state": issue_obj.state,
                 "summary": f"Issue #{issue_number}: {issue_obj.title}",
             }
@@ -499,18 +498,49 @@ class GitHubWebhookAgent(BaseAgent):
 # FastAPI endpoint
 # ------------------------------------------------------------------
 
+# In-memory delivery dedup. GitHub retries deliveries on 5xx; without this
+# every retry triggered a duplicate task / duplicate PR comment. Each entry
+# is (delivery_id → first-seen monotonic timestamp). Capped + TTL'd.
+_DELIVERY_TTL_SECONDS = 3600
+_DELIVERY_MAX_ENTRIES = 5000
+_seen_deliveries: Dict[str, float] = {}
+
+
+def _delivery_already_handled(delivery_id: str) -> bool:
+    import time as _time
+    now = _time.monotonic()
+    # Drop expired entries opportunistically.
+    if len(_seen_deliveries) > _DELIVERY_MAX_ENTRIES:
+        cutoff = now - _DELIVERY_TTL_SECONDS
+        for k in [k for k, ts in _seen_deliveries.items() if ts < cutoff]:
+            _seen_deliveries.pop(k, None)
+    if not delivery_id:
+        return False
+    seen_at = _seen_deliveries.get(delivery_id)
+    if seen_at and (now - seen_at) < _DELIVERY_TTL_SECONDS:
+        return True
+    _seen_deliveries[delivery_id] = now
+    return False
+
+
 @router.post("/github")
 async def github_webhook(
     request: Request,
     x_github_event: str = Header(default=""),
     x_hub_signature_256: str = Header(default=""),
+    x_github_delivery: str = Header(default=""),
 ):
     """Receive GitHub webhook events."""
     payload_bytes = await request.body()
     secret = get_webhook_secret()
 
-    if secret and not verify_signature(payload_bytes, x_hub_signature_256, secret):
+    if not verify_signature(payload_bytes, x_hub_signature_256, secret):
         raise HTTPException(status_code=401, detail="Invalid signature")
+
+    # Idempotency: GitHub retries deliveries on 5xx; short-circuit duplicates
+    # so we don't re-trigger agents (and re-comment on PRs) for the same event.
+    if _delivery_already_handled(x_github_delivery):
+        return {"received": True, "event": x_github_event, "handled": False, "duplicate": True}
 
     try:
         payload = json.loads(payload_bytes)

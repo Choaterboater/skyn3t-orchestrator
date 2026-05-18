@@ -6,11 +6,9 @@ from datetime import datetime
 from typing import Any, AsyncIterator, Dict, List, Optional
 from uuid import uuid4
 
-from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Integer, String, Text, func
-from sqlalchemy.ext.asyncio import AsyncAttrs, AsyncSession, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
-
-from skyn3t.config.settings import get_settings
+from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, func
+from sqlalchemy.ext.asyncio import AsyncAttrs, AsyncSession
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 class Base(AsyncAttrs, DeclarativeBase):
@@ -26,6 +24,7 @@ class AgentStatus(str, enum.Enum):
     ERROR = "error"
     RECOVERING = "recovering"
     MAINTENANCE = "maintenance"
+    DISABLED = "disabled"
 
 
 class TaskStatus(str, enum.Enum):
@@ -51,6 +50,9 @@ class Agent(Base):
     status: Mapped[AgentStatus] = mapped_column(
         Enum(AgentStatus), default=AgentStatus.IDLE, nullable=False
     )
+    role: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    reports_to: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    lifecycle: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, default="manual")
     capabilities: Mapped[List[str]] = mapped_column(JSON, default=list)
     config: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
     meta: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
@@ -142,6 +144,33 @@ class KnowledgeDocument(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
 
 
+class ExperienceIndex(Base):
+    """Per-experience denormalized row for SQL-ranked fix recall.
+
+    The RAG vector store answers "find experiences similar to this
+    prose." This table answers a tighter question the planner cares
+    about: "for this error_signature, which fix has the best historical
+    win rate?" Append-only on ingest; ``fix_worked`` is updated later
+    when the next verifier pass reports the post-fix outcome.
+
+    Pairs with ``KnowledgeDocument`` via ``embedding_id`` — the same
+    string the vector store hands back. One row per experience.
+    """
+
+    __tablename__ = "experience_index"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    embedding_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    task_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+    stack: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+    stage: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+    error_signature: Mapped[Optional[str]] = mapped_column(String(128), index=True, nullable=True)
+    fix_applied: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    fix_worked: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    success: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+
+
 class SystemLog(Base):
     """System log entry."""
 
@@ -161,6 +190,38 @@ async def init_db() -> None:
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_ensure_added_columns)
+
+
+def _ensure_added_columns(sync_conn) -> None:
+    """Add columns introduced on existing databases.
+
+    ``Base.metadata.create_all`` is a no-op for tables that already
+    exist — it never issues ``ALTER TABLE``. So when we add a column
+    to an existing model (e.g. ``agents.role`` / ``reports_to`` /
+    ``lifecycle``), pre-existing databases keep their old schema and
+    queries against the new column fail with ``OperationalError``.
+
+    This runs lightweight, idempotent ``ALTER TABLE ... ADD COLUMN``
+    statements for columns that have been added since the original
+    schema. New entries should be appended below, never removed.
+    """
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(sync_conn)
+    added_columns: list[tuple[str, str, str]] = [
+        # (table, column, "column_type default_clause")
+        ("agents", "role", "VARCHAR(100) NULL"),
+        ("agents", "reports_to", "VARCHAR(255) NULL"),
+        ("agents", "lifecycle", "VARCHAR(20) NULL DEFAULT 'manual'"),
+    ]
+    for table, column, decl in added_columns:
+        if not inspector.has_table(table):
+            continue
+        existing = {c["name"] for c in inspector.get_columns(table)}
+        if column in existing:
+            continue
+        sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {decl}"))
 
 
 @asynccontextmanager

@@ -1,6 +1,11 @@
 """Persistent store for user-created custom agents."""
+
 from __future__ import annotations
-import json, logging, threading
+
+import json
+import logging
+import os
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -22,14 +27,29 @@ class CustomAgentStore:
     def _load(self) -> Dict[str, Dict[str, Any]]:
         if self.path.exists():
             try:
-                return json.loads(self.path.read_text())
+                loaded = json.loads(self.path.read_text())
+                if isinstance(loaded, dict):
+                    return {
+                        str(name): dict(spec)
+                        for name, spec in loaded.items()
+                        if isinstance(spec, dict)
+                    }
             except Exception:
                 logger.exception("custom_agents read failed")
         return {}
 
     def _save(self) -> None:
         try:
-            self.path.write_text(json.dumps(self._data, indent=2, sort_keys=True))
+            # Atomic write: serialize to a sibling .tmp then rename, so a crash
+            # mid-write leaves the previous JSON intact rather than truncating
+            # the store to garbage that the next _load would silently discard.
+            payload = json.dumps(self._data, indent=2, sort_keys=True)
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.path)
         except Exception:
             logger.exception("custom_agents write failed")
 

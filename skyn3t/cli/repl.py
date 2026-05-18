@@ -11,7 +11,7 @@ import asyncio
 import json
 import os
 import secrets
-import sys
+import shlex
 import threading
 from collections import deque
 from dataclasses import dataclass, field
@@ -21,11 +21,12 @@ from typing import Any, Deque, List, Optional
 import httpx
 from rich.console import Console, Group
 from rich.layout import Layout
-from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+
+from skyn3t.studio.repo_target import normalize_repo_target, resolve_repo_target
 
 API_BASE = os.environ.get("SKYN3T_API_URL", "http://localhost:6660")
 WS_URL = API_BASE.replace("http://", "ws://").replace("https://", "wss://")
@@ -35,7 +36,6 @@ try:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.completion import Completer, Completion
     from prompt_toolkit.history import InMemoryHistory
-    from prompt_toolkit.patch_stdout import patch_stdout
     _HAS_PT = True
 except Exception:  # pragma: no cover
     _HAS_PT = False
@@ -372,13 +372,17 @@ async def _submit_prompt(state: ReplState, prompt: str) -> None:
 async def _pick_agent(client: httpx.AsyncClient) -> Optional[str]:
     try:
         resp = await client.get("/api/agents")
-        agents = resp.json().get("agents", [])
+        payload = resp.json()
+        agents = payload.get("agents", []) if isinstance(payload, dict) else []
         if not agents:
             return None
         for a in agents:
             if a.get("status", "idle") in ("idle", "busy"):
-                return a.get("name")
-        return agents[0].get("name")
+                name = a.get("name")
+                if isinstance(name, str):
+                    return name
+        first_name = agents[0].get("name")
+        return first_name if isinstance(first_name, str) else None
     except Exception:
         return None
 
@@ -406,7 +410,10 @@ HELP_TEXT = """\
 - `/clear` — clear the transcript
 - `/agents` — list registered agents
 - `/pipeline NAME [PROMPT...]` — run a pipeline by name
-- `/project TEMPLATE BRIEF...` — invoke project studio
+- `/project BRIEF...` — start a Studio run (defaults to the auto planner)
+- `/project --audience builders --autonomy confirm_first BRIEF...` — steer the run before launch
+- `/project --repo-path ../customer-portal --focus-file src/login.tsx BRIEF...` — target another local git repo or GitHub URL
+- `/project TEMPLATE :: BRIEF...` — force a specific Studio template
 - `/rag QUERY` — run agentic RAG
 - `/ingest REPO` — kick off a GitHub repo ingestion
 
@@ -428,6 +435,17 @@ HELP_TEXT = """\
 Multi-line input: type `\"\"\"` on its own line to open a block,
 then `\"\"\"` again to send. Ctrl-C cancels an in-flight task.
 """
+
+PROJECT_TEMPLATE_KEYS = {
+    "auto",
+    "app_saas",
+    "marketing",
+    "business_site",
+    "brand_kit",
+    "business_plan",
+    "product_idea",
+    "frontend_redesign",
+}
 
 
 async def _slash(state: ReplState, raw: str) -> bool:
@@ -528,17 +546,113 @@ async def _cmd_pipeline(state: ReplState, rest: str) -> None:
 
 
 async def _cmd_project(state: ReplState, rest: str) -> None:
+    usage = (
+        "usage: /project [--audience auto|general|builders|team|leaders|investors] "
+        "[--autonomy balanced|confirm_first|move_fast] [--repo-path PATH_OR_GITHUB_URL] [--focus-file PATH] BRIEF... "
+        "or /project [options] TEMPLATE :: BRIEF..."
+    )
     if not rest:
-        _add_transcript(state, _info_line("usage: /project TEMPLATE BRIEF...", "yellow"))
+        _add_transcript(state, _info_line(usage, "yellow"))
         return
-    parts = rest.split(maxsplit=1)
-    template = parts[0]
-    brief = parts[1] if len(parts) > 1 else ""
+    try:
+        tokens = shlex.split(rest)
+    except ValueError:
+        _add_transcript(state, _info_line(usage, "yellow"))
+        return
+    audience = "auto"
+    autonomy = "move_fast"
+    repo_path = ""
+    focus_file = ""
+    cleaned: list[str] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token.startswith("--audience="):
+            audience = token.split("=", 1)[1]
+            i += 1
+            continue
+        if token == "--audience" and i + 1 < len(tokens):
+            audience = tokens[i + 1]
+            i += 2
+            continue
+        if token.startswith("--autonomy="):
+            autonomy = token.split("=", 1)[1]
+            i += 1
+            continue
+        if token == "--autonomy" and i + 1 < len(tokens):
+            autonomy = tokens[i + 1]
+            i += 2
+            continue
+        if token.startswith("--repo-path="):
+            repo_path = token.split("=", 1)[1]
+            i += 1
+            continue
+        if token == "--repo-path" and i + 1 < len(tokens):
+            repo_path = tokens[i + 1]
+            i += 2
+            continue
+        if token.startswith("--focus-file="):
+            focus_file = token.split("=", 1)[1]
+            i += 1
+            continue
+        if token == "--focus-file" and i + 1 < len(tokens):
+            focus_file = tokens[i + 1]
+            i += 2
+            continue
+        cleaned.append(token)
+        i += 1
+    audience_map = {
+        "auto": "",
+        "general": "general",
+        "builders": "builders",
+        "team": "team",
+        "leaders": "leaders",
+        "investors": "investors",
+    }
+    audience = str(audience or "auto").strip().lower()
+    autonomy = str(autonomy or "move_fast").strip().lower()
+    allowed_autonomy = {"balanced", "confirm_first", "move_fast"}
+    if audience not in audience_map or autonomy not in allowed_autonomy:
+        _add_transcript(state, _info_line(usage, "yellow"))
+        return
+    template = "auto"
+    brief = " ".join(cleaned).strip()
+
+    if "::" in brief:
+        maybe_template, maybe_brief = [part.strip() for part in brief.split("::", 1)]
+        if maybe_template:
+            template = maybe_template
+        brief = maybe_brief
+    else:
+        parts = rest.split(maxsplit=1)
+        if len(parts) > 1 and parts[0] in PROJECT_TEMPLATE_KEYS:
+            template = parts[0]
+            brief = parts[1]
+
+    if not brief:
+        _add_transcript(state, _info_line(usage, "yellow"))
+        return
+    try:
+        repo_target = await asyncio.to_thread(
+            resolve_repo_target,
+            {"local_path": repo_path, "focus_file": focus_file},
+        )
+    except ValueError as exc:
+        _add_transcript(state, _info_line(str(exc), "red"))
+        return
     try:
         async with httpx.AsyncClient(base_url=API_BASE, timeout=30.0) as client:
             resp = await client.post(
-                "/api/project/start",
-                json={"template": template, "brief": brief},
+                "/api/studio/start",
+                json={
+                    "template": template,
+                    "brief": brief,
+                    "mission_setup": {
+                        "audience": audience_map[audience],
+                        "autonomy": autonomy,
+                    },
+                    "repo_target": repo_target,
+                },
             )
             if resp.status_code == 404:
                 _add_transcript(
@@ -549,7 +663,31 @@ async def _cmd_project(state: ReplState, rest: str) -> None:
     except Exception as exc:
         _add_transcript(state, _info_line(f"project failed: {exc}", "red"))
         return
-    _add_transcript(state, _info_line(f"project started: {data}", "green"))
+    if data.get("accepted"):
+        slug = data.get("slug") or "pending"
+        repo_target = normalize_repo_target(data.get("repo_target") or repo_target)
+        next_action = data.get("next_action") or "Queued — waiting for a worker slot."
+        _add_transcript(
+            state,
+            _info_line(
+                "project queued: "
+                f"{slug} · template={template} · audience={audience} · mode={autonomy}"
+                + f" · next={next_action}"
+                + (
+                    f" · repo={repo_target['local_path']}"
+                    if repo_target["local_path"]
+                    else ""
+                )
+                + (
+                    f" · focus={repo_target['focus_file']}"
+                    if repo_target["focus_file"]
+                    else ""
+                ),
+                "green",
+            ),
+        )
+        return
+    _add_transcript(state, _info_line(f"project failed: {data}", "red"))
 
 
 async def _cmd_rag(state: ReplState, rest: str) -> None:
@@ -638,9 +776,14 @@ async def _fetch_models(state: ReplState, backend: Optional[str] = None) -> List
             if resp.status_code == 200:
                 payload = resp.json() or {}
                 models = payload.get("models") or []
-                state.known_models = [
-                    m.get("id") for m in models if isinstance(m, dict) and m.get("id")
-                ]
+                known_models: List[str] = []
+                for model in models:
+                    if not isinstance(model, dict):
+                        continue
+                    model_id = model.get("id")
+                    if isinstance(model_id, str):
+                        known_models.append(model_id)
+                state.known_models = known_models
                 return [m for m in models if isinstance(m, dict)]
     except Exception:
         pass
@@ -824,9 +967,14 @@ async def _list_agents_raw(state: ReplState) -> List[dict]:
                         rec.setdefault("name", name)
                         out.append(rec)
                     agents = out
-                state.known_agents = [
-                    a.get("name") for a in agents if isinstance(a, dict) and a.get("name")
-                ]
+                known_agents: List[str] = []
+                for agent in agents:
+                    if not isinstance(agent, dict):
+                        continue
+                    name = agent.get("name")
+                    if isinstance(name, str):
+                        known_agents.append(name)
+                state.known_agents = known_agents
                 return [a for a in agents if isinstance(a, dict)]
     except Exception as exc:
         _add_transcript(state, _info_line(f"error: {exc}", "red"))
@@ -848,7 +996,8 @@ async def _cmd_agent(state: ReplState, rest: str) -> None:
         table.add_column("model")
         table.add_column("enabled")
         for a in agents:
-            cfg = a.get("config") if isinstance(a.get("config"), dict) else {}
+            raw_config = a.get("config")
+            cfg = raw_config if isinstance(raw_config, dict) else {}
             backend = a.get("backend") or cfg.get("backend") or a.get("provider") or "-"
             model = a.get("model") or cfg.get("model") or "-"
             atype = a.get("type") or a.get("kind") or a.get("role") or "-"
@@ -1055,11 +1204,16 @@ async def _warmup(state: ReplState) -> None:
                 payload = r.json() or {}
                 ag = payload.get("agents") or {}
                 if isinstance(ag, dict):
-                    state.known_agents = list(ag.keys())
+                    state.known_agents = [str(name) for name in ag.keys()]
                 else:
-                    state.known_agents = [
-                        a.get("name") for a in ag if isinstance(a, dict) and a.get("name")
-                    ]
+                    known_agents: List[str] = []
+                    for agent in ag:
+                        if not isinstance(agent, dict):
+                            continue
+                        name = agent.get("name")
+                        if isinstance(name, str):
+                            known_agents.append(name)
+                    state.known_agents = known_agents
                 # default active_agent if not set: prefer 'writer', else first
                 if state.active_agent is None and state.known_agents:
                     state.active_agent = next(
@@ -1083,10 +1237,14 @@ async def _warmup(state: ReplState) -> None:
             r = await client.get(f"/api/llm/models?backend={be}")
             if r.status_code == 200:
                 payload = r.json() or {}
-                state.known_models = [
-                    m.get("id") for m in (payload.get("models") or [])
-                    if isinstance(m, dict) and m.get("id")
-                ]
+                known_models: List[str] = []
+                for model in payload.get("models") or []:
+                    if not isinstance(model, dict):
+                        continue
+                    model_id = model.get("id")
+                    if isinstance(model_id, str):
+                        known_models.append(model_id)
+                state.known_models = known_models
     except Exception:
         pass
 
@@ -1114,7 +1272,7 @@ def _read_one(session: Any) -> Optional[str]:
                 break
             lines.append(ln)
         return "\n".join(lines)
-    return first
+    return str(first)
 
 
 def _read_one_basic() -> Optional[str]:
@@ -1127,7 +1285,7 @@ def _read_one_basic() -> Optional[str]:
                 break
             lines.append(ln)
         return "\n".join(lines)
-    return first
+    return str(first)
 
 
 # ---------------------------------------------------------------------------
@@ -1183,7 +1341,7 @@ def run() -> None:
     except Exception:
         pass
 
-    pt_session = None
+    pt_session: Any = None
     if _HAS_PT:
         pt_session = PromptSession(
             history=InMemoryHistory(),
@@ -1226,9 +1384,9 @@ def run() -> None:
                 continue
 
             if line.startswith("/"):
-                fut = asyncio.run_coroutine_threadsafe(_slash(state, line), loop)
+                command_future = asyncio.run_coroutine_threadsafe(_slash(state, line), loop)
                 try:
-                    should_exit = fut.result(timeout=120)
+                    should_exit = command_future.result(timeout=120)
                 except Exception as exc:
                     _add_transcript(state, _info_line(f"command error: {exc}", "red"))
                     should_exit = False
@@ -1236,11 +1394,12 @@ def run() -> None:
                     break
             else:
                 _add_transcript(state, _user_line(line))
-                fut = asyncio.run_coroutine_threadsafe(_submit_prompt(state, line), loop)
+                prompt_future = asyncio.run_coroutine_threadsafe(_submit_prompt(state, line), loop)
                 try:
-                    fut.result(timeout=600)
+                    prompt_future.result(timeout=600)
                 except KeyboardInterrupt:
-                    asyncio.run_coroutine_threadsafe(_cancel_current(state), loop)
+                    cancel_future = asyncio.run_coroutine_threadsafe(_cancel_current(state), loop)
+                    cancel_future.result(timeout=5)
                     _add_transcript(state, _info_line("cancelled", "yellow"))
                 except Exception as exc:
                     _add_transcript(state, _info_line(f"error: {exc}", "red"))

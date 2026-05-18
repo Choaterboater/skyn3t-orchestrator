@@ -6,7 +6,9 @@ and feature parity we keep the API-based implementation, placed in this file as
 requested.
 """
 
+import asyncio
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from skyn3t.config.settings import get_settings
@@ -34,7 +36,7 @@ class OpenAIAgent(BaseAgent):
             config=config,
         )
         self.model = model
-        self.client = None
+        self.client: Any = None
         self.conversation_history: List[Dict[str, str]] = []
         self.add_capability(
             AgentCapability(
@@ -73,17 +75,28 @@ class OpenAIAgent(BaseAgent):
         except ImportError:
             raise ImportError("openai package not installed. Run: pip install openai")
 
+    # Health-check cache: don't hammer models.list() (a paid call) on every
+    # 30s monitor tick — cache the last result for 5 minutes.
+    _HEALTH_TTL_SECONDS = 300
+    _health_cached_at: float = 0.0
+    _health_cached_value: bool = False
+
     async def health_check(self) -> bool:
-        """Check if OpenAI API is accessible."""
+        """Check if OpenAI API is accessible (cached + timeout-bounded)."""
         if not self.client:
             return False
+        now = time.monotonic()
+        if now - self._health_cached_at < self._HEALTH_TTL_SECONDS:
+            return self._health_cached_value
         try:
-            await self.client.models.list()
-            return True
+            await asyncio.wait_for(self.client.models.list(), timeout=5.0)
+            self._health_cached_value = True
         except Exception:
-            return False
+            self._health_cached_value = False
+        self._health_cached_at = now
+        return self._health_cached_value
 
-    async def execute(self, task: TaskRequest) -> TaskResult:
+    async def execute(self, task: TaskRequest, stdin_data: str | None = None) -> TaskResult:
         """Execute a task using OpenAI."""
         if not self.client:
             return TaskResult(

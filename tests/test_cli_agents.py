@@ -1,15 +1,15 @@
 """Tests for CLI-based agents."""
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
-from skyn3t.adapters.cli_agent import CLIAgent
 from skyn3t.adapters.claude_cli import ClaudeCLIAgent
+from skyn3t.adapters.cli_agent import CLIAgent
 from skyn3t.adapters.copilot_cli import CopilotCLIAgent
 from skyn3t.adapters.kimi_cli import KimiCLIAgent
-from skyn3t.core.agent import TaskRequest, TaskResult
+from skyn3t.core.agent import TaskRequest
 from skyn3t.core.events import EventBus
 
 
