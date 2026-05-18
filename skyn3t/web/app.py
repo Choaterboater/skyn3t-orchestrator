@@ -390,8 +390,67 @@ async def _init_integrations(
     settings,
 ) -> None:
     """Initialize external service integrations (optional)."""
-    # Integrations are loaded lazily — no auto-start to keep startup fast
-    pass
+    # Discord bot: only start if a token is configured. The bot runs as a
+    # background task so it doesn't block server startup, and any failure
+    # in the Gateway connection is logged but doesn't crash the app.
+    if settings.discord_token:
+        try:
+            from skyn3t.integrations.discord_bot import DiscordBot
+            # Runner is wired lazily — _get_studio_runner attaches it to
+            # app.state on first access. We use a thunk so the bot picks
+            # up the runner at message-receive time, not boot time.
+            class _LazyRunner:
+                def _runner(self):
+                    return _get_studio_runner(app)
+                def reserve_project(self, *args, **kwargs):
+                    return self._runner().reserve_project(*args, **kwargs)
+                async def start(self, *args, **kwargs):
+                    return await self._runner().start(*args, **kwargs)
+                def get_project(self, *args, **kwargs):
+                    return self._runner().get_project(*args, **kwargs)
+                def list_projects(self):
+                    return self._runner().list_projects()
+                async def resume_after_approval(self, *args, **kwargs):
+                    return await self._runner().resume_after_approval(*args, **kwargs)
+
+            bot = DiscordBot(event_bus, token=settings.discord_token, studio_runner=_LazyRunner())
+            app.state.discord_bot = bot
+            task = asyncio.create_task(bot.start())
+            app.state.discord_bot_task = task
+            logger.info("Discord bot starting in background")
+        except Exception:
+            logger.exception("Discord bot failed to start")
+
+    # Telegram studio control surface (long-polling — no public URL needed).
+    if settings.telegram_token and settings.telegram_user_id:
+        try:
+            from skyn3t.integrations.telegram_bot import TelegramBot
+
+            class _TGLazyRunner:
+                def _runner(self):
+                    return _get_studio_runner(app)
+                def reserve_project(self, *args, **kwargs):
+                    return self._runner().reserve_project(*args, **kwargs)
+                async def start(self, *args, **kwargs):
+                    return await self._runner().start(*args, **kwargs)
+                def get_project(self, *args, **kwargs):
+                    return self._runner().get_project(*args, **kwargs)
+                def list_projects(self):
+                    return self._runner().list_projects()
+                async def resume_after_approval(self, *args, **kwargs):
+                    return await self._runner().resume_after_approval(*args, **kwargs)
+
+            tg_bot = TelegramBot(
+                token=settings.telegram_token,
+                allowed_user_id=settings.telegram_user_id,
+                studio_runner=_TGLazyRunner(),
+            )
+            app.state.telegram_bot = tg_bot
+            tg_task = asyncio.create_task(tg_bot.start())
+            app.state.telegram_bot_task = tg_task
+            logger.info("Telegram bot starting in background")
+        except Exception:
+            logger.exception("Telegram bot failed to start")
 
 
 app = FastAPI(
@@ -2380,6 +2439,99 @@ async def studio_approval_config_put(payload: dict):
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Discord control surface
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/discord/interactions")
+async def discord_interactions(request: Request):
+    """Discord interaction webhook (slash commands, button presses, modals)."""
+    from skyn3t.config.settings import get_settings
+    from skyn3t.integrations.discord_commands import (
+        handle_interaction,
+        verify_signature,
+    )
+
+    settings = get_settings()
+    public_key = settings.discord_public_key
+    if not public_key:
+        return JSONResponse({"error": "discord not configured"}, status_code=503)
+
+    signature = request.headers.get("X-Signature-Ed25519", "")
+    timestamp = request.headers.get("X-Signature-Timestamp", "")
+    body = await request.body()
+    if not verify_signature(public_key, signature, timestamp, body):
+        return JSONResponse({"error": "invalid signature"}, status_code=401)
+
+    try:
+        payload = json.loads(body.decode("utf-8")) if body else {}
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    runner = _get_studio_runner(app)
+    result = await handle_interaction(payload, runner)
+
+    if result.follow_up is not None:
+        task = asyncio.create_task(result.follow_up())
+        _track_studio_task(task, runner=runner, slug="discord", action="discord follow-up")
+
+    return JSONResponse(result.response)
+
+
+@app.post("/api/discord/register-commands")
+async def discord_register_commands(request: Request):
+    """Idempotently register slash commands with Discord.
+
+    Requires ``X-Skyn3t-Admin`` header matching settings.discord_admin_secret.
+    If no admin secret is configured the endpoint returns 503 — set
+    SKYN3T_DISCORD_ADMIN_SECRET to enable.
+    """
+    from skyn3t.config.settings import get_settings
+    from skyn3t.integrations.discord_commands import register_slash_commands
+
+    settings = get_settings()
+    admin_secret = settings.discord_admin_secret
+    if not admin_secret:
+        return JSONResponse(
+            {"error": "set SKYN3T_DISCORD_ADMIN_SECRET to enable"},
+            status_code=503,
+        )
+    if request.headers.get("X-Skyn3t-Admin", "") != admin_secret:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    app_id = settings.discord_application_id
+    token = settings.discord_token
+    if not app_id or not token:
+        return JSONResponse(
+            {"error": "SKYN3T_DISCORD_APP_ID and DISCORD_TOKEN must be set"},
+            status_code=400,
+        )
+
+    try:
+        result = await register_slash_commands(app_id, token)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return result
+
+
+@app.get("/api/discord/status")
+async def discord_status():
+    """Return Discord wiring status for the dashboard."""
+    from skyn3t.config.settings import get_settings
+    from skyn3t.integrations.discord_commands import SLASH_COMMANDS
+
+    settings = get_settings()
+    return {
+        "app_id_configured": bool(settings.discord_application_id),
+        "public_key_configured": bool(settings.discord_public_key),
+        "bot_token_configured": bool(settings.discord_token),
+        "bot_channel_configured": bool(settings.discord_bot_channel_id),
+        "admin_secret_configured": bool(settings.discord_admin_secret),
+        "command_count": len(SLASH_COMMANDS),
+    }
 
 
 # ---------------------------------------------------------------------------

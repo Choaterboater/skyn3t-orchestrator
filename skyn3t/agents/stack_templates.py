@@ -579,25 +579,53 @@ def _mask_extensibility_examples(text: str) -> str:
     return "".join(result)
 
 
-# Triggers for the design-system tier. Any brief that paints a
-# "dashboard" picture should get the primitive components reserved.
-_DASHBOARD_SIGNALS: Tuple[str, ...] = (
-    "dashboard", "status board", "control panel", "control pane",
+# Signals for the homelab/service-status template tier specifically.
+# These are *not* generic "any dashboard" signals — earlier versions
+# triggered on the bare word "dashboard" which caused Excel-upload,
+# finance, and analytics dashboards to all get the homelab scaffold
+# (Plex/Sonarr/Radarr tiles), wrong-product disasters that tanked
+# review scores. The template tier should only kick in when the brief
+# clearly describes a multi-service status board.
+_HOMELAB_SIGNALS: Tuple[str, ...] = (
     "homelab", "home lab", "home-lab",
-    "metrics ui", "monitoring ui", "ops ui",
-    "service grid", "service tiles", "service cards",
-    "kpi", "kpis", "key metrics",
-    "homarr", "heimdall", "dashy", "grafana-style",
+    "self-hosted dashboard", "self hosted dashboard",
+    "service status dashboard", "service status board",
+    "status board", "status dashboard",
+    "media stack dashboard",
+    "homarr", "heimdall", "dashy",
+    "monitor my services", "monitor my homelab",
+    "ops dashboard", "noc dashboard",
+)
+
+
+# Briefs that explicitly disqualify the homelab path even if they
+# happen to contain "dashboard" — these describe other domains.
+_HOMELAB_DISQUALIFIERS: Tuple[str, ...] = (
+    "excel", "spreadsheet", "csv", "xlsx",
+    "finance", "expense", "budget", "transaction",
+    "kanban", "todo", "habit", "recipe",
+    "notes app", "markdown notes",
+    "bookmark", "rss", "feed reader",
+    "journal", "workout", "fitness",
+    "crm", "invoice", "billing",
+    "real estate", "listing",
 )
 
 
 def _needs_design_system(brief: str) -> bool:
-    """True when the brief paints a dashboard product. Cheap, broad.
-    False positives are fine — the 3 primitive files are tiny."""
+    """True when the brief specifically describes a homelab-style
+    service status dashboard.
+
+    Narrower than the previous "anything with the word dashboard" logic
+    — that was the root cause of CodeAgent producing homelab Plex/Sonarr
+    scaffolds for Excel uploaders and finance trackers.
+    """
     if not brief:
         return False
     text = brief.lower()
-    return any(sig in text for sig in _DASHBOARD_SIGNALS)
+    if any(d in text for d in _HOMELAB_DISQUALIFIERS):
+        return False
+    return any(sig in text for sig in _HOMELAB_SIGNALS)
 
 
 def _design_system_files() -> FilePlan:
