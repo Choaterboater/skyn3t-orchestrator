@@ -154,18 +154,27 @@ def install_handlers(orchestrator) -> None:
     async def ingest_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
         """User approved an ingest proposal → run github_ingestor."""
         topic = str(payload.get("topic") or payload.get("query") or payload.get("idea") or "").strip()
-        repo = payload.get("repo")
+        repo = str(payload.get("repo") or "").strip()
         try:
+            from skyn3t.core.agent import TaskRequest
+
             ingestor = orchestrator.agents.get("github_ingestor")
             if ingestor is None:
                 return {"ok": False, "error": "github_ingestor agent not registered"}
+            raw_limit = payload.get("limit")
+            try:
+                max_files = max(1, int(raw_limit or 5))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": f"invalid ingest limit: {raw_limit!r}"}
             input_data: Dict[str, Any] = {
-                "max_files": max(1, int(payload.get("limit") or 5)),
+                "max_files": max_files,
             }
             if repo:
                 input_data["mode"] = "single_repo"
                 input_data["repo"] = repo
             else:
+                if not topic:
+                    return {"ok": False, "error": "missing topic/query for search ingest"}
                 input_data["mode"] = "search"
                 input_data["query"] = topic
             label = topic or (str(repo).strip() if repo else "") or "unspecified"
