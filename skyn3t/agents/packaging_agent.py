@@ -113,7 +113,24 @@ class PackagingAgent(BaseAgent):
         verify_enabled = bool(data.get("packaging_verify", True))
 
         detection = detect_stack(artifact_dir)
-        env_scan = scan_env(scaffold_dir if scaffold_dir.is_dir() else artifact_dir)
+        # Scan both the scaffold dir (frontend) AND the artifact root
+        # (backend, in monorepo layouts). The scanner aggregates by var
+        # name, so vars referenced in both places just get more entries
+        # in their `used_in` list.
+        env_scan = scan_env(artifact_dir)
+        if scaffold_dir.is_dir() and scaffold_dir != artifact_dir:
+            scaffold_scan = scan_env(scaffold_dir)
+            for name, ref in scaffold_scan.vars.items():
+                if name in env_scan.vars:
+                    # Merge used_in lists, keeping default from whichever
+                    # source had one first.
+                    for f in ref.used_in:
+                        if f not in env_scan.vars[name].used_in:
+                            env_scan.vars[name].used_in.append(f)
+                else:
+                    env_scan.vars[name] = ref
+            env_scan.scanned_files += scaffold_scan.scanned_files
+            env_scan.skipped_files += scaffold_scan.skipped_files
 
         await self.think(
             f"packaging: family={detection.family}, stack={detection.stack}, "
@@ -137,9 +154,15 @@ class PackagingAgent(BaseAgent):
                         detection=detection,
                         env_scan=env_scan,
                     )
-                case "fullstack" | "unknown":
-                    # PR C-combo ships fullstack. unknown stays as
-                    # placeholder until we get a meaningful signal.
+                case "fullstack":
+                    result = await self._package_fullstack(
+                        artifact_dir=artifact_dir,
+                        scaffold_dir=scaffold_dir,
+                        detection=detection,
+                        env_scan=env_scan,
+                        verify_enabled=verify_enabled,
+                    )
+                case "unknown":
                     result = self._package_placeholder(detection, env_scan)
                 case _:
                     result = self._package_placeholder(detection, env_scan)
@@ -540,7 +563,227 @@ class PackagingAgent(BaseAgent):
         return artifact_dir
 
     # ==================================================================
-    # Strategy: placeholder for fullstack/unknown families
+    # Strategy: fullstack (web + docker, wired together)
+    # ==================================================================
+
+    async def _package_fullstack(
+        self,
+        *,
+        artifact_dir: Path,
+        scaffold_dir: Path,
+        detection: StackDetection,
+        env_scan: ScanResult,
+        verify_enabled: bool,
+    ) -> PackagingResult:
+        """Run both web + server strategies and wire them.
+
+        After both strategies run independently, we:
+
+        1. Override the **root README** with a single fullstack README
+           that explains both layers (the per-strategy READMEs already
+           wrote to scaffold/ and project root respectively — we
+           consolidate at the artifact root).
+        2. Add a **frontend service** to docker-compose so
+           ``docker compose up`` brings both layers up together.
+        3. Set ``API_BASE_URL`` as the default in the frontend's
+           useConfig so the user doesn't have to fill it in to talk
+           to the backend.
+        """
+        notes: List[str] = []
+
+        # The two strategies write into different roots — web goes
+        # under scaffold/, server goes wherever the manifest lives
+        # (frequently the artifact root). For a fullstack project the
+        # most common layout is:
+        #   artifact/
+        #     scaffold/        ← frontend (react/vite)
+        #     requirements.txt ← backend (fastapi)
+        #     main.py
+        # so the strategies naturally don't collide.
+
+        # 1. Web side first (Settings UI, useConfig, slim README)
+        web_result = await self._package_web(
+            artifact_dir=artifact_dir,
+            scaffold_dir=scaffold_dir,
+            detection=detection,
+            env_scan=env_scan,
+            verify_enabled=verify_enabled,
+        )
+
+        # 2. Server side (Dockerfile, compose, .env.example, README)
+        server_result = self._package_server(
+            artifact_dir=artifact_dir,
+            scaffold_dir=scaffold_dir,
+            detection=detection,
+            env_scan=env_scan,
+        )
+
+        # 3. Wire them: add frontend to compose so `docker compose up`
+        # builds and runs both layers together.
+        server_project_root = self._project_root_for_server(artifact_dir, scaffold_dir)
+        compose_path = server_project_root / "docker-compose.yml"
+        wired_compose = False
+        if compose_path.is_file():
+            try:
+                wired_compose = self._add_frontend_to_compose(
+                    compose_path=compose_path,
+                    scaffold_dir=scaffold_dir,
+                    backend_port=_server_port(detection),
+                )
+            except Exception as e:  # noqa: BLE001
+                notes.append(f"could not wire frontend into compose: {e}")
+        if wired_compose:
+            notes.append("frontend service added to docker-compose.yml")
+
+        # 4. Seed API_BASE_URL default in the frontend's useConfig so
+        # the user doesn't have to type the backend URL on first run.
+        seeded_url = self._seed_api_base_url(
+            scaffold_dir=scaffold_dir,
+            backend_port=_server_port(detection),
+        )
+        if seeded_url:
+            notes.append(f"API_BASE_URL default seeded → {seeded_url}")
+
+        # 5. Override the root README with a fullstack-aware version
+        # that explains both layers and the single `docker compose up`
+        # entry point. The per-strategy READMEs wrote into their own
+        # roots already; this one wins at the artifact level.
+        root_readme = artifact_dir / "README.md"
+        root_readme.write_text(
+            _render_fullstack_readme(
+                app_name=_infer_app_name(detection, artifact_dir),
+                detection=detection,
+                env_scan=env_scan,
+                wired_compose=wired_compose,
+                backend_port=_server_port(detection),
+            ),
+            encoding="utf-8",
+        )
+
+        # Merge results: union of files written, noting both strategies
+        # contributed.
+        files_written = sorted(set(web_result.files_written) | set(server_result.files_written))
+        files_patched = sorted(set(web_result.files_patched) | set(server_result.files_patched))
+        merged_notes = list(server_result.notes) + list(web_result.notes) + notes
+
+        return PackagingResult(
+            strategy="fullstack",
+            files_written=files_written + ["README.md (fullstack)"],
+            files_patched=files_patched,
+            env_vars_found=len(env_scan.vars),
+            # We inherit web's verification result — the docker side is
+            # verified downstream by BuildVerifier.
+            verified=web_result.verified,
+            verifier_skipped=web_result.verifier_skipped,
+            notes=merged_notes,
+        )
+
+    @staticmethod
+    def _add_frontend_to_compose(
+        *,
+        compose_path: Path,
+        scaffold_dir: Path,
+        backend_port: int,
+    ) -> bool:
+        """Append a `frontend` service to compose pointing at scaffold/.
+
+        Returns True if we added it, False if a frontend service was
+        already present (operator's wins).
+        """
+        text = compose_path.read_text(encoding="utf-8")
+        # Idempotent: already wired
+        if re.search(r"^\s*frontend\s*:", text, re.MULTILINE):
+            return False
+
+        # Compose lives at the server project root; scaffold lives at
+        # artifact root. Express the build path relatively if possible
+        # so the compose file works regardless of where the user
+        # cloned to.
+        try:
+            rel_scaffold = scaffold_dir.relative_to(compose_path.parent)
+            build_context = rel_scaffold.as_posix()
+        except ValueError:
+            # scaffold is not under compose dir — fall back to absolute
+            # path; the user can edit if they reorganize.
+            build_context = str(scaffold_dir)
+
+        frontend_block = f"""\
+
+  frontend:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    volumes:
+      - ./{build_context}/dist:/usr/share/nginx/html:ro
+    depends_on:
+      - app
+    # The frontend serves a pre-built static bundle. Run `npm run build`
+    # in {build_context}/ before `docker compose up`, OR replace this
+    # block with a multi-stage Dockerfile under {build_context}/ if you
+    # want compose to build the frontend too.
+"""
+
+        # Insert before any top-level `volumes:` (if present), otherwise
+        # append at the end.
+        volumes_idx = text.find("\nvolumes:")
+        if volumes_idx != -1:
+            new_text = text[:volumes_idx] + frontend_block + text[volumes_idx:]
+        else:
+            new_text = text.rstrip() + "\n" + frontend_block
+        compose_path.write_text(new_text, encoding="utf-8")
+        return True
+
+    @staticmethod
+    def _seed_api_base_url(*, scaffold_dir: Path, backend_port: int) -> Optional[str]:
+        """Patch useConfig.js to default API_BASE_URL to the backend port.
+
+        Most fullstack apps' frontends talk to ``http://localhost:<port>``
+        during local dev. We seed that as the default so first-run users
+        don't see a broken app.
+
+        Returns the seeded URL on success, None when the file isn't
+        there yet or already contains a seeded default.
+        """
+        hook_path = scaffold_dir / "src" / "hooks" / "useConfig.js"
+        if not hook_path.is_file():
+            return None
+        text = hook_path.read_text(encoding="utf-8")
+        # Idempotent: already seeded
+        if "API_BASE_URL" in text and "DEFAULTS" in text:
+            return None
+
+        default_url = f"http://localhost:{backend_port}"
+        # Inject a DEFAULTS map + use it when the stored config is missing
+        # a key. Keeps the existing get/set/setMany API untouched.
+        injection = f"""
+// @skyn3t-packaging-fullstack: defaults seeded by PackagingAgent
+const DEFAULTS = {{ API_BASE_URL: "{default_url}" }};
+"""
+        # Place the DEFAULTS const right after STORAGE_KEY so the rest
+        # of the file can see it.
+        text = re.sub(
+            r"(const STORAGE_KEY[^\n]+\n)",
+            r"\1" + injection,
+            text,
+            count=1,
+        )
+        # Update `get` to fall back to DEFAULTS when the config doesn't
+        # have a value yet.
+        text = re.sub(
+            r"const get = useCallback\(\(key, fallback = \"\"\) => \{\s*\n\s*return config\[key\] \?\? fallback;\s*\n\s*\}, \[config\]\);",
+            (
+                "const get = useCallback((key, fallback = \"\") => {\n"
+                "    return config[key] ?? DEFAULTS[key] ?? fallback;\n"
+                "  }, [config]);"
+            ),
+            text,
+        )
+        hook_path.write_text(text, encoding="utf-8")
+        return default_url
+
+    # ==================================================================
+    # Strategy: placeholder for unknown family
     # ==================================================================
 
     def _package_placeholder(self, detection: StackDetection, env_scan: ScanResult) -> PackagingResult:
@@ -1391,8 +1634,147 @@ If you prefer to run directly:
 """
 
 
+def _render_fullstack_readme(
+    *,
+    app_name: str,
+    detection: StackDetection,
+    env_scan: ScanResult,
+    wired_compose: bool,
+    backend_port: int,
+) -> str:
+    """Unified README for a project with both a frontend and a backend.
+
+    Explains the two-tier config model:
+      - server-side secrets (DB password, JWT secret) → .env
+      - client-side config (API URL overrides, theme)  → in-app Settings
+    """
+    runtimes_lines: List[str] = []
+    for r in detection.runtimes:
+        if r.name == "python":
+            v = r.min_version or "3.12"
+            runtimes_lines.append(f"- Python {v}+ ([install](https://python.org/))")
+        elif r.name == "node":
+            v = r.min_version or "22"
+            runtimes_lines.append(f"- Node {v}+ ([install](https://nodejs.org/))")
+    runtimes_lines.append("- Docker + Docker Compose ([install](https://docs.docker.com/get-docker/))")
+    runtimes_block = "\n".join(runtimes_lines)
+
+    services_block = ""
+    if detection.services:
+        services_block = (
+            "\n## Services included\n\n"
+            + "\n".join(f"- **{s}** (auto-managed via docker-compose)" for s in detection.services)
+            + "\n"
+        )
+
+    server_required = [
+        v for v in env_scan.required()
+        if not v.name.startswith(("VITE_", "REACT_APP_", "NEXT_PUBLIC_"))
+    ]
+    client_vars = [
+        v for v in env_scan.vars.values()
+        if v.name.startswith(("VITE_", "REACT_APP_", "NEXT_PUBLIC_"))
+    ]
+
+    server_required_block = ""
+    if server_required:
+        server_required_block = (
+            "\n### Server-side (in `.env`)\n\n"
+            "These are secrets and infrastructure URLs. Set them in `.env` "
+            "before running `docker compose up`:\n\n"
+        )
+        for v in server_required:
+            kind = "🔒 secret" if v.is_secret else v.type_hint
+            server_required_block += f"- `{v.name}` ({kind})\n"
+
+    client_block = ""
+    if client_vars:
+        client_block = (
+            "\n### Client-side (in the Settings page)\n\n"
+            "Open the app and click **Settings** to configure. Values are "
+            "stored in your browser, never sent to the server:\n\n"
+        )
+        for v in sorted(client_vars, key=lambda x: x.name):
+            client_block += f"- `{v.name}`\n"
+
+    if not server_required and not client_vars:
+        config_block = (
+            "\n## Configuration\n\n"
+            "No configuration is required to run the default stack — "
+            "everything has sensible defaults.\n"
+        )
+    else:
+        config_block = "\n## Configuration\n" + server_required_block + client_block
+
+    frontend_section = ""
+    if wired_compose:
+        frontend_section = (
+            f"The frontend serves a pre-built static bundle from `scaffold/dist/`. "
+            f"Run `npm run build` in `scaffold/` first, then `docker compose up` "
+            f"serves it on http://localhost:5173.\n"
+        )
+    else:
+        frontend_section = (
+            "The frontend lives in `scaffold/`. For local development:\n\n"
+            "```bash\n"
+            "cd scaffold\n"
+            "npm install\n"
+            "npm run dev\n"
+            "```\n\n"
+            "It will talk to the backend on http://localhost:" + str(backend_port) + " by default "
+            "(configurable in the in-app **Settings** page).\n"
+        )
+
+    return f"""# {app_name}
+
+A fullstack app — frontend in `scaffold/`, backend at the project root, both
+runnable with a single `docker compose up`.
+
+## Requirements
+{runtimes_block}
+
+## Quick start
+```bash
+cp .env.example .env  # fill in server secrets
+docker compose up
+```
+
+- Backend API: http://localhost:{backend_port}
+- Frontend:    http://localhost:5173
+
+## Frontend
+{frontend_section}
+## Backend
+The backend ships with a Dockerfile and is built/run by the compose stack.
+For native development:
+
+```bash
+{_native_run_command(detection)}
+```
+{config_block}{services_block}
+## Stopping
+```bash
+docker compose down
+```
+
+To wipe persistent data:
+```bash
+docker compose down -v
+```
+
+---
+*Generated by SkyN3t PackagingAgent (fullstack strategy).*
+"""
+
+
 def _native_run_command(detection: StackDetection) -> str:
-    """Snippet for running the server natively (no Docker)."""
+    """Snippet for running the server natively (no Docker).
+
+    For fullstack projects, ``detection.stack`` is the web framework
+    (since we keep that as primary) — so we infer the server framework
+    from the runtimes. Python runtime → assume fastapi/uvicorn (the
+    most common). Node runtime → assume express (most common).
+    """
     stack = detection.stack or ""
     if stack in ("fastapi", "starlette", "aiohttp"):
         return "pip install -r requirements.txt\nuvicorn main:app --reload"
@@ -1402,4 +1784,12 @@ def _native_run_command(detection: StackDetection) -> str:
         return "pip install -r requirements.txt\npython manage.py runserver"
     if stack in ("express", "fastify", "koa", "hono"):
         return "npm install\nnpm run dev  # or: node server.js"
+
+    # Fullstack path: web framework wins the stack slot. Infer server
+    # from runtimes.
+    runtime_names = {r.name for r in detection.runtimes}
+    if "python" in runtime_names:
+        return "pip install -r requirements.txt\nuvicorn main:app --reload  # adjust to your entry point"
+    if "node" in runtime_names and stack in ("react_vite", "next", "sveltekit", "astro", "nuxt", "remix"):
+        return "# Backend native command depends on your server framework.\n# Common: node server.js"
     return "# See your framework's docs for the dev command"
