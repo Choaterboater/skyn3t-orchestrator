@@ -457,6 +457,324 @@ def _scan_for_design_quality(scaffold_dir: Path) -> List[ConsistencyIssue]:
     return issues
 
 
+_HEX_RE = re.compile(r"#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})\b")
+_RE_MATCH_TYPE = re.Match  # type alias for the inner replace helper
+_FONT_FAMILY_RE = re.compile(
+    r"""(?:font[\-\s_]?family|font[\-\s_]?display|font[\-\s_]?mono)\s*[:=]\s*['"]?([A-Z][A-Za-z0-9 _\-]+)""",
+    re.IGNORECASE,
+)
+_NUMERIC_PALETTE_KEYS = ("bg", "background", "surface", "accent", "primary", "text", "muted", "border")
+
+
+def _read(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def _normalize_hex(hex_code: str) -> str:
+    """Return ``#rrggbb`` lowercase. Expands 3-char shorthand."""
+    code = hex_code.strip().lstrip("#").lower()
+    if len(code) == 3:
+        code = "".join(c * 2 for c in code)
+    return f"#{code}"
+
+
+def _extract_hexes(text: str) -> Set[str]:
+    return {_normalize_hex(m.group(1)) for m in _HEX_RE.finditer(text)}
+
+
+def _extract_fonts(text: str) -> Set[str]:
+    """Best-effort font-family extraction. Catches CSS ``font-family:`` and
+    Tailwind / JSON ``font-display`` / ``font-mono`` style declarations.
+    Filters out generic family fallbacks (sans-serif, monospace, etc.)."""
+    fonts: Set[str] = set()
+    for match in _FONT_FAMILY_RE.finditer(text):
+        raw = match.group(1).strip().strip("'\"")
+        if not raw:
+            continue
+        first = raw.split(",")[0].strip().strip("'\"")
+        if not first:
+            continue
+        if first.lower() in {"sans-serif", "serif", "monospace", "system-ui", "ui-monospace", "inherit"}:
+            continue
+        fonts.add(first)
+    return fonts
+
+
+def _extract_palette_json_hexes(project_dir: Path) -> Set[str]:
+    """Pull color hex codes out of palette.json, whether it's flat
+    {"bg": "#...", "accent": "#..."} or a list-of-objects shape."""
+    p = project_dir / "palette.json"
+    if not p.exists():
+        return set()
+    try:
+        data = json.loads(_read(p))
+    except Exception:  # noqa: BLE001
+        return set()
+    out: Set[str] = set()
+    if isinstance(data, dict):
+        for v in data.values():
+            if isinstance(v, str):
+                out.update(_extract_hexes(v))
+            elif isinstance(v, dict):
+                for vv in v.values():
+                    if isinstance(vv, str):
+                        out.update(_extract_hexes(vv))
+    elif isinstance(data, list):
+        for entry in data:
+            if isinstance(entry, dict):
+                for vv in entry.values():
+                    if isinstance(vv, str):
+                        out.update(_extract_hexes(vv))
+            elif isinstance(entry, str):
+                out.update(_extract_hexes(entry))
+    return out
+
+
+def _scan_cross_artifact_drift(
+    scaffold_dir: Path, brief: str = ""
+) -> List[ConsistencyIssue]:
+    """Detect when a project's design artifacts disagree with each other.
+
+    Real example from a project that scored 63: ``palette.json`` listed 5
+    colors, ``brand.md`` listed 10, ``tokens.css`` used different cyan
+    shades. The reviewer flagged it as ~15 points of deductions. This
+    check surfaces the same disagreements as warnings so the targeted-fix
+    loop can resolve them BEFORE the reviewer scores the project.
+
+    Looks at the project root (one level up from ``scaffold/``) for the
+    "source of truth" artifacts: ``palette.json``, ``brand.md``,
+    ``tokens.css``, ``tokens.json``, ``components.md``.
+    """
+    issues: List[ConsistencyIssue] = []
+    project_dir = scaffold_dir.parent
+    if not project_dir.exists():
+        return issues
+
+    palette_hexes = _extract_palette_json_hexes(project_dir)
+    brand_text = _read(project_dir / "brand.md")
+    brand_hexes = _extract_hexes(brand_text)
+    tokens_css_text = _read(project_dir / "tokens.css")
+    tokens_css_hexes = _extract_hexes(tokens_css_text)
+    components_text = _read(project_dir / "components.md")
+    components_hexes = _extract_hexes(components_text)
+
+    sources: Dict[str, Set[str]] = {}
+    if palette_hexes:
+        sources["palette.json"] = palette_hexes
+    if brand_hexes:
+        sources["brand.md"] = brand_hexes
+    if tokens_css_hexes:
+        sources["tokens.css"] = tokens_css_hexes
+    if components_hexes:
+        sources["components.md"] = components_hexes
+
+    # Drift = a source declares a hex that no other source uses. We
+    # compare the SMALLEST source as the canonical, since palette.json
+    # is usually that — it's the curated short-list. If any larger
+    # source uses a color that isn't in palette.json, flag it.
+    if len(sources) >= 2 and "palette.json" in sources:
+        canonical = sources["palette.json"]
+        for name, hexes in sources.items():
+            if name == "palette.json":
+                continue
+            extras = hexes - canonical
+            if len(extras) >= 2:
+                preview = ", ".join(sorted(extras)[:5])
+                issues.append(ConsistencyIssue(
+                    severity="warning",
+                    category="cross_artifact_palette_drift",
+                    file=name,
+                    message=(
+                        f"{name} uses colors not in palette.json: {preview}"
+                        + (f" (+{len(extras) - 5} more)" if len(extras) > 5 else "")
+                    ),
+                    suggestion=(
+                        "Align colors with palette.json. The brand kit is the "
+                        "single source of truth — every other artifact should "
+                        "reference these hex codes, not invent new ones."
+                    ),
+                ))
+
+    # Font drift: brand.md, tokens.css, and components.md should agree on
+    # the font families being used.
+    brand_fonts = _extract_fonts(brand_text)
+    tokens_fonts = _extract_fonts(tokens_css_text)
+    components_fonts = _extract_fonts(components_text)
+    font_sources: Dict[str, Set[str]] = {}
+    if brand_fonts:
+        font_sources["brand.md"] = brand_fonts
+    if tokens_fonts:
+        font_sources["tokens.css"] = tokens_fonts
+    if components_fonts:
+        font_sources["components.md"] = components_fonts
+    if len(font_sources) >= 2:
+        # Treat brand.md as canonical when present (it's the designer's output);
+        # else fall back to tokens.css.
+        canonical_name = "brand.md" if "brand.md" in font_sources else "tokens.css"
+        canonical_fonts = font_sources.get(canonical_name, set())
+        # Case-insensitive set for comparison
+        canonical_lower = {f.lower() for f in canonical_fonts}
+        for name, fonts in font_sources.items():
+            if name == canonical_name:
+                continue
+            extras = {f for f in fonts if f.lower() not in canonical_lower}
+            if extras:
+                preview = ", ".join(sorted(extras)[:3])
+                issues.append(ConsistencyIssue(
+                    severity="warning",
+                    category="cross_artifact_font_drift",
+                    file=name,
+                    message=(
+                        f"{name} uses font families not in {canonical_name}: {preview}"
+                    ),
+                    suggestion=(
+                        f"Align fonts with {canonical_name}. brand.md is the "
+                        "canonical source for typography; tokens.css and any "
+                        "components.md should reference the SAME families."
+                    ),
+                ))
+
+    # Scaffold-vs-brand-kit drift: at least one scaffold file should
+    # actually use a color from palette.json. Otherwise the brand kit is
+    # decorative — the scaffold ignored it.
+    if palette_hexes:
+        scaffold_used: Set[str] = set()
+        for path in scaffold_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.suffix not in (".css", ".scss", ".jsx", ".tsx", ".js", ".ts", ".html"):
+                continue
+            try:
+                scaffold_used.update(_extract_hexes(path.read_text(encoding="utf-8")))
+            except (OSError, UnicodeDecodeError):
+                continue
+        if scaffold_used:
+            overlap = palette_hexes & scaffold_used
+            if not overlap:
+                preview = ", ".join(sorted(palette_hexes)[:3])
+                issues.append(ConsistencyIssue(
+                    severity="error",
+                    category="brand_kit_ignored_by_scaffold",
+                    file="(scaffold)",
+                    message=(
+                        f"Scaffold uses no colors from palette.json ({preview}…). "
+                        "The brand kit was generated but the code ignored it."
+                    ),
+                    suggestion=(
+                        "Update scaffold CSS/JSX to use palette.json hex codes. "
+                        "Otherwise the brand work was wasted."
+                    ),
+                ))
+
+    return issues
+
+
+def _nearest_palette_color(target_hex: str, palette: Set[str]) -> str:
+    """Pick the palette color closest to ``target_hex`` by RGB distance.
+
+    Used by the auto-fix path: when tokens.css declares ``#1A2B3C`` but
+    palette.json only has ``#1B2A3D``, we want to map the off-by-a-few
+    color to the canonical palette entry instead of dropping it.
+    """
+    if not palette:
+        return target_hex
+    try:
+        t_r = int(target_hex[1:3], 16)
+        t_g = int(target_hex[3:5], 16)
+        t_b = int(target_hex[5:7], 16)
+    except (ValueError, IndexError):
+        return target_hex
+    best_color = target_hex
+    best_dist = 10**9
+    for p in palette:
+        try:
+            p_r = int(p[1:3], 16)
+            p_g = int(p[3:5], 16)
+            p_b = int(p[5:7], 16)
+        except (ValueError, IndexError):
+            continue
+        # Squared euclidean — no need for sqrt for comparison.
+        dist = (t_r - p_r) ** 2 + (t_g - p_g) ** 2 + (t_b - p_b) ** 2
+        if dist < best_dist:
+            best_dist = dist
+            best_color = p
+    return best_color
+
+
+def auto_fix_cross_artifact_drift(scaffold_dir: Path) -> Dict[str, int]:
+    """Rewrite tokens.css / components.md / scaffold files so all hex
+    color literals come from palette.json.
+
+    Strategy: take every hex literal in the target files. If it's not in
+    palette.json, replace it with the palette's nearest-neighbor color
+    (by RGB distance). This collapses 3 contradicting palettes into 1
+    without an LLM call.
+
+    Returns a dict ``{file_path: num_replacements}`` for the audit log.
+    Safe to call when palette.json is missing — returns empty dict.
+    """
+    project_dir = scaffold_dir.parent
+    if not project_dir.exists():
+        return {}
+
+    palette_hexes = _extract_palette_json_hexes(project_dir)
+    if len(palette_hexes) < 2:
+        # No canonical palette to sync against. Skip silently.
+        return {}
+
+    # Files whose hex literals should match palette.json.
+    fix_targets: List[Path] = [
+        project_dir / "tokens.css",
+        project_dir / "components.md",
+        project_dir / "brand.md",
+    ]
+    # Plus scaffold CSS + JSX (the actual code).
+    if scaffold_dir.exists():
+        for ext in (".css", ".scss", ".jsx", ".tsx", ".js", ".ts"):
+            fix_targets.extend(scaffold_dir.rglob(f"*{ext}"))
+
+    edits: Dict[str, int] = {}
+    for path in fix_targets:
+        if not path.is_file():
+            continue
+        try:
+            original = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        # Find every hex literal. For each that's NOT in palette, replace
+        # with the nearest palette color. Preserve casing in surrounding
+        # text — only the literal itself changes.
+        replacements = 0
+
+        def _replace(match: "_RE_MATCH_TYPE") -> str:  # type: ignore[name-defined]
+            nonlocal replacements
+            raw = match.group(0)
+            try:
+                normalized = _normalize_hex(raw)
+            except Exception:  # noqa: BLE001
+                return raw
+            if normalized in palette_hexes:
+                return raw  # already canonical
+            nearest = _nearest_palette_color(normalized, palette_hexes)
+            if nearest == normalized:
+                return raw  # no better match (palette empty edge case)
+            replacements += 1
+            return nearest
+
+        new_text = _HEX_RE.sub(_replace, original)
+        if replacements > 0 and new_text != original:
+            try:
+                path.write_text(new_text, encoding="utf-8")
+                edits[str(path.relative_to(project_dir))] = replacements
+            except OSError:
+                continue
+
+    return edits
+
+
 def check_consistency(scaffold_dir: Path, brief: str = "") -> ConsistencyReport:
     """Run the full static consistency check on a scaffold directory.
 
@@ -562,6 +880,9 @@ def check_consistency(scaffold_dir: Path, brief: str = "") -> ConsistencyReport:
 
     # ── 7. Frontend design-quality scan ───────────────────────────────────
     issues.extend(_scan_for_design_quality(scaffold_dir))
+
+    # ── 7b. Cross-artifact drift (palette / fonts / brand-kit usage) ────
+    issues.extend(_scan_cross_artifact_drift(scaffold_dir, brief))
 
     # ── 8. Orphan export check (lightweight) ─────────────────────────────
     # For each file that exports something, check if another file imports it.
