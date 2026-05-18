@@ -1,4 +1,4 @@
-"""Apply-handlers for proposal kinds beyond tuning + code_patch.
+"""Apply-handlers for proposal kinds beyond tuning and code_patch.
 
 Registered with the global ProposalStore at orchestrator boot.
 Each handler is async and receives the proposal payload dict.
@@ -89,7 +89,7 @@ def install_handlers(orchestrator) -> None:
                     for proposal in store.list()
                     if proposal.kind == "code_patch"
                     and proposal.status in {"pending", "approved", "applying"}
-                    and str((proposal.payload or {}).get("repo_root") or str(REPO_ROOT)) == str(REPO_ROOT)
+                    and str((proposal.payload or {}).get("repo_root") or REPO_ROOT) == str(REPO_ROOT)
                     and str((proposal.payload or {}).get("target_file") or "") == target_file
                 ),
                 None,
@@ -159,7 +159,6 @@ def install_handlers(orchestrator) -> None:
             ingestor = orchestrator.agents.get("github_ingestor")
             if ingestor is None:
                 return {"ok": False, "error": "github_ingestor agent not registered"}
-            from skyn3t.core.agent import TaskRequest
             input_data: Dict[str, Any] = {
                 "max_files": max(1, int(payload.get("limit") or 5)),
             }
@@ -172,6 +171,7 @@ def install_handlers(orchestrator) -> None:
             label = topic or (str(repo).strip() if repo else "") or "unspecified"
             req = TaskRequest(title=f"approved ingest: {label}", input_data=input_data)
             result = await ingestor.execute(req)
+            from skyn3t.core.agent import TaskRequest
             ok = bool(getattr(result, "success", False))
             out = getattr(result, "output", {}) or {}
             return {"ok": ok, "ingested": len(out.get("ingested", []) or []),
