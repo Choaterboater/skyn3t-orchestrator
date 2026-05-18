@@ -3051,12 +3051,21 @@ class CodeAgent(BaseAgent):
     # never stripped — even if not directly imported, build tools may
     # consume them.
     _STRIPPABLE_UNUSED_DEPS = frozenset({
+        # Databases
         "better-sqlite3", "sqlite3", "sqlite",
         "pg", "postgres", "@vercel/postgres",
         "mongodb", "mongoose",
         "@prisma/client", "prisma",
         "drizzle-orm",
+        # Schedulers
         "node-cron", "croner", "agenda",
+        # Server frameworks — Architect often picks these speculatively
+        # even when CodeAgent never generates a server file, leaving
+        # the scaffold with a node-gyp-flavored backend it can't use.
+        # Safe to strip because if a real server.js / index.js imports
+        # them, _is_imported() catches it and leaves them alone.
+        "express", "fastify", "koa", "hono", "@hono/node-server",
+        "cors", "helmet", "morgan", "body-parser",
     })
 
     @classmethod
