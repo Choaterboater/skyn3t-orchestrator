@@ -66,7 +66,12 @@ def install_handlers(orchestrator) -> None:
                 return {"ok": False, "error": "code_improver agent not registered"}
             proposal_id = str(payload.get("_proposal_id") or "").strip()
             current_proposal = store.get(proposal_id) if proposal_id else None
-            target_file = _resolve_repo_file(payload.get("target_file"))
+            if not _is_current_repo_root(payload.get("repo_root")):
+                return {"ok": False, "error": "proposal repo_root does not match current repository"}
+            requested_target = payload.get("target_file")
+            target_file = _resolve_repo_file(requested_target)
+            if requested_target and not target_file:
+                return {"ok": False, "error": "invalid target_file for current repository"}
             if not target_file:
                 inferred_target = _resolve_repo_file(
                     infer_feature_target_file(str(idea), repo_root=REPO_ROOT)
@@ -214,9 +219,14 @@ def install_handlers(orchestrator) -> None:
 
     async def studio_debug_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
         """Approved studio_debug → run CodeImproverAgent on target_file with verdict+risks as rationale."""
-        target = _resolve_repo_file(payload.get("target_file"))
+        if not _is_current_repo_root(payload.get("repo_root")):
+            return {"ok": False, "error": "proposal repo_root does not match current repository"}
+        requested_target = payload.get("target_file")
+        target = _resolve_repo_file(requested_target)
         risks = normalize_review_risks(payload.get("risks") or [])
         verdict = payload.get("verdict") or ""
+        if requested_target and not target:
+            return {"ok": False, "error": "invalid target_file for current repository"}
         if not target:
             return {"ok": False, "error": "invalid or missing target_file"}
         if not risks:
