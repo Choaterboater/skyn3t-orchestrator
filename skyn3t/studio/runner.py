@@ -1701,6 +1701,17 @@ class StudioRunner:
                     message=stage_summary or manifest["next_action"],
                 )
                 self._save_manifest(artifact_dir, manifest)
+                # Record stage duration in the aggregate scoreboard so
+                # we can see "Architect: avg 187s across N runs" at a
+                # glance without crawling every project.json.
+                try:
+                    _stage_duration = max(0.0, time.time() - stage_started_at)
+                    from skyn3t.intelligence.stage_latency import (
+                        record_stage_duration,
+                    )
+                    record_stage_duration(stage.name, _stage_duration)
+                except Exception:
+                    logger.debug("stage_latency record failed", exc_info=True)
                 self._publish(
                     "PROJECT_STAGE_COMPLETED",
                     {
