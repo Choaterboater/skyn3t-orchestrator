@@ -1784,6 +1784,7 @@ class CodeAgent(BaseAgent):
                         per_file_backend, per_file_model = resolve_model_for_file(
                             rel, stack=stack, scoreboard=_sb,
                             event_bus=self.event_bus,
+                            brief=brief,
                         )
                         # Only construct a new client if the routing
                         # actually differs from the agent's primary
@@ -1805,6 +1806,7 @@ class CodeAgent(BaseAgent):
                         )
 
                     # First attempt with the per-file-routed backend.
+                    primary_timed_out = False
                     try:
                         body_local = await file_client.complete(
                             file_prompt,
@@ -1814,8 +1816,11 @@ class CodeAgent(BaseAgent):
                             timeout=_FILE_BUILD_TIMEOUT_SECONDS,
                             _allow_backend_failover=False,
                         )
-                    except Exception:
+                    except Exception as exc:
+                        primary_timed_out = isinstance(exc, TimeoutError)
                         body_local = ""
+                    if not primary_timed_out:
+                        primary_timed_out = getattr(file_client, "_last_error_type", None) == "TimeoutError"
                     marked_local = _extract_marked_files(body_local or "")
                     if marked_local:
                         body_match = (
@@ -1908,9 +1913,10 @@ class CodeAgent(BaseAgent):
                             and "[deterministic-stub]" not in retry_body
                             and _syntax_ok(retry_body, rel)
                             and _stack_ok(retry_body, rel, stack)
+                            and not primary_timed_out
                         ):
                             body_local = retry_body
-                        elif not body_local:
+                        elif not body_local and not primary_timed_out:
                             body_local = retry_body  # nothing to lose
 
                     # Third-tier retry — last chance to get a real file
@@ -1929,9 +1935,12 @@ class CodeAgent(BaseAgent):
                     # second retry shares too much prompt scaffolding
                     # with the first, so the same failure mode recurs.
                     if (
-                        not body_local
-                        or "[deterministic-stub]" in body_local
-                        or not _syntax_ok(body_local, rel)
+                        not primary_timed_out
+                        and (
+                            not body_local
+                            or "[deterministic-stub]" in body_local
+                            or not _syntax_ok(body_local, rel)
+                        )
                     ):
                         # FIRED — log loudly so we can tell from history
                         # whether this path actually ran (previous bug:
@@ -2050,9 +2059,12 @@ class CodeAgent(BaseAgent):
                     # placeholder fallback below still catches when
                     # OpenRouter is unavailable.
                     if (
-                        not body_local
-                        or "[deterministic-stub]" in body_local
-                        or not _syntax_ok(body_local, rel)
+                        not primary_timed_out
+                        and (
+                            not body_local
+                            or "[deterministic-stub]" in body_local
+                            or not _syntax_ok(body_local, rel)
+                        )
                     ):
                         try:
                             import os as _os
@@ -2387,6 +2399,7 @@ class CodeAgent(BaseAgent):
                     cluster_backend, cluster_model = resolve_model_for_file(
                         cluster_paths[0], stack=stack, scoreboard=_sb_cluster,
                         event_bus=self.event_bus,
+                        brief=brief,
                     )
                     agent_backend = (self.config or {}).get("backend")
                     if cluster_backend and cluster_backend != agent_backend:
@@ -2629,6 +2642,20 @@ class CodeAgent(BaseAgent):
         except Exception:
             logger.debug("add-missing-deps failed (non-fatal)", exc_info=True)
 
+        # Auto-format with prettier. Reviewers consistently dock points
+        # for inconsistent spacing, single-vs-double quotes, missing
+        # trailing commas, etc. — formatting nits that have nothing to
+        # do with code quality. Run prettier on the scaffold before the
+        # reviewer sees it so those points stay on the table.
+        #
+        # Uses `npx --no-install` to skip the network round-trip when
+        # prettier isn't already cached; in that case we silently no-op
+        # rather than blocking the build.
+        try:
+            self._format_with_prettier(out_dir)
+        except Exception:
+            logger.debug("prettier autoformat failed (non-fatal)", exc_info=True)
+
         try:
             await self.share_learning(
                 f"scaffold: {len(files_written)} files for brief",
@@ -2743,6 +2770,7 @@ class CodeAgent(BaseAgent):
              minimal placeholder so the build at least succeeds.
         """
         from pathlib import Path as _Path
+
         from skyn3t.agents.stack_templates import manifest_for
 
         out_dir = _Path(out_dir).resolve()
@@ -2896,8 +2924,8 @@ class CodeAgent(BaseAgent):
         can't safely pick one and the caller should fall back to a
         stub).
         """
-        from pathlib import Path as _Path
         import re as _re
+        from pathlib import Path as _Path
 
         basename = target_spec.rsplit("/", 1)[-1]
         if not basename or basename in (".", ".."):
@@ -2986,15 +3014,15 @@ class CodeAgent(BaseAgent):
             )
         if ext in ("ts", "tsx"):
             return (
-                f"// @skyn3t-backfill-stub: for missing import.\n"
-                f"export default {{}};\n"
+                "// @skyn3t-backfill-stub: for missing import.\n"
+                "export default {};\n"
             )
         if ext in ("css", "scss"):
             return f"/* @skyn3t-backfill-stub: for missing import ({rel_path}) */\n"
         # js / mjs / cjs / fallback
         return (
-            f"// @skyn3t-backfill-stub: for missing import.\n"
-            f"export default {{}};\n"
+            "// @skyn3t-backfill-stub: for missing import.\n"
+            "export default {};\n"
         )
 
     # Packages we WILL strip from a package.json if no source file imports
@@ -3022,9 +3050,9 @@ class CodeAgent(BaseAgent):
         dependencies/devDependencies. Leaves package-lock.json
         untouched — operator can run `npm install` again to reconcile.
         """
-        from pathlib import Path as _Path
         import json as _json
         import re as _RE
+        from pathlib import Path as _Path
         out_dir = _Path(out_dir).resolve()
 
         # Build the source body once (skipping node_modules / dist etc.)
@@ -3121,9 +3149,9 @@ class CodeAgent(BaseAgent):
         but-unused; this adds used-but-undeclared. Both run after the
         scaffold so the manifest stays in sync with what the LLM wrote.
         """
-        from pathlib import Path as _Path
         import json as _json
         import re as _RE
+        from pathlib import Path as _Path
 
         out_dir = _Path(out_dir).resolve()
         skip = {"node_modules", "dist", "build", ".next", ".cache", ".git"}
@@ -3240,6 +3268,76 @@ class CodeAgent(BaseAgent):
                     )
                 except OSError:
                     logger.warning("could not write updated package.json: %s", pkg_path)
+
+    @staticmethod
+    def _format_with_prettier(out_dir) -> None:
+        """Run prettier on the scaffold to remove formatting nits.
+
+        Uses `npx --no-install prettier` so we never trigger a network
+        install — if prettier isn't already in the node_modules cache,
+        we no-op silently rather than block the build. This keeps the
+        step free for users who have prettier and harmless for those
+        who don't.
+
+        Targets common source globs and applies in-place. Output is
+        suppressed; only failure-class log lines bubble up.
+        """
+        from pathlib import Path as _Path
+        import subprocess as _sp
+        import shutil as _shutil
+
+        out_dir = _Path(out_dir).resolve()
+        # Where prettier should run. The nearest package.json's parent
+        # is the scaffold root — that's where node_modules lives.
+        pkg_roots = [
+            p.parent for p in out_dir.rglob("package.json")
+            if "node_modules" not in p.parts
+        ]
+        if not pkg_roots:
+            return
+
+        npx = _shutil.which("npx")
+        if not npx:
+            logger.debug("npx not on PATH — skipping prettier")
+            return
+
+        for root in pkg_roots:
+            patterns = [
+                "src/**/*.{js,jsx,ts,tsx,css,scss,json,html}",
+                "*.{js,jsx,ts,tsx,json,html,md}",
+            ]
+            try:
+                # --no-install skips downloading prettier if missing.
+                # --loglevel warn suppresses the success-list spam.
+                # --ignore-unknown lets glob misses pass quietly.
+                result = _sp.run(
+                    [
+                        npx, "--no-install", "prettier",
+                        "--write", "--loglevel", "warn",
+                        "--ignore-unknown",
+                        *patterns,
+                    ],
+                    cwd=str(root),
+                    capture_output=True,
+                    text=True,
+                    timeout=30.0,
+                )
+                if result.returncode == 0:
+                    logger.info(
+                        "prettier formatted scaffold at %s",
+                        root.relative_to(out_dir.parent).as_posix(),
+                    )
+                else:
+                    # npx exits non-zero when prettier isn't installed;
+                    # that's expected when we asked for --no-install
+                    # and the user doesn't have it. Log at debug.
+                    logger.debug(
+                        "prettier exit=%d stderr=%s",
+                        result.returncode,
+                        (result.stderr or "")[:200],
+                    )
+            except (_sp.TimeoutExpired, OSError, FileNotFoundError):
+                logger.debug("prettier invocation failed", exc_info=True)
 
     @staticmethod
     def _ensure_legacy_frontend_aliases(out_dir, files_written: list[str], brief: str) -> list[str]:
