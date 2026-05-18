@@ -21,11 +21,11 @@ def _resolve_repo_path(path_value: Any) -> Optional[Path]:
     candidate = str(path_value or "").strip()
     if not candidate:
         return None
-    resolved_path = Path(candidate)
+    resolved_path = Path(candidate).expanduser()
     if not resolved_path.is_absolute():
         resolved_path = REPO_ROOT / resolved_path
     try:
-        return resolved_path.resolve()
+        return resolved_path.resolve(strict=False)
     except (OSError, RuntimeError, ValueError):
         return None
 
