@@ -7,13 +7,10 @@
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from skyn3t.agents.stack_templates import detect_stack
 from skyn3t.memory.store import MemoryStore
-
 
 # ---------------------------------------------------------------------
 # detect_stack memoization

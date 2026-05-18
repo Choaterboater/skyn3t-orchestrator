@@ -19,7 +19,6 @@ import pytest
 from skyn3t.core.events import Event, EventType
 from skyn3t.intelligence.cortex_decisions import publish_decision
 
-
 # ---------------------------------------------------------------------
 # Fakes
 # ---------------------------------------------------------------------

@@ -429,6 +429,14 @@ def _validate_syntax(content: str, ext: str, file_path: str) -> str:
     return ""  # Valid
 
 
+def _has_build_invalid_js_export(content: str, ext: str) -> bool:
+    if ext not in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"):
+        return False
+    return bool(
+        re.search(r"^\s*export\s+default\s+(?:const|let|var)\b", content, re.MULTILINE)
+    )
+
+
 def _placeholder_for(rel_path: str) -> str:
     """Return a syntactically valid stub for a missing file."""
     ext = Path(rel_path).suffix.lower()
@@ -691,7 +699,9 @@ async def apply_targeted_fix(
 
             from skyn3t.agents.code_agent import _syntax_ok
 
-            if not _syntax_ok(new_content, issue.path):
+            if _has_build_invalid_js_export(new_content, ext) or not _syntax_ok(
+                new_content, issue.path
+            ):
                 _preserve_existing_on_regenerate_failure(
                     issue,
                     "build-invalid output",

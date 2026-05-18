@@ -406,6 +406,34 @@ def test_validate_stack_shape_no_stack_is_no_op():
     assert validate_stack_shape("", []) == []
 
 
+def test_react_vite_index_title_comes_from_brief():
+    from skyn3t.agents.stack_templates import manifest_for
+
+    body = manifest_for("react_vite", "index.html", "build a habit tracker with streaks")
+
+    assert body is not None
+    assert "<title>Habit Tracker With Streaks</title>" in body
+    assert "Homelab Dashboard" not in body
+
+
+def test_react_vite_readme_prefers_in_app_settings_for_backend_integrations():
+    from skyn3t.agents.stack_templates import readme_for_stack
+
+    body = readme_for_stack(
+        "react_vite",
+        (
+            "Build a React dashboard that connects to Sonarr and Radarr. "
+            "Users should enter API keys and service URLs after launch."
+        ),
+    )
+
+    assert body is not None
+    assert "npm install --prefix server" in body
+    assert "npm run dev --prefix server" in body
+    assert "in-app **Settings** screen" in body
+    assert ".env.example" in body
+
+
 def test_validate_stack_shape_unknown_stack_is_no_op():
     from skyn3t.agents.stack_templates import validate_stack_shape
     assert validate_stack_shape("unknown_stack", ["anything.txt"]) == []
@@ -460,6 +488,39 @@ def test_generic_serviceboard_brief_triggers_configurable_tier():
         "src/components/ServiceEditor.jsx",
         "src/hooks/useConfig.js",
     } <= paths
+
+
+def test_integration_brief_defaults_to_settings_ui_without_explicit_settings_words():
+    brief = (
+        "Build a React dashboard that connects to Sonarr and Radarr. "
+        "Users should enter their API keys and service URLs after launch "
+        "instead of editing files by hand."
+    )
+
+    plan = plan_for_stack("react_vite", brief)
+    paths = {rel for rel, _ in (plan or [])}
+
+    assert {
+        "server/index.js",
+        "server/config-store.js",
+        "src/components/SettingsModal.jsx",
+        "src/components/ServiceEditor.jsx",
+        "src/hooks/useConfig.js",
+    } <= paths
+
+
+def test_backend_brief_without_user_entered_integrations_stays_without_settings_ui():
+    brief = (
+        "Build a React app with a backend API, server-side CRUD endpoints, "
+        "and a health endpoint for app data."
+    )
+
+    plan = plan_for_stack("react_vite", brief)
+    paths = {rel for rel, _ in (plan or [])}
+
+    assert "server/index.js" in paths
+    assert "src/components/SettingsModal.jsx" not in paths
+    assert "src/hooks/useConfig.js" not in paths
 
 
 def test_generic_serviceboard_brief_uses_deterministic_dashboard_generators():

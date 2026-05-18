@@ -2,7 +2,7 @@
 
 import asyncio
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypedDict
 
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +24,13 @@ from skyn3t.core.models import (
     Task as TaskModel,
 )
 from skyn3t.memory.database import get_session_maker
+
+
+class FixOutcomeSummary(TypedDict):
+    fix_applied: str
+    wins: int
+    attempts: int
+    rate: float
 
 
 class MemoryStore:
@@ -644,7 +651,7 @@ class MemoryStore:
         min_attempts: int = 2,
         max_rate: float = 0.34,
         limit: int = 3,
-    ) -> List[Dict[str, Any]]:
+    ) -> List[FixOutcomeSummary]:
         """Return fixes that historically FAILED for this signature.
 
         Symmetric to ``rank_fixes_for_signature`` but reads the loser
@@ -685,7 +692,7 @@ class MemoryStore:
                 slot["wins"] += 1
         min_a = max(1, int(min_attempts))
         cap_rate = float(max_rate)
-        losers = []
+        losers: List[FixOutcomeSummary] = []
         for label, stats in tallies.items():
             rate = stats["wins"] / stats["attempts"]
             if stats["attempts"] >= min_a and rate <= cap_rate:

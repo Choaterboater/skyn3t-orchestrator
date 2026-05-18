@@ -2,6 +2,20 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, ProjectRow, Template } from "../api/client";
 
+function isTerminalProjectStatus(status: unknown): boolean {
+  const value = String(status ?? "").toLowerCase();
+  return [
+    "completed",
+    "done",
+    "passed",
+    "failed",
+    "error",
+    "rejected",
+    "cancelled",
+    "canceled",
+  ].includes(value);
+}
+
 // Studio (build) page — the biggest single view in the old dashboard.
 // Splits into three regions:
 //   left rail  — project list, with truncation so long titles don't
@@ -17,7 +31,12 @@ export default function StudioPage() {
   const projects = useQuery({
     queryKey: ["studio_projects"],
     queryFn: api.projects,
-    refetchInterval: 5_000,
+    refetchInterval: (query) => {
+      const rows = (query.state.data as ProjectRow[] | undefined) ?? [];
+      return rows.some((project) => !isTerminalProjectStatus(project.status))
+        ? 5_000
+        : false;
+    },
     // The list polls every 5s, but if a fetch fails (backend restart)
     // we don't want the page to stay frozen on a stale empty result.
     refetchOnMount: "always",
@@ -29,7 +48,10 @@ export default function StudioPage() {
   const usage = useQuery({
     queryKey: ["usage_projects"],
     queryFn: api.usagePerProject,
-    refetchInterval: 8_000,
+    refetchInterval: () =>
+      (projects.data ?? []).some((project) => !isTerminalProjectStatus(project.status))
+        ? 8_000
+        : false,
     retry: false,
   });
   const usageBySlug = new Map(
@@ -40,7 +62,10 @@ export default function StudioPage() {
     queryKey: ["studio_project", selected],
     queryFn: () => api.project(selected as string),
     enabled: !!selected && mode === "detail",
-    refetchInterval: 4_000,
+    refetchInterval: (query) =>
+      isTerminalProjectStatus((query.state.data as { status?: string } | undefined)?.status)
+        ? false
+        : 4_000,
   });
 
   function pickProject(slug: string) {

@@ -15,14 +15,13 @@ Two roles:
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import httpx
 
@@ -391,8 +390,8 @@ def match_references_to_brief(brief: str, user_id: str, limit: int = 3) -> List[
 def attach_references_to_project(project_dir: Path, entry_ids: List[str]) -> None:
     """Write the matched references into ``<project_dir>/design_references.md``
     so the DesignerAgent can include them in its prompt."""
-    entries = [get_reference(eid) for eid in entry_ids]
-    entries = [e for e in entries if e is not None]
+    raw_entries: List[Optional[LibraryEntry]] = [get_reference(eid) for eid in entry_ids]
+    entries: List[LibraryEntry] = [entry for entry in raw_entries if entry is not None]
     if not entries:
         return
     project_dir = Path(project_dir)
