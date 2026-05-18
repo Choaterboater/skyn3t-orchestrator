@@ -34,8 +34,9 @@ def install_handlers(orchestrator) -> None:
     """Register apply-handlers for kind='feature', 'ingest', and 'studio_debug'."""
     try:
         from skyn3t.cortex import get_store  # local import to avoid circular dependency
+        from skyn3t.core.agent import TaskRequest
     except Exception:
-        logger.exception("cortex store unavailable")
+        logger.exception("cortex handler dependencies unavailable")
         return
     store = get_store()
 
@@ -102,7 +103,6 @@ def install_handlers(orchestrator) -> None:
                     "code_patch_proposal_id": active_patch.id,
                     "details": "A code patch is already active for that file.",
                 }
-            from skyn3t.core.agent import TaskRequest
             req = TaskRequest(
                 title="apply feature proposal",
                 input_data={
@@ -180,7 +180,6 @@ def install_handlers(orchestrator) -> None:
             label = topic or (str(repo).strip() if repo else "") or "unspecified"
             req = TaskRequest(title=f"approved ingest: {label}", input_data=input_data)
             result = await ingestor.execute(req)
-            from skyn3t.core.agent import TaskRequest
             ok = bool(getattr(result, "success", False))
             out = getattr(result, "output", {}) or {}
             return {"ok": ok, "ingested": len(out.get("ingested", []) or []),
@@ -208,7 +207,6 @@ def install_handlers(orchestrator) -> None:
             improver = orchestrator.agents.get("code_improver")
             if improver is None:
                 return {"ok": False, "error": "code_improver not registered"}
-            from skyn3t.core.agent import TaskRequest
             req = TaskRequest(
                 title="studio_debug retry",
                 input_data={
