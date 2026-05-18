@@ -4048,11 +4048,15 @@ class StudioRunner:
         # We need node_modules to run vite — but vite is heavy, so cap
         # the install + build at the same total budget as the eventual
         # BuildVerifier so we don't blow the stage timeout here.
+        # Drop --silent so real errors (node-gyp failures, ECONNREFUSED,
+        # peer-dep conflicts) surface in the orchestrator log instead of
+        # appearing as a bare exit code. Keep --no-audit / --no-fund /
+        # --prefer-offline to stay fast and quiet on the happy path.
         cmd_install = [
             npm_bin, "install", "--no-audit", "--no-fund",
-            "--silent", "--prefer-offline",
+            "--prefer-offline",
         ]
-        cmd_build = [npm_bin, "run", "build", "--silent"]
+        cmd_build = [npm_bin, "run", "build"]
         env = os.environ.copy()
         env["CI"] = "1"  # vite/npm: non-interactive
 
