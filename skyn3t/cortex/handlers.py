@@ -3,9 +3,9 @@
 Registered with the global ProposalStore at orchestrator boot.
 Each handler is async and receives the proposal payload dict.
 """
-from collections.abc import Mapping
 from __future__ import annotations
 
+from collections.abc import Mapping
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
