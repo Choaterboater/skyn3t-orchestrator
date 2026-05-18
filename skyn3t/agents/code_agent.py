@@ -2621,6 +2621,25 @@ class CodeAgent(BaseAgent):
         except Exception:
             logger.exception("backfill unresolved imports failed (non-fatal)")
 
+        # Second-pass: fill backfill stubs with real implementations.
+        # The sync backfiller above writes
+        # `// @skyn3t-backfill-stub:` when neither the rewriter nor
+        # a deterministic template can satisfy an import. Those stubs
+        # are render-null components — they keep the build green but
+        # the reviewer correctly dings them as placeholder code.
+        # Async-fill any stubs by sending the brief + file purpose +
+        # path to OpenRouter Owl Alpha (free tier). Falls back to the
+        # existing stub if the call fails — same behavior as before,
+        # just with a chance at real code first.
+        try:
+            await self._llm_fill_backfill_stubs(
+                out_dir=out_dir,
+                brief=brief,
+                stack=template_key,
+            )
+        except Exception:
+            logger.debug("llm-fill stubs failed (non-fatal)", exc_info=True)
+
         # Strip declared-but-unused deps from package.json files. Every
         # canary 119-136 had the reviewer flag "better-sqlite3 declared
         # but never imported" as architecture-vs-scaffold drift (~5pt).
@@ -3268,6 +3287,142 @@ class CodeAgent(BaseAgent):
                     )
                 except OSError:
                     logger.warning("could not write updated package.json: %s", pkg_path)
+
+    async def _llm_fill_backfill_stubs(
+        self,
+        *,
+        out_dir,
+        brief: str,
+        stack: Optional[str],
+    ) -> None:
+        """Find files containing `@skyn3t-backfill-stub:` and replace
+        them with real implementations via free OpenRouter.
+
+        Only fires when both the import-rewriter AND deterministic
+        generator failed to produce a real file — a narrow case that
+        used to ship render-null placeholders to the reviewer.
+
+        Skips silently when OPENROUTER_API_KEY isn't set or when an
+        individual file's LLM call fails. The existing stub remains
+        on disk in that case, preserving today's behavior.
+        """
+        from pathlib import Path as _Path
+        import os as _os
+
+        out_dir = _Path(out_dir).resolve()
+        or_key = _os.environ.get("OPENROUTER_API_KEY")
+        if not or_key:
+            try:
+                from skyn3t.config.settings import get_settings as _gs
+                or_key = getattr(_gs(), "openrouter_api_key", None)
+            except Exception:
+                or_key = None
+        if not or_key:
+            return
+        _os.environ.setdefault("OPENROUTER_API_KEY", or_key)
+
+        # Scan scaffold for stub markers. Limit to JSX/JS/TS files —
+        # CSS stubs are fine as-is, the reviewer doesn't ding them.
+        marker = "@skyn3t-backfill-stub:"
+        scan_exts = {".jsx", ".tsx", ".js", ".ts", ".mjs", ".cjs"}
+        stub_files: list[_Path] = []
+        for p in out_dir.rglob("*"):
+            if not p.is_file():
+                continue
+            if "node_modules" in p.parts:
+                continue
+            if p.suffix.lower() not in scan_exts:
+                continue
+            try:
+                text = p.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if marker in text:
+                stub_files.append(p)
+
+        if not stub_files:
+            return
+
+        logger.info(
+            "llm-fill: replacing %d backfill stub(s)", len(stub_files)
+        )
+
+        from skyn3t.adapters import LLMClient as _LLMC
+        client = _LLMC(
+            default_model="openrouter/owl-alpha",
+            backend="openrouter",
+            event_bus=self.event_bus,
+            caller_name=self.name,
+        )
+
+        for stub_path in stub_files:
+            try:
+                rel = stub_path.relative_to(out_dir).as_posix()
+            except ValueError:
+                continue
+            # Guess purpose from the path. `src/components/HabitCard.jsx`
+            # → "HabitCard component". `src/hooks/useStats.js` → "useStats hook".
+            stem = stub_path.stem
+            purpose_hint = stem
+            if "/components/" in f"/{rel}":
+                purpose_hint = f"{stem} React component"
+            elif "/hooks/" in f"/{rel}":
+                purpose_hint = f"{stem} React hook"
+            elif "/utils/" in f"/{rel}" or "/lib/" in f"/{rel}":
+                purpose_hint = f"{stem} utility module"
+
+            prompt = (
+                f"Implement the file `{rel}` for this product brief:\n\n"
+                f"BRIEF:\n{(brief or '').strip()[:1200]}\n\n"
+                f"PURPOSE: {purpose_hint}\n"
+                f"STACK: {stack or 'react_vite'} "
+                f"(Vite + React, JSX, no TypeScript)\n\n"
+                f"Output ONLY the file body. No fences, no markdown, no commentary. "
+                f"Imports at the top, default export at the bottom. "
+                f"Write a complete, runnable implementation that fits the brief — "
+                f"not a stub, not a placeholder, not a TODO comment."
+            )
+            try:
+                body = await client.complete(
+                    prompt,
+                    system=(
+                        "You write production-grade React source code. "
+                        "Never use TODO comments, placeholders, or "
+                        "'replace with real implementation' language. "
+                        "Output the complete file body only."
+                    ),
+                    max_tokens=4000,
+                    temperature=0.2,
+                    timeout=60.0,
+                    _allow_backend_failover=False,
+                )
+            except Exception:
+                logger.debug("llm-fill failed for %s", rel, exc_info=True)
+                continue
+
+            body = _strip_cli_prelude((body or "").strip(), rel)
+            body = _strip_fences(body)
+            body = _strip_copilot_footer(body)
+
+            # Don't replace a real stub with another stub or empty content.
+            if not body or marker in body or len(body) < 50:
+                logger.debug(
+                    "llm-fill produced low-quality output for %s; keeping stub",
+                    rel,
+                )
+                continue
+            if not _syntax_ok(body, rel):
+                logger.debug(
+                    "llm-fill output for %s failed syntax check; keeping stub",
+                    rel,
+                )
+                continue
+
+            try:
+                stub_path.write_text(body, encoding="utf-8")
+                logger.info("llm-fill SUCCESS for %s (%d chars)", rel, len(body))
+            except OSError:
+                logger.warning("llm-fill write failed for %s", rel)
 
     @staticmethod
     def _format_with_prettier(out_dir) -> None:

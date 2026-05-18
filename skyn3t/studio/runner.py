@@ -67,6 +67,7 @@ class StudioRunner:
     # forward progress instead of all wedging at once.
     _concurrency_sem: Optional[asyncio.Semaphore] = None
     MAX_CONCURRENT_PROJECTS = 3
+    _THREAD_UPDATE_DEDUPE_SECONDS = 600.0
 
     @classmethod
     def _get_sem(cls) -> asyncio.Semaphore:
@@ -84,6 +85,8 @@ class StudioRunner:
         self.event_bus = event_bus
         self.rag = rag
         self._retry_tasks: Set[asyncio.Task[Any]] = set()
+        self._pending_build_fix: Optional[Dict[str, str]] = None
+        self._thread_update_cache: Dict[Tuple[str, str], float] = {}
         configured_root = projects_root if projects_root is not None else get_settings().projects_dir
         self.projects_root = Path(configured_root).expanduser()
         self.projects_root.mkdir(parents=True, exist_ok=True)
@@ -643,17 +646,40 @@ class StudioRunner:
 
         return manifest
 
-    async def _post_discord_thread_update(self, manifest: dict, content: str) -> None:
+    @staticmethod
+    def _project_is_terminal(manifest: dict) -> bool:
+        status = str(manifest.get("status") or "").strip().lower()
+        return status in {"done", "needs_fixes", "failed", "error", "blocked", "cancelled", "canceled"}
+
+    async def _post_discord_thread_update(
+        self,
+        manifest: dict,
+        content: str,
+        *,
+        force: bool = False,
+    ) -> None:
         """Reply into the project's Discord thread (if one exists) and/or
         Telegram thread (if one exists). Both calls are best-effort —
         failures are logged but never raised."""
+        if not force and manifest.get("completed_at") and self._project_is_terminal(manifest):
+            return
+        slug = str(manifest.get("slug") or "")
+        normalized = str(content or "").strip()
+        if not normalized:
+            return
+        cache_key = (slug, normalized)
+        now = time.monotonic()
+        last_sent = self._thread_update_cache.get(cache_key, 0.0)
+        if now - last_sent < self._THREAD_UPDATE_DEDUPE_SECONDS:
+            return
+        self._thread_update_cache[cache_key] = now
         # Discord
         discord_meta = manifest.get("discord") or {}
         thread_id = str(discord_meta.get("thread_id") or "")
         if thread_id:
             try:
                 from skyn3t.studio.notify_dispatcher import post_to_thread
-                await post_to_thread(thread_id, content)
+                await post_to_thread(thread_id, normalized)
             except Exception:
                 logger.exception("discord thread update failed")
         # Telegram
@@ -662,7 +688,7 @@ class StudioRunner:
         if starter_id:
             try:
                 from skyn3t.integrations.telegram_dispatch import post_thread_reply
-                await post_thread_reply(int(starter_id), content)
+                await post_thread_reply(int(starter_id), normalized)
             except Exception:
                 logger.exception("telegram thread update failed")
 
@@ -1796,6 +1822,8 @@ class StudioRunner:
                 try:
                     from skyn3t.studio.approval_gate import (
                         load_gate_config as _load_gate_cfg,
+                    )
+                    from skyn3t.studio.approval_gate import (
                         should_gate as _should_gate,
                     )
                     from skyn3t.studio.notify_dispatcher import dispatch as _notify_dispatch
@@ -1866,16 +1894,27 @@ class StudioRunner:
                             # subsequent stage / approval / completion
                             # updates reply to the same chat thread.
                             try:
-                                from skyn3t.integrations.telegram_dispatch import dispatch_approval as _tg_dispatch
-                                _tg_result = await _tg_dispatch(
-                                    slug, stage.agent, _dashboard_url, artifact_dir=artifact_dir,
-                                )
-                                if isinstance(_tg_result, dict) and _tg_result.get("ok"):
-                                    manifest.setdefault("telegram", {}).update({
-                                        "chat_id": str(_tg_result.get("chat_id") or ""),
-                                        "starter_message_id": int(_tg_result.get("message_id") or 0),
-                                    })
-                                    self._save_manifest(artifact_dir, manifest)
+                                telegram_meta = manifest.get("telegram") or {}
+                                try:
+                                    existing_tg_starter_id = int(
+                                        telegram_meta.get("starter_message_id") or 0
+                                    )
+                                except (TypeError, ValueError):
+                                    existing_tg_starter_id = 0
+                                if existing_tg_starter_id <= 0:
+                                    from skyn3t.integrations.telegram_dispatch import (
+                                        dispatch_approval as _tg_dispatch,
+                                    )
+
+                                    _tg_result = await _tg_dispatch(
+                                        slug, stage.agent, _dashboard_url, artifact_dir=artifact_dir,
+                                    )
+                                    if isinstance(_tg_result, dict) and _tg_result.get("ok"):
+                                        manifest.setdefault("telegram", {}).update({
+                                            "chat_id": str(_tg_result.get("chat_id") or ""),
+                                            "starter_message_id": int(_tg_result.get("message_id") or 0),
+                                        })
+                                        self._save_manifest(artifact_dir, manifest)
                             except Exception:
                                 logger.exception("telegram approval dispatch failed")
                         return manifest
@@ -1949,7 +1988,7 @@ class StudioRunner:
                     build_result = None
                 if build_result is not None:
                     manifest["build_verification"] = build_result
-                    verdict = build_result.get("verdict")
+                    verdict = str(build_result.get("verdict") or "")
                     if not skip_fix_loops:
                         FIX_ATTEMPTS = 2
                         attempt = 0
@@ -1972,7 +2011,7 @@ class StudioRunner:
                                 logger.exception("re-verify after fix failed")
                                 break
                             manifest["build_verification"] = build_result
-                            verdict = build_result.get("verdict")
+                            verdict = str(build_result.get("verdict") or "")
                             manifest.setdefault("build_fix_attempts", []).append({
                                 "attempt": attempt,
                                 "verdict": verdict,
@@ -2279,6 +2318,7 @@ class StudioRunner:
                 await self._post_discord_thread_update(
                     manifest,
                     f"{_emoji} **{manifest['status'].upper()}**{_score_str}\n{completion_message[:600]}",
+                    force=True,
                 )
             except Exception:
                 logger.exception("discord completion post failed")
@@ -3728,8 +3768,8 @@ class StudioRunner:
         if not scaffold_dir.exists():
             return
         from skyn3t.agents.consistency_engine import (
-            check_consistency,
             auto_fix_cross_artifact_drift,
+            check_consistency,
         )
 
         # Auto-fix cross-artifact drift BEFORE running consistency check.
@@ -4072,7 +4112,55 @@ class StudioRunner:
             return
 
         if build_proc.returncode == 0:
-            manifest["frontend_build_dryrun"] = {"ok": True}
+            # Build compiled cleanly. Add a second-tier check: scan
+            # the bundled JS in dist/assets/ for runtime-error patterns
+            # that vite/rollup don't catch at compile time. Common
+            # cases: a component references `undefined` props/state,
+            # a hook is called outside a function body, or the LLM
+            # left a typo like `useStat` (undefined) instead of
+            # `useState` (defined). The bundle is the source of truth
+            # — anything that survives into dist/ ships to the user.
+            dist_dir = scaffold_dir / "dist" / "assets"
+            runtime_signals: list[str] = []
+            if dist_dir.is_dir():
+                # These tokens shouldn't appear in a clean bundle.
+                # We're not checking string LITERALS (those would be
+                # quoted), just bare identifiers / property accesses.
+                # Vite minifies aggressively, so any of these surviving
+                # means the source has a real problem.
+                _SUSPECT_TOKENS = (
+                    "ReferenceError",        # explicit throw
+                    "is not defined",        # error message in template literal
+                    "Cannot read prop",      # error message
+                    "Cannot read properties",
+                    # Note: we intentionally don't flag "undefined"
+                    # by itself — minified code uses `void 0` and
+                    # legitimate `undefined` checks.
+                )
+                for js_file in dist_dir.rglob("*.js"):
+                    try:
+                        text = js_file.read_text(encoding="utf-8", errors="ignore")
+                    except OSError:
+                        continue
+                    for token in _SUSPECT_TOKENS:
+                        if token in text:
+                            runtime_signals.append(
+                                f"{js_file.name}: {token!r}"
+                            )
+                            break  # one signal per file is enough
+
+            if runtime_signals:
+                logger.info(
+                    "frontend build dry-run: compile ok but bundle "
+                    "contains runtime-error tokens: %s",
+                    runtime_signals[:5],
+                )
+                manifest["frontend_build_dryrun"] = {
+                    "ok": True,
+                    "runtime_signals": runtime_signals[:10],
+                }
+            else:
+                manifest["frontend_build_dryrun"] = {"ok": True}
             return
 
         # Build failed. Capture the tail of stderr (most informative
