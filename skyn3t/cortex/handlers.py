@@ -207,9 +207,9 @@ def install_handlers(orchestrator) -> None:
 
     async def ingest_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
         """User approved an ingest proposal → run github_ingestor."""
-        topic = str(payload.get("topic") or payload.get("query") or payload.get("idea") or "").strip()
-        repo = str(payload.get("repo") or "").strip()
         try:
+            topic = str(payload.get("topic") or payload.get("query") or payload.get("idea") or "").strip()
+            repo = str(payload.get("repo") or "").strip()
             from skyn3t.core.agent import TaskRequest
 
             ingestor = orchestrator.agents.get("github_ingestor")
