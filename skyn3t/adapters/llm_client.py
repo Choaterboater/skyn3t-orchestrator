@@ -177,11 +177,15 @@ class LLMClient:
         return None
 
     def _auto_cli_order(self) -> list[str]:
-        if self._routing_hint == "design":
-            return ["kimi_cli", "copilot_cli", "claude_cli", "openai_cli"]
-        if self._routing_hint == "code":
-            return ["copilot_cli", "claude_cli", "openai_cli", "kimi_cli"]
-        return ["claude_cli", "copilot_cli", "openai_cli", "kimi_cli"]
+        # Copilot-first because the Copilot CLI is effectively a
+        # multi-model proxy (--model gpt-4o / claude-sonnet / etc.).
+        # The user gets access to multiple models without us having to
+        # juggle three CLI dialects. Claude comes second as the
+        # large-subscription backup when Copilot has rate-limit or
+        # auth issues. Kimi is third because it has shown 180s
+        # streaming-idle hangs on architect/design calls. OpenAI CLI
+        # last because it requires an API key.
+        return ["copilot_cli", "claude_cli", "kimi_cli", "openai_cli"]
 
     async def _try_named_backend(self, name: str) -> bool:
         if name in getattr(self, "_skip_backends", ()):
