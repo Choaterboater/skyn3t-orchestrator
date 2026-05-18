@@ -71,6 +71,14 @@ def _result_output(result: Any) -> Dict[str, Any]:
     return {}
 
 
+def _proposal_targets_repo_file(proposal: Any, target_file: str) -> bool:
+    payload = _proposal_payload(proposal)
+    return (
+        _is_current_repo_root(payload.get("repo_root"))
+        and _normalize_repo_relative_path(payload.get("target_file")) == target_file
+    )
+
+
 def install_handlers(orchestrator) -> None:
     """Register apply-handlers for kind='feature', 'ingest', and 'studio_debug'."""
     try:
@@ -107,28 +115,31 @@ def install_handlers(orchestrator) -> None:
 
             proposals = store.list()
             current_created_at = getattr(current_proposal, "created_at", None)
-            blocking_feature = next(
-                (
-                    proposal
-                    for proposal in proposals
-                    if proposal.kind == "feature"
+            blocking_feature = None
+            active_patch = None
+            for proposal in proposals:
+                if not _proposal_targets_repo_file(proposal, target_file):
+                    continue
+                if (
+                    blocking_feature is None
+                    and proposal.kind == "feature"
                     and proposal.status in {"approved", "applying"}
                     and proposal.id != proposal_id
-                    and _is_current_repo_root(
-                        _proposal_payload(proposal).get("repo_root")
-                    )
-                    and _normalize_repo_relative_path(
-                        _proposal_payload(proposal).get("target_file")
-                    )
-                    == target_file
                     and (
                         current_created_at is None
                         or getattr(proposal, "created_at", None) is None
                         or proposal.created_at <= current_created_at
                     )
-                ),
-                None,
-            )
+                ):
+                    blocking_feature = proposal
+                if (
+                    active_patch is None
+                    and proposal.kind == "code_patch"
+                    and proposal.status in {"pending", "approved", "applying"}
+                ):
+                    active_patch = proposal
+                if blocking_feature is not None and active_patch is not None:
+                    break
             if blocking_feature is not None:
                 return {
                     "ok": True,
@@ -138,21 +149,6 @@ def install_handlers(orchestrator) -> None:
                     "details": "An older approved feature proposal is already running for that file.",
                 }
 
-            active_patch = next(
-                (
-                    proposal
-                    for proposal in proposals
-                    if proposal.kind == "code_patch"
-                    and proposal.status in {"pending", "approved", "applying"}
-                    and _is_current_repo_root(
-                        _proposal_payload(proposal).get("repo_root")
-                    )
-                    and _normalize_repo_relative_path(
-                        _proposal_payload(proposal).get("target_file")
-                    ) == target_file
-                ),
-                None,
-            )
             if active_patch is not None:
                 return {
                     "ok": True,
