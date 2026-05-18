@@ -238,7 +238,7 @@ def install_handlers(orchestrator) -> None:
             out = _result_output(result)
             return {"ok": ok, "ingested": len(out.get("ingested") or ()),
                     "summary": out.get("summary", ""),
-                    "errors": out.get("errors", [])}
+                    "errors": list(out.get("errors") or [])}
         except Exception as e:
             logger.exception("ingest_handler failed")
             return {"ok": False, "error": str(e)}
