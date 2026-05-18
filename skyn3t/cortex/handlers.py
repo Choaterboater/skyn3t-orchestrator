@@ -16,6 +16,16 @@ logger = logging.getLogger("skyn3t.cortex.handlers")
 REPO_ROOT = Path(__file__).resolve().parents[2].resolve()
 
 
+def _is_current_repo_root(repo_root: Any) -> bool:
+    candidate = str(repo_root or "").strip()
+    if not candidate:
+        return True
+    root_path = Path(candidate)
+    if not root_path.is_absolute():
+        root_path = REPO_ROOT / root_path
+    return root_path.resolve() == REPO_ROOT
+
+
 def _normalize_repo_relative_path(target_file: Any, *, require_exists: bool = False) -> str:
     candidate = str(target_file or "").strip()
     if not candidate:
@@ -78,8 +88,7 @@ def install_handlers(orchestrator) -> None:
                         and proposal.id != proposal_id
                         and getattr(proposal, "created_at", None) is not None
                         and proposal.created_at <= current_created_at
-                        and str((proposal.payload or {}).get("repo_root") or str(REPO_ROOT))
-                        == str(REPO_ROOT)
+                        and _is_current_repo_root((proposal.payload or {}).get("repo_root"))
                         and _normalize_repo_relative_path(
                             (proposal.payload or {}).get("target_file")
                         )
@@ -102,7 +111,7 @@ def install_handlers(orchestrator) -> None:
                     for proposal in proposals
                     if proposal.kind == "code_patch"
                     and proposal.status in {"pending", "approved", "applying"}
-                    and str((proposal.payload or {}).get("repo_root") or REPO_ROOT) == str(REPO_ROOT)
+                    and _is_current_repo_root((proposal.payload or {}).get("repo_root"))
                     and _normalize_repo_relative_path(
                         (proposal.payload or {}).get("target_file")
                     ) == target_file
