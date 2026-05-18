@@ -197,8 +197,29 @@ class DesignerAgent(BaseAgent):
         except Exception as e:
             return TaskResult(task_id=task.task_id, success=False, error=f"artifact_dir error: {e}")
 
-        # Palette: LLM-first, hash-keyed table fallback.
-        palette_json = await self._pick_palette(brief, mood)
+        # Design references from photos the user attached via Telegram.
+        # If present, these override the default mood/palette inference —
+        # the user has already shown us what they want.
+        attached_refs = self._load_attached_references(artifact_dir)
+        if attached_refs:
+            forced_mood = self._mood_from_references(attached_refs)
+            if forced_mood:
+                mood = forced_mood
+                await self.think(
+                    f"design_references.md present — using mood='{mood}' from attached photo(s)"
+                )
+
+        # Palette: LLM-first, hash-keyed table fallback. If we have an
+        # attached reference with concrete hex codes, those win over the
+        # LLM's pick.
+        palette_json = None
+        if attached_refs:
+            ref_palette = self._palette_from_references(attached_refs)
+            if ref_palette:
+                palette_json = ref_palette
+                await self.think("using palette from attached design reference(s)")
+        if palette_json is None:
+            palette_json = await self._pick_palette(brief, mood)
         await self.think(f"selected palette for mood='{mood}'")
         fonts = _FONTS_BY_MOOD.get(mood, _FONTS_BY_MOOD["minimal"])
         voice = _VOICE_BY_MOOD.get(mood, _VOICE_BY_MOOD["minimal"])
@@ -492,6 +513,115 @@ class DesignerAgent(BaseAgent):
                 if kw in b:
                     return mood
         return "minimal"
+
+    # ------------------------------------------------------------------
+    # Design references (user-attached photos)
+    # ------------------------------------------------------------------
+
+    def _load_attached_references(self, artifact_dir: Path) -> list:
+        """Read ``<artifact_dir>/design_references.md`` and resolve back
+        to the source DesignReference objects via the persistent cache.
+        Returns a list of ``DesignReference`` objects (possibly empty).
+        """
+        try:
+            from skyn3t.integrations.telegram_photos import _load_library
+            from skyn3t.agents.design_vision import load_by_sha
+        except Exception:  # noqa: BLE001
+            return []
+        refs_md = artifact_dir / "design_references.md"
+        if not refs_md.exists():
+            return []
+        try:
+            content = refs_md.read_text(encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            return []
+        # Extract reference IDs from "## Reference `<id>`" lines.
+        import re as _re
+        ids = _re.findall(r"## Reference `([^`]+)`", content)
+        if not ids:
+            return []
+        library = _load_library()
+        out: list = []
+        for ref_id in ids:
+            entry = library.get(ref_id)
+            if entry is None:
+                continue
+            extraction = load_by_sha(entry.sha)
+            if extraction is not None:
+                out.append(extraction)
+        return out
+
+    def _mood_from_references(self, references: list) -> str:
+        """Derive a designer mood label from the extracted reference
+        mood adjectives. We use simple keyword overlap against the
+        existing ``_MOOD_KEYWORDS`` table — whatever mood has the most
+        matching adjectives wins. Falls back to ``""`` (no override) if
+        nothing matches."""
+        if not references:
+            return ""
+        adjectives = []
+        for ref in references:
+            adjectives.extend(getattr(ref, "mood", []) or [])
+            adjectives.extend(getattr(ref, "notable_elements", []) or [])
+        if not adjectives:
+            return ""
+        adj_text = " ".join(adjectives).lower()
+        best = ("", 0)
+        for mood, keywords in _MOOD_KEYWORDS:
+            score = sum(1 for kw in keywords if kw in adj_text)
+            if score > best[1]:
+                best = (mood, score)
+        return best[0]
+
+    def _palette_from_references(self, references: list) -> Optional[Dict[str, str]]:
+        """Build a palette dict from the first reference that has a
+        usable palette. The DesignerAgent's downstream code expects
+        keys (primary, secondary, accent, bg, text) — NOT the vision
+        extractor's natural shape (bg, surface, accent, text, muted).
+        We map between them: bg→bg, accent→accent (also doubles as
+        primary), text→text. Surface and muted are absorbed as
+        secondary. Returns None if the reference can't satisfy the
+        minimum required keys."""
+        for ref in references:
+            palette_entries = getattr(ref, "palette", []) or []
+            if not palette_entries:
+                continue
+            by_role: Dict[str, str] = {}
+            for entry in palette_entries:
+                role = (getattr(entry, "role", "") or "").lower()
+                hex_code = getattr(entry, "hex", "") or ""
+                if not hex_code.startswith("#") or len(hex_code) not in (4, 7):
+                    continue
+                if role and role not in by_role:
+                    by_role[role] = hex_code
+
+            # Backfill any missing required roles from unused entries.
+            unused = [
+                getattr(e, "hex", "")
+                for e in palette_entries
+                if (getattr(e, "role", "") or "").lower() not in by_role
+                and getattr(e, "hex", "")
+            ]
+            for needed in ("bg", "accent", "text", "surface", "muted"):
+                if needed not in by_role and unused:
+                    by_role[needed] = unused.pop(0)
+
+            if not all(role in by_role for role in ("bg", "accent", "text")):
+                continue  # try next reference
+
+            # Map vision-shape → designer-shape. primary defaults to
+            # accent (it's the brand color CTAs use); secondary uses
+            # surface or muted if available so the gradient/hover
+            # branches in brand.md have something distinct to render.
+            accent = by_role["accent"]
+            return {
+                "primary":   accent,
+                "secondary": by_role.get("surface") or by_role.get("muted") or accent,
+                "accent":    accent,
+                "bg":        by_role["bg"],
+                "text":      by_role["text"],
+            }
+        return None
 
     async def _pick_palette(self, brief: str, mood: str) -> Dict[str, str]:
         """LLM-first palette picker. Falls back to hashed curated table."""
