@@ -5,8 +5,8 @@ Each handler is async and receives the proposal payload dict.
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -45,7 +45,10 @@ def _normalize_repo_relative_path(target_file: Any, *, require_exists: bool = Fa
         relative_path = target_path.relative_to(REPO_ROOT)
     except ValueError:
         return ""
-    if require_exists and (not target_path.exists() or not target_path.is_file()):
+    if target_path.exists():
+        if not target_path.is_file():
+            return ""
+    elif require_exists:
         return ""
     return relative_path.as_posix()
 
@@ -83,11 +86,11 @@ def install_handlers(orchestrator) -> None:
             if not _is_current_repo_root(payload.get("repo_root")):
                 return {"ok": False, "error": "proposal repo_root does not match current repository"}
             requested_target = payload.get("target_file")
-            target_file = _resolve_repo_file(requested_target)
+            target_file = _normalize_repo_relative_path(requested_target)
             if requested_target and not target_file:
                 return {"ok": False, "error": "invalid target_file for current repository"}
             if not target_file:
-                inferred_target = _resolve_repo_file(
+                inferred_target = _normalize_repo_relative_path(
                     infer_feature_target_file(str(idea), repo_root=REPO_ROOT)
                 )
                 if inferred_target:
@@ -233,18 +236,18 @@ def install_handlers(orchestrator) -> None:
 
     async def studio_debug_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
         """Approved studio_debug → run CodeImproverAgent on target_file with verdict+risks as rationale."""
+        risks = normalize_review_risks(payload.get("risks") or [])
+        if not risks:
+            return {"ok": False, "error": "review flagged no actionable risks"}
         if not _is_current_repo_root(payload.get("repo_root")):
             return {"ok": False, "error": "proposal repo_root does not match current repository"}
         requested_target = payload.get("target_file")
         target = _resolve_repo_file(requested_target)
-        risks = normalize_review_risks(payload.get("risks") or [])
         verdict = payload.get("verdict") or ""
         if requested_target and not target:
             return {"ok": False, "error": "invalid target_file for current repository"}
         if not target:
             return {"ok": False, "error": "invalid or missing target_file"}
-        if not risks:
-            return {"ok": True, "status": "noop", "details": "review flagged no actionable risks"}
         rationale = (
             f"Address Reviewer's critique on `{target}`.\n\n"
             f"Verdict: {verdict}\n\n"
