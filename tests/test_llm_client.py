@@ -29,12 +29,15 @@ async def test_llm_client_auto_mode_tries_all_local_clis_before_api_keys(monkeyp
 
     await client._get_impl()
 
-    assert order == ["claude_cli", "copilot_cli", "openai_cli", "kimi_cli"]
+    assert order == ["copilot_cli", "claude_cli", "kimi_cli", "openai_cli"]
     assert client.backend == "deterministic"
 
 
 @pytest.mark.asyncio
-async def test_llm_client_design_hint_prefers_kimi_first(monkeypatch):
+async def test_llm_client_design_hint_uses_copilot_first(monkeypatch):
+    """Claude is the user's largest subscription; Kimi has shown 180s
+    streaming-idle hangs on architect/design calls. Across every
+    routing hint, the order is Claude first."""
     order = []
 
     async def fake_try_cli(self, name, cls):
@@ -49,12 +52,12 @@ async def test_llm_client_design_hint_prefers_kimi_first(monkeypatch):
 
     await client._get_impl()
 
-    assert order == ["kimi_cli", "copilot_cli", "claude_cli", "openai_cli"]
+    assert order == ["copilot_cli", "claude_cli", "kimi_cli", "openai_cli"]
     assert client.backend == "deterministic"
 
 
 @pytest.mark.asyncio
-async def test_llm_client_code_hint_prefers_coder_backends_first(monkeypatch):
+async def test_llm_client_code_hint_uses_copilot_first(monkeypatch):
     order = []
 
     async def fake_try_cli(self, name, cls):
@@ -69,7 +72,7 @@ async def test_llm_client_code_hint_prefers_coder_backends_first(monkeypatch):
 
     await client._get_impl()
 
-    assert order == ["copilot_cli", "claude_cli", "openai_cli", "kimi_cli"]
+    assert order == ["copilot_cli", "claude_cli", "kimi_cli", "openai_cli"]
     assert client.backend == "deterministic"
 
 
@@ -97,7 +100,13 @@ async def test_policy_backend_falls_through_to_auto_chain(monkeypatch):
 
     await client._get_impl()
 
-    assert order == ["kimi_cli", "copilot_cli"]
+    # Policy "kimi_cli" tries kimi first, then falls through to the
+    # auto chain (claude_cli, copilot_cli, kimi_cli skipped, openai_cli).
+    # copilot_cli is the second one that succeeds, so it should land first
+    # after the initial kimi attempt and the claude attempt.
+    # Policy "kimi_cli" tries kimi first, then falls through to the
+    # auto chain (copilot_cli first since Copilot is multi-model proxy).
+    assert order[:2] == ["kimi_cli", "copilot_cli"]
     assert client.backend == "copilot_cli"
 
 
