@@ -182,7 +182,7 @@ def install_handlers(orchestrator) -> None:
         rationale = (
             f"Address Reviewer's critique on `{target}`.\n\n"
             f"Verdict: {verdict}\n\n"
-            "Risks to address:\n" + "\n".join(f"- {r}" for r in risks if r)
+            "Risks to address:\n" + "\n".join(f"- {r}" for r in risks if r) 
             + "\n\nProduce a unified diff that resolves these risks while keeping existing structure."
         )
         try:
