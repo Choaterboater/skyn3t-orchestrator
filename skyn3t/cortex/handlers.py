@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from skyn3t.cortex.feature_suggester import infer_feature_target_file
 from skyn3t.cortex.review_utils import normalize_review_risks
@@ -16,24 +16,30 @@ logger = logging.getLogger("skyn3t.cortex.handlers")
 REPO_ROOT = Path(__file__).resolve().parents[2].resolve()
 
 
-def _is_current_repo_root(repo_root: Any) -> bool:
-    candidate = str(repo_root or "").strip()
+def _resolve_repo_path(path_value: Any) -> Optional[Path]:
+    candidate = str(path_value or "").strip()
     if not candidate:
+        return None
+    resolved_path = Path(candidate)
+    if not resolved_path.is_absolute():
+        resolved_path = REPO_ROOT / resolved_path
+    try:
+        return resolved_path.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _is_current_repo_root(repo_root: Any) -> bool:
+    if not str(repo_root or "").strip():
         return True
-    root_path = Path(candidate)
-    if not root_path.is_absolute():
-        root_path = REPO_ROOT / root_path
-    return root_path.resolve() == REPO_ROOT
+    root_path = _resolve_repo_path(repo_root)
+    return root_path == REPO_ROOT
 
 
 def _normalize_repo_relative_path(target_file: Any, *, require_exists: bool = False) -> str:
-    candidate = str(target_file or "").strip()
-    if not candidate:
+    target_path = _resolve_repo_path(target_file)
+    if target_path is None:
         return ""
-    target_path = Path(candidate)
-    if not target_path.is_absolute():
-        target_path = REPO_ROOT / target_path
-    target_path = target_path.resolve()
     try:
         relative_path = target_path.relative_to(REPO_ROOT)
     except ValueError:
