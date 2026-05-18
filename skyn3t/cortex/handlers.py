@@ -3,6 +3,7 @@
 Registered with the global ProposalStore at orchestrator boot.
 Each handler is async and receives the proposal payload dict.
 """
+from collections.abc import Mapping
 from __future__ import annotations
 
 import logging
@@ -51,6 +52,13 @@ def _normalize_repo_relative_path(target_file: Any, *, require_exists: bool = Fa
 
 def _resolve_repo_file(target_file: Any) -> str:
     return _normalize_repo_relative_path(target_file, require_exists=True)
+
+
+def _result_output(result: Any) -> Dict[str, Any]:
+    output = getattr(result, "output", None)
+    if isinstance(output, Mapping):
+        return dict(output)
+    return {}
 
 
 def install_handlers(orchestrator) -> None:
@@ -150,7 +158,7 @@ def install_handlers(orchestrator) -> None:
                 },
             )
             result = await improver.execute(req)
-            out = getattr(result, "output", {}) or {}
+            out = _result_output(result)
             if out.get("proposed") and out.get("proposal_id") and not out.get("applied"):
                 return {
                     "ok": True,
@@ -215,7 +223,7 @@ def install_handlers(orchestrator) -> None:
             req = TaskRequest(title=f"approved ingest: {label}", input_data=input_data)
             result = await ingestor.execute(req)
             ok = bool(getattr(result, "success", False))
-            out = getattr(result, "output", {}) or {}
+            out = _result_output(result)
             return {"ok": ok, "ingested": len(out.get("ingested") or []),
                     "summary": out.get("summary", ""),
                     "errors": out.get("errors", [])}
@@ -260,7 +268,7 @@ def install_handlers(orchestrator) -> None:
             )
             result = await improver.execute(req)
             ok = bool(getattr(result, "success", False))
-            out = getattr(result, "output", {}) or {}
+            out = _result_output(result)
             return {"ok": ok, "spawned": "code_improver",
                     "draft_proposal_id": out.get("proposal_id"),
                     "details": out.get("summary") or out.get("reason") or ""}
