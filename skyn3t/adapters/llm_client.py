@@ -301,14 +301,35 @@ class LLMClient:
                 # flag is not available" or similar. Drop the
                 # default_model on failover so the next backend uses
                 # its own default.
-                failover_default_model = (
-                    self.default_model
-                    if self.default_model and "/" not in self.default_model
-                    else None
+                #
+                # Detection uses explicit provider-prefix names rather
+                # than "any string with a /" — Copilot's
+                # `kimi-code/kimi-for-coding` model has a slash but is
+                # NOT cross-provider; dropping it on a Copilot-to-CLI
+                # failover would lose the working model name.
+                _PROVIDER_PREFIXES = (
+                    "openrouter/",
+                    "anthropic/",
+                    "openai/",
+                    "google/",
+                    "meta-llama/",
+                    "mistralai/",
+                    "deepseek/",
+                    "qwen/",
+                    "nvidia/",
+                    "tencent/",
+                    "stepfun/",
+                    "xai/",
                 )
-                failover_explicit_model = (
-                    model if model and "/" not in model else None
-                )
+
+                def _drop_if_cross_provider(m: Optional[str]) -> Optional[str]:
+                    if not m:
+                        return None
+                    lower = m.lower()
+                    return None if lower.startswith(_PROVIDER_PREFIXES) else m
+
+                failover_default_model = _drop_if_cross_provider(self.default_model)
+                failover_explicit_model = _drop_if_cross_provider(model)
                 try:
                     retry_client = LLMClient(
                         default_model=failover_default_model,

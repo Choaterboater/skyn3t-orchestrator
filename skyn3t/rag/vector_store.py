@@ -107,12 +107,10 @@ class VectorStore:
         for m in metadatas:
             clean = {}
             for k, v in (m or {}).items():
-                if isinstance(v, (str, int, float, bool)) and not isinstance(v, bool):
-                    clean[str(k)] = v
-                elif isinstance(v, bool):
-                    clean[str(k)] = v
-                elif v is None:
+                if v is None:
                     continue
+                if isinstance(v, (str, int, float, bool)):
+                    clean[str(k)] = v
                 else:
                     try:
                         clean[str(k)] = _json.dumps(v, default=str)

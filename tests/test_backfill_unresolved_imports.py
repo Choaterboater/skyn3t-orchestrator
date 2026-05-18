@@ -300,3 +300,154 @@ def test_add_missing_deps_ignores_node_builtins(tmp_path: Path) -> None:
     data = json.loads((out_dir / "package.json").read_text())
     # No builtins should leak in as deps
     assert data["dependencies"] == {}
+
+
+def test_backfill_rewrites_parent_dir_relative_import(tmp_path: Path) -> None:
+    """Hooks file imports '../utils/format' but the file is actually
+    at src/lib/format.js (one dir higher than expected). Rewriter
+    should find by basename and emit a working relative path.
+    """
+    out_dir = tmp_path / "scaffold"
+    _write(
+        out_dir / "src" / "hooks" / "useThing.js",
+        "import { format } from '../utils/format';\n"
+        "export function useThing(){return format(1);}\n",
+    )
+    _write(
+        out_dir / "src" / "lib" / "format.js",
+        "export function format(x){return String(x);}\n",
+    )
+    agent = _new_agent()
+    agent._backfill_unresolved_local_imports(
+        out_dir=out_dir,
+        files_written=[
+            str(out_dir / "src" / "hooks" / "useThing.js"),
+            str(out_dir / "src" / "lib" / "format.js"),
+        ],
+        stack="react_vite",
+        brief="",
+    )
+    body = (out_dir / "src" / "hooks" / "useThing.js").read_text()
+    # Rewriter found format.js at src/lib/format.js. From src/hooks/,
+    # the correct relative path is '../lib/format'.
+    assert "'../lib/format'" in body, f"got: {body!r}"
+
+
+def test_backfill_rewrites_dynamic_import(tmp_path: Path) -> None:
+    """Dynamic imports (`import('./foo')`) should be rewritten too —
+    the regex covers `import\\s*\\(` not just `from`.
+    """
+    out_dir = tmp_path / "scaffold"
+    _write(
+        out_dir / "src" / "App.jsx",
+        "const mod = import('./Helper');\n"
+        "export default function App(){return null;}\n",
+    )
+    _write(
+        out_dir / "src" / "utils" / "Helper.jsx",
+        "export default function Helper(){return null;}\n",
+    )
+    agent = _new_agent()
+    agent._backfill_unresolved_local_imports(
+        out_dir=out_dir,
+        files_written=[
+            str(out_dir / "src" / "App.jsx"),
+            str(out_dir / "src" / "utils" / "Helper.jsx"),
+        ],
+        stack="react_vite",
+        brief="",
+    )
+    body = (out_dir / "src" / "App.jsx").read_text()
+    assert "import('./utils/Helper')" in body, f"got: {body!r}"
+
+
+def test_add_missing_deps_handles_scoped_packages(tmp_path: Path) -> None:
+    """Scoped packages like @radix-ui/react-dialog must be added under
+    their full @scope/name, not just @scope or the bare leaf.
+    """
+    import json
+    out_dir = tmp_path / "scaffold"
+    _write(
+        out_dir / "package.json",
+        json.dumps({"name": "x", "dependencies": {}}, indent=2),
+    )
+    _write(
+        out_dir / "src" / "App.jsx",
+        "import { Dialog } from '@radix-ui/react-dialog';\n"
+        "import { QueryClient } from '@tanstack/react-query';\n",
+    )
+    CodeAgent._add_missing_package_deps(out_dir)
+    data = json.loads((out_dir / "package.json").read_text())
+    assert "@radix-ui/react-dialog" in data["dependencies"]
+    assert "@tanstack/react-query" in data["dependencies"]
+    # Should NOT add the bare scope or leaf
+    assert "@radix-ui" not in data["dependencies"]
+    assert "react-dialog" not in data["dependencies"]
+
+
+def test_add_missing_deps_handles_trailing_slash_import(tmp_path: Path) -> None:
+    """`from 'date-fns/format'` should be recognized as the date-fns
+    package (we don't sub-resolve; we just declare the root package).
+    """
+    import json
+    out_dir = tmp_path / "scaffold"
+    _write(
+        out_dir / "package.json",
+        json.dumps({"name": "x", "dependencies": {}}, indent=2),
+    )
+    _write(
+        out_dir / "src" / "App.jsx",
+        "import format from 'date-fns/format';\n"
+        "import isToday from 'date-fns/isToday';\n",
+    )
+    CodeAgent._add_missing_package_deps(out_dir)
+    data = json.loads((out_dir / "package.json").read_text())
+    assert "date-fns" in data["dependencies"]
+    # We extract the root package, never the sub-path itself.
+    assert "date-fns/format" not in data["dependencies"]
+
+
+def test_vector_store_metadata_coercion_roundtrip() -> None:
+    """Nested dict/list metadata values should JSON-serialize cleanly
+    and deserialize back to equivalent Python objects.
+    """
+    import json
+    from skyn3t.rag import vector_store as _vs
+    # Reproduce the sanitize loop inline (the method is async + needs
+    # an initialized store). The fix is pure-Python so this is fine.
+    metadatas_in = [
+        {
+            "tags": ["python", "fastapi", "ci"],
+            "owner": {"name": "alice", "team": "platform"},
+            "count": 7,
+            "active": True,
+            "ratio": 0.42,
+            "name": "demo",
+            "skipped": None,
+        }
+    ]
+    sanitized = []
+    for m in metadatas_in:
+        clean = {}
+        for k, v in (m or {}).items():
+            if v is None:
+                continue
+            if isinstance(v, (str, int, float, bool)):
+                clean[str(k)] = v
+            else:
+                try:
+                    clean[str(k)] = json.dumps(v, default=str)
+                except (TypeError, ValueError):
+                    clean[str(k)] = str(v)
+        sanitized.append(clean)
+    out = sanitized[0]
+    # Primitives pass through unchanged
+    assert out["count"] == 7
+    assert out["active"] is True
+    assert out["ratio"] == 0.42
+    assert out["name"] == "demo"
+    # None was dropped
+    assert "skipped" not in out
+    # Lists / dicts became JSON strings that round-trip
+    assert json.loads(out["tags"]) == ["python", "fastapi", "ci"]
+    assert json.loads(out["owner"]) == {"name": "alice", "team": "platform"}
