@@ -89,7 +89,7 @@ def install_handlers(orchestrator) -> None:
                     for proposal in store.list()
                     if proposal.kind == "code_patch"
                     and proposal.status in {"pending", "approved", "applying"}
-                    and str((proposal.payload or {}).get("repo_root") or "") == str(REPO_ROOT)
+                    and str((proposal.payload or {}).get("repo_root") or str(REPO_ROOT)) == str(REPO_ROOT)
                     and str((proposal.payload or {}).get("target_file") or "") == target_file
                 ),
                 None,
@@ -169,7 +169,8 @@ def install_handlers(orchestrator) -> None:
             else:
                 input_data["mode"] = "search"
                 input_data["query"] = topic
-            req = TaskRequest(title=f"approved ingest: {topic or repo or 'unspecified'}", input_data=input_data)
+            label = topic or (str(repo) if repo else "") or "unspecified"
+            req = TaskRequest(title=f"approved ingest: {label}", input_data=input_data)
             result = await ingestor.execute(req)
             ok = bool(getattr(result, "success", False))
             out = getattr(result, "output", {}) or {}
