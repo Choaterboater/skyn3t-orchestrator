@@ -84,9 +84,31 @@ class TokenTracker:
                 if response_chars >= 2000:
                     response_chars = max(response_chars, 4000)
 
-            prompt_tokens = _estimate_tokens("x" * prompt_chars)
-            prompt_tokens += _estimate_tokens("x" * system_chars)
-            response_tokens = _estimate_tokens("x" * response_chars)
+            # Clamp anomalously large responses. CLIs sometimes dump
+            # their entire agent-loop trace (tool calls, file reads,
+            # search results) to stdout before the final code — we
+            # saw 5MB+ per call on the dashboard, producing
+            # nonsense per-build totals like 11.5M response tokens.
+            # The clamp keeps the legitimate output range (LLMs cap
+            # at ~32KB per response in practice) while flattening
+            # the trace-dump cases. A future fix can extract just
+            # the code body from CLI output before length-measuring.
+            _RESPONSE_CHAR_CAP = 200_000  # ~50K tokens; well above any real LLM output
+            _PROMPT_CHAR_CAP = 500_000    # ~125K tokens; covers context+system+files
+            if response_chars > _RESPONSE_CHAR_CAP:
+                response_chars = _RESPONSE_CHAR_CAP
+            if prompt_chars > _PROMPT_CHAR_CAP:
+                prompt_chars = _PROMPT_CHAR_CAP
+            if system_chars > _PROMPT_CHAR_CAP:
+                system_chars = _PROMPT_CHAR_CAP
+
+            # Token estimate: chars/4 (industry-standard approximation).
+            # We avoid the previous "build a string of N x-chars then
+            # measure it" trick which allocated up to 200KB per call
+            # just to do an integer division.
+            prompt_tokens = max(1, prompt_chars // 4) if prompt_chars else 0
+            prompt_tokens += max(0, system_chars // 4) if system_chars else 0
+            response_tokens = max(1, response_chars // 4) if response_chars else 0
             total = prompt_tokens + response_tokens
 
             agent_name = payload.get("agent") or "unknown"
