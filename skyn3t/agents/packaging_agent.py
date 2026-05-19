@@ -71,7 +71,7 @@ class PackagingAgent(BaseAgent):
     ) -> None:
         super().__init__(
             name=name,
-            agent_type="reviewer",
+            agent_type="packaging",
             provider="local",
             event_bus=event_bus or EventBus(),
             config=config,
