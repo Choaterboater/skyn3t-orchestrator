@@ -174,8 +174,12 @@ function Sidebar() {
   ];
   return (
     <aside className="flex flex-col gap-6 border-r border-border bg-bg-1 px-5 py-6">
-      <div className="display text-xl tracking-wider">
-        <span className="text-accent">S</span>KYN3T
+      <div className="display text-xl tracking-wider wordmark-glow">
+        <span className="text-accent">SKYN3</span>
+        <span className="text-chrome-bright">T</span>
+      </div>
+      <div className="-mt-5 text-[10px] tracking-[0.18em] text-text-dim uppercase">
+        ChoateLabs · Autonomous AI
       </div>
       <nav className="flex flex-col gap-1 text-sm">
         {items.map((it) => (

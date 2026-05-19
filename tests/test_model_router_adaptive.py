@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
-from typing import Optional, Tuple
 
 import pytest
 
@@ -24,7 +23,6 @@ from skyn3t.core.model_router import (
     resolve_model_for_file,
 )
 from skyn3t.intelligence.build_patterns import BuildPatternScoreboard
-
 
 # ---------------------------------------------------------------------
 # Fixtures

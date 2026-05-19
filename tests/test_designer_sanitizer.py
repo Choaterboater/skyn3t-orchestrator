@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from skyn3t.agents.designer import DesignerAgent
 
-
 WARM_BRIEF = (
     "Build a polished dark-mode service dashboard with a premium "
     "glassmorphism feel inspired by the HomeLab Dashboard reference. "
