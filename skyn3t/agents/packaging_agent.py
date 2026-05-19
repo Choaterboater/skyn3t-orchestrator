@@ -1652,11 +1652,11 @@ def _render_fullstack_readme(
     runtimes_lines: List[str] = []
     for r in detection.runtimes:
         if r.name == "python":
-            v = r.min_version or "3.12"
-            runtimes_lines.append(f"- Python {v}+ ([install](https://python.org/))")
+            runtime_version = r.min_version or "3.12"
+            runtimes_lines.append(f"- Python {runtime_version}+ ([install](https://python.org/))")
         elif r.name == "node":
-            v = r.min_version or "22"
-            runtimes_lines.append(f"- Node {v}+ ([install](https://nodejs.org/))")
+            runtime_version = r.min_version or "22"
+            runtimes_lines.append(f"- Node {runtime_version}+ ([install](https://nodejs.org/))")
     runtimes_lines.append("- Docker + Docker Compose ([install](https://docs.docker.com/get-docker/))")
     runtimes_block = "\n".join(runtimes_lines)
 
@@ -1669,12 +1669,14 @@ def _render_fullstack_readme(
         )
 
     server_required = [
-        v for v in env_scan.required()
-        if not v.name.startswith(("VITE_", "REACT_APP_", "NEXT_PUBLIC_"))
+        env_var
+        for env_var in env_scan.required()
+        if not env_var.name.startswith(("VITE_", "REACT_APP_", "NEXT_PUBLIC_"))
     ]
     client_vars = [
-        v for v in env_scan.vars.values()
-        if v.name.startswith(("VITE_", "REACT_APP_", "NEXT_PUBLIC_"))
+        env_var
+        for env_var in env_scan.vars.values()
+        if env_var.name.startswith(("VITE_", "REACT_APP_", "NEXT_PUBLIC_"))
     ]
 
     server_required_block = ""
@@ -1684,9 +1686,9 @@ def _render_fullstack_readme(
             "These are secrets and infrastructure URLs. Set them in `.env` "
             "before running `docker compose up`:\n\n"
         )
-        for v in server_required:
-            kind = "🔒 secret" if v.is_secret else v.type_hint
-            server_required_block += f"- `{v.name}` ({kind})\n"
+        for env_var in server_required:
+            kind = "🔒 secret" if env_var.is_secret else env_var.type_hint
+            server_required_block += f"- `{env_var.name}` ({kind})\n"
 
     client_block = ""
     if client_vars:
@@ -1695,8 +1697,8 @@ def _render_fullstack_readme(
             "Open the app and click **Settings** to configure. Values are "
             "stored in your browser, never sent to the server:\n\n"
         )
-        for v in sorted(client_vars, key=lambda x: x.name):
-            client_block += f"- `{v.name}`\n"
+        for env_var in sorted(client_vars, key=lambda x: x.name):
+            client_block += f"- `{env_var.name}`\n"
 
     if not server_required and not client_vars:
         config_block = (
@@ -1710,9 +1712,9 @@ def _render_fullstack_readme(
     frontend_section = ""
     if wired_compose:
         frontend_section = (
-            f"The frontend serves a pre-built static bundle from `scaffold/dist/`. "
-            f"Run `npm run build` in `scaffold/` first, then `docker compose up` "
-            f"serves it on http://localhost:5173.\n"
+            "The frontend serves a pre-built static bundle from `scaffold/dist/`. "
+            "Run `npm run build` in `scaffold/` first, then `docker compose up` "
+            "serves it on http://localhost:5173.\n"
         )
     else:
         frontend_section = (
