@@ -504,22 +504,26 @@ class ConsistencyReviewerAgent(BaseAgent):
         if decisions:
             decided_port = decisions.get("backend_port")
             if isinstance(decided_port, int):
-                env_file = scaffold_dir / ".env.example"
-                if env_file.is_file():
-                    env_text = env_file.read_text(encoding="utf-8")
-                    for line in env_text.splitlines():
+                # Variables are renamed (decided_*) to avoid colliding
+                # with Check 2's `env_port: str | None` and
+                # `compose_ports: list[str]`. Same files, different
+                # types per check.
+                decided_env_file = scaffold_dir / ".env.example"
+                if decided_env_file.is_file():
+                    decided_env_text = decided_env_file.read_text(encoding="utf-8")
+                    for line in decided_env_text.splitlines():
                         if line.startswith("PORT="):
                             try:
-                                env_port = int(line.split("=", 1)[1].strip())
+                                decided_env_port = int(line.split("=", 1)[1].strip())
                             except (ValueError, IndexError):
                                 break
-                            if env_port != decided_port:
+                            if decided_env_port != decided_port:
                                 findings.append(ConsistencyFinding(
                                     severity="blocker",
                                     category="contradiction",
                                     file=".env.example",
                                     message=(
-                                        f".env.example PORT={env_port} disagrees with "
+                                        f".env.example PORT={decided_env_port} disagrees with "
                                         f"decisions.json backend_port={decided_port}."
                                     ),
                                     suggestion=(
@@ -528,24 +532,24 @@ class ConsistencyReviewerAgent(BaseAgent):
                                     ),
                                 ))
                             break
-                compose_file = scaffold_dir / "docker-compose.yml"
-                if compose_file.is_file():
-                    compose_text = compose_file.read_text(encoding="utf-8")
-                    compose_ports: List[int] = []
-                    for line in compose_text.splitlines():
+                decided_compose_file = scaffold_dir / "docker-compose.yml"
+                if decided_compose_file.is_file():
+                    decided_compose_text = decided_compose_file.read_text(encoding="utf-8")
+                    decided_compose_ports: List[int] = []
+                    for line in decided_compose_text.splitlines():
                         m = re.search(r'"(\d+):\d+"', line)
                         if m:
                             try:
-                                compose_ports.append(int(m.group(1)))
+                                decided_compose_ports.append(int(m.group(1)))
                             except ValueError:
                                 pass
-                    if compose_ports and decided_port not in compose_ports:
+                    if decided_compose_ports and decided_port not in decided_compose_ports:
                         findings.append(ConsistencyFinding(
                             severity="blocker",
                             category="contradiction",
                             file="docker-compose.yml",
                             message=(
-                                f"docker-compose.yml exposes {compose_ports} but "
+                                f"docker-compose.yml exposes {decided_compose_ports} but "
                                 f"decisions.json backend_port={decided_port}."
                             ),
                             suggestion=(
