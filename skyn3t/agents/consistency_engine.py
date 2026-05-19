@@ -688,6 +688,106 @@ def _scan_for_leaked_path_markers(
     return issues
 
 
+# Tailwind utility-class shapes that strongly imply Tailwind is in use.
+# We look for at least one MULTI-PART class (e.g. bg-slate-900, h-14,
+# px-3, rounded-xl) to avoid false-firing on plain CSS classes that
+# happen to share a word like "flex" or "grid".
+_TAILWIND_CLASS_RE = re.compile(
+    r'\bclassName\s*=\s*["`\'][^"`\']*\b'
+    r'(?:bg|text|border|ring|shadow|from|to|via|hover|focus|p|m|px|py|pt|pb|pl|pr|'
+    r'mx|my|mt|mb|ml|mr|w|h|gap|space|rounded|opacity|z|inset|top|left|right|bottom|'
+    r'flex|grid|order|col|row|justify|items|self|content|place)-'
+)
+
+
+def _scan_for_tailwind_without_config(scaffold_dir: Path) -> List[ConsistencyIssue]:
+    """Flag scaffolds that use Tailwind utility classes in JSX but have
+    no tailwindcss dep / no tailwind.config.* / no @tailwind directive.
+
+    Real bug from 3c6a98: 4 components used Tailwind classes; no
+    tailwindcss in package.json; no config files. Classes shipped as
+    dead strings and the UI rendered unstyled. The build verifier
+    passes because Vite happily compiles JSX with no idea what
+    "bg-slate-900" means.
+    """
+    issues: List[ConsistencyIssue] = []
+
+    # Collect package.json dependency unions across the scaffold.
+    deps: Set[str] = set()
+    for pkg_path in scaffold_dir.rglob("package.json"):
+        try:
+            data = json.loads(pkg_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for key in ("dependencies", "devDependencies"):
+            section = data.get(key)
+            if isinstance(section, dict):
+                deps.update(section.keys())
+
+    has_tailwind_dep = "tailwindcss" in deps
+    if has_tailwind_dep:
+        return issues  # nothing to flag — Tailwind is properly installed
+
+    # Check for tailwind.config.{js,cjs,mjs,ts} anywhere in scaffold.
+    has_tailwind_config = any(
+        (scaffold_dir / f"tailwind.config{ext}").is_file()
+        for ext in (".js", ".cjs", ".mjs", ".ts")
+    ) or any(scaffold_dir.rglob("tailwind.config.*"))
+
+    # Check for @tailwind directives in CSS files (alternative way to
+    # know Tailwind is in use, e.g. via PostCSS without an explicit
+    # dependency in this package.json).
+    has_tailwind_directive = False
+    for css in scaffold_dir.rglob("*.css"):
+        try:
+            text = css.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if "@tailwind" in text:
+            has_tailwind_directive = True
+            break
+
+    if has_tailwind_config or has_tailwind_directive:
+        return issues  # something else proves Tailwind is wired
+
+    # Scan JSX / TSX files for Tailwind utility classes.
+    tailwind_users: List[str] = []
+    for path in scaffold_dir.rglob("*"):
+        if path.suffix not in (".jsx", ".tsx", ".html"):
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if _TAILWIND_CLASS_RE.search(source):
+            tailwind_users.append(path.relative_to(scaffold_dir).as_posix())
+
+    if not tailwind_users:
+        return issues  # no Tailwind classes used — no problem
+
+    # Cap at 5 files in the message for readability.
+    preview = ", ".join(tailwind_users[:5])
+    more = f" (+{len(tailwind_users) - 5} more)" if len(tailwind_users) > 5 else ""
+    issues.append(ConsistencyIssue(
+        severity="error",
+        category="missing_dep",
+        file="package.json",
+        message=(
+            f"{len(tailwind_users)} file(s) use Tailwind classes "
+            f"({preview}{more}) but tailwindcss is not in any "
+            "package.json and no tailwind.config.* / @tailwind "
+            "directive was found. Classes will ship as dead strings."
+        ),
+        suggestion=(
+            "Either add `tailwindcss` to package.json (plus "
+            "`tailwind.config.js` and `@tailwind base; @tailwind "
+            "components; @tailwind utilities;` in your main CSS), "
+            "or replace the Tailwind classes with plain CSS."
+        ),
+    ))
+    return issues
+
+
 def _scan_for_hallucinations(scaffold_dir: Path, allowed_services: Set[str]) -> List[ConsistencyIssue]:
     """Scan JS/JSX/MD files for mentions of services not in the allowed set.
 
@@ -1510,6 +1610,14 @@ def check_consistency(scaffold_dir: Path, brief: str = "") -> ConsistencyReport:
     # scaffold shipped no .github/workflows/*.yml. The reviewer flagged
     # this as a hallucinated claim; this check catches it deterministically.
     issues.extend(_scan_tech_stack_claim_drift(scaffold_dir))
+
+    # ── 7d. Tailwind classes without Tailwind installed ───────────────────
+    # Real bug from 3c6a98: AddHabitForm / HabitCard / HabitList etc.
+    # all used Tailwind classes (`bg-slate-900`, `text-emerald-300`,
+    # `flex`, `gap-4`) but package.json had no tailwindcss dep, no
+    # tailwind.config.js, no PostCSS config. The classes ship as dead
+    # strings — the markup renders but the styling is invisible.
+    issues.extend(_scan_for_tailwind_without_config(scaffold_dir))
 
     # ── 8. Orphan export check (lightweight) ─────────────────────────────
     # For each file that exports something, check if another file imports it.

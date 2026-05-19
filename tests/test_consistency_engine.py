@@ -1094,3 +1094,162 @@ def test_consistency_leak_check_only_on_code_files(tmp_path: Path) -> None:
         and "bare path string" in i.message
     ]
     assert not leaks
+
+
+# ─── Tailwind classes without Tailwind config ─────────────────────────
+
+
+def test_tailwind_classes_without_dep_flags_error(tmp_path: Path) -> None:
+    """3c6a98 used Tailwind classes everywhere but had no tailwindcss
+    dep, no tailwind.config.js, no @tailwind directive. Classes ship
+    as dead strings."""
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "package.json",
+        json.dumps({"dependencies": {"react": "^18", "react-dom": "^18"}}),
+    )
+    _write(
+        scaffold / "src" / "App.jsx",
+        """
+export default function App() {
+  return (
+    <div className="bg-slate-900 text-white p-6 rounded-xl">
+      <h1 className="text-emerald-300">Hello</h1>
+    </div>
+  );
+}
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    tw_issues = [
+        i for i in report.issues
+        if i.category == "missing_dep"
+        and "Tailwind" in i.message
+    ]
+    assert tw_issues, [i.message for i in report.issues]
+    assert tw_issues[0].severity == "error"
+
+
+def test_tailwind_classes_with_dep_is_clean(tmp_path: Path) -> None:
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "package.json",
+        json.dumps({
+            "dependencies": {"react": "^18"},
+            "devDependencies": {"tailwindcss": "^3.4"},
+        }),
+    )
+    _write(
+        scaffold / "src" / "App.jsx",
+        """
+export default function App() {
+  return <div className="bg-slate-900 text-white">Hello</div>;
+}
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    tw_issues = [
+        i for i in report.issues
+        if i.category == "missing_dep" and "Tailwind" in i.message
+    ]
+    assert not tw_issues
+
+
+def test_tailwind_classes_with_config_is_clean(tmp_path: Path) -> None:
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "package.json",
+        json.dumps({"dependencies": {"react": "^18"}}),
+    )
+    _write(
+        scaffold / "tailwind.config.js",
+        "module.exports = { content: ['./src/**/*.jsx'] };",
+    )
+    _write(
+        scaffold / "src" / "App.jsx",
+        """
+export default function App() {
+  return <div className="bg-slate-900">Hi</div>;
+}
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    tw_issues = [
+        i for i in report.issues
+        if i.category == "missing_dep" and "Tailwind" in i.message
+    ]
+    assert not tw_issues
+
+
+def test_tailwind_classes_with_directive_is_clean(tmp_path: Path) -> None:
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "package.json",
+        json.dumps({"dependencies": {"react": "^18"}}),
+    )
+    _write(
+        scaffold / "src" / "styles.css",
+        "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n",
+    )
+    _write(
+        scaffold / "src" / "App.jsx",
+        "export default function App() { return <div className=\"bg-slate-900\">Hi</div>; }",
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    tw_issues = [
+        i for i in report.issues
+        if i.category == "missing_dep" and "Tailwind" in i.message
+    ]
+    assert not tw_issues
+
+
+def test_plain_css_classes_dont_false_fire(tmp_path: Path) -> None:
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "package.json",
+        json.dumps({"dependencies": {"react": "^18"}}),
+    )
+    _write(
+        scaffold / "src" / "App.jsx",
+        """
+export default function App() {
+  return <div className="app-root">Hello</div>;
+}
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    tw_issues = [
+        i for i in report.issues
+        if i.category == "missing_dep" and "Tailwind" in i.message
+    ]
+    assert not tw_issues
+
+
+def test_plain_flex_or_grid_class_doesnt_false_fire(tmp_path: Path) -> None:
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "package.json",
+        json.dumps({"dependencies": {"react": "^18"}}),
+    )
+    _write(
+        scaffold / "src" / "App.jsx",
+        'export default function App() { return <div className="flex">Hi</div>; }',
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    tw_issues = [
+        i for i in report.issues
+        if i.category == "missing_dep" and "Tailwind" in i.message
+    ]
+    assert not tw_issues
