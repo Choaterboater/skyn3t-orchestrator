@@ -427,11 +427,11 @@ class ConsistencyReviewerAgent(BaseAgent):
                         file="index.html",
                         message=(
                             f"<title>{title}</title> looks like a template leftover — "
-                            f"it shares no words with the brief."
+                            "it shares no words with the brief."
                         ),
                         suggestion=(
-                            f"Set <title> to something descriptive of the actual product "
-                            f"(e.g. derived from the brief)."
+                            "Set <title> to something descriptive of the actual product "
+                            "(e.g. derived from the brief)."
                         ),
                     ))
 
