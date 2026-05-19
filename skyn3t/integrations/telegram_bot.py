@@ -608,7 +608,8 @@ class TelegramBot:
         # Tell the user it landed, then run vision extraction in
         # background; the bot will edit/append once it's done.
         tag_hint = f" Tags: `{', '.join(entry.tags)}`" if entry.tags else ""
-        msg = await self._reply(
+        # Send-and-forget acknowledgement; the actual analysis edits/appends below.
+        await self._reply(
             chat_id,
             f"📸 Saved reference *{entry.id}*.{tag_hint}\n"
             "Running design analysis…",

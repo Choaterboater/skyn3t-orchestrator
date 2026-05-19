@@ -220,54 +220,6 @@ def detect_stack_from_handoff(
     return None
 
 
-def detect_stack_from_handoff(
-    brief: str,
-    *,
-    architecture_text: str = "",
-    tech_stack: Optional[Dict[str, Any]] = None,
-) -> Optional[str]:
-    """Pick a stack template using the brief plus upstream architect hints.
-
-    CodeAgent used to detect the scaffold stack from the raw brief only. That
-    fails on generic product briefs ("service dashboard", "SaaS app") even when
-    ArchitectAgent has already written concrete stack guidance in
-    ``architecture.md`` / ``tech_stack.json``. When the brief itself is too
-    vague, prefer explicit architect handoff before falling back to the LLM
-    planner.
-    """
-    direct = detect_stack(brief)
-    if direct:
-        return direct
-
-    signal_chunks: List[str] = []
-    if architecture_text:
-        signal_chunks.append(architecture_text.lower())
-    if tech_stack:
-        for key in ("frontend", "backend", "db", "infra"):
-            value = tech_stack.get(key)
-            if isinstance(value, str) and value.strip():
-                signal_chunks.append(value.lower())
-    signal_text = "\n".join(signal_chunks)
-    if signal_text:
-        # Prefer the explicit Vite/SPA shape over Next if the architect output
-        # mentions both. This happens when tech_stack.json drifts but the
-        # architecture overview still says "Vite + React SPA + Express".
-        if any(token in signal_text for token in ("vite", "react spa", "single-page app", "single page app")):
-            return "react_vite"
-        if any(token in signal_text for token in ("next.js", "nextjs", "app router", "route handlers")):
-            return "next"
-        inferred = detect_stack(signal_text)
-        if inferred:
-            return inferred
-
-    # Dashboard-class briefs without an explicit framework still map much more
-    # often to a SPA scaffold than to a static site. This keeps the deterministic
-    # browser-first template path available for homelab/service-board briefs.
-    if _needs_design_system(brief):
-        return "react_vite"
-    return None
-
-
 def plan_for_stack(stack: str, brief: str = "") -> Optional[FilePlan]:
     """Return the file plan for ``stack``, augmented for the brief.
 

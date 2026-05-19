@@ -17,7 +17,6 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-
 _SLUG_RE = re.compile(r"\b([a-z][a-z0-9-]{2,40}-\d{1,6}|[a-z][a-z0-9]{1,15}-[a-z0-9-]{2,40})\b", re.IGNORECASE)
 _MENTION_RE = re.compile(r"<@!?(\d+)>")
 _START_VERBS = ("start", "build", "make", "create", "spin up", "kick off", "launch", "scaffold", "generate")

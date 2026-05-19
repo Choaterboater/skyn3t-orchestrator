@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
@@ -540,8 +541,8 @@ class DesignerAgent(BaseAgent):
         Returns a list of ``DesignReference`` objects (possibly empty).
         """
         try:
-            from skyn3t.integrations.telegram_photos import _load_library
             from skyn3t.agents.design_vision import load_by_sha
+            from skyn3t.integrations.telegram_photos import _load_library
         except Exception:  # noqa: BLE001
             return []
         refs_md = artifact_dir / "design_references.md"
