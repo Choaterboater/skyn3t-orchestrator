@@ -138,24 +138,50 @@ class CodeImproverAgent(BaseAgent):
         repo_root: Path,
         commands: List[Tuple[List[str], str]],
         *,
-        timeout: int = 180,
+        timeout: int = 1200,
+        idle_timeout: int = 180,
         note: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Run check commands with a streaming-idle timeout.
+
+        Mirrors the two-tier timeout from ``LLMClient._run_capture``:
+        * HARD: ``timeout`` is the absolute wall-clock cap per command.
+        * IDLE: ``idle_timeout`` kills a command that emits no bytes on
+          stdout+stderr for that long. Catches genuine hangs without
+          punishing slow-but-working processes (npm install on a large
+          tree, pytest on a big suite, etc.).
+
+        Hard default 1200s + idle 180s matches the established contract
+        for CLI subprocess calls (see user memory
+        feedback_cli_timeout_streaming.md). Never go back to a flat
+        ``subprocess.run(..., timeout=180)`` — that killed real builds
+        whenever a step took >3 min, even when it was making progress.
+        """
         stdout_parts: List[str] = []
         stderr_parts: List[str] = []
         executed: List[str] = []
         for args, display in commands:
-            proc = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                cwd=str(repo_root),
-                timeout=timeout,
-            )
+            try:
+                stdout, stderr, returncode = CodeImproverAgent._stream_capture(
+                    args=args,
+                    cwd=str(repo_root),
+                    hard_timeout=timeout,
+                    idle_timeout=idle_timeout,
+                )
+            except subprocess.TimeoutExpired as exc:
+                # Surface a TimeoutExpired with the partial output so
+                # callers (and tests) keep the existing exception
+                # contract.
+                raise subprocess.TimeoutExpired(
+                    cmd=args,
+                    timeout=exc.timeout,
+                    output=exc.output,
+                    stderr=exc.stderr,
+                )
             executed.append(display)
-            stdout_parts.append(f"$ {display}\n{proc.stdout}".rstrip())
-            stderr_parts.append(f"$ {display}\n{proc.stderr}".rstrip())
-            if proc.returncode != 0:
+            stdout_parts.append(f"$ {display}\n{stdout}".rstrip())
+            stderr_parts.append(f"$ {display}\n{stderr}".rstrip())
+            if returncode != 0:
                 return {
                     "ran": True,
                     "ok": False,
@@ -172,6 +198,106 @@ class CodeImproverAgent(BaseAgent):
             "stderr": "\n\n".join(part for part in stderr_parts if part),
             "note": note,
         }
+
+    @staticmethod
+    def _stream_capture(
+        *,
+        args: List[str],
+        cwd: str,
+        hard_timeout: float,
+        idle_timeout: float,
+    ) -> Tuple[str, str, int]:
+        """Run a subprocess with streaming-idle timeout. Returns
+        ``(stdout, stderr, returncode)``.
+
+        Uses ``Popen`` + per-stream reader threads so we can observe
+        progress without blocking. The hard timeout caps total wall
+        time; the idle timeout fires if neither stream has produced
+        any new bytes for that long. Either kind of timeout raises
+        ``subprocess.TimeoutExpired`` carrying the partial output.
+        """
+        import threading
+
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=cwd,
+            text=True,
+            bufsize=1,  # line-buffered, so progress is observable
+        )
+
+        stdout_chunks: List[str] = []
+        stderr_chunks: List[str] = []
+        progress_lock = threading.Lock()
+        last_progress = time.monotonic()
+
+        def _drain(stream, sink: List[str]) -> None:
+            nonlocal last_progress
+            try:
+                for line in iter(stream.readline, ""):
+                    sink.append(line)
+                    with progress_lock:
+                        last_progress = time.monotonic()
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+        t_out = threading.Thread(
+            target=_drain, args=(proc.stdout, stdout_chunks), daemon=True
+        )
+        t_err = threading.Thread(
+            target=_drain, args=(proc.stderr, stderr_chunks), daemon=True
+        )
+        t_out.start()
+        t_err.start()
+
+        start = time.monotonic()
+        # Poll every 0.5s — granular enough that an idle timeout fires
+        # close to its nominal value, light enough that the loop
+        # itself doesn't burn CPU on a long-running healthy process.
+        poll_interval = 0.5
+        timeout_kind: Optional[str] = None
+        while True:
+            if proc.poll() is not None:
+                break
+            now = time.monotonic()
+            if now - start >= hard_timeout:
+                timeout_kind = f"hard timeout after {int(now - start)}s"
+                break
+            with progress_lock:
+                idle_for = now - last_progress
+            if idle_for >= idle_timeout:
+                timeout_kind = f"idle timeout ({int(idle_timeout)}s no output)"
+                break
+            time.sleep(poll_interval)
+
+        if timeout_kind is not None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                pass
+            # Drain whatever the threads collected before raising.
+            t_out.join(timeout=2.0)
+            t_err.join(timeout=2.0)
+            raise subprocess.TimeoutExpired(
+                cmd=args,
+                timeout=hard_timeout,
+                output="".join(stdout_chunks),
+                stderr="".join(stderr_chunks) + f"\n[{timeout_kind}]",
+            )
+
+        # Process exited on its own — let the reader threads finish
+        # flushing the pipes before we report.
+        t_out.join(timeout=2.0)
+        t_err.join(timeout=2.0)
+        return "".join(stdout_chunks), "".join(stderr_chunks), proc.returncode
 
     @staticmethod
     def _node_package_manager(repo_root: Path, package_data: Dict[str, Any]) -> Optional[str]:
