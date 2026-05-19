@@ -188,3 +188,204 @@ export default function App() {
     assert todo_stubs[0].file == "src/App.jsx"
     assert todo_stubs[0].severity == "error"
     assert not report.ok
+
+
+# ─── default-vs-named import-style mismatch ───────────────────────────
+
+
+def test_named_import_of_default_export_is_flagged(tmp_path: Path) -> None:
+    """Real bug from e79bc0 review: HabitList imports { HabitCard }
+    by name, but HabitCard.jsx exports default. Would crash at
+    runtime with HabitCard undefined."""
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "src" / "components" / "HabitCard.jsx",
+        "export default function HabitCard() { return null; }\n",
+    )
+    _write(
+        scaffold / "src" / "components" / "HabitList.jsx",
+        """
+import { HabitCard } from './HabitCard';
+export default function HabitList() {
+  return <HabitCard />;
+}
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    mismatches = [
+        i for i in report.issues
+        if i.category == "broken_import"
+        and "HabitCard" in i.message
+        and "default export" in i.message
+    ]
+    assert mismatches, [i.message for i in report.issues]
+    assert mismatches[0].severity == "error"
+    # Suggestion should point at the fix.
+    assert (
+        "import HabitCard from" in mismatches[0].suggestion
+        or "export { HabitCard }" in mismatches[0].suggestion
+    )
+
+
+def test_named_import_matching_named_export_is_clean(tmp_path: Path) -> None:
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "src" / "utils.js",
+        """
+export const formatDate = (d) => d.toISOString();
+export const parseDate = (s) => new Date(s);
+""".strip(),
+    )
+    _write(
+        scaffold / "src" / "App.jsx",
+        """
+import { formatDate, parseDate } from './utils';
+export default function App() {
+  return formatDate(new Date());
+}
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    style_issues = [
+        i for i in report.issues
+        if i.category == "broken_import" and "does not export" in i.message
+    ]
+    assert not style_issues, [i.message for i in style_issues]
+
+
+def test_default_import_of_default_export_is_clean(tmp_path: Path) -> None:
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "src" / "App.jsx",
+        "export default function App() { return null; }\n",
+    )
+    _write(
+        scaffold / "src" / "main.jsx",
+        """
+import App from './App';
+console.log(App);
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    style_issues = [
+        i for i in report.issues
+        if i.category == "broken_import"
+        and "does not export" in i.message
+    ]
+    assert not style_issues
+
+
+def test_mixed_default_and_named_import_validated(tmp_path: Path) -> None:
+    """`import App, { utility } from './app'` — both parts checked.
+    Default is fine; the named one is missing → flag only the named."""
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "src" / "app.js",
+        """
+export default function App() { return null; }
+export const knownUtil = 1;
+""".strip(),
+    )
+    _write(
+        scaffold / "src" / "main.js",
+        """
+import App, { missingUtil } from './app';
+console.log(App, missingUtil);
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    mismatches = [
+        i for i in report.issues
+        if i.category == "broken_import" and "missingUtil" in i.message
+    ]
+    assert mismatches, [i.message for i in report.issues]
+
+
+def test_aliased_named_import_validated_against_source_name(tmp_path: Path) -> None:
+    """`import { Foo as Bar }` — we validate that Foo is exported,
+    not Bar (which is the local alias)."""
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "src" / "util.js",
+        "export const realName = 1;\n",
+    )
+    _write(
+        scaffold / "src" / "main.js",
+        "import { realName as localAlias } from './util'; console.log(localAlias);\n",
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    style_issues = [
+        i for i in report.issues
+        if i.category == "broken_import"
+        and ("realName" in i.message or "localAlias" in i.message)
+        and "does not export" in i.message
+    ]
+    assert not style_issues, [i.message for i in style_issues]
+
+
+def test_module_with_no_detectable_exports_is_silently_skipped(tmp_path: Path) -> None:
+    """CommonJS `module.exports = {...}` patterns aren't covered by
+    our ES-export regexes. Don't false-flag those."""
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "src" / "legacy.js",
+        "module.exports = { foo: 1, bar: 2 };\n",
+    )
+    _write(
+        scaffold / "src" / "main.js",
+        "import { foo } from './legacy'; console.log(foo);\n",
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    style_issues = [
+        i for i in report.issues
+        if i.category == "broken_import" and "does not export" in i.message
+    ]
+    assert not style_issues
+
+
+def test_re_export_named_block_validated(tmp_path: Path) -> None:
+    """`export { Foo as Bar }` re-exports use Bar as the EXTERNALLY
+    visible name. Importing { Bar } from this file is valid;
+    importing { Foo } is not."""
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "src" / "thing.js",
+        "function _internal() {} export { _internal as PublicAPI };\n",
+    )
+    _write(
+        scaffold / "src" / "ok.js",
+        "import { PublicAPI } from './thing'; console.log(PublicAPI);\n",
+    )
+    _write(
+        scaffold / "src" / "broken.js",
+        "import { _internal } from './thing'; console.log(_internal);\n",
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    ok_issues = [
+        i for i in report.issues
+        if i.file == "src/ok.js"
+        and i.category == "broken_import"
+        and "does not export" in i.message
+    ]
+    broken_issues = [
+        i for i in report.issues
+        if i.file == "src/broken.js"
+        and i.category == "broken_import"
+        and "_internal" in i.message
+    ]
+    assert not ok_issues
+    assert broken_issues
