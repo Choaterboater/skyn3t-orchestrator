@@ -30,6 +30,31 @@ _last_dispatch: Dict[Tuple[str, str], float] = {}
 _lock = asyncio.Lock()
 
 
+# Telegram legacy "Markdown" parse_mode special characters. An
+# unescaped one in user-supplied content (slug, summary, brief)
+# returns 400 from the Bot API; the retry path strips parse_mode
+# entirely, so the message arrives but loses ALL formatting. Escape
+# them before interpolating into Markdown templates so the message
+# stays bold/italic where the template intends.
+#
+# Note: this is the LEGACY "Markdown" character set, not MarkdownV2.
+# We use parse_mode="Markdown" everywhere — see send_message default.
+def escape_markdown(text: str) -> str:
+    """Escape Telegram legacy-Markdown special chars in user content.
+
+    Backslash-escapes ``*``, ``_``, `` ` ``, ``[`` — the four chars
+    the legacy parser treats specially. Safe to apply to slugs,
+    briefs, stage summaries, anything else that flows in from
+    outside this module's templates.
+    """
+    if not text:
+        return text
+    out = text
+    for ch in ("\\", "*", "_", "`", "["):
+        out = out.replace(ch, "\\" + ch)
+    return out
+
+
 _PRIORITY_SECTIONS = ("overview", "components", "data model", "apis", "api")
 _SKIP_SECTIONS = ("non-goals", "out of scope", "appendix", "references")
 
@@ -238,19 +263,26 @@ def _format_approval_message(
     dashboard_url: str,
     plain_english: str = "",
 ) -> str:
+    # Escape user-supplied content before splicing into Markdown
+    # templates — an unescaped `*` / `_` / backtick in slug, summary
+    # or plain_english returns 400 from the Bot API and the retry
+    # path drops formatting for the whole message.
+    safe_slug = escape_markdown(slug)
+    safe_summary = escape_markdown(summary)
+    safe_plain = escape_markdown(plain_english)
     parts = [
-        f"🔍 *{slug}* needs review",
+        f"🔍 *{safe_slug}* needs review",
         "",
         "Tap *Approve* to continue, *Reject* to send feedback back to the architect.",
     ]
-    if plain_english:
+    if safe_plain:
         parts.append("")
         parts.append("─── *What this means* ───")
-        parts.append(plain_english)
-    if summary:
+        parts.append(safe_plain)
+    if safe_summary:
         parts.append("")
         parts.append("─── *Technical plan* ───")
-        parts.append(summary)
+        parts.append(safe_summary)
     if dashboard_url and _is_publicly_routable(dashboard_url):
         parts.append("")
         parts.append(f"Dashboard: {dashboard_url}")
