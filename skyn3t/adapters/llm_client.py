@@ -92,6 +92,14 @@ class LLMRequest:
     max_tokens: int = 4000
     temperature: float = 0.4
     metadata: dict = field(default_factory=dict)
+    # When set, CLI backends will use this directory as their subprocess
+    # CWD instead of an empty per-call sandbox. Use case: reviewer / QA
+    # callers need the LLM CLI's tool calls (Read/glob) to see real
+    # scaffold files; otherwise the LLM "sees" an empty directory and
+    # reports "scaffold root is empty" as a blocker. Caller is responsible
+    # for ensuring the path exists. CLI artifact harvesting is skipped
+    # when this is set so we never pollute the caller's directory.
+    cwd: Optional[str] = None
 
 
 # Subprocess timeouts (seconds)
@@ -283,10 +291,11 @@ class LLMClient:
     async def complete(self, prompt: str, *, system: Optional[str] = None,
                        model: Optional[str] = None, max_tokens: int = 4000,
                        temperature: float = 0.4, timeout: Optional[float] = None,
+                       cwd: Optional[str] = None,
                        _allow_backend_failover: bool = True) -> str:
         self._last_failed_backend = None
         req = LLMRequest(prompt=prompt, system=system, model=model or self.default_model,
-                         max_tokens=max_tokens, temperature=temperature)
+                         max_tokens=max_tokens, temperature=temperature, cwd=cwd)
         elapsed = 0.0
         try:
             impl = await self._get_impl()
@@ -348,6 +357,7 @@ class LLMClient:
                         max_tokens=max_tokens,
                         temperature=temperature,
                         timeout=timeout,
+                        cwd=cwd,
                         _allow_backend_failover=False,
                     )
                 except Exception:
@@ -586,7 +596,7 @@ def _append_sandbox_artifacts(stdout_text: str, artifacts: list[tuple[str, str]]
     return f"{text}\n\n{merged}"
 
 
-async def _run_capture(args: list[str]) -> str:
+async def _run_capture(args: list[str], cwd: Optional[str] = None) -> str:
     """Run a subprocess and return its stdout (raises on non-zero).
 
     Uses two-tier timeout:
@@ -604,11 +614,24 @@ async def _run_capture(args: list[str]) -> str:
         the C stdio level as a safety net for other runtimes.
       * Idle detection watches BOTH stdout and stderr so progress
         logged to either stream resets the idle timer.
+
+    CWD:
+      * If ``cwd`` is supplied and exists, the subprocess runs there and
+        artifact harvesting is skipped. Use for reviewer/QA callers that
+        need the CLI's Read/glob tools to see the real scaffold.
+      * Otherwise a fresh /tmp sandbox is created so code-generating
+        CLI tools can't leak into the SkyN3t repo root.
     """
     import shutil as _sh
     import sys as _sys
     start_wall = time.time()
-    sandbox_cwd = _make_llm_cli_sandbox_cwd()
+    use_caller_cwd = bool(cwd) and Path(cwd).is_dir()
+    if cwd and not use_caller_cwd:
+        logger.warning(
+            "LLM caller-provided cwd does not exist; falling back to sandbox. cwd=%r",
+            cwd,
+        )
+    sandbox_cwd = cwd if use_caller_cwd else _make_llm_cli_sandbox_cwd()
 
     # Build subprocess env with Python unbuffered mode — critical for
     # Python-based CLIs (kimi, openai) that otherwise block-buffer
@@ -705,6 +728,10 @@ async def _run_capture(args: list[str]) -> str:
                 f"{args[0]} cli failed: {stderr.decode(errors='replace')[:300]}"
             )
         stdout_text = stdout.decode(errors="replace")
+        # Skip artifact harvest when running in a caller-supplied cwd —
+        # we don't own that directory and must not move files out of it.
+        if use_caller_cwd:
+            return stdout_text
         artifacts = _collect_sandbox_artifacts(sandbox_cwd, started_at=start_wall)
         if artifacts:
             logger.info(
@@ -716,8 +743,10 @@ async def _run_capture(args: list[str]) -> str:
     finally:
         # Clean up the per-call sandbox dir on success, failure, OR
         # cancellation. ignore_errors=True so a busy file (Windows) or
-        # vanished tree doesn't mask the real result/exception.
-        _sh.rmtree(sandbox_cwd, ignore_errors=True)
+        # vanished tree doesn't mask the real result/exception. Skip
+        # cleanup for caller-supplied cwd — we don't own that directory.
+        if not use_caller_cwd:
+            _sh.rmtree(sandbox_cwd, ignore_errors=True)
 
 
 class _ClaudeCLIBackend:
@@ -732,7 +761,7 @@ class _ClaudeCLIBackend:
             args.extend(["--append-system-prompt", req.system])
         if req.model:
             args.extend(["--model", req.model])
-        return await _run_capture(args)
+        return await _run_capture(args, cwd=req.cwd)
 
 
 class _KimiCLIBackend:
@@ -750,7 +779,7 @@ class _KimiCLIBackend:
         if req.model:
             args.extend(["-m", req.model])
         args.extend(["-p", req.prompt])
-        return await _run_capture(args)
+        return await _run_capture(args, cwd=req.cwd)
 
 
 class _CopilotCLIBackend:
@@ -774,7 +803,7 @@ class _CopilotCLIBackend:
         args = ["copilot", "--available-tools=", "-p", req.prompt]
         if req.model:
             args.extend(["--model", req.model])
-        return await _run_capture(args)
+        return await _run_capture(args, cwd=req.cwd)
 
 
 class _OpenAICLIBackend:
@@ -799,7 +828,7 @@ class _OpenAICLIBackend:
         if req.system:
             args.extend(["-g", "system", req.system])
         args.extend(["-g", "user", req.prompt])
-        return await _run_capture(args)
+        return await _run_capture(args, cwd=req.cwd)
 
 
 class _AnthropicBackend:

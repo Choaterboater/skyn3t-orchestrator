@@ -112,7 +112,15 @@ class ReviewerAgent(BaseAgent):
         heuristic_verdict, heuristic_score = self._verdict(completeness, consistency, risks)
 
         # LLM pass - reads artifacts and produces a senior-reviewer narrative.
-        llm_review_md, llm_score = await self._llm_review(brief=brief, contents=contents)
+        # Pass the scaffold dir (or artifact dir if no scaffold) so CLI
+        # backends' tool calls see the actual files instead of an empty
+        # /tmp sandbox — otherwise the LLM scores against a phantom
+        # "scaffold is empty" reading.
+        scaffold_dir = artifact_dir / "scaffold"
+        llm_cwd = scaffold_dir if scaffold_dir.exists() else artifact_dir
+        llm_review_md, llm_score = await self._llm_review(
+            brief=brief, contents=contents, cwd=str(llm_cwd),
+        )
         llm_review_md = self._sanitize_llm_review_md(llm_review_md)
 
         # Packaging axis (0-10) — does this scaffold ship as a runnable
@@ -514,6 +522,7 @@ class ReviewerAgent(BaseAgent):
         max_tokens: int = 2500,
         timeout_seconds: float = _LLM_REVIEW_TIMEOUT_SECONDS,
         purpose: str = "review",
+        cwd: Optional[str] = None,
     ) -> str:
         try:
             client = self.get_llm() if hasattr(self, "get_llm") else None
@@ -548,7 +557,9 @@ class ReviewerAgent(BaseAgent):
                 pass
             out = str(
                 await asyncio.wait_for(
-                    client.complete(prompt, max_tokens=max_tokens, temperature=0.2),
+                    client.complete(
+                        prompt, max_tokens=max_tokens, temperature=0.2, cwd=cwd,
+                    ),
                     timeout=timeout_seconds,
                 )
             )
@@ -569,8 +580,13 @@ class ReviewerAgent(BaseAgent):
         *,
         brief: str,
         contents: Dict[str, str],
+        cwd: Optional[str] = None,
     ) -> Tuple[Optional[str], Optional[int]]:
-        """Run an LLM review pass. Returns (markdown body, score) or (None, None)."""
+        """Run an LLM review pass. Returns (markdown body, score) or (None, None).
+
+        ``cwd`` is forwarded to the LLM CLI backend so its file-inspection
+        tool calls see the real scaffold instead of an empty sandbox.
+        """
         if not contents:
             return None, None
 
@@ -626,6 +642,7 @@ class ReviewerAgent(BaseAgent):
             brief=brief or "(no brief provided)",
             fallback="",  # Empty fallback - we handle missing LLM separately.
             max_tokens=8000,
+            cwd=cwd,
         )
         if not out:
             return None, None

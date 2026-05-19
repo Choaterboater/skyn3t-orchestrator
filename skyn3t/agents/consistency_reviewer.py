@@ -302,7 +302,13 @@ class ConsistencyReviewerAgent(BaseAgent):
         )
 
         try:
-            raw = await llm_client.complete(prompt, max_tokens=4000, temperature=0.3)
+            # Pin CLI backends' subprocess CWD to the real scaffold dir
+            # so any Read/glob tool calls see the actual files. Without
+            # this the CLI sees an empty /tmp sandbox and incorrectly
+            # reports the scaffold as empty.
+            raw = await llm_client.complete(
+                prompt, max_tokens=4000, temperature=0.3, cwd=str(scaffold_dir),
+            )
         except Exception as exc:
             logger.warning("LLM consistency review failed: %s", exc)
             return findings
