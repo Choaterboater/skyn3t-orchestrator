@@ -402,6 +402,12 @@ def _syntax_ok(body: str, rel_path: str, timeout: float = 5.0) -> bool:
             return False
         if text.count("(") != text.count(")"):
             return False
+        # `export default const|let|var` is invalid ES syntax — the
+        # declaration after `export default` must be an expression or
+        # a function/class declaration. Catches an LLM failure mode
+        # where the model generates the keyword but not a usable rhs.
+        if _RE.search(r"\bexport\s+default\s+(const|let|var)\b", text):
+            return False
         return True
     if rl.endswith((".js", ".mjs", ".cjs")):
         # Plain JS/ESM: node --check works correctly for these.
