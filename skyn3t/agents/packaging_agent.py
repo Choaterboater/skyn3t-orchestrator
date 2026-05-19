@@ -14,8 +14,8 @@ packaging strategy based on StackDetector's family classification:
 Each strategy is a self-contained _package_* method so adding a new
 family later is one match-arm + one method.
 
-This PR ships the **web** strategy only. Docker, fullstack, and the
-reviewer-scoring axis land in subsequent PRs (C-docker, C-combo, D).
+This PR ships the **web + server** strategies. Fullstack and the
+reviewer-scoring axis land in subsequent PRs (C-combo, D).
 
 Feature-flagged via `extra={"packaging_enabled": False}` on the
 StudioRunner — defaults on, easy to disable per-run if it misbehaves.
@@ -30,11 +30,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from skyn3t.agents.env_scanner import EnvVarRef, ScanResult, scan as scan_env
-from skyn3t.agents.stack_detector import StackDetection, detect as detect_stack
+from skyn3t.agents.env_scanner import EnvVarRef, ScanResult
+from skyn3t.agents.env_scanner import scan as scan_env
+from skyn3t.agents.stack_detector import StackDetection
+from skyn3t.agents.stack_detector import detect as detect_stack
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
-
 
 logger = logging.getLogger("skyn3t.agents.packaging_agent")
 
@@ -237,9 +238,6 @@ class PackagingAgent(BaseAgent):
             files_patched.append("scaffold/src/App.jsx")
         elif patch_note:
             notes.append(patch_note)
-        # Stash the specific reason so the README can echo it.
-        self._last_patch_note = patch_note
-
         # 4. .gitignore (stack-aware, web-tier)
         gitignore_path = artifact_dir / ".gitignore"
         if not gitignore_path.is_file():
@@ -365,7 +363,7 @@ class PackagingAgent(BaseAgent):
                 text,
                 count=1,
             )
-            text += f"\n\n// @skyn3t-packaging: first-run Settings gate (do not edit by hand)\nexport default {exported};\n"
+            text += f"\n\nexport default {exported};\n"
             return _inject_settings_wrapper(text, exported)
 
         exported = m.group(1)
@@ -797,7 +795,7 @@ const DEFAULTS = {{ API_BASE_URL: "{default_url}" }};
             verifier_skipped=True,
             notes=[
                 f"packaging strategy '{detection.family}' not implemented in this PR — "
-                "see roadmap PR C-docker / C-combo"
+                "see roadmap PR C-combo"
             ],
         )
 
@@ -1298,7 +1296,7 @@ def _render_dockerfile(detection: StackDetection) -> str:
         cmd_line = f'CMD ["gunicorn", "-w", "2", "-b", "0.0.0.0:{port}", "config.wsgi:application"]'
         return _PYTHON_DOCKERFILE.format(port=port, cmd_line=cmd_line)
     if stack == "bottle":
-        cmd_line = f'CMD ["python", "app.py"]'
+        cmd_line = 'CMD ["python", "app.py"]'
         return _PYTHON_DOCKERFILE.format(port=port, cmd_line=cmd_line)
 
     if stack in ("express", "fastify", "koa", "hono"):
@@ -1307,7 +1305,7 @@ def _render_dockerfile(detection: StackDetection) -> str:
 
     # Unknown server stack — generate the most common Python shape with a
     # comment telling the operator to adjust the CMD.
-    cmd_line = f'# Replace with your start command\nCMD ["python", "main.py"]'
+    cmd_line = '# Replace with your start command\nCMD ["python", "main.py"]'
     return _PYTHON_DOCKERFILE.format(port=port, cmd_line=cmd_line)
 
 
@@ -1574,11 +1572,11 @@ def _render_server_readme(
     runtimes_lines: List[str] = []
     for r in detection.runtimes:
         if r.name == "python":
-            v = r.min_version or "3.12"
-            runtimes_lines.append(f"- Python {v}+ ([install](https://python.org/))")
+            runtime_version = r.min_version or "3.12"
+            runtimes_lines.append(f"- Python {runtime_version}+ ([install](https://python.org/))")
         elif r.name == "node":
-            v = r.min_version or "22"
-            runtimes_lines.append(f"- Node {v}+ ([install](https://nodejs.org/))")
+            runtime_version = r.min_version or "22"
+            runtimes_lines.append(f"- Node {runtime_version}+ ([install](https://nodejs.org/))")
     runtimes_lines.append("- Docker + Docker Compose ([install](https://docs.docker.com/get-docker/))")
     runtimes_block = "\n".join(runtimes_lines)
 
@@ -1588,17 +1586,20 @@ def _render_server_readme(
         services_block += "\n".join(f"- **{s}** (auto-managed via docker-compose)" for s in detection.services)
         services_block += "\n"
 
-    env_required = [v for v in env_scan.required()
-                    if not v.name.startswith(("VITE_", "REACT_APP_", "NEXT_PUBLIC_"))]
+    env_required = [
+        env_var
+        for env_var in env_scan.required()
+        if not env_var.name.startswith(("VITE_", "REACT_APP_", "NEXT_PUBLIC_"))
+    ]
     required_block = ""
     if env_required:
         required_block = (
             "\n## Required environment variables\n\n"
             "Before running `docker compose up`, set these in `.env`:\n\n"
         )
-        for v in env_required:
-            kind = "🔒 secret" if v.is_secret else v.type_hint
-            required_block += f"- `{v.name}` ({kind})\n"
+        for env_var in env_required:
+            kind = "🔒 secret" if env_var.is_secret else env_var.type_hint
+            required_block += f"- `{env_var.name}` ({kind})\n"
 
     return f"""# {app_name}
 
@@ -1651,11 +1652,11 @@ def _render_fullstack_readme(
     runtimes_lines: List[str] = []
     for r in detection.runtimes:
         if r.name == "python":
-            v = r.min_version or "3.12"
-            runtimes_lines.append(f"- Python {v}+ ([install](https://python.org/))")
+            runtime_version = r.min_version or "3.12"
+            runtimes_lines.append(f"- Python {runtime_version}+ ([install](https://python.org/))")
         elif r.name == "node":
-            v = r.min_version or "22"
-            runtimes_lines.append(f"- Node {v}+ ([install](https://nodejs.org/))")
+            runtime_version = r.min_version or "22"
+            runtimes_lines.append(f"- Node {runtime_version}+ ([install](https://nodejs.org/))")
     runtimes_lines.append("- Docker + Docker Compose ([install](https://docs.docker.com/get-docker/))")
     runtimes_block = "\n".join(runtimes_lines)
 
@@ -1668,12 +1669,14 @@ def _render_fullstack_readme(
         )
 
     server_required = [
-        v for v in env_scan.required()
-        if not v.name.startswith(("VITE_", "REACT_APP_", "NEXT_PUBLIC_"))
+        env_var
+        for env_var in env_scan.required()
+        if not env_var.name.startswith(("VITE_", "REACT_APP_", "NEXT_PUBLIC_"))
     ]
     client_vars = [
-        v for v in env_scan.vars.values()
-        if v.name.startswith(("VITE_", "REACT_APP_", "NEXT_PUBLIC_"))
+        env_var
+        for env_var in env_scan.vars.values()
+        if env_var.name.startswith(("VITE_", "REACT_APP_", "NEXT_PUBLIC_"))
     ]
 
     server_required_block = ""
@@ -1683,9 +1686,9 @@ def _render_fullstack_readme(
             "These are secrets and infrastructure URLs. Set them in `.env` "
             "before running `docker compose up`:\n\n"
         )
-        for v in server_required:
-            kind = "🔒 secret" if v.is_secret else v.type_hint
-            server_required_block += f"- `{v.name}` ({kind})\n"
+        for env_var in server_required:
+            kind = "🔒 secret" if env_var.is_secret else env_var.type_hint
+            server_required_block += f"- `{env_var.name}` ({kind})\n"
 
     client_block = ""
     if client_vars:
@@ -1694,8 +1697,8 @@ def _render_fullstack_readme(
             "Open the app and click **Settings** to configure. Values are "
             "stored in your browser, never sent to the server:\n\n"
         )
-        for v in sorted(client_vars, key=lambda x: x.name):
-            client_block += f"- `{v.name}`\n"
+        for env_var in sorted(client_vars, key=lambda x: x.name):
+            client_block += f"- `{env_var.name}`\n"
 
     if not server_required and not client_vars:
         config_block = (
@@ -1709,9 +1712,9 @@ def _render_fullstack_readme(
     frontend_section = ""
     if wired_compose:
         frontend_section = (
-            f"The frontend serves a pre-built static bundle from `scaffold/dist/`. "
-            f"Run `npm run build` in `scaffold/` first, then `docker compose up` "
-            f"serves it on http://localhost:5173.\n"
+            "The frontend serves a pre-built static bundle from `scaffold/dist/`. "
+            "Run `npm run build` in `scaffold/` first, then `docker compose up` "
+            "serves it on http://localhost:5173.\n"
         )
     else:
         frontend_section = (

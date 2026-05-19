@@ -35,13 +35,16 @@ _CODE_TECH_SIGNAL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _CODE_BUILD_VERB_PATTERN = re.compile(
-    # build/create/etc followed by up to ~6 intervening words (qualifiers,
-    # me, a, an, "tic-tac-toe", etc.) then a software-y noun. The old
-    # version required a fixed adjective vocabulary which made it brittle
-    # for natural briefs like "build me a tic-tac-toe game".
-    r"\b(?:build|create|make|ship|launch|scaffold|generate|prototype|develop|implement)"
-    r"(?:\s+\S+){0,6}\s+"
-    r"(?:app|site|website|api|backend|frontend|service|tool|script|cli|bot|dashboard|extension|game)\b",
+    # Build/create/etc near the start of the brief — treat as code build
+    # unless explicitly contradicted by docs-only signals (checked
+    # separately). The old version required a known software noun like
+    # "app" / "tool" / "dashboard" which broke on natural phrasings like
+    # "build a homelab uploader" (uploader isn't a known noun) or
+    # "build me a budget tracker" (tracker isn't either). The fix: the
+    # verb itself is enough signal. Docs detection elsewhere catches
+    # genuine "write a README" cases.
+    r"\b(?:build|create|make|ship|launch|scaffold|generate|prototype|develop|implement|spin\s+up|kick\s+off)"
+    r"\s+(?:me\s+)?(?:a|an|the|some|my|us|something)\b",
     re.IGNORECASE,
 )
 _CODE_BUILD_PATTERNS = (_CODE_TECH_SIGNAL_PATTERN, _CODE_BUILD_VERB_PATTERN)
@@ -268,16 +271,27 @@ def _heuristic_plan(brief: str) -> tuple[List[str], List[str], Dict[str, str]]:
             else "brief mentions research/competitor/market"
         )
 
-    needs_arch = _mentions_any(
+    # Architect: include for any software build OR for briefs that
+    # explicitly mention architecture/system concepts.
+    needs_software_build = _should_force_code_agent(brief)
+    needs_arch = needs_software_build or _mentions_any(
         b,
         _SOFTWARE_ARCHITECTURE_KEYWORDS,
     )
     if needs_arch:
         chosen.append("ArchitectAgent")
         arts.append("architecture.md")
-        why["ArchitectAgent"] = "brief implies a software/system component"
+        why["ArchitectAgent"] = (
+            "every software build needs a design doc before code"
+            if needs_software_build
+            else "brief implies a software/system component"
+        )
 
-    needs_design = _mentions_any(
+    # Designer: include for any UI-bearing software build OR explicit
+    # visual/brand cues. A "build a habit tracker" brief without "design"
+    # in it still ships UI, so it needs a brand/palette/typography pass
+    # — otherwise CodeAgent generates raw HTML with no design system.
+    needs_design = needs_software_build or _mentions_any(
         b,
         [
             "design",
@@ -296,10 +310,6 @@ def _heuristic_plan(brief: str) -> tuple[List[str], List[str], Dict[str, str]]:
             "landing",
         ],
     )
-    # Keep designer for software-build briefs even when style cues are
-    # present in the brief. Without a design stage, code generation tends
-    # to satisfy "works" while regressing visual polish and UX states.
-    needs_software_build = _should_force_code_agent(brief)
     design_already_specified = _mentions_any(
         b, ["tailwind", "shadcn", "chakra", "material ui", "material-ui",
             "mui", "ant design", "bootstrap", "tokens.css", "design tokens"]
@@ -480,6 +490,17 @@ def _should_force_code_agent(brief: str) -> bool:
     # Hard "I want docs, only docs" signal — short brief leading with
     # write/draft/produce <docs-noun>. Don't force code in that case.
     if _PURE_DOCS_INTENT_PATTERN.search(text):
+        return False
+    # Explicit non-software domain words override every code-build signal
+    # below — "build a launch campaign", "build a marketing plan" are NOT
+    # code builds even though they start with "build a".
+    _NON_SOFTWARE_OBJECTS = re.compile(
+        r"\b(?:campaign|marketing\s+plan|launch\s+plan|gtm|strategy|"
+        r"playbook|deck|pitch|proposal|roadmap\s+document|case\s+study|"
+        r"copy(?:writing)?|content\s+plan|brand\s+strategy)\b",
+        re.IGNORECASE,
+    )
+    if _NON_SOFTWARE_OBJECTS.search(text):
         return False
     # Strongest signal: explicit code-build phrase ("build an app", "create
     # an API", etc). Keep this ahead of path checks so retry hints like

@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
@@ -197,8 +198,29 @@ class DesignerAgent(BaseAgent):
         except Exception as e:
             return TaskResult(task_id=task.task_id, success=False, error=f"artifact_dir error: {e}")
 
-        # Palette: LLM-first, hash-keyed table fallback.
-        palette_json = await self._pick_palette(brief, mood)
+        # Design references from photos the user attached via Telegram.
+        # If present, these override the default mood/palette inference —
+        # the user has already shown us what they want.
+        attached_refs = self._load_attached_references(artifact_dir)
+        if attached_refs:
+            forced_mood = self._mood_from_references(attached_refs)
+            if forced_mood:
+                mood = forced_mood
+                await self.think(
+                    f"design_references.md present — using mood='{mood}' from attached photo(s)"
+                )
+
+        # Palette: LLM-first, hash-keyed table fallback. If we have an
+        # attached reference with concrete hex codes, those win over the
+        # LLM's pick.
+        palette_json = None
+        if attached_refs:
+            ref_palette = self._palette_from_references(attached_refs)
+            if ref_palette:
+                palette_json = ref_palette
+                await self.think("using palette from attached design reference(s)")
+        if palette_json is None:
+            palette_json = await self._pick_palette(brief, mood)
         await self.think(f"selected palette for mood='{mood}'")
         fonts = _FONTS_BY_MOOD.get(mood, _FONTS_BY_MOOD["minimal"])
         voice = _VOICE_BY_MOOD.get(mood, _VOICE_BY_MOOD["minimal"])
@@ -277,6 +299,22 @@ class DesignerAgent(BaseAgent):
         components_path = artifact_dir / "components.md"
         components_path.write_text(components_md, encoding="utf-8")
         await self.think(f"wrote {components_path.name}")
+
+        # Structured component file plan — gives CodeAgent a list of
+        # small component files to generate ONE AT A TIME instead of
+        # cramming the whole app into App.jsx. Best-effort: a failure
+        # here just means CodeAgent keeps using its existing stack
+        # template plan (a smaller set of files).
+        try:
+            plan = await self._render_component_file_plan(brief, mood, target, palette_json)
+            if plan and plan.get("files"):
+                plan_path = artifact_dir / "component_file_plan.json"
+                plan_path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
+                await self.think(
+                    f"wrote component_file_plan.json with {len(plan['files'])} component(s)"
+                )
+        except Exception:
+            logger.exception("component_file_plan generation failed (non-fatal)")
 
         # ── Usable code deliverables ────────────────────────────────────
         # Markdown docs are good but not droppable into a project. Generate
@@ -493,8 +531,129 @@ class DesignerAgent(BaseAgent):
                     return mood
         return "minimal"
 
+    # ------------------------------------------------------------------
+    # Design references (user-attached photos)
+    # ------------------------------------------------------------------
+
+    def _load_attached_references(self, artifact_dir: Path) -> list:
+        """Read ``<artifact_dir>/design_references.md`` and resolve back
+        to the source DesignReference objects via the persistent cache.
+        Returns a list of ``DesignReference`` objects (possibly empty).
+        """
+        try:
+            from skyn3t.agents.design_vision import load_by_sha
+            from skyn3t.integrations.telegram_photos import _load_library
+        except Exception:  # noqa: BLE001
+            return []
+        refs_md = artifact_dir / "design_references.md"
+        if not refs_md.exists():
+            return []
+        try:
+            content = refs_md.read_text(encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            return []
+        # Extract reference IDs from "## Reference `<id>`" lines.
+        import re as _re
+        ids = _re.findall(r"## Reference `([^`]+)`", content)
+        if not ids:
+            return []
+        library = _load_library()
+        out: list = []
+        for ref_id in ids:
+            entry = library.get(ref_id)
+            if entry is None:
+                continue
+            extraction = load_by_sha(entry.sha)
+            if extraction is not None:
+                out.append(extraction)
+        return out
+
+    def _mood_from_references(self, references: list) -> str:
+        """Derive a designer mood label from the extracted reference
+        mood adjectives. We use simple keyword overlap against the
+        existing ``_MOOD_KEYWORDS`` table — whatever mood has the most
+        matching adjectives wins. Falls back to ``""`` (no override) if
+        nothing matches."""
+        if not references:
+            return ""
+        adjectives: list[str] = []
+        for ref in references:
+            adjectives.extend(getattr(ref, "mood", []) or [])
+            adjectives.extend(getattr(ref, "notable_elements", []) or [])
+        if not adjectives:
+            return ""
+        adj_text = " ".join(adjectives).lower()
+        best = ("", 0)
+        for mood, keywords in _MOOD_KEYWORDS:
+            score = sum(1 for kw in keywords if kw in adj_text)
+            if score > best[1]:
+                best = (mood, score)
+        return best[0]
+
+    def _palette_from_references(self, references: list) -> Optional[Dict[str, str]]:
+        """Build a palette dict from the first reference that has a
+        usable palette. The DesignerAgent's downstream code expects
+        keys (primary, secondary, accent, bg, text) — NOT the vision
+        extractor's natural shape (bg, surface, accent, text, muted).
+        We map between them: bg→bg, accent→accent (also doubles as
+        primary), text→text. Surface and muted are absorbed as
+        secondary. Returns None if the reference can't satisfy the
+        minimum required keys."""
+        for ref in references:
+            palette_entries = getattr(ref, "palette", []) or []
+            if not palette_entries:
+                continue
+            by_role: Dict[str, str] = {}
+            for entry in palette_entries:
+                role = (getattr(entry, "role", "") or "").lower()
+                hex_code = getattr(entry, "hex", "") or ""
+                if not hex_code.startswith("#") or len(hex_code) not in (4, 7):
+                    continue
+                if role and role not in by_role:
+                    by_role[role] = hex_code
+
+            # Backfill any missing required roles from unused entries.
+            unused = [
+                hex_val
+                for e in palette_entries
+                for hex_val in [getattr(e, "hex", "")]
+                if (getattr(e, "role", "") or "").lower() not in by_role
+                and hex_val
+            ]
+            for needed in ("bg", "accent", "text", "surface", "muted"):
+                if needed not in by_role and unused:
+                    by_role[needed] = unused.pop(0)
+
+            if not all(role in by_role for role in ("bg", "accent", "text")):
+                continue  # try next reference
+
+            # Map vision-shape → designer-shape. primary defaults to
+            # accent (it's the brand color CTAs use); secondary uses
+            # surface or muted if available so the gradient/hover
+            # branches in brand.md have something distinct to render.
+            accent = by_role["accent"]
+            return {
+                "primary":   accent,
+                "secondary": by_role.get("surface") or by_role.get("muted") or accent,
+                "accent":    accent,
+                "bg":        by_role["bg"],
+                "text":      by_role["text"],
+            }
+        return None
+
     async def _pick_palette(self, brief: str, mood: str) -> Dict[str, str]:
-        """LLM-first palette picker. Falls back to hashed curated table."""
+        """Palette picker with three tiers:
+
+        1. **OpenRouter (Owl Alpha)** — free, fast, fresh inference per
+           project. Picks colors from the brief, not from memorized
+           tables. This is the new primary path — fixes the bug where
+           every habit/finance/notes project shipped the same warm
+           amber palette regardless of context.
+        2. **Agent CLI** — original path. Uses whatever backend the
+           agent was configured with. Often hangs.
+        3. **Deterministic hashed table** — pre-curated 5-color sets
+           keyed by `(brief, mood)`. Same fallback as before.
+        """
         fallback_palette = self._fallback_palette(brief, mood)
         fallback_json = json.dumps({
             "primary": fallback_palette[0],
@@ -504,6 +663,15 @@ class DesignerAgent(BaseAgent):
             "text": fallback_palette[4],
         })
 
+        # Tier 1: OpenRouter palette inference.
+        or_palette = await self._pick_palette_openrouter(brief, mood)
+        if or_palette is not None:
+            await self.think(
+                f"palette inferred via OpenRouter Owl Alpha for mood='{mood}'"
+            )
+            return or_palette
+
+        # Tier 2: existing agent-CLI path (LLM-first via configured backend).
         role = (
             "You are a brand designer. Given the user's brief, infer the "
             "aesthetic intent (cyberpunk HUD, minimal SaaS, warm/organic, "
@@ -525,7 +693,7 @@ class DesignerAgent(BaseAgent):
         if parsed is not None:
             return parsed
 
-        # If parse failed, fall back to deterministic table.
+        # Tier 3: deterministic hashed table.
         return {
             "primary": fallback_palette[0],
             "secondary": fallback_palette[1],
@@ -533,6 +701,74 @@ class DesignerAgent(BaseAgent):
             "bg": fallback_palette[3],
             "text": fallback_palette[4],
         }
+
+    async def _pick_palette_openrouter(
+        self, brief: str, mood: str,
+    ) -> Optional[Dict[str, str]]:
+        """OpenRouter-driven palette inference. Returns ``None`` on any
+        failure so the caller can fall through to the next tier."""
+        import os as _os
+        api_key = _os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            try:
+                from skyn3t.config.settings import get_settings
+                api_key = getattr(get_settings(), "openrouter_api_key", None)
+                if api_key:
+                    _os.environ.setdefault("OPENROUTER_API_KEY", api_key)
+            except Exception:  # noqa: BLE001
+                api_key = None
+        if not api_key:
+            return None
+
+        prompt = (
+            f"BRIEF FROM USER: {brief.strip()[:600]}\n\n"
+            f"Mood hint (rough): {mood}\n\n"
+            "Pick a 5-color palette that fits the brief's product domain "
+            "and emotional tone. Habit trackers, finance apps, and todo "
+            "apps each have distinct conventions — match the convention.\n\n"
+            "Return ONLY this JSON shape, no commentary, no fences:\n"
+            "{\n"
+            '  "primary":   "#RRGGBB",\n'
+            '  "secondary": "#RRGGBB",\n'
+            '  "accent":    "#RRGGBB",\n'
+            '  "bg":        "#RRGGBB",\n'
+            '  "text":      "#RRGGBB"\n'
+            "}\n\n"
+            "Rules:\n"
+            "- bg + text must have 4.5:1 contrast minimum.\n"
+            "- accent should pop against bg but not overwhelm text.\n"
+            "- secondary should harmonize with primary (analogous or muted variant).\n"
+            "- AVOID generic 'warm amber on graphite' unless the brief specifically "
+            "calls for that aesthetic — pick a fresh palette per project."
+        )
+        try:
+            from skyn3t.adapters import LLMClient
+            client = LLMClient(
+                default_model="openrouter/owl-alpha",
+                backend="openrouter",
+                event_bus=self.event_bus,
+                caller_name=self.name,
+            )
+            try:
+                raw = await client.complete(
+                    prompt,
+                    system=(
+                        "You are a senior brand designer. Read the brief, "
+                        "match the convention, output strict JSON only."
+                    ),
+                    max_tokens=300,
+                    temperature=0.4,
+                    timeout=30.0,
+                )
+            finally:
+                try:
+                    await client.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            logger.debug("openrouter palette inference failed", exc_info=True)
+            return None
+        return self._parse_palette_json(raw)
 
     def _fallback_palette(self, brief: str, mood: str) -> Tuple[str, str, str, str, str]:
         rows = _PALETTES.get(mood, _PALETTES["minimal"])
@@ -762,6 +998,173 @@ class DesignerAgent(BaseAgent):
             fallback=fallback,
             max_tokens=3500,
         )
+
+    async def _render_component_file_plan(
+        self,
+        brief: str,
+        mood: str,
+        target: str,
+        palette: Dict[str, str],
+    ) -> Optional[Dict[str, Any]]:
+        """Produce a structured component file plan.
+
+        CodeAgent's per-file generation produces better output when
+        each call has a small, focused scope. The default stack
+        template plan for ``react_vite`` only lists App.jsx — which
+        means the LLM has to fit every component, hook, and util into
+        one ~5KB file. Breaking that into 4-6 named component files
+        (HabitCard.jsx, StreakBadge.jsx, AddHabitForm.jsx, ...) lets
+        each generation be 1-2KB instead of 5-8KB. Smaller calls
+        succeed where huge ones time out.
+
+        Returns a dict like::
+
+            {"files": [
+                {"path": "src/components/HabitCard.jsx",
+                 "purpose": "Single habit card with streak badge",
+                 "props": ["habit", "onCheckIn"]},
+                ...
+            ]}
+
+        or ``None`` if generation failed.
+        """
+        # Only emit a plan when the target is a UI build — backend-only
+        # / docs builds don't need component breakdowns.
+        target_norm = (target or "").lower()
+        if target_norm not in ("saas", "site", "app", "spa", "dashboard", ""):
+            return None
+
+        import os as _os_plan
+        api_key = _os_plan.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            try:
+                from skyn3t.config.settings import get_settings
+                api_key = getattr(get_settings(), "openrouter_api_key", None)
+                if api_key:
+                    _os_plan.environ.setdefault("OPENROUTER_API_KEY", api_key)
+            except Exception:  # noqa: BLE001
+                api_key = None
+        if not api_key:
+            return None
+
+        prompt = (
+            f"BRIEF: {(brief or '').strip()[:800]}\n"
+            f"Inferred mood: {mood}\n"
+            f"Target: {target}\n\n"
+            "Break this product into 4-8 small React components. For each, "
+            "give: path (under src/components/), purpose (one sentence), "
+            "and props (list of prop names, NOT types).\n\n"
+            "Rules:\n"
+            "- App.jsx is the shell — DON'T include it in the list. It "
+            "  composes the components you list.\n"
+            "- Each component does ONE thing. If it would be larger than "
+            "  ~80 lines of JSX, break it further.\n"
+            "- Use specific names tied to the product domain "
+            "  (e.g. 'HabitCard' not 'Card', 'StreakBadge' not 'Badge').\n"
+            "- Use src/components/<Name>.jsx paths (PascalCase filenames).\n"
+            "- Include hooks if logic is reused (src/hooks/<useFoo>.js).\n\n"
+            "Return STRICT JSON, no commentary, no fences:\n"
+            "{\n"
+            '  "files": [\n'
+            '    {"path": "src/components/HabitCard.jsx", "purpose": "...", "props": ["habit", "onCheckIn"]}\n'
+            "  ]\n"
+            "}"
+        )
+
+        try:
+            from skyn3t.adapters import LLMClient
+            client = LLMClient(
+                default_model="openrouter/owl-alpha",
+                backend="openrouter",
+                event_bus=self.event_bus,
+                caller_name=self.name,
+            )
+            try:
+                raw = await client.complete(
+                    prompt,
+                    system=(
+                        "You are a React UI architect. Output strict JSON "
+                        "only — no preamble, no fences."
+                    ),
+                    max_tokens=900,
+                    temperature=0.3,
+                    timeout=45.0,
+                )
+            finally:
+                try:
+                    await client.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            logger.debug("component file plan generation failed", exc_info=True)
+            return None
+
+        # Tolerate code fences if the model added them.
+        body = (raw or "").strip()
+        if body.startswith("```"):
+            body = body.strip("`")
+            if body.startswith("json"):
+                body = body[4:]
+            body = body.strip()
+            if body.endswith("```"):
+                body = body[:-3].strip()
+        # Find the first { and last } in case there's lingering prose.
+        start = body.find("{")
+        end = body.rfind("}")
+        if start >= 0 and end > start:
+            body = body[start : end + 1]
+
+        try:
+            parsed = json.loads(body)
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        files = parsed.get("files")
+        if not isinstance(files, list) or not files:
+            return None
+
+        # Validate + normalize entries. Reject anything that doesn't
+        # have a sensible path/purpose pair. Drop dupes.
+        seen_paths: set = set()
+        cleaned: List[Dict[str, Any]] = []
+        for entry in files:
+            if not isinstance(entry, dict):
+                continue
+            path = str(entry.get("path") or "").strip().lstrip("/")
+            purpose = str(entry.get("purpose") or "").strip()
+            if not path or not purpose:
+                continue
+            # Reject paths that try to escape src/ — keep it scoped.
+            if not (
+                path.startswith("src/components/")
+                or path.startswith("src/hooks/")
+                or path.startswith("src/lib/")
+                or path.startswith("src/utils/")
+            ):
+                continue
+            # Reject filename extensions outside our generator scope.
+            if not path.endswith((".jsx", ".tsx", ".js", ".ts")):
+                continue
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            props = entry.get("props") or []
+            if isinstance(props, list):
+                props_clean = [str(p).strip() for p in props if str(p).strip()]
+            else:
+                props_clean = []
+            cleaned.append({
+                "path": path,
+                "purpose": purpose,
+                "props": props_clean,
+            })
+            if len(cleaned) >= 8:
+                break
+
+        if not cleaned:
+            return None
+        return {"files": cleaned}
 
     def _render_components_md_fallback(self, target: str, palette: Dict[str, str]) -> str:
         primary = palette["primary"]

@@ -466,7 +466,12 @@ def test_generic_serviceboard_brief_uses_deterministic_dashboard_generators():
     from skyn3t.agents.stack_templates import manifest_for
 
     brief = (
-        "Build a polished dark-mode service dashboard with a premium glassmorphism feel. "
+        # Explicit homelab framing — the deterministic generators should
+        # fire here. The previous version used the bare phrase "service
+        # dashboard" which is too generic; that wording is now the
+        # source of homelab-bias bugs in Excel/finance/notes briefs and
+        # is intentionally NOT in the homelab-trigger set anymore.
+        "Build a polished dark-mode homelab dashboard with a premium glassmorphism feel. "
         "Scope it to 6-8 integrations and a simple builder/settings flow. "
         "The app must include a real persistent backend config store from the first boot, "
         "server-side CRUD for integrations, a health endpoint, and a UI that saves and "
