@@ -8,6 +8,26 @@ from skyn3t.config.settings import get_settings
 _logger = logging.getLogger("skyn3t.rag.vector_store")
 
 
+def _sanitize_metadata(meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    # Chroma only accepts str | int | float | bool as metadata values.
+    # Anything else (None, dict, list, Path, etc.) is coerced to str so an
+    # ingest doesn't crash the whole pipeline on one stray field.
+    if not meta:
+        return {}
+    out: Dict[str, Any] = {}
+    for k, v in meta.items():
+        if isinstance(v, (str, int, float, bool)):
+            out[str(k)] = v
+        elif v is None:
+            continue
+        else:
+            try:
+                out[str(k)] = str(v)
+            except Exception:
+                continue
+    return out
+
+
 class VectorStore:
     """Vector store for document embeddings and retrieval."""
 
@@ -97,6 +117,8 @@ class VectorStore:
 
         if metadatas is None:
             metadatas = [{} for _ in documents]
+        else:
+            metadatas = [_sanitize_metadata(m) for m in metadatas]
 
         collection = self._require_collection()
         collection.add(
