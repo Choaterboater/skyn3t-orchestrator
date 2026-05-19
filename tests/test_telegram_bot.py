@@ -8,13 +8,12 @@ user-id gating, and the reject-feedback follow-up flow.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, List
+from typing import List
 
 import pytest
 
 from skyn3t.integrations import telegram_bot as tg
 from skyn3t.integrations import telegram_dispatch as tgd
-
 
 # ---------------------------------------------------------------------------
 # Fakes

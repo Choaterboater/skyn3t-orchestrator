@@ -40,8 +40,8 @@ def _resolve_repo_file(target_file: Any) -> str:
 def install_handlers(orchestrator) -> None:
     """Register apply-handlers for kind='feature', 'ingest', and 'studio_debug'."""
     try:
-        from skyn3t.cortex import get_store  # local import to avoid circular dependency
         from skyn3t.core.agent import TaskRequest
+        from skyn3t.cortex import get_store  # local import to avoid circular dependency
     except Exception:
         logger.exception("cortex handler dependencies unavailable")
         return

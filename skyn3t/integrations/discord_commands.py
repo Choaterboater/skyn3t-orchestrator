@@ -21,12 +21,12 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import httpx
 
 from skyn3t.config.settings import get_settings
-from skyn3t.integrations.discord_intent import Intent, parse as parse_intent
+from skyn3t.integrations.discord_intent import parse as parse_intent
 
 logger = logging.getLogger(__name__)
 
@@ -86,8 +86,8 @@ def verify_signature(public_key_hex: str, signature: str, timestamp: str, body: 
     if not public_key_hex or not signature or not timestamp:
         return False
     try:
-        from nacl.signing import VerifyKey
         from nacl.exceptions import BadSignatureError
+        from nacl.signing import VerifyKey
         verify_key = VerifyKey(bytes.fromhex(public_key_hex))
         verify_key.verify(timestamp.encode("utf-8") + body, bytes.fromhex(signature))
         return True

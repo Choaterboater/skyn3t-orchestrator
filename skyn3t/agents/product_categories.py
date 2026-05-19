@@ -28,8 +28,11 @@ Why this is the right shape:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
+
+logger = logging.getLogger(__name__)
 
 _SPARSE_EXPANSION_MARKER = "## Auto-expanded product baseline"
 
@@ -367,6 +370,7 @@ Do not include the verbatim brief. Do not add commentary. Do not wrap output in 
 
     try:
         import asyncio
+
         from skyn3t.adapters import LLMClient
 
         async def _run() -> str:
@@ -391,7 +395,9 @@ Do not include the verbatim brief. Do not add commentary. Do not wrap output in 
 
         # Run synchronously — this function is called from a sync code path.
         try:
-            loop = asyncio.get_running_loop()
+            # Probe for a running loop. We don't need the loop object, just
+            # the RuntimeError it raises when there isn't one.
+            asyncio.get_running_loop()
             # Already inside an async context — run the coro in a thread
             # so we don't deadlock on the existing loop.
             import concurrent.futures

@@ -17,12 +17,11 @@ No coupling to the runner's stage machinery.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 logger = logging.getLogger(__name__)
 
@@ -295,7 +294,10 @@ async def _try_fix_one(
         # Strip any opening/closing fences the model may have added despite
         # the instruction.
         from skyn3t.agents.code_agent import (
-            _strip_cli_prelude, _strip_fences, _strip_copilot_footer, _syntax_ok,
+            _strip_cli_prelude,
+            _strip_copilot_footer,
+            _strip_fences,
+            _syntax_ok,
         )
         body = _strip_cli_prelude(body, candidate.file_path)
         body = _strip_fences(body)

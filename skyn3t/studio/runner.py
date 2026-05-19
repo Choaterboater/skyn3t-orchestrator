@@ -1796,6 +1796,8 @@ class StudioRunner:
                 try:
                     from skyn3t.studio.approval_gate import (
                         load_gate_config as _load_gate_cfg,
+                    )
+                    from skyn3t.studio.approval_gate import (
                         should_gate as _should_gate,
                     )
                     from skyn3t.studio.notify_dispatcher import dispatch as _notify_dispatch
@@ -1866,7 +1868,9 @@ class StudioRunner:
                             # subsequent stage / approval / completion
                             # updates reply to the same chat thread.
                             try:
-                                from skyn3t.integrations.telegram_dispatch import dispatch_approval as _tg_dispatch
+                                from skyn3t.integrations.telegram_dispatch import (
+                                    dispatch_approval as _tg_dispatch,
+                                )
                                 _tg_result = await _tg_dispatch(
                                     slug, stage.agent, _dashboard_url, artifact_dir=artifact_dir,
                                 )
@@ -3728,8 +3732,8 @@ class StudioRunner:
         if not scaffold_dir.exists():
             return
         from skyn3t.agents.consistency_engine import (
-            check_consistency,
             auto_fix_cross_artifact_drift,
+            check_consistency,
         )
 
         # Auto-fix cross-artifact drift BEFORE running consistency check.

@@ -2637,6 +2637,7 @@ class CodeAgent(BaseAgent):
              minimal placeholder so the build at least succeeds.
         """
         from pathlib import Path as _Path
+
         from skyn3t.agents.stack_templates import manifest_for
 
         out_dir = _Path(out_dir).resolve()
@@ -2767,15 +2768,15 @@ class CodeAgent(BaseAgent):
             )
         if ext in ("ts", "tsx"):
             return (
-                f"// @skyn3t-backfill-stub: for missing import.\n"
-                f"export default {{}};\n"
+                "// @skyn3t-backfill-stub: for missing import.\n"
+                "export default {};\n"
             )
         if ext in ("css", "scss"):
             return f"/* @skyn3t-backfill-stub: for missing import ({rel_path}) */\n"
         # js / mjs / cjs / fallback
         return (
-            f"// @skyn3t-backfill-stub: for missing import.\n"
-            f"export default {{}};\n"
+            "// @skyn3t-backfill-stub: for missing import.\n"
+            "export default {};\n"
         )
 
     # Packages we WILL strip from a package.json if no source file imports
@@ -2803,9 +2804,9 @@ class CodeAgent(BaseAgent):
         dependencies/devDependencies. Leaves package-lock.json
         untouched — operator can run `npm install` again to reconcile.
         """
-        from pathlib import Path as _Path
         import json as _json
         import re as _RE
+        from pathlib import Path as _Path
         out_dir = _Path(out_dir).resolve()
 
         # Build the source body once (skipping node_modules / dist etc.)

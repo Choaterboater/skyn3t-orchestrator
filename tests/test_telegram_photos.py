@@ -14,16 +14,12 @@ mocked — these tests run offline.
 
 from __future__ import annotations
 
-import asyncio
 import json
-from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
-from skyn3t.integrations import telegram_photos as photos
 from skyn3t.agents.design_vision import DesignReference, PaletteEntry
-
+from skyn3t.integrations import telegram_photos as photos
 
 # ---------------------------------------------------------------------------
 # Per-test isolation: redirect data dir to a tmp_path
