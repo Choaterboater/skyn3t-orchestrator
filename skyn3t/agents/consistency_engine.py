@@ -107,7 +107,14 @@ _ORGANIC_STUB_PATTERNS = (
     re.compile(r"(?im)^\s*(//|#|/\*)\s*(TODO|FIXME)\b"),
     re.compile(r"""(?i)throw\s+new\s+Error\s*\(\s*['"][^'"]*not\s+implemented"""),
     re.compile(r"(?i)raise\s+NotImplementedError\b"),
-    re.compile(r"(?im)^\s*(//|#)\s*replace with real implementation\b"),
+    # "replace with real implementation" anywhere in a line comment.
+    # Previously this required the phrase to follow the comment delimiter
+    # directly; e79bc0 shipped `// Auto-generated placeholder — replace
+    # with real implementation.` which had a prefix and slipped past.
+    re.compile(r"(?im)^\s*(//|#).*?\breplace\s+with\s+real\s+implementation\b"),
+    # "auto-generated placeholder" anywhere in a line comment — common
+    # shape for scaffolding cruft that escaped per-file LLM writes.
+    re.compile(r"(?im)^\s*(//|#).*?\bauto-?generated\s+placeholder\b"),
 )
 
 
