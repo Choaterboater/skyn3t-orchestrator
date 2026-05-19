@@ -84,11 +84,19 @@ def _help_text() -> str:
 
 
 def _format_status(proj: dict) -> str:
-    slug = proj.get("slug") or "?"
-    status = proj.get("status") or "?"
-    stage = proj.get("current_stage") or proj.get("next_action") or ""
+    # Escape user-supplied fields before splicing into Markdown — an
+    # unescaped `*` / `_` / backtick in slug or stage returns 400 from
+    # the Bot API and the retry path drops formatting for the whole
+    # message. See dispatch.escape_markdown for the contract.
+    slug = dispatch.escape_markdown(proj.get("slug") or "?")
+    status = dispatch.escape_markdown(proj.get("status") or "?")
+    stage = dispatch.escape_markdown(
+        proj.get("current_stage") or proj.get("next_action") or ""
+    )
     score = (proj.get("quality_summary") or {}).get("score")
-    verdict = (proj.get("quality_summary") or {}).get("verdict")
+    verdict = dispatch.escape_markdown(
+        (proj.get("quality_summary") or {}).get("verdict") or ""
+    )
     lines = [f"*{slug}* — `{status}`"]
     if stage:
         lines.append(f"Stage: {stage}")
@@ -111,8 +119,8 @@ def _format_project_list(projects: list) -> str:
     recent = sorted(projects, key=sort_key, reverse=True)[:10]
     lines = ["*Recent projects:*"]
     for p in recent:
-        slug = p.get("slug") or "?"
-        status = p.get("status") or "?"
+        slug = dispatch.escape_markdown(p.get("slug") or "?")
+        status = dispatch.escape_markdown(p.get("status") or "?")
         lines.append(f"• `{slug}` — {status}")
     return "\n".join(lines)
 
