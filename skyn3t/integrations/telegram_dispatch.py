@@ -295,7 +295,8 @@ async def _telegram_post(token: str, method: str, payload: dict) -> Optional[dic
             if not data.get("ok"):
                 logger.warning("telegram %s returned not-ok: %s", method, data)
                 return None
-            return data.get("result")
+            result = data.get("result")
+            return result if isinstance(result, dict) else None
     except Exception:  # noqa: BLE001
         logger.warning("telegram %s failed", method, exc_info=True)
         return None

@@ -310,27 +310,27 @@ class TelegramBot:
             await self._do_start(chat_id, brief, intent.slug)
             return
         if intent.action == "status":
-            slug = intent.slug or _most_recent_slug(self.studio_runner)
-            await self._do_status(chat_id, slug)
+            status_slug: Optional[str] = intent.slug or _most_recent_slug(self.studio_runner)
+            await self._do_status(chat_id, status_slug)
             return
         if intent.action == "approve":
-            slug = intent.slug or _most_recent_awaiting_slug(self.studio_runner)
-            if not slug:
+            approve_slug = intent.slug or _most_recent_awaiting_slug(self.studio_runner)
+            if not approve_slug:
                 await self._reply(chat_id, "No project is awaiting approval right now.")
                 return
-            await self._do_approve(chat_id, slug)
+            await self._do_approve(chat_id, approve_slug)
             return
         if intent.action == "reject":
-            slug = intent.slug or _most_recent_awaiting_slug(self.studio_runner)
+            reject_slug = intent.slug or _most_recent_awaiting_slug(self.studio_runner)
             feedback = (intent.feedback or "").strip()
-            if not slug:
+            if not reject_slug:
                 await self._reply(chat_id, "No project is awaiting approval right now.")
                 return
             if not feedback:
-                await self._reply(chat_id, f"Reply with feedback for `{slug}` and I'll send it back to the architect.")
-                self._pending_reject_slugs[user_key] = slug
+                await self._reply(chat_id, f"Reply with feedback for `{reject_slug}` and I'll send it back to the architect.")
+                self._pending_reject_slugs[user_key] = reject_slug
                 return
-            await self._do_reject(chat_id, slug, feedback)
+            await self._do_reject(chat_id, reject_slug, feedback)
             return
 
         # Unknown — show help.

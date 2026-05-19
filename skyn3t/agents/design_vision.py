@@ -264,7 +264,8 @@ async def _try_claude_cli(image_path: Path) -> Optional[dict]:
         return None
     raw = _strip_json_fences(out)
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
     except Exception:  # noqa: BLE001
         logger.warning("claude CLI returned non-JSON for %s: %s", image_path.name, out[:200])
         return None
@@ -289,7 +290,8 @@ async def _try_copilot_cli(image_path: Path) -> Optional[dict]:
         return None
     raw = _strip_json_fences(out)
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
     except Exception:  # noqa: BLE001
         logger.warning("copilot CLI returned non-JSON for %s: %s", image_path.name, out[:200])
         return None
@@ -309,7 +311,8 @@ async def _try_kimi_cli(image_path: Path) -> Optional[dict]:
         return None
     raw = _strip_json_fences(out)
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
     except Exception:  # noqa: BLE001
         logger.warning("kimi CLI returned non-JSON for %s: %s", image_path.name, out[:200])
         return None

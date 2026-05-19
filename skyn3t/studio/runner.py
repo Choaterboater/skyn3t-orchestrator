@@ -1953,7 +1953,7 @@ class StudioRunner:
                     build_result = None
                 if build_result is not None:
                     manifest["build_verification"] = build_result
-                    verdict = build_result.get("verdict")
+                    verdict = str(build_result.get("verdict") or "")
                     if not skip_fix_loops:
                         FIX_ATTEMPTS = 2
                         attempt = 0
@@ -1976,7 +1976,7 @@ class StudioRunner:
                                 logger.exception("re-verify after fix failed")
                                 break
                             manifest["build_verification"] = build_result
-                            verdict = build_result.get("verdict")
+                            verdict = str(build_result.get("verdict") or "")
                             manifest.setdefault("build_fix_attempts", []).append({
                                 "attempt": attempt,
                                 "verdict": verdict,
@@ -1987,7 +1987,7 @@ class StudioRunner:
                             # re-verify tells us whether it worked.
                             pending_build = getattr(self, "_pending_build_fix", None)
                             if pending_build:
-                                self._pending_build_fix = None
+                                self._pending_build_fix: Optional[Dict[str, Any]] = None
                                 prior_sig = pending_build.get("error_signature") or ""
                                 if prior_sig:
                                     try:

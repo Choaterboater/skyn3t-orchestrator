@@ -1843,7 +1843,11 @@ def manifest_for(
     try:
         sig = inspect.signature(gen)
         if "palette_hexes" in sig.parameters:
-            return gen(brief or "", palette_hexes=palette_hexes)
+            # mypy can't follow the inspect-based signature check; cast to
+            # an Any-typed callable so the palette-aware kwarg goes through.
+            from typing import Any, cast
+            result = cast(Any, gen)(brief or "", palette_hexes=palette_hexes)
+            return cast(Optional[str], result)
     except (TypeError, ValueError):
         pass
     return gen(brief or "")

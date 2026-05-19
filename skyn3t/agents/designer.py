@@ -576,7 +576,7 @@ class DesignerAgent(BaseAgent):
         nothing matches."""
         if not references:
             return ""
-        adjectives = []
+        adjectives: list[str] = []
         for ref in references:
             adjectives.extend(getattr(ref, "mood", []) or [])
             adjectives.extend(getattr(ref, "notable_elements", []) or [])
@@ -614,10 +614,11 @@ class DesignerAgent(BaseAgent):
 
             # Backfill any missing required roles from unused entries.
             unused = [
-                getattr(e, "hex", "")
+                hex_val
                 for e in palette_entries
+                for hex_val in [getattr(e, "hex", "")]
                 if (getattr(e, "role", "") or "").lower() not in by_role
-                and getattr(e, "hex", "")
+                and hex_val
             ]
             for needed in ("bg", "accent", "text", "surface", "muted"):
                 if needed not in by_role and unused:
