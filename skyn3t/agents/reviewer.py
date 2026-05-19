@@ -40,6 +40,7 @@ _LLM_CRITIQUE_TIMEOUT_SECONDS = 90.0
 
 
 def _llm_bucket_ceiling(score: int) -> int:
+    """Keep blended scores inside the verdict bucket implied by the LLM."""
     if score < 50:
         return 49
     if score < 75:

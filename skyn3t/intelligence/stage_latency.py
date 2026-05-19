@@ -24,14 +24,6 @@ from typing import Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
-def _coerce_optional_float(value: object) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float, str)):
-        return float(value)
-    return None
-
-
 @dataclass
 class StageLatencyStats:
     """Aggregate stats for one stage across many runs.
@@ -82,8 +74,12 @@ class StageLatencyStats:
             stage=str(data.get("stage") or ""),
             count=int(data.get("count") or 0),
             total_seconds=float(data.get("total_seconds") or 0.0),
-            min_seconds=_coerce_optional_float(data.get("min_seconds")),
-            max_seconds=_coerce_optional_float(data.get("max_seconds")),
+            min_seconds=(
+                float(data["min_seconds"]) if data.get("min_seconds") is not None else None
+            ),
+            max_seconds=(
+                float(data["max_seconds"]) if data.get("max_seconds") is not None else None
+            ),
             last_seconds=float(data.get("last_seconds") or 0.0),
             last_updated_at=float(data.get("last_updated_at") or 0.0),
             recent=[float(x) for x in (data.get("recent") or []) if isinstance(x, (int, float))],

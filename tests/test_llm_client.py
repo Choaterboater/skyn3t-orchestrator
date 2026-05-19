@@ -9,6 +9,7 @@ from skyn3t.adapters.llm_client import (
     LLMClient,
     _append_sandbox_artifacts,
     _collect_sandbox_artifacts,
+    _drop_cross_provider_model_name,
 )
 from skyn3t.core.events import EventBus, EventType
 
@@ -234,6 +235,60 @@ async def test_llm_complete_timeout_retries_next_backend_once(monkeypatch):
     result = await client.complete("hello", timeout=0.05)
 
     assert result == "fallback backend response"
+
+
+@pytest.mark.parametrize(
+    ("default_model", "explicit_model", "expected_retry_model"),
+    [
+        ("openrouter/owl-alpha", None, None),
+        (None, "anthropic/claude-sonnet-4", None),
+        ("kimi-code/kimi-for-coding", None, "kimi-code/kimi-for-coding"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_llm_complete_failover_sanitizes_only_cross_provider_models(
+    monkeypatch, default_model, explicit_model, expected_retry_model
+):
+    seen_retry_models = []
+
+    class FailingBackend:
+        async def complete(self, req):  # noqa: ARG002
+            raise RuntimeError("primary backend rejected the request")
+
+    class SuccessBackend:
+        async def complete(self, req):
+            seen_retry_models.append(req.model)
+            return "fallback backend response"
+
+    async def fake_get_impl(self):
+        if "openrouter" in self._skip_backends:
+            self._backend_name = "copilot_cli"
+            return SuccessBackend()
+        self._backend_name = "openrouter"
+        return FailingBackend()
+
+    monkeypatch.setattr(LLMClient, "_get_impl", fake_get_impl)
+
+    client = LLMClient(backend="openrouter", default_model=default_model, caller_name="designer")
+    result = await client.complete("hello", model=explicit_model)
+
+    assert result == "fallback backend response"
+    assert seen_retry_models == [expected_retry_model]
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        (None, None),
+        ("openrouter/owl-alpha", None),
+        ("anthropic/claude-sonnet-4", None),
+        ("OpenRouter/Owl-Alpha", None),
+        ("kimi-code/kimi-for-coding", "kimi-code/kimi-for-coding"),
+        ("gpt-5.4", "gpt-5.4"),
+    ],
+)
+def test_drop_cross_provider_model_name(model, expected):
+    assert _drop_cross_provider_model_name(model) == expected
 
 
 def test_collect_sandbox_artifacts_harvests_new_files(tmp_path: Path):

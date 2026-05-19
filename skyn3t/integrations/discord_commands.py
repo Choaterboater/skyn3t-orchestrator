@@ -21,7 +21,7 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, cast
+from typing import Any, Dict, Optional
 
 import httpx
 
@@ -88,7 +88,6 @@ def verify_signature(public_key_hex: str, signature: str, timestamp: str, body: 
     try:
         from nacl.exceptions import BadSignatureError
         from nacl.signing import VerifyKey
-
         verify_key = VerifyKey(bytes.fromhex(public_key_hex))
         verify_key.verify(timestamp.encode("utf-8") + body, bytes.fromhex(signature))
         return True
@@ -359,33 +358,36 @@ async def handle_dm(text: str, user_id: str, runner: Any) -> str:
             return f"Couldn't start project: {exc}"
 
     if intent.action == "status":
-        status_slug = intent.slug or _most_recent_slug(runner)
-        if not status_slug:
+        slug_opt: Optional[str] = intent.slug or _most_recent_slug(runner)
+        if not slug_opt:
             return "No projects yet. Try: `start a todo app`."
-        proj = runner.get_project(status_slug) if hasattr(runner, "get_project") else None
+        slug = slug_opt
+        proj = runner.get_project(slug) if hasattr(runner, "get_project") else None
         if proj is None:
-            return f"Project `{status_slug}` not found."
+            return f"Project `{slug}` not found."
         return _format_status(proj)
 
     if intent.action == "approve":
-        approve_slug = intent.slug or _most_recent_awaiting_slug(runner)
-        if not approve_slug:
+        slug_opt = intent.slug or _most_recent_awaiting_slug(runner)
+        if not slug_opt:
             return "No project is awaiting approval right now."
+        slug = slug_opt
         try:
-            await _resume_project(runner, approve_slug, "approve", None, None, source_user=user_id)
-            return f"✅ Approved `{approve_slug}` — pipeline resuming."
+            await _resume_project(runner, slug, "approve", None, None, source_user=user_id)
+            return f"✅ Approved `{slug}` — pipeline resuming."
         except Exception as exc:  # noqa: BLE001
             logger.exception("DM approve failed")
             return f"Couldn't approve: {exc}"
 
     if intent.action == "reject":
-        reject_slug = intent.slug or _most_recent_awaiting_slug(runner)
-        if not reject_slug:
+        slug_opt = intent.slug or _most_recent_awaiting_slug(runner)
+        if not slug_opt:
             return "No project is awaiting approval right now."
+        slug = slug_opt
         feedback = intent.feedback or "Rejected via Discord without specific feedback."
         try:
-            await _resume_project(runner, reject_slug, "reject", None, feedback, source_user=user_id)
-            return f"❌ Rejected `{reject_slug}` — architect will re-run with your feedback."
+            await _resume_project(runner, slug, "reject", None, feedback, source_user=user_id)
+            return f"❌ Rejected `{slug}` — architect will re-run with your feedback."
         except Exception as exc:  # noqa: BLE001
             logger.exception("DM reject failed")
             return f"Couldn't reject: {exc}"
@@ -427,17 +429,17 @@ async def _resume_project(
     edited_md: Optional[str],
     feedback: Optional[str],
     source_user: str = "",
-) -> Dict[str, Any]:
+) -> dict:
     """Wraps StudioRunner.resume_after_approval. Tags approval history
     with the originating Discord user.
     """
     proj = runner.get_project(slug) if hasattr(runner, "get_project") else None
     if proj is None:
         raise FileNotFoundError(slug)
-    return cast(
-        Dict[str, Any],
-        await runner.resume_after_approval(slug, decision, edited_md=edited_md, feedback=feedback),
+    result: dict = await runner.resume_after_approval(
+        slug, decision, edited_md=edited_md, feedback=feedback
     )
+    return result
 
 
 def _most_recent_slug(runner: Any) -> Optional[str]:

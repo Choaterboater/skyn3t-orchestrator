@@ -493,7 +493,6 @@ def resolve_model_for_file(
     stack: Optional[str] = None,
     scoreboard: Any = None,
     event_bus: Any = None,
-    brief: Optional[str] = None,
 ) -> Tuple[str, Optional[str]]:
     """Pick (backend, model) for a SPECIFIC file inside the code stage.
 
@@ -515,43 +514,7 @@ def resolve_model_for_file(
     ``event_bus`` is optional; when supplied, demotion decisions are
     published as ``CORTEX_DECISION`` events so the Activity timeline
     can render them alongside other autonomous-system decisions.
-
-    When ``brief`` is supplied, the brief-driven project_type_router
-    (#135) is consulted FIRST. That router classifies the build as
-    UI_HEAVY / BACKEND / DATA_VIZ / GAME / DOCS / GENERIC and returns
-    a model ladder tuned to that work type. Its rungs are OpenRouter
-    model names (e.g. "openrouter/owl-alpha", "qwen/qwen3-coder")
-    and we route them via the openrouter backend. Without this hook,
-    project_type_router was dead code unreachable from the primary
-    code path.
     """
-    if brief:
-        try:
-            import os as _os
-            from skyn3t.core.project_type_router import (
-                ladder_for_file_and_brief,
-            )
-            # Only honor the brief-driven ladder when OpenRouter is
-            # actually usable — the ladder rungs are all OpenRouter
-            # models. If we have no key configured, fall through to
-            # the static (CLI-aware) routing below.
-            _or_key = _os.environ.get("OPENROUTER_API_KEY")
-            if not _or_key:
-                try:
-                    from skyn3t.config.settings import get_settings as _gs
-                    _or_key = getattr(_gs(), "openrouter_api_key", None)
-                except Exception:
-                    _or_key = None
-            ladder = ladder_for_file_and_brief(rel_path, brief)
-            if _or_key and ladder:
-                # First rung is the preferred model for this work type.
-                return "openrouter", ladder[0]
-        except Exception:
-            logger.debug(
-                "project_type_router consult failed; falling back to static",
-                exc_info=True,
-            )
-
     backend, model = _resolve_static(rel_path, stage_name)
     if (
         stack and scoreboard is not None and _adaptive_enabled()

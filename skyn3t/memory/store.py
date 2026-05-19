@@ -2,7 +2,7 @@
 
 import asyncio
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,13 +24,6 @@ from skyn3t.core.models import (
     Task as TaskModel,
 )
 from skyn3t.memory.database import get_session_maker
-
-
-class FixOutcomeSummary(TypedDict):
-    fix_applied: str
-    wins: int
-    attempts: int
-    rate: float
 
 
 class MemoryStore:
@@ -651,7 +644,7 @@ class MemoryStore:
         min_attempts: int = 2,
         max_rate: float = 0.34,
         limit: int = 3,
-    ) -> List[FixOutcomeSummary]:
+    ) -> List[Dict[str, Any]]:
         """Return fixes that historically FAILED for this signature.
 
         Symmetric to ``rank_fixes_for_signature`` but reads the loser
@@ -692,7 +685,7 @@ class MemoryStore:
                 slot["wins"] += 1
         min_a = max(1, int(min_attempts))
         cap_rate = float(max_rate)
-        losers: List[FixOutcomeSummary] = []
+        losers = []
         for label, stats in tallies.items():
             rate = stats["wins"] / stats["attempts"]
             if stats["attempts"] >= min_a and rate <= cap_rate:
@@ -702,7 +695,11 @@ class MemoryStore:
                     "attempts": stats["attempts"],
                     "rate": rate,
                 })
-        losers.sort(key=lambda r: (r["rate"], -r["attempts"]))
+        # Sort primarily by win-rate (ascending — worst first), then by
+        # attempts (most-tried first as a tiebreaker). The cast keeps mypy
+        # happy on the unary minus; the dict values are populated above.
+        from typing import cast
+        losers.sort(key=lambda r: (cast(float, r["rate"]), -cast(int, r["attempts"])))
         return losers[: max(0, int(limit))]
 
     # ------------------------------------------------------------------

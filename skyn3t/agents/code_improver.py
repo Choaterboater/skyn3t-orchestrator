@@ -200,36 +200,6 @@ class CodeImproverAgent(BaseAgent):
             return (["npm", "run", script], f"npm run {script}")
         return ([manager, script], f"{manager} {script}")
 
-    # Cortex pytest fast subset: a curated list of unit-test files
-    # that exercise the modules cortex proposals most frequently
-    # touch. Running the full tests/ tree hit the 180s timeout every
-    # time, rejecting every approved proposal with "apply failed".
-    # This curated list runs in <60s and covers the high-signal
-    # surfaces: LLM client failover, code-agent output parsing,
-    # import backfill, consistency reviewer, build patterns.
-    # -x stops at first failure (the proposal is broken — no point
-    # running the rest), -p no:cacheprovider avoids touching the
-    # user's .pytest_cache during a verification run.
-    _CORTEX_PYTEST_FAST_FILES = (
-        "tests/test_llm_client.py",
-        "tests/test_code_agent_output_parsing.py",
-        "tests/test_backfill_unresolved_imports.py",
-        "tests/test_consistency_reviewer.py",
-        "tests/test_build_patterns.py",
-        "tests/test_token_tracker.py",
-        "tests/test_telegram_bot.py",
-    )
-    _CORTEX_PYTEST_CMD = [
-        "python3", "-m", "pytest",
-        "-q", "--tb=line",
-        "-x", "-p", "no:cacheprovider",
-        *_CORTEX_PYTEST_FAST_FILES,
-    ]
-    _CORTEX_PYTEST_DISPLAY = (
-        "python3 -m pytest -q --tb=line -x -p no:cacheprovider "
-        + " ".join(_CORTEX_PYTEST_FAST_FILES)
-    )
-
     @staticmethod
     def _run_repo_checks(repo_root: Path) -> Dict[str, Any]:
         markers = ("pyproject.toml", "pytest.ini", "tox.ini", "setup.py", "requirements.txt")
@@ -239,10 +209,7 @@ class CodeImproverAgent(BaseAgent):
         if has_python_checks:
             return CodeImproverAgent._run_check_commands(
                 repo_root,
-                [(
-                    CodeImproverAgent._CORTEX_PYTEST_CMD,
-                    CodeImproverAgent._CORTEX_PYTEST_DISPLAY,
-                )],
+                [(["python3", "-m", "pytest", "-q", "--tb=line"], "python3 -m pytest -q --tb=line")],
             )
 
         package_json = repo_root / "package.json"

@@ -25,6 +25,21 @@ _default_event_bus = None
 # callers don't thread RAG through every code path.
 _default_rag = None
 
+_CROSS_PROVIDER_MODEL_PREFIXES = (
+    "openrouter/",
+    "anthropic/",
+    "openai/",
+    "google/",
+    "meta-llama/",
+    "mistralai/",
+    "deepseek/",
+    "qwen/",
+    "nvidia/",
+    "tencent/",
+    "stepfun/",
+    "xai/",
+)
+
 
 def _try_register_default(eb) -> None:
     global _default_event_bus
@@ -48,6 +63,20 @@ def install_default_rag(rag) -> None:
     """Explicit setter for the module-level fallback RAG instance."""
     global _default_rag
     _default_rag = rag
+
+
+def _drop_cross_provider_model_name(model: Optional[str]) -> Optional[str]:
+    """Drop provider-qualified model IDs before cross-backend failover.
+
+    ``openrouter/foo`` or ``anthropic/bar`` are valid only for those specific
+    providers. When we retry on a different backend, passing them through makes
+    the second backend fail immediately on model validation instead of using its
+    own default model.
+    """
+    if not model:
+        return None
+    lower = model.lower()
+    return None if lower.startswith(_CROSS_PROVIDER_MODEL_PREFIXES) else model
 
 
 @dataclass
@@ -155,7 +184,6 @@ class LLMClient:
         # system prompt.
         self._rag = rag or _default_rag
         self._last_failed_backend: Optional[str] = None
-        self._last_error_type: Optional[str] = None
         self._backend_is_policy = bool(backend_is_policy)
         self._routing_hint = self._normalize_routing_hint(routing_hint) or self._infer_routing_hint(
             caller_name
@@ -257,7 +285,6 @@ class LLMClient:
                        temperature: float = 0.4, timeout: Optional[float] = None,
                        _allow_backend_failover: bool = True) -> str:
         self._last_failed_backend = None
-        self._last_error_type = None
         req = LLMRequest(prompt=prompt, system=system, model=model or self.default_model,
                          max_tokens=max_tokens, temperature=temperature)
         elapsed = 0.0
@@ -290,49 +317,13 @@ class LLMClient:
             )
             failed_backend = (self._backend_name or "").strip().lower()
             self._last_failed_backend = failed_backend or None
-            self._last_error_type = type(e).__name__
             if (
                 _allow_backend_failover
                 and failed_backend
                 and failed_backend != "deterministic"
             ):
-                # Model names are backend-specific. The model that the
-                # original backend (e.g. openrouter/owl-alpha) accepted
-                # is not a model name another backend (copilot_cli,
-                # claude_cli, ...) knows about. Passing it through
-                # produces "Model 'openrouter/owl-alpha' from --model
-                # flag is not available" or similar. Drop the
-                # default_model on failover so the next backend uses
-                # its own default.
-                #
-                # Detection uses explicit provider-prefix names rather
-                # than "any string with a /" — Copilot's
-                # `kimi-code/kimi-for-coding` model has a slash but is
-                # NOT cross-provider; dropping it on a Copilot-to-CLI
-                # failover would lose the working model name.
-                _PROVIDER_PREFIXES = (
-                    "openrouter/",
-                    "anthropic/",
-                    "openai/",
-                    "google/",
-                    "meta-llama/",
-                    "mistralai/",
-                    "deepseek/",
-                    "qwen/",
-                    "nvidia/",
-                    "tencent/",
-                    "stepfun/",
-                    "xai/",
-                )
-
-                def _drop_if_cross_provider(m: Optional[str]) -> Optional[str]:
-                    if not m:
-                        return None
-                    lower = m.lower()
-                    return None if lower.startswith(_PROVIDER_PREFIXES) else m
-
-                failover_default_model = _drop_if_cross_provider(self.default_model)
-                failover_explicit_model = _drop_if_cross_provider(model)
+                failover_default_model = _drop_cross_provider_model_name(self.default_model)
+                failover_explicit_model = _drop_cross_provider_model_name(model)
                 try:
                     retry_client = LLMClient(
                         default_model=failover_default_model,

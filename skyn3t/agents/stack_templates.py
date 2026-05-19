@@ -47,9 +47,8 @@ to drop in services at runtime.
 
 from __future__ import annotations
 
-import re
 from functools import lru_cache
-from typing import Any, Callable, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 # A file plan entry: (relative path, one-line purpose).
 FilePlan = List[Tuple[str, str]]
@@ -544,8 +543,15 @@ _HOMELAB_SIGNALS: Tuple[str, ...] = (
     "self-hosted dashboard", "self hosted dashboard",
     "service status dashboard", "service status board",
     "status board", "status dashboard",
+    "service dashboard", "services dashboard",
     "media stack dashboard",
     "homarr", "heimdall", "dashy",
+    # Explicit dashboard component asks — when the brief mentions a
+    # command palette, activity feed, or service detail drawer, the
+    # design-system primitives are the intended output even if the
+    # brief doesn't mention "homelab". The backfill path falls back
+    # to a placeholder stub otherwise.
+    "command palette", "activity feed", "service detail",
     "monitor my services", "monitor my homelab",
     "ops dashboard", "noc dashboard",
 )
@@ -578,31 +584,7 @@ def _needs_design_system(brief: str) -> bool:
     text = brief.lower()
     if any(d in text for d in _HOMELAB_DISQUALIFIERS):
         return False
-    if any(sig in text for sig in _HOMELAB_SIGNALS):
-        return True
-
-    # Generic "service dashboard" briefs still need the deterministic
-    # React/Vite dashboard shell when they clearly describe a browser UI
-    # with persistent backend config + settings flow. Requiring both the
-    # backend and configurable-UI tiers keeps us from reintroducing the
-    # old "any dashboard becomes homelab" bug for finance/Excel/etc.
-    if "dashboard" not in text and "status board" not in text:
-        return False
-    if not (_needs_backend(brief) and _needs_configurable_ui(brief)):
-        return False
-    return any(
-        sig in text
-        for sig in (
-            "integration",
-            "integrations",
-            "builder",
-            "settings flow",
-            "glassmorphism",
-            "dark-mode",
-            "dark mode",
-            "service dashboard",
-        )
-    )
+    return any(sig in text for sig in _HOMELAB_SIGNALS)
 
 
 def _design_system_files() -> FilePlan:
@@ -742,53 +724,6 @@ _CONFIGURABLE_SIGNALS: Tuple[str, ...] = (
     "across restarts",
 )
 
-_SETTINGS_FIRST_SURFACE_SIGNALS: Tuple[str, ...] = (
-    "api key", "api keys",
-    "token", "tokens",
-    "credential", "credentials",
-    "secret", "secrets",
-    "webhook", "webhooks",
-    "base url", "callback url",
-    "host", "port",
-    "service url", "service urls",
-    "auth header", "bearer token",
-)
-
-_SETTINGS_FIRST_PRODUCT_SIGNALS: Tuple[str, ...] = (
-    "integration", "integrations",
-    "service", "services",
-    "provider", "providers",
-    "connect", "connection",
-    "bring your own", "byo",
-    "user enters", "user can enter",
-    "configure", "configurable",
-)
-
-
-def _defaults_to_settings_ui(brief: str) -> bool:
-    """True when a browser app likely needs end-user config in the UI.
-
-    This is the "Model 2" path: generated apps should prefer a Settings
-    surface over making end users hand-edit `.env` whenever the brief
-    describes user-supplied integrations, credentials, endpoints, or
-    similar runtime config.
-
-    The heuristic intentionally stays narrower than `_needs_backend()`:
-    a backend API by itself does NOT imply a Settings screen, but a
-    backend plus named services or user-entered credentials almost
-    always does.
-    """
-    if not brief or not _needs_backend(brief):
-        return False
-    text = brief.lower()
-    if _detect_services(brief):
-        return True
-    if any(sig in text for sig in _SETTINGS_FIRST_SURFACE_SIGNALS) and any(
-        sig in text for sig in _SETTINGS_FIRST_PRODUCT_SIGNALS
-    ):
-        return True
-    return False
-
 
 def _needs_configurable_ui(brief: str) -> bool:
     """True when the brief says the user should edit config from the UI.
@@ -805,8 +740,6 @@ def _needs_configurable_ui(brief: str) -> bool:
         if sig in text:
             return True
     if _needs_backend(brief) and "settings" in text:
-        return True
-    if _defaults_to_settings_ui(brief):
         return True
     return False
 
@@ -1174,33 +1107,6 @@ def _readme_node_cli(brief: str) -> str:
 
 
 def _readme_react_vite(brief: str) -> str:
-    if _needs_backend(brief) and _needs_configurable_ui(brief):
-        return (
-            f"# Project\n\n"
-            f"{brief.strip()}\n\n"
-            "## Install\n\n"
-            "```bash\n"
-            "npm install\n"
-            "npm install --prefix server\n"
-            "```\n\n"
-            "## Run\n\n"
-            "Start the API in one terminal:\n\n"
-            "```bash\n"
-            "npm run dev --prefix server\n"
-            "```\n\n"
-            "Start the frontend in a second terminal:\n\n"
-            "```bash\n"
-            "npm run dev\n"
-            "```\n\n"
-            "Then open http://127.0.0.1:5180 and use the in-app **Settings** "
-            "screen to enter service URLs, API keys, and other runtime config. "
-            "`.env.example` is only for operator defaults / advanced deploys — "
-            "end users should not need to edit it to get started.\n\n"
-            "## Build\n\n"
-            "```bash\n"
-            "npm run build\n"
-            "```\n"
-        )
     return (
         f"# Project\n\n"
         f"{brief.strip()}\n\n"
@@ -1221,33 +1127,6 @@ def _readme_react_vite(brief: str) -> str:
 
 
 def _readme_next(brief: str) -> str:
-    if _needs_backend(brief) and _needs_configurable_ui(brief):
-        return (
-            f"# Project\n\n"
-            f"{brief.strip()}\n\n"
-            "## Install\n\n"
-            "```bash\n"
-            "npm install\n"
-            "npm install --prefix server\n"
-            "```\n\n"
-            "## Run\n\n"
-            "Start the API in one terminal:\n\n"
-            "```bash\n"
-            "npm run dev --prefix server\n"
-            "```\n\n"
-            "Start Next.js in a second terminal:\n\n"
-            "```bash\n"
-            "npm run dev\n"
-            "```\n\n"
-            "Then open http://127.0.0.1:3000 and use the in-app **Settings** "
-            "screen to enter service URLs, API keys, and other runtime config. "
-            "`.env.example` remains an operator-facing bootstrap file, not the "
-            "primary end-user setup path.\n\n"
-            "## Build\n\n"
-            "```bash\n"
-            "npm run build && npm start\n"
-            "```\n"
-        )
     return (
         f"# Project\n\n"
         f"{brief.strip()}\n\n"
@@ -1380,43 +1259,15 @@ def _manifest_react_vite(brief: str) -> str:
     })
 
 
-def _index_title_from_brief(brief: str) -> str:
-    text = (brief or "").strip()
-    if not text:
-        return "SkyN3t App"
-    first_line = text.splitlines()[0].strip()
-    explicit = re.search(
-        r"\b(?:called|named)\s+['\"]?([A-Za-z0-9][A-Za-z0-9\s\-_.]{1,40})['\"]?",
-        first_line,
-        re.IGNORECASE,
-    )
-    if explicit:
-        candidate = explicit.group(1).strip()
-    else:
-        candidate = re.sub(
-            r"^(?:build|create|make|design|ship|launch|craft|develop|generate|scaffold)\s+",
-            "",
-            first_line,
-            flags=re.IGNORECASE,
-        )
-        candidate = re.sub(r"^(?:a|an|the)\s+", "", candidate, flags=re.IGNORECASE)
-    candidate = re.sub(r"[^A-Za-z0-9\s\-_.]", " ", candidate)
-    candidate = re.sub(r"\s+", " ", candidate).strip(" .-_")
-    if not candidate:
-        return "SkyN3t App"
-    return candidate.title()[:60]
-
-
 def _manifest_index_html(brief: str) -> str:
     """Deterministic Vite entry HTML."""
-    title = _index_title_from_brief(brief)
     return (
         '<!doctype html>\n'
         '<html lang="en">\n'
         '  <head>\n'
         '    <meta charset="UTF-8" />\n'
         '    <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n'
-        f'    <title>{title}</title>\n'
+        '    <title>Homelab Dashboard</title>\n'
         '  </head>\n'
         '  <body>\n'
         '    <div id="root"></div>\n'
@@ -1528,9 +1379,7 @@ def _env_example_for_services(brief: str) -> str:
     """
     services = _detect_services(brief)
     lines: List[str] = [
-        "# Optional operator bootstrap defaults. Real secrets go here — do not commit .env.",
-        "# Settings-first scaffolds let end users enter URLs / API keys in the UI after boot;",
-        "# keep this file for deployments, docker compose, or non-interactive defaults.",
+        "# Copy this file to .env. Real secrets go here — do not commit .env.",
         "# Default ports match the SkyN3t generated-app plan:",
         "#   backend  → PORT=3100",
         "#   frontend → http://localhost:5180 (Vite dev)",
@@ -1848,28 +1697,28 @@ def _hook_use_polling(brief: str) -> Optional[str]:
     return cast(Optional[str], mod.use_polling_hook())
 
 
-def _needs_dashboard_backfill(brief: str) -> bool:
-    text = (brief or "").lower()
-    return _needs_design_system(brief) or "dashboard" in text or "command palette" in text
-
-
 def _component_command_palette(brief: str) -> Optional[str]:
+    # No _needs_design_system gate here: this generator is only reached
+    # via manifest_for() when the scaffold's App.jsx already imports
+    # CommandPalette.jsx — that import IS the signal. The brief-level
+    # gate was incorrectly suppressing backfill for briefs like "build
+    # a polished dashboard" that ask for these primitives indirectly.
     mod = _homelab_mod()
-    if mod is None or not _needs_dashboard_backfill(brief):
+    if mod is None:
         return None
     return cast(Optional[str], mod.command_palette())
 
 
 def _component_service_detail(brief: str) -> Optional[str]:
     mod = _homelab_mod()
-    if mod is None or not _needs_dashboard_backfill(brief):
+    if mod is None:
         return None
     return cast(Optional[str], mod.service_detail())
 
 
 def _component_activity_feed(brief: str) -> Optional[str]:
     mod = _homelab_mod()
-    if mod is None or not _needs_dashboard_backfill(brief):
+    if mod is None:
         return None
     return cast(Optional[str], mod.activity_feed())
 
@@ -1916,7 +1765,7 @@ def _hook_use_config_homelab(brief: str) -> Optional[str]:
     return cast(Optional[str], mod.use_config_js())
 
 
-_MANIFEST_GENERATORS: Dict[Tuple[str, str], Callable[..., Optional[str]]] = {
+_MANIFEST_GENERATORS = {
     # path → generator. Keyed by the SPECIFIC file the generator writes
     # so CodeAgent can match on filename and short-circuit.
     ("python_cli", "requirements.txt"): _manifest_python_cli,
@@ -2006,7 +1855,11 @@ def manifest_for(
     try:
         sig = inspect.signature(gen)
         if "palette_hexes" in sig.parameters:
-            return gen(brief or "", palette_hexes=palette_hexes)
+            # mypy can't follow the inspect-based signature check; cast to
+            # an Any-typed callable so the palette-aware kwarg goes through.
+            from typing import Any, cast
+            result = cast(Any, gen)(brief or "", palette_hexes=palette_hexes)
+            return cast(Optional[str], result)
     except (TypeError, ValueError):
         pass
     return gen(brief or "")

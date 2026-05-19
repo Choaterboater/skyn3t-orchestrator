@@ -751,7 +751,7 @@ def auto_fix_cross_artifact_drift(scaffold_dir: Path) -> Dict[str, int]:
 
         def _replace(match: "_RE_MATCH_TYPE") -> str:  # type: ignore[name-defined]
             nonlocal replacements
-            raw = str(match.group(0))
+            raw: str = match.group(0)
             try:
                 normalized = _normalize_hex(raw)
             except Exception:  # noqa: BLE001
