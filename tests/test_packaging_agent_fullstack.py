@@ -20,7 +20,6 @@ from skyn3t.agents.packaging_agent import PackagingAgent
 from skyn3t.core.agent import TaskRequest
 from skyn3t.core.events import EventBus
 
-
 # ---------------------------------------------------------------------------
 # Fixture builder
 # ---------------------------------------------------------------------------
