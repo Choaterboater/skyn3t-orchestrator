@@ -850,6 +850,7 @@ class TestReviewerAgent:
                 "Score: 90/100\n"
                 "Verdict: no-go\n",
                 90,
+                None,
             )
 
         monkeypatch.setattr(agent, "think", noop)
@@ -893,7 +894,7 @@ class TestReviewerAgent:
 
         async def fake_llm_review(*, brief, contents, **_kwargs):
             assert "scaffold/index.html" in contents
-            return ("## Summary\n\nStill has important gaps.\n", 69)
+            return ("## Summary\n\nStill has important gaps.\n", 69, None)
 
         monkeypatch.setattr(agent, "think", noop)
         monkeypatch.setattr(agent, "share_learning", noop)
@@ -933,7 +934,7 @@ class TestReviewerAgent:
 
         async def fake_llm_review(*, brief, contents, **_kwargs):
             assert "scaffold/index.html" in contents
-            return ("## Summary\n\nLooks good overall.\n", 82)
+            return ("## Summary\n\nLooks good overall.\n", 82, None)
 
         monkeypatch.setattr(agent, "think", noop)
         monkeypatch.setattr(agent, "share_learning", noop)

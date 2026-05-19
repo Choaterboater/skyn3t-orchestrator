@@ -288,3 +288,71 @@ class TestBlending:
         assert "packaging=10/10" in rendered
         assert "Packaging (server tier): 10/10" in rendered
         assert "✓ All packaging artifacts present" in rendered
+
+
+# ---------------------------------------------------------------------------
+# 4-axis rubric parser (BR-028 follow-up: structured scoring)
+# ---------------------------------------------------------------------------
+
+
+class TestSubScoreParser:
+    """The reviewer asks the LLM for four /25 sub-scores plus a /100 total.
+    These tests exercise the regex used to extract them from free-form LLM
+    output — different models follow the format with varying precision."""
+
+    def _parse(self, text: str):
+        from skyn3t.agents.reviewer import _SUB_SCORE_RES, _SCORE_RE
+        subs = {}
+        for axis, rx in _SUB_SCORE_RES.items():
+            m = rx.search(text)
+            if m:
+                subs[axis] = int(m.group(1))
+        total = None
+        m = _SCORE_RE.search(text)
+        if m:
+            total = int(m.group(1))
+        return subs, total
+
+    def test_canonical_format(self):
+        text = (
+            "## 5. Score\n"
+            "Completeness: 18/25\n"
+            "Correctness:  20/25\n"
+            "Consistency:  22/25\n"
+            "Packaging:    15/25\n"
+            "Score:        75/100\n"
+        )
+        subs, total = self._parse(text)
+        assert subs == {
+            "completeness": 18, "correctness": 20,
+            "consistency": 22, "packaging": 15,
+        }
+        assert total == 75
+
+    def test_loose_format_no_denominator(self):
+        text = (
+            "Completeness 18\n"
+            "Correctness 20\n"
+            "Consistency 22\n"
+            "Packaging 15\n"
+            "Score 75/100\n"
+        )
+        subs, total = self._parse(text)
+        assert subs["completeness"] == 18
+        assert subs["correctness"] == 20
+        assert subs["consistency"] == 22
+        assert subs["packaging"] == 15
+        assert total == 75
+
+    def test_em_dash_separator(self):
+        text = "- Completeness — 14/25\n- Correctness — 16/25\n"
+        subs, _ = self._parse(text)
+        assert subs["completeness"] == 14
+        assert subs["correctness"] == 16
+
+    def test_partial_axes_returns_partial_dict(self):
+        # Real-world: smaller models sometimes drop an axis.
+        text = "Completeness: 20/25\nConsistency: 18/25\nScore: 70/100\n"
+        subs, total = self._parse(text)
+        assert subs == {"completeness": 20, "consistency": 18}
+        assert total == 70
