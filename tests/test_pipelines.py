@@ -550,7 +550,7 @@ class TestStudioRunner:
         monkeypatch.setattr(
             StudioRunner,
             "_critique_timeout_for",
-            staticmethod(lambda stage_name, execution_profile="balanced": 0.01),
+            staticmethod(lambda stage_name, execution_profile="balanced", brief="": 0.01),
         )
         monkeypatch.setattr(
             "skyn3t.studio.runner.get_template",

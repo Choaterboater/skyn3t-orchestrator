@@ -1641,6 +1641,7 @@ class StudioRunner:
                 critique_timeout_seconds = self._critique_timeout_for(
                     stage_name=stage.name,
                     execution_profile=execution_profile,
+                    brief=brief,
                 )
                 try:
                     revised_result = await asyncio.wait_for(
@@ -4788,25 +4789,61 @@ class StudioRunner:
             return 3 if has_visual_signal else 2
         return 4 if has_visual_signal else 3
 
+    # One round of `reviewer.critique()` budgets 180s — see the
+    # hard-coded `critique_timeout_seconds = 180.0` inside
+    # `_critique_and_revise` at the per-round call. The outer wrapper
+    # must give multi-round critiques room to finish; otherwise the
+    # outer kills the inner mid-round and we get CRITIQUE_FAILED on
+    # every build even though the critique was making progress.
+    _CRITIQUE_ROUND_BUDGET_SECONDS = 180.0
+    # Slack for setup/teardown between rounds (file collection,
+    # message-bus publish, manifest history append). One-time, not
+    # per-round, so 20s is comfortable.
+    _CRITIQUE_OVERHEAD_SECONDS = 20.0
+
     @staticmethod
     def _critique_timeout_for(
         stage_name: str,
         execution_profile: str = "balanced",
+        brief: str = "",
     ) -> float:
+        """Wall-clock budget for the full critique + revision loop.
+
+        Must be ≥ ``max_rounds * 180 + overhead`` so the outer wrapper
+        doesn't kill the inner per-round 180s timeout mid-flight. The
+        old formula used a static base × profile-multiplier that
+        ignored round count entirely — on fast profile + architect it
+        produced 108s (60% of 180), shorter than even ONE round's
+        inner budget, so CRITIQUE_FAILED fired on every build.
+        """
+        # Anchor the budget to the actual round count this stage will
+        # attempt, then add a per-stage floor so heavier stages get
+        # extra room beyond the rounds × budget math.
+        rounds = StudioRunner._critique_rounds_for(
+            stage_name=stage_name,
+            brief=brief,
+            execution_profile=execution_profile,
+        )
+        per_round = StudioRunner._CRITIQUE_ROUND_BUDGET_SECONDS
+        overhead = StudioRunner._CRITIQUE_OVERHEAD_SECONDS
+        rounds_budget = rounds * per_round + overhead
+
         normalized = (stage_name or "").strip().lower()
         if normalized == "code":
-            base = 420.0
+            floor = 420.0
         elif normalized in {"designer", "architect", "research", "marketer", "business"}:
-            base = 180.0
+            floor = 180.0
         else:
-            base = 120.0
-
+            floor = 120.0
+        # Floor scales with profile so "fast" can still ship a leaner
+        # budget when the rounds-based number is already small.
         profile = (execution_profile or "balanced").strip().lower()
         if profile == "fast":
-            return max(60.0, base * 0.6)
-        if profile == "deep":
-            return base * 1.3
-        return base
+            floor = max(60.0, floor * 0.6)
+        elif profile == "deep":
+            floor = floor * 1.3
+
+        return max(rounds_budget, floor)
 
     @staticmethod
     def _relativize_artifact_path(artifact_dir: Path, value: Any) -> Optional[str]:
