@@ -482,3 +482,169 @@ export default function Failed() {
     stubs = [i for i in report.issues if i.category == "todo_stub"]
     assert stubs
     assert any("code generation failed" in i.message.lower() for i in stubs)
+
+
+# ─── collapsed brand-palette detection ────────────────────────────────
+
+
+def test_consistency_flags_brand_border_same_as_bg(tmp_path: Path) -> None:
+    """e79bc0's brand.md declared `border: #f5f5f0` on `bg: #F5F5F0`
+    — the LLM's commentary literally said "the warmth comes from the
+    contrast between them" but there was none. Catch this before the
+    LLM reviewer."""
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    scaffold.mkdir()
+    _write(
+        project_dir / "brand.md",
+        """
+# Brand
+
+## Palette
+
+| Token | Hex | Usage |
+|-------|-----|-------|
+| `bg` | `#F5F5F0` | Canvas |
+| `surface` | `#f5f5f0` | Cards |
+| `border` | `#f5f5f0` | Hairlines |
+| `text` | `#2D3E40` | Body |
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    border_issues = [
+        i for i in report.issues
+        if i.category == "design_quality"
+        and "border" in i.message.lower()
+        and "invisible" in i.message.lower()
+    ]
+    surface_issues = [
+        i for i in report.issues
+        if i.category == "design_quality"
+        and "surface" in i.message.lower()
+        and "elevation" in i.message.lower()
+    ]
+    assert border_issues
+    assert surface_issues
+
+
+def test_consistency_flags_bold_dash_form_palette(tmp_path: Path) -> None:
+    """tactrax used the `- **Background**` `#FFFFFF` form, not the
+    Markdown table. Both shapes must be detected."""
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    scaffold.mkdir()
+    _write(
+        project_dir / "brand.md",
+        """
+# Brand
+
+## Palette
+
+- **Background** `#FFFFFF`
+- **Border** `#FFFFFF`
+- **Text** `#111111`
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    border_issues = [
+        i for i in report.issues
+        if i.category == "design_quality"
+        and "border" in i.message.lower()
+    ]
+    assert border_issues
+
+
+def test_consistency_clean_palette_has_no_collapse_finding(tmp_path: Path) -> None:
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    scaffold.mkdir()
+    _write(
+        project_dir / "brand.md",
+        """
+# Brand
+
+## Palette
+
+| Token | Hex | Usage |
+|-------|-----|-------|
+| `bg` | `#FFFFFF` | Canvas |
+| `surface` | `#F8F8F8` | Cards |
+| `border` | `#E5E5E5` | Hairlines |
+| `text` | `#111111` | Body |
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    collapse_issues = [
+        i for i in report.issues
+        if i.category == "design_quality"
+        and ("invisible" in i.message.lower() or "elevation" in i.message.lower())
+    ]
+    assert not collapse_issues, [i.message for i in collapse_issues]
+
+
+def test_consistency_handles_missing_bg_gracefully(tmp_path: Path) -> None:
+    """If brand.md doesn't declare a `bg` / `background` token, the
+    check should silently skip — not crash, not flag everything."""
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    scaffold.mkdir()
+    _write(
+        project_dir / "brand.md",
+        """
+# Brand
+
+## Palette
+
+| Token | Hex | Usage |
+|-------|-----|-------|
+| `primary` | `#FF0000` | Brand |
+| `text` | `#111111` | Body |
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    collapse_issues = [
+        i for i in report.issues
+        if i.category == "design_quality"
+        and ("invisible" in i.message.lower() or "elevation" in i.message.lower())
+    ]
+    assert not collapse_issues
+
+
+def test_consistency_case_insensitive_hex_comparison(tmp_path: Path) -> None:
+    """`#FFFFFF` and `#ffffff` must compare as equal — both shapes
+    appear in real artifacts."""
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    scaffold.mkdir()
+    _write(
+        project_dir / "brand.md",
+        """
+# Brand
+
+## Palette
+
+| Token | Hex | Usage |
+|-------|-----|-------|
+| `bg` | `#FFFFFF` | Canvas |
+| `border` | `#ffffff` | Hairlines |
+| `text` | `#111111` | Body |
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    border_issues = [
+        i for i in report.issues
+        if i.category == "design_quality"
+        and "border" in i.message.lower()
+        and "invisible" in i.message.lower()
+    ]
+    assert border_issues
