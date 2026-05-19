@@ -1253,3 +1253,168 @@ def test_plain_flex_or_grid_class_doesnt_false_fire(tmp_path: Path) -> None:
         if i.category == "missing_dep" and "Tailwind" in i.message
     ]
     assert not tw_issues
+
+
+# ─── frontend ignores promised backend ────────────────────────────────
+
+
+def test_frontend_ignores_backend_when_express_promised(tmp_path: Path) -> None:
+    """e79bc0 reproduction: tech_stack says express, server/ has code,
+    but App.jsx uses pure localStorage with zero fetch calls. Flag it."""
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    _write(
+        project_dir / "tech_stack.json",
+        json.dumps({"backend": "express", "db": "none"}),
+    )
+    _write(
+        scaffold / "server" / "index.js",
+        "import express from 'express'; const app = express(); app.listen(3000);",
+    )
+    _write(
+        scaffold / "src" / "App.jsx",
+        """
+import { useState } from 'react';
+export default function App() {
+  const [habits, setHabits] = useState(() =>
+    JSON.parse(localStorage.getItem('habits') || '[]')
+  );
+  return <div>{habits.length}</div>;
+}
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    drift_issues = [
+        i for i in report.issues
+        if i.category == "contradiction"
+        and "frontend" in i.message.lower()
+        and "ZERO API calls" in i.message
+    ]
+    assert drift_issues, [i.message for i in report.issues]
+
+
+def test_frontend_with_fetch_call_is_clean(tmp_path: Path) -> None:
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    _write(
+        project_dir / "tech_stack.json",
+        json.dumps({"backend": "express", "db": "none"}),
+    )
+    _write(
+        scaffold / "server" / "index.js",
+        "import express from 'express'; const app = express(); app.listen(3000);",
+    )
+    _write(
+        scaffold / "src" / "App.jsx",
+        """
+import { useState, useEffect } from 'react';
+export default function App() {
+  const [habits, setHabits] = useState([]);
+  useEffect(() => {
+    fetch('/api/habits').then(r => r.json()).then(setHabits);
+  }, []);
+  return <div>{habits.length}</div>;
+}
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    drift_issues = [
+        i for i in report.issues
+        if i.category == "contradiction"
+        and "ZERO API calls" in i.message
+    ]
+    assert not drift_issues
+
+
+def test_frontend_with_axios_is_clean(tmp_path: Path) -> None:
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    _write(project_dir / "tech_stack.json", json.dumps({"backend": "express"}))
+    _write(scaffold / "server" / "index.js", "// server")
+    _write(
+        scaffold / "src" / "App.jsx",
+        "import axios from 'axios'; axios.get('/api/habits'); export default function App() {}",
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    drift_issues = [
+        i for i in report.issues
+        if i.category == "contradiction" and "ZERO API calls" in i.message
+    ]
+    assert not drift_issues
+
+
+def test_frontend_with_useSWR_is_clean(tmp_path: Path) -> None:
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    _write(project_dir / "tech_stack.json", json.dumps({"backend": "express"}))
+    _write(scaffold / "server" / "index.js", "// server")
+    _write(
+        scaffold / "src" / "App.jsx",
+        "import useSWR from 'swr'; const x = useSWR('/api/x'); export default function App() {}",
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    drift_issues = [
+        i for i in report.issues
+        if i.category == "contradiction" and "ZERO API calls" in i.message
+    ]
+    assert not drift_issues
+
+
+def test_no_backend_in_tech_stack_skips_check(tmp_path: Path) -> None:
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    _write(
+        project_dir / "tech_stack.json",
+        json.dumps({"backend": "none", "db": "none"}),
+    )
+    _write(
+        scaffold / "src" / "App.jsx",
+        "export default function App() { return <div>local only</div>; }",
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    drift_issues = [
+        i for i in report.issues
+        if i.category == "contradiction" and "ZERO API calls" in i.message
+    ]
+    assert not drift_issues
+
+
+def test_no_server_directory_skips_check(tmp_path: Path) -> None:
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    _write(project_dir / "tech_stack.json", json.dumps({"backend": "express"}))
+    _write(
+        scaffold / "src" / "App.jsx",
+        "export default function App() { return null; }",
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    drift_issues = [
+        i for i in report.issues
+        if i.category == "contradiction" and "ZERO API calls" in i.message
+    ]
+    assert not drift_issues
+
+
+def test_no_tech_stack_json_skips_check(tmp_path: Path) -> None:
+    scaffold = tmp_path / "scaffold"
+    _write(scaffold / "src" / "App.jsx", "export default function App() {}")
+
+    report = check_consistency(scaffold, brief="")
+
+    drift_issues = [
+        i for i in report.issues
+        if i.category == "contradiction" and "ZERO API calls" in i.message
+    ]
+    assert not drift_issues

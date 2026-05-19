@@ -788,6 +788,119 @@ def _scan_for_tailwind_without_config(scaffold_dir: Path) -> List[ConsistencyIss
     return issues
 
 
+# Backend framework names that imply "the scaffold has a server the
+# frontend is supposed to talk to." Static-only / none / unknown are
+# excluded.
+_REAL_BACKEND_FRAMEWORKS = {
+    "express", "fastify", "koa", "hono", "hono-node",
+    "fastapi", "flask", "django", "starlette", "aiohttp", "bottle",
+    "next",  # API routes
+}
+
+# Regex hints that a frontend file is actually making API calls.
+# Conservative — we just need ONE call site to know the frontend
+# isn't a pure localStorage app.
+_FRONTEND_API_CALL_RE = re.compile(
+    r"\b(?:"
+    r"fetch\s*\(\s*['\"`]\s*(?:/api|http)|"   # fetch('/api/...') / fetch('http...
+    r"axios\.|axios\s*\(|"                      # axios calls
+    r"XMLHttpRequest|"                           # raw XHR
+    r"useSWR\s*\(|useQuery\s*\(|"               # SWR / TanStack Query
+    r"api\.get\(|api\.post\(|api\.put\(|api\.delete\("  # api.get() etc
+    r")"
+)
+
+
+def _scan_for_frontend_ignores_backend(scaffold_dir: Path) -> List[ConsistencyIssue]:
+    """Detect when tech_stack.json promises a backend but the frontend
+    never calls it.
+
+    Strong signal of "two disconnected halves": architecture.md
+    describes /api/habits, decisions.json pins backend_port=3000,
+    server/index.js exists — but App.jsx + every component uses pure
+    localStorage and zero fetch calls. The user gets a frontend that
+    can't possibly talk to the backend that was just built.
+    """
+    issues: List[ConsistencyIssue] = []
+    project_dir = scaffold_dir.parent
+
+    # Determine "is there supposed to be a backend?"
+    tech_stack_path = project_dir / "tech_stack.json"
+    if not tech_stack_path.is_file():
+        return issues
+    try:
+        data = json.loads(tech_stack_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return issues
+    if not isinstance(data, dict):
+        return issues
+    backend = str(data.get("backend") or "").strip().lower()
+    if backend not in _REAL_BACKEND_FRAMEWORKS:
+        return issues  # static / none / unknown — frontend is allowed to be local-only
+
+    # Confirm a server actually shipped — if there's no server code
+    # at all, the "frontend ignores backend" diagnosis is wrong (the
+    # right diagnosis is "backend is fictional", which the
+    # tech_stack-vs-reality check already catches).
+    server_dir = scaffold_dir / "server"
+    if not server_dir.is_dir():
+        return issues  # no server to be ignored
+    server_code_present = any(
+        f.suffix in (".js", ".jsx", ".ts", ".tsx", ".py", ".mjs", ".cjs")
+        for f in server_dir.rglob("*")
+        if f.is_file()
+    )
+    if not server_code_present:
+        return issues
+
+    # Scan frontend JSX/TSX for any API call patterns.
+    src_dir = scaffold_dir / "src"
+    if not src_dir.is_dir():
+        # No src/ → not a standard frontend layout, skip
+        return issues
+
+    frontend_files_scanned = 0
+    frontend_files_with_api_calls = 0
+    for path in src_dir.rglob("*"):
+        if path.suffix not in (".jsx", ".tsx", ".js", ".ts", ".mjs"):
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        frontend_files_scanned += 1
+        if _FRONTEND_API_CALL_RE.search(source):
+            frontend_files_with_api_calls += 1
+
+    if frontend_files_scanned == 0:
+        return issues  # nothing to scan
+    if frontend_files_with_api_calls > 0:
+        return issues  # at least one frontend file IS calling the API
+
+    # Strong signal: backend exists, frontend has source files, NONE
+    # of them call the API. The two halves are disconnected.
+    issues.append(ConsistencyIssue(
+        severity="error",
+        category="contradiction",
+        file="src/",
+        message=(
+            f"tech_stack.json declares `backend: {backend}` and "
+            f"server/ has real code, but {frontend_files_scanned} "
+            f"frontend file(s) under src/ make ZERO API calls "
+            "(no fetch, axios, useSWR, useQuery, etc.). The frontend "
+            "appears to be pure-localStorage and never talks to the "
+            "backend that was built."
+        ),
+        suggestion=(
+            "Either wire the frontend to call the backend "
+            "(`fetch('/api/<resource>')` in App.jsx / hooks), or "
+            "change `backend` to `none` and drop the server/ "
+            "directory if the app really is local-only."
+        ),
+    ))
+    return issues
+
+
 def _scan_for_hallucinations(scaffold_dir: Path, allowed_services: Set[str]) -> List[ConsistencyIssue]:
     """Scan JS/JSX/MD files for mentions of services not in the allowed set.
 
@@ -1618,6 +1731,14 @@ def check_consistency(scaffold_dir: Path, brief: str = "") -> ConsistencyReport:
     # tailwind.config.js, no PostCSS config. The classes ship as dead
     # strings — the markup renders but the styling is invisible.
     issues.extend(_scan_for_tailwind_without_config(scaffold_dir))
+
+    # ── 7e. Frontend ignores promised backend ─────────────────────────────
+    # Real bug from e79bc0 + others: tech_stack.json declares a backend
+    # framework (express, fastapi, ...) and architecture.md spec'd
+    # /api/habits endpoints, but App.jsx never calls fetch('/api/...').
+    # The scaffold is two disconnected halves: a frontend that uses
+    # localStorage and a backend that nobody calls.
+    issues.extend(_scan_for_frontend_ignores_backend(scaffold_dir))
 
     # ── 8. Orphan export check (lightweight) ─────────────────────────────
     # For each file that exports something, check if another file imports it.
