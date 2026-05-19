@@ -341,10 +341,26 @@ def detect(root: Path) -> StackDetection:
                     detection.services.append(_SERVICE_BY_DEP[dep])
 
     # ---- Python side ----------------------------------------------------
-    pyproject_path = project_root / "pyproject.toml"
-    requirements_path = project_root / "requirements.txt"
-    pyproject_text = _read_text(pyproject_path) if pyproject_path.is_file() else None
-    requirements_text = _read_text(requirements_path) if requirements_path.is_file() else None
+    # Look in project_root first (most common), but also peek at the
+    # artifact root when project_root is scaffold/. This catches the
+    # fullstack monorepo layout:
+    #   artifact/
+    #     scaffold/        ← frontend (react/vite)
+    #     requirements.txt ← backend (fastapi) — would be missed otherwise
+    #     main.py
+    py_search_dirs = [project_root]
+    if project_root != root:
+        py_search_dirs.append(root)
+
+    pyproject_text: Optional[str] = None
+    requirements_text: Optional[str] = None
+    for search_dir in py_search_dirs:
+        pp = search_dir / "pyproject.toml"
+        rq = search_dir / "requirements.txt"
+        if pp.is_file() and pyproject_text is None:
+            pyproject_text = _read_text(pp)
+        if rq.is_file() and requirements_text is None:
+            requirements_text = _read_text(rq)
 
     if pyproject_text:
         py_dep_names.extend(_parse_pyproject_deps(pyproject_text))
