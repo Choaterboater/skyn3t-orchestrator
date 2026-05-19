@@ -648,3 +648,141 @@ def test_consistency_case_insensitive_hex_comparison(tmp_path: Path) -> None:
         and "invisible" in i.message.lower()
     ]
     assert border_issues
+
+
+# ─── entry-file brand drift (App.jsx ignores palette) ─────────────────
+
+
+def test_entry_file_drift_flags_dark_theme_when_palette_is_warm(tmp_path: Path) -> None:
+    """e79bc0 reproduction: brand.md says warm paper + amber accent;
+    App.jsx ships bg-slate-900 + emerald-400 + gradients + emoji."""
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    scaffold.mkdir()
+    _write(
+        project_dir / "palette.json",
+        '{"bg": "#F5F5F0", "primary": "#4A90A4", "accent": "#F4A261", "text": "#2D3E40"}',
+    )
+    _write(
+        scaffold / "src" / "App.jsx",
+        """
+export default function App() {
+  return (
+    <div className="bg-slate-950 text-slate-100">
+      <header className="bg-slate-900 border-emerald-400 backdrop-blur">
+        <h1 className="text-emerald-300">Habits 🔥</h1>
+      </header>
+      <main className="bg-gradient-to-r from-emerald-400 to-teal-300">
+        <span className="text-rose-500">Streak: 12 days</span>
+      </main>
+    </div>
+  );
+}
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    drift_issues = [
+        i for i in report.issues
+        if i.category == "brand_kit_ignored_by_scaffold"
+        and "App.jsx" in i.file
+    ]
+    assert drift_issues, [i.message for i in report.issues]
+    assert "dark-Tailwind" in drift_issues[0].message or "dark" in drift_issues[0].message.lower()
+
+
+def test_entry_file_drift_silent_when_palette_used(tmp_path: Path) -> None:
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    scaffold.mkdir()
+    _write(project_dir / "palette.json", '{"bg": "#F5F5F0", "primary": "#4A90A4"}')
+    _write(
+        scaffold / "src" / "App.jsx",
+        """
+export default function App() {
+  return <div className="bg-[#F5F5F0] text-[#4A90A4]">Hello</div>;
+}
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    drift_issues = [
+        i for i in report.issues
+        if i.category == "brand_kit_ignored_by_scaffold"
+        and "App.jsx" in i.file
+    ]
+    assert not drift_issues, [i.message for i in drift_issues]
+
+
+def test_entry_file_drift_silent_on_low_signal(tmp_path: Path) -> None:
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    scaffold.mkdir()
+    _write(project_dir / "palette.json", '{"bg": "#F5F5F0", "primary": "#4A90A4"}')
+    _write(
+        scaffold / "src" / "App.jsx",
+        """
+export default function App() {
+  return <div className="bg-slate-900">Hello</div>;
+}
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    drift_issues = [
+        i for i in report.issues
+        if i.category == "brand_kit_ignored_by_scaffold"
+        and "App.jsx" in i.file
+    ]
+    assert not drift_issues
+
+
+def test_entry_file_drift_no_app_jsx_silent(tmp_path: Path) -> None:
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    scaffold.mkdir()
+    _write(project_dir / "palette.json", '{"bg": "#F5F5F0", "primary": "#4A90A4"}')
+    _write(scaffold / "index.html", "<html><body>Static site</body></html>")
+
+    report = check_consistency(scaffold, brief="")
+
+    drift_issues = [
+        i for i in report.issues
+        if i.category == "brand_kit_ignored_by_scaffold"
+        and i.file != "(scaffold)"
+    ]
+    assert not drift_issues
+
+
+def test_entry_file_drift_finds_next_page_too(tmp_path: Path) -> None:
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    scaffold.mkdir()
+    _write(project_dir / "palette.json", '{"bg": "#F5F5F0", "primary": "#4A90A4"}')
+    _write(
+        scaffold / "app" / "page.tsx",
+        """
+export default function Page() {
+  return (
+    <div className="bg-slate-950 text-slate-100">
+      <header className="bg-slate-900 backdrop-blur">
+        <h1 className="text-emerald-300">Hello 🔥</h1>
+      </header>
+      <main className="bg-gradient-to-r from-emerald-400 to-teal-300">body</main>
+    </div>
+  );
+}
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    drift_issues = [
+        i for i in report.issues
+        if i.category == "brand_kit_ignored_by_scaffold"
+        and "page.tsx" in i.file
+    ]
+    assert drift_issues

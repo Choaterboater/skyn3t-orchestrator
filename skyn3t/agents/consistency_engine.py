@@ -902,6 +902,17 @@ def _scan_cross_artifact_drift(
     if brand_text:
         issues.extend(_check_collapsed_brand_palette(brand_text))
 
+    # Entry-file specific brand drift: the scaffold-wide check above
+    # passes if ANY file uses the palette. e79bc0 had HabitCard.jsx
+    # (orphaned) using the brand colors while App.jsx (active) used
+    # bg-slate-900 + emerald-400 + gradients + emoji — the user only
+    # ever sees App.jsx. The reviewer correctly flagged this even
+    # though "scaffold-wide" had palette coverage.
+    if palette_hexes:
+        issues.extend(
+            _scan_entry_file_brand_drift(scaffold_dir, palette_hexes)
+        )
+
     return issues
 
 
@@ -983,6 +994,105 @@ def _check_collapsed_brand_palette(brand_text: str) -> List[ConsistencyIssue]:
                 "Shift surface tokens 3-5% off `bg` so cards have "
                 "real elevation. For light themes, slightly darker; "
                 "for dark themes, slightly lighter."
+            ),
+        ))
+    return issues
+
+
+# Tailwind utility names that strongly imply a dark / saturated theme
+# (e.g. `bg-slate-900`, `bg-zinc-950`, `text-emerald-400`). When App.jsx
+# uses these AND zero palette hexes, the LLM almost certainly ignored
+# brand.md in favor of its training-set defaults.
+_DARK_TAILWIND_RE = re.compile(
+    r"\b(?:bg|text|border|ring|shadow|from|to|via)-"
+    r"(?:slate|zinc|neutral|stone|gray|emerald|teal|rose|cyan|"
+    r"indigo|violet|fuchsia|sky|amber|lime|red)-"
+    r"(?:[5-9]\d{2})\b"
+)
+# Gradients + glassmorphism are the other off-brief patterns
+# review.md repeatedly flagged.
+_TAILWIND_GRADIENT_RE = re.compile(r"\bbg-gradient-to-")
+_GLASSMORPHISM_RE = re.compile(r"\bbackdrop-blur(?:-\w+)?\b")
+# Emoji are a common brand-violation: "no confetti, no exclamation
+# points" type brand voices wouldn't ship 🔥. Match common emoji
+# unicode ranges.
+_EMOJI_RE = re.compile(
+    r"[\U0001F300-\U0001F9FF\U0001FA70-\U0001FAFF☀-⛿✀-➿]"
+)
+
+# Entry files we care about — the user-visible top-level scaffold.
+_ENTRY_FILE_REL_PATTERNS = (
+    "src/App.jsx", "src/App.tsx",
+    "App.jsx", "App.tsx",
+    "src/app.jsx", "src/app.tsx",
+    "src/pages/index.tsx", "src/pages/index.jsx",
+    "app/page.tsx", "app/page.jsx",
+)
+
+
+def _scan_entry_file_brand_drift(
+    scaffold_dir: Path, palette_hexes: Set[str]
+) -> List[ConsistencyIssue]:
+    """Flag entry files that use zero palette hex codes AND heavy
+    dark-Tailwind / gradient / glassmorphism / emoji styling — strong
+    signal the LLM emitted training-set defaults instead of honoring
+    brand.md."""
+    issues: List[ConsistencyIssue] = []
+    for rel in _ENTRY_FILE_REL_PATTERNS:
+        path = scaffold_dir / rel
+        if not path.is_file():
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        file_hexes = _extract_hexes(source)
+        if file_hexes & palette_hexes:
+            continue  # entry file uses at least one palette color
+
+        # Count drift signals — we need MULTIPLE to be confident
+        # this is brand drift and not a legitimate dark theme.
+        dark_hits = len(_DARK_TAILWIND_RE.findall(source))
+        gradient_hits = len(_TAILWIND_GRADIENT_RE.findall(source))
+        glass_hits = len(_GLASSMORPHISM_RE.findall(source))
+        emoji_hits = len(_EMOJI_RE.findall(source))
+
+        signal_count = (
+            (1 if dark_hits >= 3 else 0)
+            + (1 if gradient_hits >= 1 else 0)
+            + (1 if glass_hits >= 1 else 0)
+            + (1 if emoji_hits >= 1 else 0)
+        )
+        if signal_count < 2:
+            continue  # not enough signal — stay quiet
+
+        signals: List[str] = []
+        if dark_hits >= 3:
+            signals.append(f"{dark_hits} dark-Tailwind class(es)")
+        if gradient_hits >= 1:
+            signals.append(f"{gradient_hits} gradient(s)")
+        if glass_hits >= 1:
+            signals.append(f"{glass_hits} glassmorphism class(es)")
+        if emoji_hits >= 1:
+            signals.append(f"{emoji_hits} emoji")
+        preview = ", ".join(sorted(palette_hexes)[:3])
+
+        issues.append(ConsistencyIssue(
+            severity="error",
+            category="brand_kit_ignored_by_scaffold",
+            file=rel,
+            message=(
+                f"{rel} uses none of the palette.json hex codes "
+                f"({preview}…) AND heavy off-brief styling: "
+                + "; ".join(signals)
+                + ". Strong signal the LLM ignored brand.md."
+            ),
+            suggestion=(
+                "Rewrite the file using palette.json hex codes (or "
+                "Tailwind arbitrary values like `bg-[#F5F5F0]`). "
+                "Drop the dark-mode default Tailwind classes, "
+                "gradients, glassmorphism, and emoji unless brand.md "
+                "explicitly endorses them."
             ),
         ))
     return issues
