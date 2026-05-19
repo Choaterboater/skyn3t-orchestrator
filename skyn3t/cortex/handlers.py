@@ -204,13 +204,16 @@ def install_handlers(orchestrator) -> None:
 
     async def studio_debug_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
         """Approved studio_debug → run CodeImproverAgent on target_file with verdict+risks as rationale."""
-        target = _resolve_repo_file(payload.get("target_file"))
         risks = normalize_review_risks(payload.get("risks") or [])
         verdict = payload.get("verdict") or ""
+        # Check risks before resolving the target. A no-actionable-risks
+        # review never needs the file to exist on disk — and the proposal
+        # may target a still-to-be-generated project artifact.
+        if not risks:
+            return {"ok": False, "error": "review flagged no actionable risks"}
+        target = _resolve_repo_file(payload.get("target_file"))
         if not target:
             return {"ok": False, "error": "invalid or missing target_file"}
-        if not risks:
-            return {"ok": True, "status": "noop", "details": "review flagged no actionable risks"}
         rationale = (
             f"Address Reviewer's critique on `{target}`.\n\n"
             f"Verdict: {verdict}\n\n"

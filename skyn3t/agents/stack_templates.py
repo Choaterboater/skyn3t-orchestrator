@@ -543,8 +543,15 @@ _HOMELAB_SIGNALS: Tuple[str, ...] = (
     "self-hosted dashboard", "self hosted dashboard",
     "service status dashboard", "service status board",
     "status board", "status dashboard",
+    "service dashboard", "services dashboard",
     "media stack dashboard",
     "homarr", "heimdall", "dashy",
+    # Explicit dashboard component asks — when the brief mentions a
+    # command palette, activity feed, or service detail drawer, the
+    # design-system primitives are the intended output even if the
+    # brief doesn't mention "homelab". The backfill path falls back
+    # to a placeholder stub otherwise.
+    "command palette", "activity feed", "service detail",
     "monitor my services", "monitor my homelab",
     "ops dashboard", "noc dashboard",
 )
@@ -1691,22 +1698,27 @@ def _hook_use_polling(brief: str) -> Optional[str]:
 
 
 def _component_command_palette(brief: str) -> Optional[str]:
+    # No _needs_design_system gate here: this generator is only reached
+    # via manifest_for() when the scaffold's App.jsx already imports
+    # CommandPalette.jsx — that import IS the signal. The brief-level
+    # gate was incorrectly suppressing backfill for briefs like "build
+    # a polished dashboard" that ask for these primitives indirectly.
     mod = _homelab_mod()
-    if mod is None or not _needs_design_system(brief):
+    if mod is None:
         return None
     return cast(Optional[str], mod.command_palette())
 
 
 def _component_service_detail(brief: str) -> Optional[str]:
     mod = _homelab_mod()
-    if mod is None or not _needs_design_system(brief):
+    if mod is None:
         return None
     return cast(Optional[str], mod.service_detail())
 
 
 def _component_activity_feed(brief: str) -> Optional[str]:
     mod = _homelab_mod()
-    if mod is None or not _needs_design_system(brief):
+    if mod is None:
         return None
     return cast(Optional[str], mod.activity_feed())
 
