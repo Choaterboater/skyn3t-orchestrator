@@ -1,4 +1,4 @@
-"""Apply-handlers for proposal kinds beyond tuning + code_patch.
+"""Apply-handlers for proposal kinds beyond tuning and code_patch.
 
 Registered with the global ProposalStore at orchestrator boot.
 Each handler is async and receives the proposal payload dict.
@@ -16,12 +16,34 @@ logger = logging.getLogger("skyn3t.cortex.handlers")
 REPO_ROOT = Path(__file__).resolve().parents[2].resolve()
 
 
-def install_handlers(orchestrator) -> None:
-    """Register apply-handlers for kind='feature' and kind='ingest'."""
+def _normalize_repo_relative_path(target_file: Any, *, require_exists: bool = False) -> str:
+    candidate = str(target_file or "").strip()
+    if not candidate:
+        return ""
+    target_path = Path(candidate)
+    if not target_path.is_absolute():
+        target_path = REPO_ROOT / target_path
+    target_path = target_path.resolve()
     try:
-        from skyn3t.cortex import get_store
+        relative_path = target_path.relative_to(REPO_ROOT)
+    except ValueError:
+        return ""
+    if require_exists and (not target_path.exists() or not target_path.is_file()):
+        return ""
+    return relative_path.as_posix()
+
+
+def _resolve_repo_file(target_file: Any) -> str:
+    return _normalize_repo_relative_path(target_file, require_exists=True)
+
+
+def install_handlers(orchestrator) -> None:
+    """Register apply-handlers for kind='feature', 'ingest', and 'studio_debug'."""
+    try:
+        from skyn3t.core.agent import TaskRequest
+        from skyn3t.cortex import get_store  # local import to avoid circular dependency
     except Exception:
-        logger.exception("cortex store unavailable")
+        logger.exception("cortex handler dependencies unavailable")
         return
     store = get_store()
 
@@ -34,36 +56,34 @@ def install_handlers(orchestrator) -> None:
                 return {"ok": False, "error": "code_improver agent not registered"}
             proposal_id = str(payload.get("_proposal_id") or "").strip()
             current_proposal = store.get(proposal_id) if proposal_id else None
-            target_file = str(payload.get("target_file") or "").strip()
-            if target_file:
-                target_path = (REPO_ROOT / target_file).resolve()
-                try:
-                    target_path.relative_to(REPO_ROOT)
-                except ValueError:
-                    target_file = ""
-                else:
-                    if not target_path.exists() or not target_path.is_file():
-                        target_file = ""
+            target_file = _resolve_repo_file(payload.get("target_file"))
             if not target_file:
-                inferred_target = infer_feature_target_file(str(idea), repo_root=REPO_ROOT)
+                inferred_target = _resolve_repo_file(
+                    infer_feature_target_file(str(idea), repo_root=REPO_ROOT)
+                )
                 if inferred_target:
                     target_file = inferred_target
             if not target_file:
                 return {"ok": False, "error": "could not infer a starting file for this idea"}
 
+            proposals = store.list()
             current_created_at = getattr(current_proposal, "created_at", None)
             if current_created_at is not None:
                 older_feature = next(
                     (
                         proposal
-                        for proposal in store.list()
+                        for proposal in proposals
                         if proposal.kind == "feature"
                         and proposal.status in {"approved", "applying"}
                         and proposal.id != proposal_id
+                        and getattr(proposal, "created_at", None) is not None
                         and proposal.created_at <= current_created_at
                         and str((proposal.payload or {}).get("repo_root") or str(REPO_ROOT))
                         == str(REPO_ROOT)
-                        and str((proposal.payload or {}).get("target_file") or "") == target_file
+                        and _normalize_repo_relative_path(
+                            (proposal.payload or {}).get("target_file")
+                        )
+                        == target_file
                     ),
                     None,
                 )
@@ -79,11 +99,13 @@ def install_handlers(orchestrator) -> None:
             active_patch = next(
                 (
                     proposal
-                    for proposal in store.list()
+                    for proposal in proposals
                     if proposal.kind == "code_patch"
                     and proposal.status in {"pending", "approved", "applying"}
-                    and str((proposal.payload or {}).get("repo_root") or "") == str(REPO_ROOT)
-                    and str((proposal.payload or {}).get("target_file") or "") == target_file
+                    and str((proposal.payload or {}).get("repo_root") or REPO_ROOT) == str(REPO_ROOT)
+                    and _normalize_repo_relative_path(
+                        (proposal.payload or {}).get("target_file")
+                    ) == target_file
                 ),
                 None,
             )
@@ -95,7 +117,6 @@ def install_handlers(orchestrator) -> None:
                     "code_patch_proposal_id": active_patch.id,
                     "details": "A code patch is already active for that file.",
                 }
-            from skyn3t.core.agent import TaskRequest
             req = TaskRequest(
                 title="apply feature proposal",
                 input_data={
@@ -146,23 +167,32 @@ def install_handlers(orchestrator) -> None:
 
     async def ingest_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
         """User approved an ingest proposal → run github_ingestor."""
-        topic = payload.get("topic") or payload.get("query") or payload.get("repo") or ""
-        repo = payload.get("repo")
+        topic = str(payload.get("topic") or payload.get("query") or payload.get("idea") or "").strip()
+        repo = str(payload.get("repo") or "").strip()
         try:
+            from skyn3t.core.agent import TaskRequest
+
             ingestor = orchestrator.agents.get("github_ingestor")
             if ingestor is None:
                 return {"ok": False, "error": "github_ingestor agent not registered"}
-            from skyn3t.core.agent import TaskRequest
+            raw_limit = payload.get("limit")
+            try:
+                max_files = max(1, int(raw_limit or 5))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": f"invalid ingest limit: {raw_limit!r}"}
             input_data: Dict[str, Any] = {
-                "max_files": max(1, int(payload.get("limit") or 5)),
+                "max_files": max_files,
             }
-            if repo:  # prefer explicit repo over topic-based search
+            if repo:
                 input_data["mode"] = "single_repo"
                 input_data["repo"] = repo
             else:
+                if not topic:
+                    return {"ok": False, "error": "missing topic/query for search ingest"}
                 input_data["mode"] = "search"
                 input_data["query"] = topic
-            req = TaskRequest(title=f"approved ingest: {topic or repo or 'unspecified'}", input_data=input_data)
+            label = topic or (str(repo).strip() if repo else "") or "unspecified"
+            req = TaskRequest(title=f"approved ingest: {label}", input_data=input_data)
             result = await ingestor.execute(req)
             ok = bool(getattr(result, "success", False))
             out = getattr(result, "output", {}) or {}
@@ -174,26 +204,32 @@ def install_handlers(orchestrator) -> None:
 
     async def studio_debug_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
         """Approved studio_debug → run CodeImproverAgent on target_file with verdict+risks as rationale."""
-        target = payload.get("target_file") or ""
         risks = normalize_review_risks(payload.get("risks") or [])
         verdict = payload.get("verdict") or ""
+        # Check risks before resolving the target. A no-actionable-risks
+        # review never needs the file to exist on disk — and the proposal
+        # may target a still-to-be-generated project artifact.
         if not risks:
             return {"ok": False, "error": "review flagged no actionable risks"}
+        target = _resolve_repo_file(payload.get("target_file"))
+        if not target:
+            return {"ok": False, "error": "invalid or missing target_file"}
         rationale = (
             f"Address Reviewer's critique on `{target}`.\n\n"
             f"Verdict: {verdict}\n\n"
-            + "Risks to address:\n" + "\n".join(f"- {r}" for r in risks)
+            "Risks to address:\n"
+            + "\n".join(f"- {r}" for r in risks if r)
             + "\n\nProduce a unified diff that resolves these risks while keeping existing structure."
         )
         try:
             improver = orchestrator.agents.get("code_improver")
             if improver is None:
                 return {"ok": False, "error": "code_improver not registered"}
-            from skyn3t.core.agent import TaskRequest
             req = TaskRequest(
                 title="studio_debug retry",
                 input_data={
                     "target_file": target,
+                    "repo_root": str(REPO_ROOT),
                     "rationale": rationale,
                     "intent": "studio_debug",
                     "review_risks": risks,

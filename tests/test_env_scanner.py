@@ -6,8 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from skyn3t.agents.env_scanner import EnvVarRef, ScanResult, scan
-
+from skyn3t.agents.env_scanner import ScanResult, scan
 
 # ---------------------------------------------------------------------------
 # Helpers

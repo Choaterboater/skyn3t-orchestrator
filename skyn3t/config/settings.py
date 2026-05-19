@@ -71,6 +71,30 @@ class Settings(BaseSettings):
     chunk_overlap: int = Field(default=200, alias="CHUNK_OVERLAP")
     top_k_retrieval: int = Field(default=5, alias="TOP_K_RETRIEVAL")
 
+    # Discord (all optional — control surface; bot/webhook still gated by token)
+    discord_application_id: Optional[str] = Field(default=None, alias="SKYN3T_DISCORD_APP_ID")
+    discord_public_key: Optional[str] = Field(default=None, alias="SKYN3T_DISCORD_PUBLIC_KEY")
+    discord_bot_channel_id: Optional[str] = Field(default=None, alias="SKYN3T_DISCORD_CHANNEL_ID")
+    discord_token: Optional[str] = Field(default=None, alias="DISCORD_TOKEN")
+    discord_admin_secret: Optional[str] = Field(default=None, alias="SKYN3T_DISCORD_ADMIN_SECRET")
+
+    # Telegram studio control surface (long-polling, no public URL needed)
+    telegram_token: Optional[str] = Field(default=None, alias="SKYN3T_TELEGRAM_TOKEN")
+    telegram_user_id: Optional[str] = Field(default=None, alias="SKYN3T_TELEGRAM_USER_ID")
+
+    # OpenRouter — single API key for dozens of models. Used as a
+    # fallback when CLI subprocesses fail (App.jsx-stub failure mode)
+    # and as a fast-path for known-problematic entrypoint files.
+    openrouter_api_key: Optional[str] = Field(default=None, alias="OPENROUTER_API_KEY")
+    max_build_cost_usd: float = Field(default=1.0, alias="SKYN3T_MAX_BUILD_COST_USD")
+
+    # Public URL — used in notification embeds (Discord etc.) so users can
+    # click through to the dashboard. Leave unset to fall back to
+    # http://<web_host>:<web_port>, which is fine for local-only use but
+    # won't resolve from a phone. Set this once you have a Cloudflare
+    # Tunnel or stable public hostname.
+    public_url: Optional[str] = Field(default=None, alias="SKYN3T_PUBLIC_URL")
+
     # Web
     web_host: str = Field(default="0.0.0.0", alias="WEB_HOST")
     web_port: int = Field(default=6660, alias="WEB_PORT")
