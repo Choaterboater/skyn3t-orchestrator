@@ -22,7 +22,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, cast
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
@@ -138,7 +138,8 @@ async def _post_via_bot(channel_id: str, payload: dict) -> Optional[dict]:
             response = await client.post(url, headers=headers, json=payload)
             response.raise_for_status()
             try:
-                return cast(Dict[str, Any], response.json())
+                parsed = response.json()
+                return parsed if isinstance(parsed, dict) else {}
             except Exception:  # noqa: BLE001
                 return {}
     except Exception:  # noqa: BLE001

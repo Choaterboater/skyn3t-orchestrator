@@ -402,6 +402,12 @@ def _syntax_ok(body: str, rel_path: str, timeout: float = 5.0) -> bool:
             return False
         if text.count("(") != text.count(")"):
             return False
+        # `export default const|let|var` is invalid ES syntax — the
+        # declaration after `export default` must be an expression or
+        # a function/class declaration. Catches an LLM failure mode
+        # where the model generates the keyword but not a usable rhs.
+        if _RE.search(r"\bexport\s+default\s+(const|let|var)\b", text):
+            return False
         return True
     if rl.endswith((".js", ".mjs", ".cjs")):
         # Plain JS/ESM: node --check works correctly for these.
@@ -1667,100 +1673,6 @@ class CodeAgent(BaseAgent):
                                 "entrypoint fast-path errored for %s; continuing with CLI", rel,
                             )
 
-                    # BULK FAST-PATH ladder: try free/cheap OpenRouter
-                    # models for every per-component file before
-                    # touching the CLI chain. Order is free-first:
-                    #   1. openrouter/owl-alpha          (free, 1M ctx)
-                    #   2. nvidia/nemotron-3-super-120b-a12b:free
-                    #                                    (free, 1M ctx)
-                    #   3. tencent/hy3-preview           ($0.066/$0.26
-                    #                                     per 1M, 262K
-                    #                                     ctx, agentic)
-                    # Each try gets a 90s timeout. First valid response
-                    # wins; on failure (timeout / bad syntax / rate
-                    # limit) we fall through to the next rung. CLIs
-                    # remain the final fallback below.
-                    _bulk_ladder = (
-                        ("openrouter/owl-alpha", "free"),
-                        ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
-                        ("tencent/hy3-preview", "paid"),
-                    )
-                    if not _is_problem_file:  # entrypoint path above already tried
-                        import os as _os_bulk
-                        _bulk_or_key = _os_bulk.environ.get("OPENROUTER_API_KEY")
-                        if not _bulk_or_key:
-                            try:
-                                from skyn3t.config.settings import get_settings as _gs_bulk
-                                _bulk_or_key = getattr(_gs_bulk(), "openrouter_api_key", None)
-                            except Exception:
-                                _bulk_or_key = None
-                        if _bulk_or_key:
-                            _os_bulk.environ.setdefault("OPENROUTER_API_KEY", _bulk_or_key)
-                            from skyn3t.adapters import LLMClient as _LLMCBulk
-                            for _bulk_model, _bulk_tier in _bulk_ladder:
-                                try:
-                                    bulk_client = _LLMCBulk(
-                                        default_model=_bulk_model,
-                                        backend="openrouter",
-                                        event_bus=self.event_bus,
-                                        caller_name=self.name,
-                                    )
-                                    try:
-                                        body_local = await bulk_client.complete(
-                                            file_prompt,
-                                            system=build_system,
-                                            max_tokens=8000,
-                                            temperature=0.3,
-                                            timeout=90.0,
-                                            _allow_backend_failover=False,
-                                        )
-                                    except Exception:
-                                        body_local = ""
-                                    marked_local = _extract_marked_files(body_local or "")
-                                    if marked_local:
-                                        body_match = (
-                                            marked_local.get(rel)
-                                            or marked_local.get(rel.lstrip("/"))
-                                            or marked_local.get(_Path(rel).name)
-                                        )
-                                        if not body_match and len(marked_local) == 1:
-                                            body_match = next(iter(marked_local.values()))
-                                        if body_match:
-                                            body_local = body_match
-                                    body_local = _strip_cli_prelude((body_local or "").strip(), rel)
-                                    body_local = _strip_fences(body_local)
-                                    body_local = _strip_copilot_footer(body_local)
-                                    if (
-                                        body_local
-                                        and "[deterministic-stub]" not in body_local
-                                        and "TODO[skyn3t]" not in body_local
-                                        and _syntax_ok(body_local, rel)
-                                        and _stack_ok(body_local, rel, stack)
-                                    ):
-                                        logger.info(
-                                            "BULK FAST-PATH SUCCESS for %s via %s (%s)",
-                                            rel, _bulk_model, _bulk_tier,
-                                        )
-                                        return rel, body_local, target
-                                    else:
-                                        logger.debug(
-                                            "BULK FAST-PATH failed for %s on %s — trying next rung",
-                                            rel, _bulk_model,
-                                        )
-                                        body_local = ""
-                                except Exception:
-                                    logger.debug(
-                                        "bulk fast-path errored for %s on %s; trying next rung",
-                                        rel, _bulk_model, exc_info=True,
-                                    )
-                                    continue
-                            # All ladder rungs exhausted — fall through
-                            # to the existing CLI per-file routing below.
-                            logger.debug(
-                                "BULK FAST-PATH ladder exhausted for %s — falling back to CLI",
-                                rel,
-                            )
-
                     # Per-file routing: pick the BACKEND best for THIS
                     # file's type. Frontend (.jsx, components/, pages/,
                     # hooks/) → kimi_cli (pretty UI). Backend (server/,
@@ -1784,7 +1696,6 @@ class CodeAgent(BaseAgent):
                         per_file_backend, per_file_model = resolve_model_for_file(
                             rel, stack=stack, scoreboard=_sb,
                             event_bus=self.event_bus,
-                            brief=brief,
                         )
                         # Only construct a new client if the routing
                         # actually differs from the agent's primary
@@ -1806,7 +1717,6 @@ class CodeAgent(BaseAgent):
                         )
 
                     # First attempt with the per-file-routed backend.
-                    primary_timed_out = False
                     try:
                         body_local = await file_client.complete(
                             file_prompt,
@@ -1816,11 +1726,8 @@ class CodeAgent(BaseAgent):
                             timeout=_FILE_BUILD_TIMEOUT_SECONDS,
                             _allow_backend_failover=False,
                         )
-                    except Exception as exc:
-                        primary_timed_out = isinstance(exc, TimeoutError)
+                    except Exception:
                         body_local = ""
-                    if not primary_timed_out:
-                        primary_timed_out = getattr(file_client, "_last_error_type", None) == "TimeoutError"
                     marked_local = _extract_marked_files(body_local or "")
                     if marked_local:
                         body_match = (
@@ -1913,10 +1820,9 @@ class CodeAgent(BaseAgent):
                             and "[deterministic-stub]" not in retry_body
                             and _syntax_ok(retry_body, rel)
                             and _stack_ok(retry_body, rel, stack)
-                            and not primary_timed_out
                         ):
                             body_local = retry_body
-                        elif not body_local and not primary_timed_out:
+                        elif not body_local:
                             body_local = retry_body  # nothing to lose
 
                     # Third-tier retry — last chance to get a real file
@@ -1935,12 +1841,9 @@ class CodeAgent(BaseAgent):
                     # second retry shares too much prompt scaffolding
                     # with the first, so the same failure mode recurs.
                     if (
-                        not primary_timed_out
-                        and (
-                            not body_local
-                            or "[deterministic-stub]" in body_local
-                            or not _syntax_ok(body_local, rel)
-                        )
+                        not body_local
+                        or "[deterministic-stub]" in body_local
+                        or not _syntax_ok(body_local, rel)
                     ):
                         # FIRED — log loudly so we can tell from history
                         # whether this path actually ran (previous bug:
@@ -2059,12 +1962,9 @@ class CodeAgent(BaseAgent):
                     # placeholder fallback below still catches when
                     # OpenRouter is unavailable.
                     if (
-                        not primary_timed_out
-                        and (
-                            not body_local
-                            or "[deterministic-stub]" in body_local
-                            or not _syntax_ok(body_local, rel)
-                        )
+                        not body_local
+                        or "[deterministic-stub]" in body_local
+                        or not _syntax_ok(body_local, rel)
                     ):
                         try:
                             import os as _os
@@ -2399,7 +2299,6 @@ class CodeAgent(BaseAgent):
                     cluster_backend, cluster_model = resolve_model_for_file(
                         cluster_paths[0], stack=stack, scoreboard=_sb_cluster,
                         event_bus=self.event_bus,
-                        brief=brief,
                     )
                     agent_backend = (self.config or {}).get("backend")
                     if cluster_backend and cluster_backend != agent_backend:
@@ -2621,25 +2520,6 @@ class CodeAgent(BaseAgent):
         except Exception:
             logger.exception("backfill unresolved imports failed (non-fatal)")
 
-        # Second-pass: fill backfill stubs with real implementations.
-        # The sync backfiller above writes
-        # `// @skyn3t-backfill-stub:` when neither the rewriter nor
-        # a deterministic template can satisfy an import. Those stubs
-        # are render-null components — they keep the build green but
-        # the reviewer correctly dings them as placeholder code.
-        # Async-fill any stubs by sending the brief + file purpose +
-        # path to OpenRouter Owl Alpha (free tier). Falls back to the
-        # existing stub if the call fails — same behavior as before,
-        # just with a chance at real code first.
-        try:
-            await self._llm_fill_backfill_stubs(
-                out_dir=out_dir,
-                brief=brief,
-                stack=template_key,
-            )
-        except Exception:
-            logger.debug("llm-fill stubs failed (non-fatal)", exc_info=True)
-
         # Strip declared-but-unused deps from package.json files. Every
         # canary 119-136 had the reviewer flag "better-sqlite3 declared
         # but never imported" as architecture-vs-scaffold drift (~5pt).
@@ -2649,31 +2529,6 @@ class CodeAgent(BaseAgent):
             self._strip_unused_package_deps(out_dir)
         except Exception:
             logger.debug("strip-unused-deps failed (non-fatal)", exc_info=True)
-
-        # Inverse: add declared-by-imports-but-missing deps. Counter to
-        # canary-cf9270 where StreakCalendar.jsx imported date-fns +
-        # lucide-react but the architect's tech_stack.json never
-        # declared them. vite build then failed with
-        # "Could not resolve 'date-fns'". This scan keeps the manifest
-        # in sync with what the LLM actually wrote.
-        try:
-            self._add_missing_package_deps(out_dir)
-        except Exception:
-            logger.debug("add-missing-deps failed (non-fatal)", exc_info=True)
-
-        # Auto-format with prettier. Reviewers consistently dock points
-        # for inconsistent spacing, single-vs-double quotes, missing
-        # trailing commas, etc. — formatting nits that have nothing to
-        # do with code quality. Run prettier on the scaffold before the
-        # reviewer sees it so those points stay on the table.
-        #
-        # Uses `npx --no-install` to skip the network round-trip when
-        # prettier isn't already cached; in that case we silently no-op
-        # rather than blocking the build.
-        try:
-            self._format_with_prettier(out_dir)
-        except Exception:
-            logger.debug("prettier autoformat failed (non-fatal)", exc_info=True)
 
         try:
             await self.share_learning(
@@ -2750,7 +2605,6 @@ class CodeAgent(BaseAgent):
             ^\s*import\s+(?:[^'";\n]+?\s+from\s+)?['"](\.{1,2}/[^'"\n]+)['"]
           | ^\s*export\s+(?:\*|\{[^}]*\})\s+from\s+['"](\.{1,2}/[^'"\n]+)['"]
           | \brequire\s*\(\s*['"](\.{1,2}/[^'"\n]+)['"]\s*\)
-          | \bimport\s*\(\s*['"](\.{1,2}/[^'"\n]+)['"]\s*\)
         )
         """
     )
@@ -2815,10 +2669,7 @@ class CodeAgent(BaseAgent):
 
             file_dir = p.parent
             for match in self._LOCAL_IMPORT_RE.finditer(text):
-                target = (
-                    match.group(1) or match.group(2)
-                    or match.group(3) or match.group(4) or ""
-                )
+                target = match.group(1) or match.group(2) or match.group(3) or ""
                 if not target:
                     continue
                 # Resolve relative to the importing file's directory.
@@ -2835,28 +2686,6 @@ class CodeAgent(BaseAgent):
                 resolved = self._resolve_import_path(base)
                 if resolved is not None:
                     continue  # already on disk — nothing to do
-
-                # Before backfilling a stub, see if a file with the same
-                # basename already lives elsewhere in the scaffold. The
-                # component-breakdown path (#113) puts hooks in
-                # `src/hooks/`, components in `src/components/`, etc.,
-                # but App.jsx may have imported `./useHabits` instead of
-                # `./hooks/useHabits`. Rewriting the import is cheaper
-                # and produces a working build vs. shipping a stub.
-                rewritten = self._rewrite_import_to_existing_file(
-                    importing_file=p,
-                    out_dir=out_dir,
-                    target_spec=target,
-                    text=text,
-                )
-                if rewritten is not None:
-                    text = rewritten
-                    try:
-                        p.write_text(text, encoding="utf-8")
-                        backfilled.append(str(p))
-                    except OSError:
-                        logger.warning("import-rewrite write failed: %s", p)
-                    continue
 
                 # Pick a concrete path for the new file. If the target
                 # ends with an extension we leave it alone; otherwise
@@ -2926,94 +2755,6 @@ class CodeAgent(BaseAgent):
                     return idx
         return None
 
-    def _rewrite_import_to_existing_file(
-        self,
-        *,
-        importing_file,
-        out_dir,
-        target_spec: str,
-        text: str,
-    ) -> Optional[str]:
-        """If `target_spec` can't be resolved but a file with the same
-        basename exists elsewhere in the scaffold, rewrite every import
-        of `target_spec` in `text` to point at that file's actual path.
-
-        Returns the rewritten text, or None if no match is found (or
-        the match is ambiguous — multiple basename hits means we
-        can't safely pick one and the caller should fall back to a
-        stub).
-        """
-        import re as _re
-        from pathlib import Path as _Path
-
-        basename = target_spec.rsplit("/", 1)[-1]
-        if not basename or basename in (".", ".."):
-            return None
-        stem = basename.rsplit(".", 1)[0] if "." in basename else basename
-
-        # Find every file under out_dir whose stem matches. Skip
-        # node_modules and the importing file itself.
-        candidates: list[_Path] = []
-        for ext in (".jsx", ".tsx", ".js", ".ts", ".mjs", ".cjs"):
-            for hit in out_dir.rglob(f"{stem}{ext}"):
-                if "node_modules" in hit.parts:
-                    continue
-                if hit.resolve() == importing_file.resolve():
-                    continue
-                candidates.append(hit)
-
-        if len(candidates) != 1:
-            # Zero hits: nothing to rewrite. Multiple hits: ambiguous —
-            # don't guess; let the stub path take over.
-            return None
-
-        match_path = candidates[0]
-        # Use os.path.relpath so parent traversals (../) work — the
-        # naive `Path.relative_to` only works when match_path is a
-        # descendant of importing_file.parent. Real scaffolds put
-        # hooks/, components/, lib/ as siblings, so going from
-        # src/hooks/useThing.js to src/lib/format.js needs "../lib/...".
-        import os.path as _osp
-        try:
-            new_rel = _osp.relpath(
-                str(match_path), start=str(importing_file.parent)
-            )
-        except ValueError:
-            # Different drive on Windows. Skip.
-            return None
-        # Normalize separators to POSIX (Vite/Webpack want forward slashes).
-        new_rel = new_rel.replace("\\", "/")
-
-        # Strip the trailing extension to mirror the LLM's import
-        # style (most generated imports omit extensions).
-        for ext in (".jsx", ".tsx", ".js", ".ts", ".mjs", ".cjs"):
-            if new_rel.endswith(ext):
-                new_rel = new_rel[: -len(ext)]
-                break
-        # Normalize: never leave a bare "filename" — keep the leading "./".
-        if not new_rel.startswith((".", "/")):
-            new_rel = "./" + new_rel
-
-        # Replace the target_spec in import / require / dynamic-import
-        # statements only. Use a narrow regex so we don't substitute
-        # the same string inside a regular string literal that happens
-        # to share the path.
-        spec_escaped = _re.escape(target_spec)
-        new_text, n = _re.subn(
-            rf"((?:from\s+|import\s*\(\s*|require\s*\(\s*)['\"]){spec_escaped}(['\"])",
-            rf"\g<1>{new_rel}\g<2>",
-            text,
-        )
-        if n == 0:
-            return None
-        logger.info(
-            "import-rewrite in %s: '%s' -> '%s'",
-            importing_file.name,
-            target_spec,
-            new_rel,
-        )
-        return new_text
-
     @staticmethod
     def _placeholder_local_import(rel_path: str) -> str:
         """Tiny build-valid stub for an unresolved local import.
@@ -3051,21 +2792,12 @@ class CodeAgent(BaseAgent):
     # never stripped — even if not directly imported, build tools may
     # consume them.
     _STRIPPABLE_UNUSED_DEPS = frozenset({
-        # Databases
         "better-sqlite3", "sqlite3", "sqlite",
         "pg", "postgres", "@vercel/postgres",
         "mongodb", "mongoose",
         "@prisma/client", "prisma",
         "drizzle-orm",
-        # Schedulers
         "node-cron", "croner", "agenda",
-        # Server frameworks — Architect often picks these speculatively
-        # even when CodeAgent never generates a server file, leaving
-        # the scaffold with a node-gyp-flavored backend it can't use.
-        # Safe to strip because if a real server.js / index.js imports
-        # them, _is_imported() catches it and leaves them alone.
-        "express", "fastify", "koa", "hono", "@hono/node-server",
-        "cors", "helmet", "morgan", "body-parser",
     })
 
     @classmethod
@@ -3141,367 +2873,6 @@ class CodeAgent(BaseAgent):
                         fh.write("\n")
                 except OSError:
                     logger.warning("could not write stripped package.json: %s", pkg_path)
-
-    # Curated versions for packages we commonly see imported but missing
-    # from generated package.json. Conservative — we only add packages
-    # we recognize. Unknown packages get "latest" so the build doesn't
-    # break, but operators should pin them properly.
-    _DEFAULT_DEP_VERSIONS = {
-        "date-fns": "^3.6.0",
-        "lucide-react": "^0.460.0",
-        "clsx": "^2.1.1",
-        "classnames": "^2.5.1",
-        "uuid": "^10.0.0",
-        "axios": "^1.7.0",
-        "zustand": "^4.5.0",
-        "react-router-dom": "^6.26.0",
-        "@tanstack/react-query": "^5.50.0",
-        "framer-motion": "^11.3.0",
-        "recharts": "^2.12.0",
-        "chart.js": "^4.4.0",
-        "react-chartjs-2": "^5.2.0",
-        "tailwindcss": "^3.4.0",
-        "react-icons": "^5.2.0",
-    }
-
-    @classmethod
-    def _add_missing_package_deps(cls, out_dir) -> None:
-        """Add bare-package imports that are missing from package.json.
-
-        Walks each non-vendor source file under out_dir, extracts every
-        bare-package specifier (`import x from 'date-fns'`,
-        `require('lodash')`, etc.), and ensures each one is declared in
-        the nearest enclosing package.json's dependencies.
-
-        Counter to `_strip_unused_package_deps`: that strips declared-
-        but-unused; this adds used-but-undeclared. Both run after the
-        scaffold so the manifest stays in sync with what the LLM wrote.
-        """
-        import json as _json
-        import re as _RE
-        from pathlib import Path as _Path
-
-        out_dir = _Path(out_dir).resolve()
-        skip = {"node_modules", "dist", "build", ".next", ".cache", ".git"}
-
-        # Bare-package regex: matches `from "pkg"`, `from "pkg/sub"`,
-        # `from "@scope/pkg"`. Excludes relative paths (starting with
-        # `.` or `/`).
-        bare_re = _RE.compile(
-            r"""(?:from|require\(|import\()\s*['"]"""
-            r"""(@?[a-z0-9][a-z0-9._\-]*(?:/[a-z0-9._\-]+)*)"""
-            r"""['"]""",
-            _RE.IGNORECASE,
-        )
-
-        # node:* (e.g. "node:fs"), and Node built-ins shouldn't be
-        # declared as deps. Vite's externalization handles them.
-        BUILTINS = frozenset({
-            "fs", "path", "os", "url", "util", "crypto", "http", "https",
-            "stream", "buffer", "zlib", "querystring", "child_process",
-            "events", "assert", "net", "dns", "tls", "process",
-            "module", "v8", "vm", "worker_threads", "timers", "string_decoder",
-            "punycode", "readline", "tty", "perf_hooks", "constants",
-        })
-
-        # Collect imports per source file, grouped by their nearest
-        # package.json ancestor.
-        imports_by_pkg: dict[_Path, set[str]] = {}
-
-        # Cache: pkg.json found per directory walked-up. None means none found.
-        pkg_cache: dict[_Path, _Path | None] = {}
-
-        def _nearest_pkg(start: _Path) -> _Path | None:
-            cur = start
-            while True:
-                if cur in pkg_cache:
-                    return pkg_cache[cur]
-                candidate = cur / "package.json"
-                if candidate.is_file():
-                    pkg_cache[cur] = candidate
-                    return candidate
-                if cur == out_dir or cur.parent == cur:
-                    pkg_cache[cur] = None
-                    return None
-                cur = cur.parent
-
-        for path in out_dir.rglob("*"):
-            if not path.is_file():
-                continue
-            try:
-                rel_parts = path.relative_to(out_dir).parts
-            except ValueError:
-                continue
-            if any(part in skip for part in rel_parts):
-                continue
-            if path.suffix.lower() not in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
-                continue
-            try:
-                body = path.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-
-            target_pkg = _nearest_pkg(path.parent)
-            if target_pkg is None:
-                continue
-
-            for match in bare_re.finditer(body):
-                spec = match.group(1)
-                if spec.startswith("node:"):
-                    continue
-                # Extract the package name proper: for `@scope/pkg/sub`,
-                # the package is `@scope/pkg`. For `pkg/sub`, it's `pkg`.
-                if spec.startswith("@"):
-                    parts = spec.split("/", 2)
-                    pkg_name = "/".join(parts[:2]) if len(parts) >= 2 else spec
-                else:
-                    pkg_name = spec.split("/", 1)[0]
-                if pkg_name in BUILTINS:
-                    continue
-                imports_by_pkg.setdefault(target_pkg, set()).add(pkg_name)
-
-        # Now reconcile each package.json
-        for pkg_path, used in imports_by_pkg.items():
-            try:
-                with open(pkg_path, "r", encoding="utf-8") as fh:
-                    data = _json.load(fh)
-            except (OSError, ValueError):
-                continue
-            if not isinstance(data, dict):
-                continue
-            deps = data.setdefault("dependencies", {})
-            dev_deps = data.get("devDependencies") or {}
-            if not isinstance(deps, dict):
-                continue
-
-            added: list[str] = []
-            for pkg_name in sorted(used):
-                if pkg_name in deps or pkg_name in dev_deps:
-                    continue
-                version = cls._DEFAULT_DEP_VERSIONS.get(pkg_name, "latest")
-                deps[pkg_name] = version
-                added.append(f"{pkg_name}@{version}")
-
-            if added:
-                try:
-                    with open(pkg_path, "w", encoding="utf-8") as fh:
-                        _json.dump(data, fh, indent=2)
-                        fh.write("\n")
-                    logger.info(
-                        "Added %d missing dep(s) to %s: %s",
-                        len(added),
-                        pkg_path.relative_to(out_dir).as_posix(),
-                        ", ".join(added[:5])
-                        + ("…" if len(added) > 5 else ""),
-                    )
-                except OSError:
-                    logger.warning("could not write updated package.json: %s", pkg_path)
-
-    async def _llm_fill_backfill_stubs(
-        self,
-        *,
-        out_dir,
-        brief: str,
-        stack: Optional[str],
-    ) -> None:
-        """Find files containing `@skyn3t-backfill-stub:` and replace
-        them with real implementations via free OpenRouter.
-
-        Only fires when both the import-rewriter AND deterministic
-        generator failed to produce a real file — a narrow case that
-        used to ship render-null placeholders to the reviewer.
-
-        Skips silently when OPENROUTER_API_KEY isn't set or when an
-        individual file's LLM call fails. The existing stub remains
-        on disk in that case, preserving today's behavior.
-        """
-        from pathlib import Path as _Path
-        import os as _os
-
-        out_dir = _Path(out_dir).resolve()
-        or_key = _os.environ.get("OPENROUTER_API_KEY")
-        if not or_key:
-            try:
-                from skyn3t.config.settings import get_settings as _gs
-                or_key = getattr(_gs(), "openrouter_api_key", None)
-            except Exception:
-                or_key = None
-        if not or_key:
-            return
-        _os.environ.setdefault("OPENROUTER_API_KEY", or_key)
-
-        # Scan scaffold for stub markers. Limit to JSX/JS/TS files —
-        # CSS stubs are fine as-is, the reviewer doesn't ding them.
-        marker = "@skyn3t-backfill-stub:"
-        scan_exts = {".jsx", ".tsx", ".js", ".ts", ".mjs", ".cjs"}
-        stub_files: list[_Path] = []
-        for p in out_dir.rglob("*"):
-            if not p.is_file():
-                continue
-            if "node_modules" in p.parts:
-                continue
-            if p.suffix.lower() not in scan_exts:
-                continue
-            try:
-                text = p.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            if marker in text:
-                stub_files.append(p)
-
-        if not stub_files:
-            return
-
-        logger.info(
-            "llm-fill: replacing %d backfill stub(s)", len(stub_files)
-        )
-
-        from skyn3t.adapters import LLMClient as _LLMC
-        client = _LLMC(
-            default_model="openrouter/owl-alpha",
-            backend="openrouter",
-            event_bus=self.event_bus,
-            caller_name=self.name,
-        )
-
-        for stub_path in stub_files:
-            try:
-                rel = stub_path.relative_to(out_dir).as_posix()
-            except ValueError:
-                continue
-            # Guess purpose from the path. `src/components/HabitCard.jsx`
-            # → "HabitCard component". `src/hooks/useStats.js` → "useStats hook".
-            stem = stub_path.stem
-            purpose_hint = stem
-            if "/components/" in f"/{rel}":
-                purpose_hint = f"{stem} React component"
-            elif "/hooks/" in f"/{rel}":
-                purpose_hint = f"{stem} React hook"
-            elif "/utils/" in f"/{rel}" or "/lib/" in f"/{rel}":
-                purpose_hint = f"{stem} utility module"
-
-            prompt = (
-                f"Implement the file `{rel}` for this product brief:\n\n"
-                f"BRIEF:\n{(brief or '').strip()[:1200]}\n\n"
-                f"PURPOSE: {purpose_hint}\n"
-                f"STACK: {stack or 'react_vite'} "
-                f"(Vite + React, JSX, no TypeScript)\n\n"
-                f"Output ONLY the file body. No fences, no markdown, no commentary. "
-                f"Imports at the top, default export at the bottom. "
-                f"Write a complete, runnable implementation that fits the brief — "
-                f"not a stub, not a placeholder, not a TODO comment."
-            )
-            try:
-                body = await client.complete(
-                    prompt,
-                    system=(
-                        "You write production-grade React source code. "
-                        "Never use TODO comments, placeholders, or "
-                        "'replace with real implementation' language. "
-                        "Output the complete file body only."
-                    ),
-                    max_tokens=4000,
-                    temperature=0.2,
-                    timeout=60.0,
-                    _allow_backend_failover=False,
-                )
-            except Exception:
-                logger.debug("llm-fill failed for %s", rel, exc_info=True)
-                continue
-
-            body = _strip_cli_prelude((body or "").strip(), rel)
-            body = _strip_fences(body)
-            body = _strip_copilot_footer(body)
-
-            # Don't replace a real stub with another stub or empty content.
-            if not body or marker in body or len(body) < 50:
-                logger.debug(
-                    "llm-fill produced low-quality output for %s; keeping stub",
-                    rel,
-                )
-                continue
-            if not _syntax_ok(body, rel):
-                logger.debug(
-                    "llm-fill output for %s failed syntax check; keeping stub",
-                    rel,
-                )
-                continue
-
-            try:
-                stub_path.write_text(body, encoding="utf-8")
-                logger.info("llm-fill SUCCESS for %s (%d chars)", rel, len(body))
-            except OSError:
-                logger.warning("llm-fill write failed for %s", rel)
-
-    @staticmethod
-    def _format_with_prettier(out_dir) -> None:
-        """Run prettier on the scaffold to remove formatting nits.
-
-        Uses `npx --no-install prettier` so we never trigger a network
-        install — if prettier isn't already in the node_modules cache,
-        we no-op silently rather than block the build. This keeps the
-        step free for users who have prettier and harmless for those
-        who don't.
-
-        Targets common source globs and applies in-place. Output is
-        suppressed; only failure-class log lines bubble up.
-        """
-        from pathlib import Path as _Path
-        import subprocess as _sp
-        import shutil as _shutil
-
-        out_dir = _Path(out_dir).resolve()
-        # Where prettier should run. The nearest package.json's parent
-        # is the scaffold root — that's where node_modules lives.
-        pkg_roots = [
-            p.parent for p in out_dir.rglob("package.json")
-            if "node_modules" not in p.parts
-        ]
-        if not pkg_roots:
-            return
-
-        npx = _shutil.which("npx")
-        if not npx:
-            logger.debug("npx not on PATH — skipping prettier")
-            return
-
-        for root in pkg_roots:
-            patterns = [
-                "src/**/*.{js,jsx,ts,tsx,css,scss,json,html}",
-                "*.{js,jsx,ts,tsx,json,html,md}",
-            ]
-            try:
-                # --no-install skips downloading prettier if missing.
-                # --loglevel warn suppresses the success-list spam.
-                # --ignore-unknown lets glob misses pass quietly.
-                result = _sp.run(
-                    [
-                        npx, "--no-install", "prettier",
-                        "--write", "--loglevel", "warn",
-                        "--ignore-unknown",
-                        *patterns,
-                    ],
-                    cwd=str(root),
-                    capture_output=True,
-                    text=True,
-                    timeout=30.0,
-                )
-                if result.returncode == 0:
-                    logger.info(
-                        "prettier formatted scaffold at %s",
-                        root.relative_to(out_dir.parent).as_posix(),
-                    )
-                else:
-                    # npx exits non-zero when prettier isn't installed;
-                    # that's expected when we asked for --no-install
-                    # and the user doesn't have it. Log at debug.
-                    logger.debug(
-                        "prettier exit=%d stderr=%s",
-                        result.returncode,
-                        (result.stderr or "")[:200],
-                    )
-            except (_sp.TimeoutExpired, OSError, FileNotFoundError):
-                logger.debug("prettier invocation failed", exc_info=True)
 
     @staticmethod
     def _ensure_legacy_frontend_aliases(out_dir, files_written: list[str], brief: str) -> list[str]:
