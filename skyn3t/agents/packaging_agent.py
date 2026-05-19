@@ -365,7 +365,10 @@ class PackagingAgent(BaseAgent):
                 text,
                 count=1,
             )
-            text += f"\n\n// @skyn3t-packaging: first-run Settings gate (do not edit by hand)\nexport default {exported};\n"
+            # Add a bare default export so _inject_settings_wrapper can
+            # find-and-replace it. The wrapper inserts its own marker
+            # comment — don't add one here or it ends up duplicated.
+            text += f"\nexport default {exported};\n"
             return _inject_settings_wrapper(text, exported)
 
         exported = m.group(1)
