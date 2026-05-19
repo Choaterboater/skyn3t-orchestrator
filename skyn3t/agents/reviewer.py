@@ -32,7 +32,27 @@ _HEX_RE = re.compile(r"#[0-9A-Fa-f]{6}\b")
 _HEADING_RE = re.compile(r"^(#{1,6})\s*(.*)$", re.MULTILINE)
 _TODO_RE = re.compile(r"\b(TODO|FIXME|TBD|XXX)\b")
 _CTA_HINTS = ("cta", "call to action", "get started", "sign up", "start free", "buy", "try")
-_SCORE_RE = re.compile(r"(?:score|rating)[^\d]{0,15}(\d{1,3})", re.IGNORECASE)
+# Total score. Requires the digit be ON THE SAME LINE as "Score:" or
+# "Rating:" so we don't slurp across the new sub-score lines (e.g. a
+# match against "## 5. Score\nCompleteness: 18" would otherwise return 18).
+_SCORE_RE = re.compile(
+    r"(?:score|rating)\b[ \t:\-–—]*?(\d{1,3})\b(?!\s*/\s*25)",
+    re.IGNORECASE,
+)
+# Per-axis regexes for the 4-axis structured rubric. Each axis scores
+# /25 and the four sum into the /100 total. We accept "Completeness:
+# 18/25", "Completeness: 18", and "Completeness 18 / 25" — graders
+# don't always follow the exact format, especially smaller models.
+_SUB_SCORE_AXES = ("completeness", "correctness", "consistency", "packaging")
+_SUB_SCORE_RES = {
+    axis: re.compile(
+        # Accept space, colon, hyphen, em-dash, or en-dash as a separator
+        # between the axis label and its score.
+        rf"\b{axis}\b[\s:\-–—]*?(\d{{1,3}})\s*(?:/\s*25)?",
+        re.IGNORECASE,
+    )
+    for axis in _SUB_SCORE_AXES
+}
 
 logger = logging.getLogger(__name__)
 _LLM_REVIEW_TIMEOUT_SECONDS = 180.0
@@ -118,7 +138,7 @@ class ReviewerAgent(BaseAgent):
         # "scaffold is empty" reading.
         scaffold_dir = artifact_dir / "scaffold"
         llm_cwd = scaffold_dir if scaffold_dir.exists() else artifact_dir
-        llm_review_md, llm_score = await self._llm_review(
+        llm_review_md, llm_score, llm_sub_scores = await self._llm_review(
             brief=brief, contents=contents, cwd=str(llm_cwd),
         )
         llm_review_md = self._sanitize_llm_review_md(llm_review_md)
@@ -203,6 +223,7 @@ class ReviewerAgent(BaseAgent):
             llm_review_md=llm_review_md,
             heuristic_score=heuristic_score,
             llm_score=llm_score,
+            llm_sub_scores=llm_sub_scores,
             packaging_score=packaging_score,
             packaging_gaps=packaging_gaps,
             packaging_family=packaging_family,
@@ -234,6 +255,7 @@ class ReviewerAgent(BaseAgent):
                 "verdict": verdict,
                 "score": blended,
                 "summary": f"Review complete: {verdict} ({blended}/100).",
+                "sub_scores": llm_sub_scores,
             },
         )
 
@@ -539,7 +561,7 @@ class ReviewerAgent(BaseAgent):
                 "1. Did the brief actually get addressed?\n"
                 "2. Are the artifacts internally consistent (e.g. brand voice matches palette mood)?\n"
                 "3. What's missing that a real user would notice immediately?\n"
-                "4. What's the most generous fair score (0-100)?\n"
+                "4. What's an honest score (0-100) that reflects what you actually saw?\n"
                 "THEN write the review.\n\n"
             )
             prompt = (
@@ -581,14 +603,22 @@ class ReviewerAgent(BaseAgent):
         brief: str,
         contents: Dict[str, str],
         cwd: Optional[str] = None,
-    ) -> Tuple[Optional[str], Optional[int]]:
-        """Run an LLM review pass. Returns (markdown body, score) or (None, None).
+    ) -> Tuple[Optional[str], Optional[int], Optional[Dict[str, int]]]:
+        """Run an LLM review pass.
+
+        Returns ``(markdown body, total_score, sub_scores)``:
+          * ``total_score``: 0..100 final score the LLM gave (or computed
+            from sub-scores if it omitted the total).
+          * ``sub_scores``: 4-axis dict
+            {completeness, correctness, consistency, packaging}, each /25.
+            ``None`` if the LLM didn't follow the new format — callers
+            fall back to using only ``total_score``.
 
         ``cwd`` is forwarded to the LLM CLI backend so its file-inspection
         tool calls see the real scaffold instead of an empty sandbox.
         """
         if not contents:
-            return None, None
+            return None, None, None
 
         # Build a "Files" block. Caps used to be 1500/30000 — that
         # truncated App.jsx (37KB) to its first 1500 chars and the LLM
@@ -631,7 +661,14 @@ class ReviewerAgent(BaseAgent):
             "2. Strengths (bullet list, max 5).\n"
             "3. Gaps & inconsistencies (bullet list).\n"
             "4. Weak claims / risks (bullet list).\n"
-            "5. Score: a single line of the form `Score: NN/100`.\n"
+            "5. Score: four sub-scores plus the final total. Use EXACTLY this format,\n"
+            "   one per line:\n"
+            "       Completeness: NN/25   # planned artifacts present, non-empty, no stubs\n"
+            "       Correctness:  NN/25   # code/content actually does what it claims\n"
+            "       Consistency:  NN/25   # palette/voice/architecture align across files\n"
+            "       Packaging:    NN/25   # README, env, build/boot artifacts present\n"
+            "       Score:        NN/100  # sum of the four\n"
+            "   Be honest, not generous. A stubbed entrypoint is not 'completeness=25'.\n"
             "Do not include a separate verdict line; the final verdict is blended outside your review.\n\n"
             f"Artifacts:\n{files_block}"
         )
@@ -645,9 +682,26 @@ class ReviewerAgent(BaseAgent):
             cwd=cwd,
         )
         if not out:
-            return None, None
+            return None, None, None
 
-        # Extract score from the response. Be lenient about formatting.
+        # Extract sub-scores (Completeness/Correctness/Consistency/Packaging,
+        # each /25). The LLM is asked to produce all four. If a model
+        # ignores the format or only partially complies, sub_scores is
+        # None and we fall back to the single-score regex below.
+        sub_scores: Dict[str, int] = {}
+        for axis, rx in _SUB_SCORE_RES.items():
+            m_axis = rx.search(out)
+            if not m_axis:
+                continue
+            try:
+                v_axis = int(m_axis.group(1))
+            except ValueError:
+                continue
+            if 0 <= v_axis <= 25:
+                sub_scores[axis] = v_axis
+
+        # Total score. Prefer the explicit `Score: NN/100` line. Fall
+        # back to summing the four sub-scores when they're all present.
         score: Optional[int] = None
         m = _SCORE_RE.search(out)
         if m:
@@ -657,7 +711,16 @@ class ReviewerAgent(BaseAgent):
                     score = v
             except ValueError:
                 pass
-        return out, score
+        if score is None and len(sub_scores) == 4:
+            total = sum(sub_scores.values())
+            if 0 <= total <= 100:
+                score = total
+
+        # Only return sub_scores when all four are present — partial
+        # coverage isn't useful downstream and would mislead the rubric
+        # display in review.md.
+        full_sub_scores = sub_scores if len(sub_scores) == 4 else None
+        return out, score, full_sub_scores
 
     # ------------------------------------------------------------------
     # Heuristic checks (unchanged behaviour, kept compatible)
@@ -935,6 +998,7 @@ class ReviewerAgent(BaseAgent):
         llm_review_md: Optional[str] = None,
         heuristic_score: Optional[int] = None,
         llm_score: Optional[int] = None,
+        llm_sub_scores: Optional[Dict[str, int]] = None,
         packaging_score: Optional[int] = None,
         packaging_gaps: Optional[List[str]] = None,
         packaging_family: Optional[str] = None,
@@ -953,6 +1017,16 @@ class ReviewerAgent(BaseAgent):
                 parts.append(f"packaging={packaging_score}/10")
             if parts:
                 out.append(f"_Score breakdown: {', '.join(parts)}_")
+        if llm_sub_scores:
+            # Surface the 4-axis breakdown so a reader can see which
+            # dimension dragged the score. Order is fixed for scanability.
+            axis_parts = []
+            for _axis in ("completeness", "correctness", "consistency", "packaging"):
+                v = llm_sub_scores.get(_axis)
+                if v is not None:
+                    axis_parts.append(f"{_axis}={v}/25")
+            if axis_parts:
+                out.append(f"_LLM sub-scores: {', '.join(axis_parts)}_")
         if packaging_score is not None and (packaging_gaps or packaging_family):
             out.append("")
             family_label = packaging_family or "unknown"
