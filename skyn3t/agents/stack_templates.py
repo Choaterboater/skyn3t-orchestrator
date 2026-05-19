@@ -220,54 +220,6 @@ def detect_stack_from_handoff(
     return None
 
 
-def detect_stack_from_handoff(
-    brief: str,
-    *,
-    architecture_text: str = "",
-    tech_stack: Optional[Dict[str, Any]] = None,
-) -> Optional[str]:
-    """Pick a stack template using the brief plus upstream architect hints.
-
-    CodeAgent used to detect the scaffold stack from the raw brief only. That
-    fails on generic product briefs ("service dashboard", "SaaS app") even when
-    ArchitectAgent has already written concrete stack guidance in
-    ``architecture.md`` / ``tech_stack.json``. When the brief itself is too
-    vague, prefer explicit architect handoff before falling back to the LLM
-    planner.
-    """
-    direct = detect_stack(brief)
-    if direct:
-        return direct
-
-    signal_chunks: List[str] = []
-    if architecture_text:
-        signal_chunks.append(architecture_text.lower())
-    if tech_stack:
-        for key in ("frontend", "backend", "db", "infra"):
-            value = tech_stack.get(key)
-            if isinstance(value, str) and value.strip():
-                signal_chunks.append(value.lower())
-    signal_text = "\n".join(signal_chunks)
-    if signal_text:
-        # Prefer the explicit Vite/SPA shape over Next if the architect output
-        # mentions both. This happens when tech_stack.json drifts but the
-        # architecture overview still says "Vite + React SPA + Express".
-        if any(token in signal_text for token in ("vite", "react spa", "single-page app", "single page app")):
-            return "react_vite"
-        if any(token in signal_text for token in ("next.js", "nextjs", "app router", "route handlers")):
-            return "next"
-        inferred = detect_stack(signal_text)
-        if inferred:
-            return inferred
-
-    # Dashboard-class briefs without an explicit framework still map much more
-    # often to a SPA scaffold than to a static site. This keeps the deterministic
-    # browser-first template path available for homelab/service-board briefs.
-    if _needs_design_system(brief):
-        return "react_vite"
-    return None
-
-
 def plan_for_stack(stack: str, brief: str = "") -> Optional[FilePlan]:
     """Return the file plan for ``stack``, augmented for the brief.
 
@@ -579,25 +531,60 @@ def _mask_extensibility_examples(text: str) -> str:
     return "".join(result)
 
 
-# Triggers for the design-system tier. Any brief that paints a
-# "dashboard" picture should get the primitive components reserved.
-_DASHBOARD_SIGNALS: Tuple[str, ...] = (
-    "dashboard", "status board", "control panel", "control pane",
+# Signals for the homelab/service-status template tier specifically.
+# These are *not* generic "any dashboard" signals — earlier versions
+# triggered on the bare word "dashboard" which caused Excel-upload,
+# finance, and analytics dashboards to all get the homelab scaffold
+# (Plex/Sonarr/Radarr tiles), wrong-product disasters that tanked
+# review scores. The template tier should only kick in when the brief
+# clearly describes a multi-service status board.
+_HOMELAB_SIGNALS: Tuple[str, ...] = (
     "homelab", "home lab", "home-lab",
-    "metrics ui", "monitoring ui", "ops ui",
-    "service grid", "service tiles", "service cards",
-    "kpi", "kpis", "key metrics",
-    "homarr", "heimdall", "dashy", "grafana-style",
+    "self-hosted dashboard", "self hosted dashboard",
+    "service status dashboard", "service status board",
+    "status board", "status dashboard",
+    "service dashboard", "services dashboard",
+    "media stack dashboard",
+    "homarr", "heimdall", "dashy",
+    # Explicit dashboard component asks — when the brief mentions a
+    # command palette, activity feed, or service detail drawer, the
+    # design-system primitives are the intended output even if the
+    # brief doesn't mention "homelab". The backfill path falls back
+    # to a placeholder stub otherwise.
+    "command palette", "activity feed", "service detail",
+    "monitor my services", "monitor my homelab",
+    "ops dashboard", "noc dashboard",
+)
+
+
+# Briefs that explicitly disqualify the homelab path even if they
+# happen to contain "dashboard" — these describe other domains.
+_HOMELAB_DISQUALIFIERS: Tuple[str, ...] = (
+    "excel", "spreadsheet", "csv", "xlsx",
+    "finance", "expense", "budget", "transaction",
+    "kanban", "todo", "habit", "recipe",
+    "notes app", "markdown notes",
+    "bookmark", "rss", "feed reader",
+    "journal", "workout", "fitness",
+    "crm", "invoice", "billing",
+    "real estate", "listing",
 )
 
 
 def _needs_design_system(brief: str) -> bool:
-    """True when the brief paints a dashboard product. Cheap, broad.
-    False positives are fine — the 3 primitive files are tiny."""
+    """True when the brief specifically describes a homelab-style
+    service status dashboard.
+
+    Narrower than the previous "anything with the word dashboard" logic
+    — that was the root cause of CodeAgent producing homelab Plex/Sonarr
+    scaffolds for Excel uploaders and finance trackers.
+    """
     if not brief:
         return False
     text = brief.lower()
-    return any(sig in text for sig in _DASHBOARD_SIGNALS)
+    if any(d in text for d in _HOMELAB_DISQUALIFIERS):
+        return False
+    return any(sig in text for sig in _HOMELAB_SIGNALS)
 
 
 def _design_system_files() -> FilePlan:
@@ -1711,22 +1698,27 @@ def _hook_use_polling(brief: str) -> Optional[str]:
 
 
 def _component_command_palette(brief: str) -> Optional[str]:
+    # No _needs_design_system gate here: this generator is only reached
+    # via manifest_for() when the scaffold's App.jsx already imports
+    # CommandPalette.jsx — that import IS the signal. The brief-level
+    # gate was incorrectly suppressing backfill for briefs like "build
+    # a polished dashboard" that ask for these primitives indirectly.
     mod = _homelab_mod()
-    if mod is None or not _needs_design_system(brief):
+    if mod is None:
         return None
     return cast(Optional[str], mod.command_palette())
 
 
 def _component_service_detail(brief: str) -> Optional[str]:
     mod = _homelab_mod()
-    if mod is None or not _needs_design_system(brief):
+    if mod is None:
         return None
     return cast(Optional[str], mod.service_detail())
 
 
 def _component_activity_feed(brief: str) -> Optional[str]:
     mod = _homelab_mod()
-    if mod is None or not _needs_design_system(brief):
+    if mod is None:
         return None
     return cast(Optional[str], mod.activity_feed())
 
@@ -1863,7 +1855,11 @@ def manifest_for(
     try:
         sig = inspect.signature(gen)
         if "palette_hexes" in sig.parameters:
-            return gen(brief or "", palette_hexes=palette_hexes)
+            # mypy can't follow the inspect-based signature check; cast to
+            # an Any-typed callable so the palette-aware kwarg goes through.
+            from typing import Any, cast
+            result = cast(Any, gen)(brief or "", palette_hexes=palette_hexes)
+            return cast(Optional[str], result)
     except (TypeError, ValueError):
         pass
     return gen(brief or "")

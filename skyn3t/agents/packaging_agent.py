@@ -30,11 +30,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from skyn3t.agents.env_scanner import EnvVarRef, ScanResult, scan as scan_env
-from skyn3t.agents.stack_detector import StackDetection, detect as detect_stack
+from skyn3t.agents.env_scanner import EnvVarRef, ScanResult
+from skyn3t.agents.env_scanner import scan as scan_env
+from skyn3t.agents.stack_detector import StackDetection
+from skyn3t.agents.stack_detector import detect as detect_stack
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
-
 
 logger = logging.getLogger("skyn3t.agents.packaging_agent")
 
@@ -209,9 +210,6 @@ class PackagingAgent(BaseAgent):
             files_patched.append("scaffold/src/App.jsx")
         elif patch_note:
             notes.append(patch_note)
-        # Stash the specific reason so the README can echo it.
-        self._last_patch_note = patch_note
-
         # 4. .gitignore (stack-aware, web-tier)
         gitignore_path = artifact_dir / ".gitignore"
         if not gitignore_path.is_file():
@@ -337,7 +335,7 @@ class PackagingAgent(BaseAgent):
                 text,
                 count=1,
             )
-            text += f"\n\n// @skyn3t-packaging: first-run Settings gate (do not edit by hand)\nexport default {exported};\n"
+            text += f"\n\nexport default {exported};\n"
             return _inject_settings_wrapper(text, exported)
 
         exported = m.group(1)

@@ -16,8 +16,6 @@ Keeps the autonomy story honest in CI.
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from skyn3t.intelligence.error_signatures import signature_for_findings
