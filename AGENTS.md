@@ -115,6 +115,61 @@ class MyAgent(BaseAgent):
         return True
 ```
 
+## PackagingAgent — runnable-product generation
+
+Pipeline stage that runs **after `contract_verifier`** and **before `consistency_reviewer`**. Turns every generated scaffold into something a stranger can run, instead of a config-puzzle the user has to debug.
+
+**Files:**
+- `skyn3t/agents/packaging_agent.py` — the agent + per-strategy templates
+- `skyn3t/agents/env_scanner.py` — finds `process.env.X` / `import.meta.env.X` / `os.getenv("X")` / pydantic Settings refs in source
+- `skyn3t/agents/stack_detector.py` — classifies project family from manifests
+- `tests/test_env_scanner.py`, `test_stack_detector.py`, `test_packaging_agent_{web,docker,fullstack}.py`, `test_reviewer_packaging_axis.py`
+
+### Strategy dispatch
+
+`StackDetector.detect(artifact_dir)` returns `family ∈ {web, server, fullstack, unknown}`. `PackagingAgent.execute` matches on family:
+
+| Family | What gets generated |
+|---|---|
+| **web** (react_vite / next / svelte / etc.) | `scaffold/src/hooks/useConfig.js` (localStorage-backed config) + `scaffold/src/Settings.jsx` (auto-generated from env scanner) + first-run gate patched into `App.jsx` + `.gitignore` + slim README |
+| **server** (fastapi / flask / express / etc.) | `Dockerfile` (stack-aware) + `docker-compose.yml` (app + detected services) + `.env.example` (slim, only server vars) + `.gitignore` + README with `cp .env.example .env && docker compose up` |
+| **fullstack** (web + server in one repo) | Both of the above, plus: frontend added as a service in compose, `API_BASE_URL` seeded as default in `useConfig`, unified root README explaining the two-tier config model |
+| **unknown** | Placeholder result — no files generated |
+
+### Feature flag
+
+Disable per-run via `extra={"packaging_enabled": False}` on `StudioRunner.start(...)`. Defaults to enabled.
+
+### Reviewer scoring
+
+`ReviewerAgent._packaging_score(artifact_dir)` returns `(score 0-10, gaps, family)`. Blended into the final review score at **10% weight**:
+
+- With LLM score: `blend = 0.54 · llm + 0.36 · heuristic + 0.10 · packaging`
+- Without:        `blend = 0.90 · heuristic + 0.10 · packaging`
+
+Per-family rubric (all award 5 base points for README + .gitignore):
+
+| Family | +5 specific |
+|---|---|
+| web | Settings.jsx (+3), useConfig hook (+2) |
+| server | Dockerfile (+2), docker-compose.yml (+2), .env.example (+1) |
+| fullstack | web layer (+2), server layer (+2), frontend wired into compose (+1) |
+| unknown | +5 default (can't grade specifics) |
+
+Packaging gaps surface as ⚠️ bullets in `review.md`.
+
+### When to extend
+
+- **New stack family** (CLI tools, iOS apps, etc.): add a `_package_<family>` method, a new `case` arm in `execute`, a `_packaging_score` branch in `reviewer.py`. Add per-stack templates next to the existing `_WEB_GITIGNORE` / `_PYTHON_DOCKERFILE` constants.
+- **New infra service** for docker-compose: add an entry to `_SERVICE_STANZAS` in `packaging_agent.py`. The compose generator handles the rest.
+- **New env-var idiom**: add a regex + an AST handler in `env_scanner.py`. Aim for word-boundary matching to avoid false positives.
+
+### Safety invariants
+
+- **Never overwrite operator's existing infra.** Dockerfile / docker-compose / .env.example are detected and left in place when present, with a note appended to the result.
+- **App.jsx patching is AST-safe.** Skips when react-router is already imported, when file is over 200 lines, when no `export default` is found, or when the `@skyn3t-packaging` marker is already present (idempotent).
+- **Sandbox verification is bounded.** Web tier runs `npm install + npm run build` with a 180s timeout; failure is non-fatal because the downstream BuildVerifier catches it again. Server tier skips verification entirely (BuildVerifier owns `docker compose build`).
+
 ## Testing Guidelines
 
 - **Framework** — pytest with `asyncio.run()` for async code (see `tests/test_memory.py`)
