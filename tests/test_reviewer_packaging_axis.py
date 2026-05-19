@@ -10,11 +10,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from skyn3t.agents.reviewer import ReviewerAgent
 from skyn3t.core.events import EventBus
-
 
 # ---------------------------------------------------------------------------
 # Helpers
