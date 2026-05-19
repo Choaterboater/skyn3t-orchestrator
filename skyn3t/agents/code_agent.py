@@ -1005,13 +1005,32 @@ class CodeAgent(BaseAgent):
             except Exception:
                 tech_stack = {}
 
+            # Honor the architect's decisions.json contract (PR #23).
+            # When the architect committed to a Node backend bundle
+            # (express / hono-node), pass that down to plan_for_stack
+            # so the backend tier ships even when the brief itself
+            # didn't trigger _needs_backend. Without this hook the
+            # scaffold is frontend-only and the consistency reviewer
+            # flags "architect promised Express + port 3000 but no
+            # server code shipped" on every build.
+            from skyn3t.agents.decisions import load_decisions
+            decisions = (
+                d.get("decisions")
+                if isinstance(d.get("decisions"), dict)
+                else load_decisions(artifact_dir)
+            )
+
             from skyn3t.agents.stack_templates import detect_stack_from_handoff, plan_for_stack
             template_key = detect_stack_from_handoff(
                 brief,
                 architecture_text=architecture_text,
                 tech_stack=tech_stack,
             )
-            template_plan = plan_for_stack(template_key, brief) if template_key else None
+            template_plan = (
+                plan_for_stack(template_key, brief, decisions=decisions)
+                if template_key
+                else None
+            )
 
             plan: Dict[str, Any] = {}
             file_specs: List[Dict[str, Any]] = []

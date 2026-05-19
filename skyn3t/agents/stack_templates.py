@@ -220,7 +220,12 @@ def detect_stack_from_handoff(
     return None
 
 
-def plan_for_stack(stack: str, brief: str = "") -> Optional[FilePlan]:
+def plan_for_stack(
+    stack: str,
+    brief: str = "",
+    *,
+    decisions: Optional[Dict[str, Any]] = None,
+) -> Optional[FilePlan]:
     """Return the file plan for ``stack``, augmented for the brief.
 
     Three layered augmentations on top of the base template:
@@ -230,6 +235,14 @@ def plan_for_stack(stack: str, brief: str = "") -> Optional[FilePlan]:
        server process, per-service adapters, ``.env.example``, and
        ``docker-compose.yml``. Without this, the browser-only scaffold
        can't hold credentials and the program can't run.
+
+       The architect's ``decisions.json`` (when present) is a stronger
+       signal than brief detection: if the architect committed to a
+       Node backend framework (``express``, ``hono-node``), the
+       backend tier ships regardless of brief signals. This stops the
+       "architect said Express + port 3000 but no server code shipped"
+       class of consistency-reviewer finding that dominated tactrax /
+       crack-track / e79bc0 reviews.
 
     2. **Configurable tier** — when the brief signals "the user should be
        able to edit config from the UI" (set API keys, change host/port,
@@ -250,7 +263,7 @@ def plan_for_stack(stack: str, brief: str = "") -> Optional[FilePlan]:
         return None
     plan: FilePlan = list(base)
     if stack in _BROWSER_FIRST_STACKS:
-        if _needs_backend(brief):
+        if _needs_backend(brief) or _decisions_pin_node_backend(decisions):
             services = _detect_services(brief)
             plan = plan + _backend_tier_files(services)
             # Configurable tier rides on backend tier — pointless to add
@@ -403,6 +416,38 @@ def _needs_backend(brief: str) -> bool:
     # Fallback: 2+ named services in a single brief is itself a signal
     # — a real homelab integration UI never talks to one service.
     if len(_detect_services(brief)) >= 2:
+        return True
+    return False
+
+
+# Decisions-contract bundle backend slots that mean "ship a Node
+# backend tier." Kept narrow on purpose — `next` has its own
+# fullstack template so it doesn't need the Express tier appended,
+# and `none` is explicit no-backend.
+_NODE_BACKEND_FRAMEWORKS = {"express", "hono-node", "hono"}
+
+
+def _decisions_pin_node_backend(decisions: Optional[Dict[str, Any]]) -> bool:
+    """True when the architect's decisions.json committed to a Node
+    backend framework that needs the backend tier shipped.
+
+    Honors the architect contract (PR #23) — when decisions.framework
+    is express / hono-node, the scaffold ships the server even if the
+    brief itself didn't trigger _needs_backend. Without this, the
+    architect promises Express + port 3000 in decisions.json and the
+    consistency reviewer correctly flags the missing backend on
+    every build.
+    """
+    if not decisions:
+        return False
+    framework = str(decisions.get("framework") or "").strip().lower()
+    if framework in _NODE_BACKEND_FRAMEWORKS:
+        return True
+    # backend_language as a secondary signal in case `framework`
+    # is unset / unknown but the decisions still committed to Node.
+    language = str(decisions.get("backend_language") or "").strip().lower()
+    backend_port = decisions.get("backend_port")
+    if language == "node" and isinstance(backend_port, int):
         return True
     return False
 
