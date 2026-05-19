@@ -777,12 +777,14 @@ class TestCodeImproverAgent:
 
         commands = []
 
-        def fake_run(cmd, capture_output, text, cwd, timeout):
-            commands.append((cmd, cwd, timeout))
-            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+        def fake_stream_capture(*, args, cwd, hard_timeout, idle_timeout):
+            commands.append((args, cwd, hard_timeout, idle_timeout))
+            return ("ok\n", "", 0)
 
         monkeypatch.setattr("skyn3t.agents.code_improver.shutil.which", lambda name: f"/usr/bin/{name}")
-        monkeypatch.setattr("skyn3t.agents.code_improver.subprocess.run", fake_run)
+        monkeypatch.setattr(
+            CodeImproverAgent, "_stream_capture", staticmethod(fake_stream_capture)
+        )
 
         result = CodeImproverAgent._run_repo_checks(repo_root)
 
@@ -790,9 +792,10 @@ class TestCodeImproverAgent:
         assert result["ok"] is True
         assert result["command"] == "pnpm test && pnpm build"
         assert "validated Node repo with pnpm" == result["note"]
+        # Hard cap of 240s (caller-supplied) + idle of 180s (default).
         assert commands == [
-            (["pnpm", "test"], str(repo_root), 240),
-            (["pnpm", "build"], str(repo_root), 240),
+            (["pnpm", "test"], str(repo_root), 240, 180),
+            (["pnpm", "build"], str(repo_root), 240, 180),
         ]
 
     def test_run_repo_checks_detects_go_modules(self, tmp_path, monkeypatch):
@@ -804,18 +807,20 @@ class TestCodeImproverAgent:
 
         calls = []
 
-        def fake_run(cmd, capture_output, text, cwd, timeout):
-            calls.append((cmd, cwd, timeout))
-            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+        def fake_stream_capture(*, args, cwd, hard_timeout, idle_timeout):
+            calls.append((args, cwd, hard_timeout, idle_timeout))
+            return ("ok\n", "", 0)
 
-        monkeypatch.setattr("skyn3t.agents.code_improver.subprocess.run", fake_run)
+        monkeypatch.setattr(
+            CodeImproverAgent, "_stream_capture", staticmethod(fake_stream_capture)
+        )
 
         result = CodeImproverAgent._run_repo_checks(repo_root)
 
         assert result["ran"] is True
         assert result["ok"] is True
         assert result["command"] == "go test ./..."
-        assert calls == [(["go", "test", "./..."], str(repo_root), 240)]
+        assert calls == [(["go", "test", "./..."], str(repo_root), 240, 180)]
 
 
 class TestReviewerAgent:
