@@ -118,33 +118,48 @@ class ReviewerAgent(BaseAgent):
         # Packaging axis (0-10) — does this scaffold ship as a runnable
         # product? Scored against the project's detected stack family
         # so a CLI tool doesn't get docked for missing a Settings UI.
-        packaging_score, packaging_gaps, packaging_family = self._packaging_score(artifact_dir)
+        # If the run intentionally skipped PackagingAgent (extra=
+        # {"packaging_enabled": False}), don't grade against artifacts
+        # the pipeline was told not to generate.
+        packaging_enabled = data.get("packaging_enabled") is not False
+        if packaging_enabled:
+            packaging_score, packaging_gaps, packaging_family = self._packaging_score(artifact_dir)
+        else:
+            packaging_score, packaging_gaps, packaging_family = None, [], None
 
-        # Blend scores. If LLM produced a usable score, weight it 54/36/10
-        # with the heuristic and the packaging axis; otherwise 90/10
-        # against just the heuristic + packaging.
-        # Rationale: packaging-completeness deserves ~10% of the final
-        # score — small enough to not dominate, large enough to nudge
-        # the swarm toward shipping runnable artifacts.
-        packaging_pct = packaging_score * 10  # rescale 0-10 to 0-100
+        # Blend scores. When packaging is enabled, weight LLM/heuristic/
+        # packaging at 54/36/10 (or 90/10 heuristic+packaging if no LLM).
+        # When disabled, drop the packaging axis entirely and rescale
+        # to 60/40 (or 100% heuristic if no LLM) so the missing 10%
+        # doesn't silently penalize the score.
+        if packaging_enabled:
+            packaging_pct = (packaging_score or 0) * 10  # rescale 0-10 to 0-100
+            if llm_score is not None:
+                blended = int(round(
+                    llm_score * 0.54
+                    + heuristic_score * 0.36
+                    + packaging_pct * 0.10
+                ))
+            else:
+                blended = int(round(heuristic_score * 0.90 + packaging_pct * 0.10))
+        else:
+            if llm_score is not None:
+                blended = int(round(llm_score * 0.60 + heuristic_score * 0.40))
+            else:
+                blended = int(round(heuristic_score * 1.00))
         if llm_score is not None:
-            blended = int(round(
-                llm_score * 0.54
-                + heuristic_score * 0.36
-                + packaging_pct * 0.10
-            ))
             # Don't let a perfect heuristic checklist promote a middling
             # LLM review into a higher verdict bucket. The blend may still
             # improve the score within the same bucket, but a 69-quality
             # artifact should not become a `go`.
             blended = min(blended, _llm_bucket_ceiling(llm_score))
-        else:
-            blended = int(round(heuristic_score * 0.90 + packaging_pct * 0.10))
         blended = max(0, min(100, blended))
 
         # Surface packaging gaps as soft risks so the reviewer markdown
-        # explains why the score landed where it did.
-        if packaging_gaps:
+        # explains why the score landed where it did. Skip when packaging
+        # was intentionally disabled — the gaps reflect files the pipeline
+        # chose not to generate, not actual quality issues.
+        if packaging_enabled and packaging_gaps:
             for gap in packaging_gaps:
                 risks.append(f"Packaging: {gap}")
 
