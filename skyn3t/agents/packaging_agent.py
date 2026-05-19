@@ -14,8 +14,8 @@ packaging strategy based on StackDetector's family classification:
 Each strategy is a self-contained _package_* method so adding a new
 family later is one match-arm + one method.
 
-This PR ships the **web** strategy only. Docker, fullstack, and the
-reviewer-scoring axis land in subsequent PRs (C-docker, C-combo, D).
+This PR ships the **web + server** strategies. Fullstack and the
+reviewer-scoring axis land in subsequent PRs (C-combo, D).
 
 Feature-flagged via `extra={"packaging_enabled": False}` on the
 StudioRunner — defaults on, easy to disable per-run if it misbehaves.
@@ -131,11 +131,16 @@ class PackagingAgent(BaseAgent):
                         env_scan=env_scan,
                         verify_enabled=verify_enabled,
                     )
-                case "server" | "fullstack" | "unknown":
-                    # PR C-web ships web only. Other families get a
-                    # placeholder that records the gap rather than
-                    # leaving the pipeline with no PackagingAgent output
-                    # at all.
+                case "server":
+                    result = self._package_server(
+                        artifact_dir=artifact_dir,
+                        scaffold_dir=scaffold_dir,
+                        detection=detection,
+                        env_scan=env_scan,
+                    )
+                case "fullstack" | "unknown":
+                    # PR C-combo ships fullstack. unknown stays as
+                    # placeholder until we get a meaningful signal.
                     result = self._package_placeholder(detection, env_scan)
                 case _:
                     result = self._package_placeholder(detection, env_scan)
@@ -404,7 +409,136 @@ class PackagingAgent(BaseAgent):
         return True, "verified: install + build succeeded"
 
     # ==================================================================
-    # Strategy: placeholder for non-web families (PR C-docker fills this in)
+    # Strategy: server (Docker)
+    # ==================================================================
+
+    def _package_server(
+        self,
+        *,
+        artifact_dir: Path,
+        scaffold_dir: Path,
+        detection: StackDetection,
+        env_scan: ScanResult,
+    ) -> PackagingResult:
+        """Generate Dockerfile + docker-compose.yml + slim .env.example + README.
+
+        Verification is skipped — the downstream BuildVerifier already
+        runs `docker compose build` for Docker projects, no need to
+        double-pay the install/build cost here.
+        """
+        files_written: List[str] = []
+        notes: List[str] = []
+
+        # Backends usually live at the project root (FastAPI app on root,
+        # not in scaffold/). Pick the dir that has the manifest.
+        project_root = self._project_root_for_server(artifact_dir, scaffold_dir)
+
+        # 1. Dockerfile — stack-aware
+        dockerfile_path = project_root / "Dockerfile"
+        if dockerfile_path.is_file():
+            notes.append("Dockerfile already exists — left in place")
+        else:
+            dockerfile_path.write_text(
+                _render_dockerfile(detection),
+                encoding="utf-8",
+            )
+            files_written.append(
+                str(dockerfile_path.relative_to(artifact_dir))
+                if dockerfile_path.is_relative_to(artifact_dir)
+                else dockerfile_path.name
+            )
+
+        # 2. docker-compose.yml — app + detected services
+        compose_path = project_root / "docker-compose.yml"
+        if compose_path.is_file() or (project_root / "compose.yaml").is_file():
+            notes.append("docker-compose already exists — left in place")
+        else:
+            compose_path.write_text(
+                _render_compose(detection, env_scan),
+                encoding="utf-8",
+            )
+            files_written.append(
+                str(compose_path.relative_to(artifact_dir))
+                if compose_path.is_relative_to(artifact_dir)
+                else compose_path.name
+            )
+
+        # 3. .env.example — only the truly server-side vars
+        env_example_path = project_root / ".env.example"
+        if env_example_path.is_file():
+            notes.append(".env.example already exists — left in place")
+        else:
+            env_example_path.write_text(
+                _render_env_example(detection, env_scan),
+                encoding="utf-8",
+            )
+            files_written.append(
+                str(env_example_path.relative_to(artifact_dir))
+                if env_example_path.is_relative_to(artifact_dir)
+                else env_example_path.name
+            )
+
+        # 4. .gitignore — server-tier
+        gitignore_path = project_root / ".gitignore"
+        if not gitignore_path.is_file():
+            gitignore_path.write_text(_SERVER_GITIGNORE, encoding="utf-8")
+            files_written.append(
+                str(gitignore_path.relative_to(artifact_dir))
+                if gitignore_path.is_relative_to(artifact_dir)
+                else gitignore_path.name
+            )
+
+        # 5. README — two-command quick start (cp .env, docker compose up)
+        readme_path = project_root / "README.md"
+        readme_path.write_text(
+            _render_server_readme(
+                app_name=_infer_app_name(detection, artifact_dir),
+                detection=detection,
+                env_scan=env_scan,
+            ),
+            encoding="utf-8",
+        )
+        files_written.append(
+            str(readme_path.relative_to(artifact_dir))
+            if readme_path.is_relative_to(artifact_dir)
+            else readme_path.name
+        )
+
+        return PackagingResult(
+            strategy="server",
+            files_written=files_written,
+            files_patched=[],
+            env_vars_found=len(env_scan.vars),
+            verified=False,
+            # Server verification is owned by the downstream BuildVerifier
+            # (docker compose build) — skipping here is intentional, not
+            # a failure.
+            verifier_skipped=True,
+            notes=notes,
+        )
+
+    @staticmethod
+    def _project_root_for_server(artifact_dir: Path, scaffold_dir: Path) -> Path:
+        """Return the dir that has the server manifest.
+
+        Most Python servers ship requirements.txt / pyproject.toml at the
+        artifact root rather than under scaffold/, but a few (e.g.
+        express apps generated alongside a frontend) live in scaffold/.
+        Pick whichever has a Python manifest first, fall back to scaffold,
+        fall back to artifact root.
+        """
+        for candidate in (artifact_dir, scaffold_dir):
+            if candidate.is_dir() and any(
+                (candidate / m).is_file()
+                for m in ("requirements.txt", "pyproject.toml", "package.json")
+            ):
+                return candidate
+        if scaffold_dir.is_dir():
+            return scaffold_dir
+        return artifact_dir
+
+    # ==================================================================
+    # Strategy: placeholder for fullstack/unknown families
     # ==================================================================
 
     def _package_placeholder(self, detection: StackDetection, env_scan: ScanResult) -> PackagingResult:
@@ -418,7 +552,7 @@ class PackagingAgent(BaseAgent):
             verifier_skipped=True,
             notes=[
                 f"packaging strategy '{detection.family}' not implemented in this PR — "
-                "see roadmap PR C-docker / C-combo"
+                "see roadmap PR C-combo"
             ],
         )
 
@@ -839,3 +973,434 @@ build/
 .env.local
 .env.*.local
 """
+
+
+_SERVER_GITIGNORE = """\
+# Generated by SkyN3t PackagingAgent
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+env/
+.eggs/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+node_modules/
+dist/
+build/
+*.log
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+"""
+
+
+# ---------------------------------------------------------------------------
+# Docker render helpers
+# ---------------------------------------------------------------------------
+
+# Default port per known server stack — chosen to match the framework's
+# documented default so users hit a familiar number.
+_DEFAULT_PORT_BY_STACK: Dict[str, int] = {
+    "fastapi": 8000,
+    "flask": 5000,
+    "django": 8000,
+    "starlette": 8000,
+    "aiohttp": 8080,
+    "bottle": 8080,
+    "express": 3000,
+    "fastify": 3000,
+    "koa": 3000,
+    "hono": 3000,
+}
+
+
+def _server_port(detection: StackDetection) -> int:
+    """Pick the run port from the stack hint, default to 8000."""
+    if detection.stack and detection.stack in _DEFAULT_PORT_BY_STACK:
+        return _DEFAULT_PORT_BY_STACK[detection.stack]
+    return 8000
+
+
+def _render_dockerfile(detection: StackDetection) -> str:
+    """Pick a multi-stage Dockerfile template per stack family.
+
+    Python stacks get python:3.12-slim + pip install. Node stacks get
+    node:22-alpine + npm ci. Both pin specific image tags so builds are
+    reproducible.
+    """
+    stack = detection.stack or ""
+    port = _server_port(detection)
+
+    if stack in ("fastapi", "starlette", "aiohttp"):
+        cmd_line = f'CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "{port}"]'
+        return _PYTHON_DOCKERFILE.format(port=port, cmd_line=cmd_line)
+    if stack == "flask":
+        cmd_line = f'CMD ["gunicorn", "-w", "2", "-b", "0.0.0.0:{port}", "app:app"]'
+        return _PYTHON_DOCKERFILE.format(port=port, cmd_line=cmd_line)
+    if stack == "django":
+        cmd_line = f'CMD ["gunicorn", "-w", "2", "-b", "0.0.0.0:{port}", "config.wsgi:application"]'
+        return _PYTHON_DOCKERFILE.format(port=port, cmd_line=cmd_line)
+    if stack == "bottle":
+        cmd_line = 'CMD ["python", "app.py"]'
+        return _PYTHON_DOCKERFILE.format(port=port, cmd_line=cmd_line)
+
+    if stack in ("express", "fastify", "koa", "hono"):
+        cmd_line = 'CMD ["node", "server.js"]'
+        return _NODE_DOCKERFILE.format(port=port, cmd_line=cmd_line)
+
+    # Unknown server stack — generate the most common Python shape with a
+    # comment telling the operator to adjust the CMD.
+    cmd_line = '# Replace with your start command\nCMD ["python", "main.py"]'
+    return _PYTHON_DOCKERFILE.format(port=port, cmd_line=cmd_line)
+
+
+_PYTHON_DOCKERFILE = """\
+# syntax=docker/dockerfile:1.6
+# Generated by SkyN3t PackagingAgent.
+
+FROM python:3.12-slim AS runtime
+
+# Don't write .pyc files; ensure stdout is unbuffered for container logs.
+ENV PYTHONDONTWRITEBYTECODE=1 \\
+    PYTHONUNBUFFERED=1 \\
+    PIP_NO_CACHE_DIR=1 \\
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+# Install build deps only if they exist on disk. requirements.txt is the
+# primary source; pyproject.toml is a fallback for poetry/PEP-621 projects.
+COPY requirements.txt* pyproject.toml* ./
+RUN if [ -f requirements.txt ]; then \\
+        pip install -r requirements.txt; \\
+    elif [ -f pyproject.toml ]; then \\
+        pip install .; \\
+    fi
+
+COPY . .
+
+EXPOSE {port}
+
+{cmd_line}
+"""
+
+
+_NODE_DOCKERFILE = """\
+# syntax=docker/dockerfile:1.6
+# Generated by SkyN3t PackagingAgent.
+
+FROM node:22-alpine AS runtime
+
+WORKDIR /app
+
+# Use npm ci when a lockfile is present (reproducible install); fall
+# back to npm install for tracked-but-no-lock setups.
+COPY package*.json ./
+RUN if [ -f package-lock.json ]; then \\
+        npm ci --omit=dev; \\
+    else \\
+        npm install --omit=dev --no-audit --no-fund; \\
+    fi
+
+COPY . .
+
+EXPOSE {port}
+
+{cmd_line}
+"""
+
+
+# Each known infra service gets a docker-compose stanza we can drop in
+# verbatim. Volumes are declared as a list since compose lets us
+# accumulate them across services.
+_SERVICE_STANZAS: Dict[str, tuple[str, List[str]]] = {
+    "postgres": (
+        """\
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme-in-env}
+      POSTGRES_DB: ${POSTGRES_DB:-app}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-app}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+""",
+        ["postgres-data"],
+    ),
+    "redis": (
+        """\
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+""",
+        [],
+    ),
+    "mongodb": (
+        """\
+  mongodb:
+    image: mongo:7
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-app}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-changeme-in-env}
+    volumes:
+      - mongo-data:/data/db
+""",
+        ["mongo-data"],
+    ),
+    "rabbitmq": (
+        """\
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    restart: unless-stopped
+""",
+        [],
+    ),
+    "elasticsearch": (
+        """\
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+""",
+        ["es-data"],
+    ),
+}
+
+
+def _render_compose(detection: StackDetection, env_scan: ScanResult) -> str:
+    """Build a docker-compose.yml: app service + each detected infra service."""
+    port = _server_port(detection)
+    depends_on: List[str] = []
+    service_blocks: List[str] = []
+    volumes: List[str] = []
+
+    for svc in detection.services:
+        if svc in _SERVICE_STANZAS:
+            block, vols = _SERVICE_STANZAS[svc]
+            service_blocks.append(block)
+            depends_on.append(svc)
+            volumes.extend(vols)
+
+    depends_block = ""
+    if depends_on:
+        depends_block = "    depends_on:\n" + "".join(
+            f"      {svc}:\n        condition: service_started\n"
+            if svc not in ("postgres",)
+            else f"      {svc}:\n        condition: service_healthy\n"
+            for svc in depends_on
+        )
+
+    volumes_block = ""
+    if volumes:
+        volumes_block = "\nvolumes:\n" + "".join(f"  {v}: {{}}\n" for v in sorted(set(volumes)))
+
+    has_env = bool(env_scan.vars)
+    env_file_line = "    env_file: .env\n" if has_env else ""
+
+    return f"""\
+# Generated by SkyN3t PackagingAgent.
+# Run: cp .env.example .env  &&  docker compose up
+
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "{port}:{port}"
+{env_file_line}{depends_block}{"".join(service_blocks)}{volumes_block}"""
+
+
+def _render_env_example(detection: StackDetection, env_scan: ScanResult) -> str:
+    """Build a slim .env.example — only what the server actually needs.
+
+    Skips client-side (VITE_/REACT_APP_/NEXT_PUBLIC_) vars because those
+    belong in the frontend's Settings UI, not in a server-side env file.
+    Adds infra-service defaults the docker-compose expects when a
+    service was detected.
+    """
+    lines: List[str] = [
+        "# Generated by SkyN3t PackagingAgent.",
+        "# Copy to .env and fill in the values, then run: docker compose up",
+        "",
+    ]
+
+    # Infra creds — only listed when the matching service is in compose.
+    infra_added = False
+    if "postgres" in detection.services:
+        lines.extend([
+            "# --- Postgres ---------------------------------------------------",
+            "POSTGRES_USER=app",
+            "POSTGRES_PASSWORD=changeme-strong-random-value",
+            "POSTGRES_DB=app",
+            "# DATABASE_URL is what your app reads. Matches the postgres service above.",
+            "DATABASE_URL=postgresql://app:changeme-strong-random-value@postgres:5432/app",
+            "",
+        ])
+        infra_added = True
+    if "mongodb" in detection.services:
+        lines.extend([
+            "# --- MongoDB ----------------------------------------------------",
+            "MONGO_USER=app",
+            "MONGO_PASSWORD=changeme-strong-random-value",
+            "MONGODB_URL=mongodb://app:changeme-strong-random-value@mongodb:27017",
+            "",
+        ])
+        infra_added = True
+
+    # Application-discovered env vars. Skip client-side prefixes — those
+    # belong in the frontend's Settings UI.
+    app_vars = [
+        v for v in sorted(env_scan.vars.values(), key=lambda x: x.name)
+        if not v.name.startswith(("VITE_", "REACT_APP_", "NEXT_PUBLIC_"))
+        # Skip ones we already wrote in the infra section.
+        and v.name not in {"POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB",
+                           "DATABASE_URL", "MONGO_USER", "MONGO_PASSWORD",
+                           "MONGODB_URL"}
+    ]
+
+    if app_vars:
+        lines.append("# --- Application ------------------------------------------------")
+        for var in app_vars:
+            comment = _env_comment_for(var)
+            if comment:
+                lines.append(f"# {comment}")
+            default = var.default if var.default else ""
+            lines.append(f"{var.name}={default}")
+        lines.append("")
+
+    if not infra_added and not app_vars:
+        lines.extend([
+            "# No required env vars detected. This file is kept as a placeholder.",
+            "# Add any operator-side configuration below.",
+            "",
+        ])
+
+    return "\n".join(lines)
+
+
+def _env_comment_for(var: EnvVarRef) -> str:
+    """One-line human hint for an env var in .env.example."""
+    if var.is_secret:
+        return f"{var.name} — secret. Generate a strong random value."
+    if var.type_hint == "url":
+        return f"{var.name} — full URL (e.g. https://api.example.com)."
+    if var.type_hint == "int":
+        return f"{var.name} — integer."
+    if var.type_hint == "bool":
+        return f"{var.name} — true/false."
+    return ""
+
+
+def _render_server_readme(
+    *,
+    app_name: str,
+    detection: StackDetection,
+    env_scan: ScanResult,
+) -> str:
+    """Two-command quick start + service overview."""
+    runtimes_lines: List[str] = []
+    for r in detection.runtimes:
+        if r.name == "python":
+            runtime_version = r.min_version or "3.12"
+            runtimes_lines.append(f"- Python {runtime_version}+ ([install](https://python.org/))")
+        elif r.name == "node":
+            runtime_version = r.min_version or "22"
+            runtimes_lines.append(f"- Node {runtime_version}+ ([install](https://nodejs.org/))")
+    runtimes_lines.append("- Docker + Docker Compose ([install](https://docs.docker.com/get-docker/))")
+    runtimes_block = "\n".join(runtimes_lines)
+
+    services_block = ""
+    if detection.services:
+        services_block = "\n## Services included\n\n"
+        services_block += "\n".join(f"- **{s}** (auto-managed via docker-compose)" for s in detection.services)
+        services_block += "\n"
+
+    env_required = [
+        env_var
+        for env_var in env_scan.required()
+        if not env_var.name.startswith(("VITE_", "REACT_APP_", "NEXT_PUBLIC_"))
+    ]
+    required_block = ""
+    if env_required:
+        required_block = (
+            "\n## Required environment variables\n\n"
+            "Before running `docker compose up`, set these in `.env`:\n\n"
+        )
+        for env_var in env_required:
+            kind = "🔒 secret" if env_var.is_secret else env_var.type_hint
+            required_block += f"- `{env_var.name}` ({kind})\n"
+
+    return f"""# {app_name}
+
+## Requirements
+{runtimes_block}
+
+## Quick start
+```bash
+cp .env.example .env  # then edit .env with your values
+docker compose up
+```
+
+The app will be available on http://localhost:{_server_port(detection)}.
+{services_block}{required_block}
+## Stopping
+```bash
+docker compose down
+```
+
+To wipe persistent data (postgres volumes, etc.) add `-v`:
+```bash
+docker compose down -v
+```
+
+## Development without Docker
+If you prefer to run directly:
+```bash
+{_native_run_command(detection)}
+```
+
+---
+*Generated by SkyN3t PackagingAgent.*
+"""
+
+
+def _native_run_command(detection: StackDetection) -> str:
+    """Snippet for running the server natively (no Docker)."""
+    stack = detection.stack or ""
+    if stack in ("fastapi", "starlette", "aiohttp"):
+        return "pip install -r requirements.txt\nuvicorn main:app --reload"
+    if stack == "flask":
+        return "pip install -r requirements.txt\nflask run --debug"
+    if stack == "django":
+        return "pip install -r requirements.txt\npython manage.py runserver"
+    if stack in ("express", "fastify", "koa", "hono"):
+        return "npm install\nnpm run dev  # or: node server.js"
+    return "# See your framework's docs for the dev command"
