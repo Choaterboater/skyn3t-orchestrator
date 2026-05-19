@@ -508,3 +508,107 @@ def test_browser_only_persistence_brief_does_not_trigger_backend_tier():
 
     assert "server/index.js" not in paths
     assert "server/routes/config.js" not in paths
+
+
+# ─── decisions contract: backend tier triggered by architect ───────────
+
+
+def test_decisions_express_ships_backend_even_when_brief_has_no_signals():
+    """Habit-tracker-class briefs have zero backend signals — no API
+    keys, no integrations, no persistence keywords. Before the
+    decisions hook, plan_for_stack returned frontend-only here even
+    though the architect picked `express` and pinned `backend_port:
+    3000`. The consistency reviewer then correctly flagged "Express +
+    port 3000 promised but no server code shipped" on every build.
+    With decisions in scope, the backend tier ships."""
+    brief = "Build a habit tracker with streaks"
+    # Without decisions: stays frontend-only (regression guard).
+    plan_no_decisions = plan_for_stack("react_vite", brief)
+    paths_no = {rel for rel, _ in (plan_no_decisions or [])}
+    assert "server/index.js" not in paths_no
+
+    # With decisions pinning Express: backend tier MUST ship.
+    decisions = {
+        "frontend_port": 5173,
+        "backend_port": 3000,
+        "framework": "express",
+        "backend_language": "node",
+    }
+    plan_decisions = plan_for_stack("react_vite", brief, decisions=decisions)
+    paths_dec = {rel for rel, _ in (plan_decisions or [])}
+    assert "server/index.js" in paths_dec
+    assert "server/package.json" in paths_dec
+    assert ".env.example" in paths_dec
+    assert "docker-compose.yml" in paths_dec
+
+
+def test_decisions_hono_also_ships_backend_tier():
+    brief = "Build a habit tracker"
+    decisions = {"framework": "hono-node", "backend_language": "node"}
+    plan = plan_for_stack("react_vite", brief, decisions=decisions)
+    paths = {rel for rel, _ in (plan or [])}
+    assert "server/index.js" in paths
+
+
+def test_decisions_none_framework_keeps_frontend_only():
+    """Explicit `framework=none` (static-only bundle) must not trigger
+    the backend tier, even if other decisions fields are populated."""
+    brief = "Build a habit tracker"
+    decisions = {
+        "frontend_port": 5173,
+        "backend_port": None,
+        "framework": "none",
+        "backend_language": "none",
+    }
+    plan = plan_for_stack("react_vite", brief, decisions=decisions)
+    paths = {rel for rel, _ in (plan or [])}
+    assert "server/index.js" not in paths
+
+
+def test_decisions_unknown_framework_falls_back_to_brief_detection():
+    """Unknown / future framework values fall through to the existing
+    brief-based _needs_backend logic. Habit brief with unknown
+    framework stays frontend-only because the brief has no signals."""
+    brief = "Build a habit tracker"
+    decisions = {"framework": "rocket", "backend_language": "rust"}
+    plan = plan_for_stack("react_vite", brief, decisions=decisions)
+    paths = {rel for rel, _ in (plan or [])}
+    assert "server/index.js" not in paths
+
+
+def test_decisions_none_arg_is_backwards_compatible():
+    """plan_for_stack(stack, brief) — no decisions kwarg — must behave
+    exactly like the pre-PR version. Briefs that triggered backend
+    tier via _needs_backend keep doing so; briefs that didn't, don't."""
+    backend_brief = (
+        "Build a React dashboard with a persistent backend config store "
+        "and server-side CRUD."
+    )
+    no_backend_brief = "Build a habit tracker"
+
+    backend_plan = plan_for_stack("react_vite", backend_brief)
+    no_backend_plan = plan_for_stack("react_vite", no_backend_brief)
+
+    backend_paths = {rel for rel, _ in (backend_plan or [])}
+    no_backend_paths = {rel for rel, _ in (no_backend_plan or [])}
+
+    assert "server/index.js" in backend_paths
+    assert "server/index.js" not in no_backend_paths
+
+
+def test_decisions_node_language_with_port_alone_triggers_backend():
+    """Defense-in-depth: even if framework is unset/unknown, when the
+    architect committed to a Node backend with a real port, ship the
+    backend tier. Catches the case where decisions.json's framework
+    drifted (architect bug) but the language + port still tell us
+    what to build."""
+    brief = "Build a habit tracker"
+    decisions = {
+        "frontend_port": 5173,
+        "backend_port": 3000,
+        "framework": "",  # missing
+        "backend_language": "node",
+    }
+    plan = plan_for_stack("react_vite", brief, decisions=decisions)
+    paths = {rel for rel, _ in (plan or [])}
+    assert "server/index.js" in paths
