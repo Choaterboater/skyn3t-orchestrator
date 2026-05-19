@@ -75,12 +75,10 @@ class StageLatencyStats:
             count=int(data.get("count") or 0),
             total_seconds=float(data.get("total_seconds") or 0.0),
             min_seconds=(
-                None if data.get("min_seconds") is None
-                else float(data.get("min_seconds"))
+                float(data["min_seconds"]) if data.get("min_seconds") is not None else None
             ),
             max_seconds=(
-                None if data.get("max_seconds") is None
-                else float(data.get("max_seconds"))
+                float(data["max_seconds"]) if data.get("max_seconds") is not None else None
             ),
             last_seconds=float(data.get("last_seconds") or 0.0),
             last_updated_at=float(data.get("last_updated_at") or 0.0),

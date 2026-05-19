@@ -390,8 +390,11 @@ def match_references_to_brief(brief: str, user_id: str, limit: int = 3) -> List[
 def attach_references_to_project(project_dir: Path, entry_ids: List[str]) -> None:
     """Write the matched references into ``<project_dir>/design_references.md``
     so the DesignerAgent can include them in its prompt."""
-    entries = [get_reference(eid) for eid in entry_ids]
-    entries = [e for e in entries if e is not None]
+    # Combine fetch + None-filter in one comprehension so mypy can narrow
+    # the element type to LibraryEntry instead of LibraryEntry | None.
+    entries: List[LibraryEntry] = [
+        ref for ref in (get_reference(eid) for eid in entry_ids) if ref is not None
+    ]
     if not entries:
         return
     project_dir = Path(project_dir)

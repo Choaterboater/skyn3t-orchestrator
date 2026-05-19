@@ -358,18 +358,20 @@ async def handle_dm(text: str, user_id: str, runner: Any) -> str:
             return f"Couldn't start project: {exc}"
 
     if intent.action == "status":
-        slug = intent.slug or _most_recent_slug(runner)
-        if not slug:
+        slug_opt: Optional[str] = intent.slug or _most_recent_slug(runner)
+        if not slug_opt:
             return "No projects yet. Try: `start a todo app`."
+        slug = slug_opt
         proj = runner.get_project(slug) if hasattr(runner, "get_project") else None
         if proj is None:
             return f"Project `{slug}` not found."
         return _format_status(proj)
 
     if intent.action == "approve":
-        slug = intent.slug or _most_recent_awaiting_slug(runner)
-        if not slug:
+        slug_opt = intent.slug or _most_recent_awaiting_slug(runner)
+        if not slug_opt:
             return "No project is awaiting approval right now."
+        slug = slug_opt
         try:
             await _resume_project(runner, slug, "approve", None, None, source_user=user_id)
             return f"✅ Approved `{slug}` — pipeline resuming."
@@ -378,9 +380,10 @@ async def handle_dm(text: str, user_id: str, runner: Any) -> str:
             return f"Couldn't approve: {exc}"
 
     if intent.action == "reject":
-        slug = intent.slug or _most_recent_awaiting_slug(runner)
-        if not slug:
+        slug_opt = intent.slug or _most_recent_awaiting_slug(runner)
+        if not slug_opt:
             return "No project is awaiting approval right now."
+        slug = slug_opt
         feedback = intent.feedback or "Rejected via Discord without specific feedback."
         try:
             await _resume_project(runner, slug, "reject", None, feedback, source_user=user_id)
@@ -433,9 +436,10 @@ async def _resume_project(
     proj = runner.get_project(slug) if hasattr(runner, "get_project") else None
     if proj is None:
         raise FileNotFoundError(slug)
-    return await runner.resume_after_approval(
+    result: dict = await runner.resume_after_approval(
         slug, decision, edited_md=edited_md, feedback=feedback
     )
+    return result
 
 
 def _most_recent_slug(runner: Any) -> Optional[str]:
