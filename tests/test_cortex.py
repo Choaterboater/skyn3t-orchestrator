@@ -328,6 +328,49 @@ async def test_review_watcher_inspect_skips_no_actionable_risks(tmp_path, monkey
 
 
 @pytest.mark.asyncio
+async def test_review_watcher_inspect_does_not_file_proposal_for_project_review(
+    tmp_path, monkeypatch
+):
+    """ReviewWatcher used to file studio_debug proposals for project reviews,
+    but that handler calls CodeImproverAgent against REPO_ROOT (the
+    orchestrator), not the project — so approving the proposal made the
+    orchestrator try to patch itself. The watcher should now log and
+    mark-seen instead, without creating a proposal."""
+    from skyn3t.cortex.review_watcher import ReviewWatcher
+
+    project_root = tmp_path / "projects" / "demo-project"
+    project_root.mkdir(parents=True)
+    (project_root / "architecture.md").write_text("## Overview\n", encoding="utf-8")
+    (project_root / "review.md").write_text(
+        "## Verdict\nVerdict: no-go\n\n## Risks\n"
+        "- Missing core: brief asks for an API but no backend exists.\n"
+        "- Port mismatch between vite.config.js and README.md.\n",
+        encoding="utf-8",
+    )
+
+    created: list[dict] = []
+
+    class StubStore:
+        def create(self, **kwargs):
+            created.append(kwargs)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("skyn3t.cortex.get_store", lambda: StubStore())
+    monkeypatch.setattr(
+        "skyn3t.cortex.review_watcher.get_settings",
+        lambda: SimpleNamespace(projects_dir=tmp_path / "projects"),
+    )
+
+    watcher = ReviewWatcher(event_bus=SimpleNamespace())
+    await watcher._inspect("demo-project", {})
+
+    # No proposal filed, but slug IS marked seen so we don't re-log on
+    # every event for the same project.
+    assert created == []
+    assert "demo-project" in watcher._seen
+
+
+@pytest.mark.asyncio
 async def test_studio_debug_handler_rejects_placeholder_risks(tmp_path, monkeypatch):
     from skyn3t.cortex.handlers import install_handlers
 

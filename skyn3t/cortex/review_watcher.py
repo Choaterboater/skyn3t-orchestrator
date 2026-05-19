@@ -99,39 +99,36 @@ class ReviewWatcher:
                 return
             text = review.read_text(encoding="utf-8")
             verdict, risks = self._parse(text)
-            # Only file when verdict is a hard "no-go" or "blocked".
+            # Only act when verdict is a hard "no-go" or "blocked".
             # `go-with-fixes` is the default for almost every project — flagging
             # it pops a useless modal every run, so we ignore it silently here.
             v = verdict.lower()
             needs_fix = any(k in v for k in ("no-go", "blocked"))
             if not needs_fix or not risks:
                 return
-            from skyn3t.cortex import get_store
-            primary_artifact = self._guess_target(root)
-            # Create the proposal FIRST. Only mark the slug as seen after
-            # the store accepts the record — otherwise a transient DB
-            # failure would silently drop the review forever because the
-            # slug would be in _seen on the next event.
-            get_store().create(
-                kind="studio_debug",
-                title=f"Reviewer flagged issues in {slug}",
-                summary=verdict[:200] or "Reviewer flagged risks.",
-                detail=(
-                    f"_Project_: `{slug}`\n_Template_: `{payload.get('template','')}`\n\n"
-                    f"## Verdict\n{verdict}\n\n## Risks\n"
-                    + ("\n".join(f"- {r}" for r in risks) if risks else "(none parsed)")
-                    + f"\n\n## Suggested target\n`{primary_artifact}`\n\n"
-                    "Approving this will spawn CodeImproverAgent to draft a v2 of the target."
-                ),
-                payload={
-                    "slug": slug,
-                    "template": payload.get("template", ""),
-                    "target_file": primary_artifact,
-                    "verdict": verdict,
-                    "risks": risks,
-                    "review_path": str(review),
-                },
-                source="review_watcher",
+
+            # NOTE: ReviewWatcher used to file kind="studio_debug" proposals
+            # here. That handler (cortex/handlers.py:studio_debug_handler)
+            # calls CodeImproverAgent with repo_root=REPO_ROOT — the
+            # orchestrator itself — but the target_file we emit
+            # (_guess_target) is always a per-project artifact like
+            # /Users/.../Projects/<slug>/architecture.md. So approving the
+            # proposal made the orchestrator try to git-apply a patch to
+            # itself, then run its own 1,422-test pytest suite (which
+            # timed out at 180s on every single attempt — see the
+            # "subprocess.TimeoutExpired" traces in production logs).
+            # The whole code path was broken-by-design for the use case
+            # we hit in practice (project review → fix project).
+            #
+            # Until we have a real per-project auto-fix path (which would
+            # need to call CodeImproverAgent with repo_root=project root,
+            # not REPO_ROOT), just log the slug + risks and move on. The
+            # in-build critique/fix loop is what's supposed to handle
+            # per-project quality, not cortex proposals.
+            logger.info(
+                "ReviewWatcher: %s flagged %s with %d risk(s) — no proposal filed "
+                "(studio_debug pipeline only fixes orchestrator code, not projects).",
+                slug, verdict, len(risks),
             )
             self._seen.add(slug)
             self._save_seen()
