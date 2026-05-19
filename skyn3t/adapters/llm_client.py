@@ -25,6 +25,21 @@ _default_event_bus = None
 # callers don't thread RAG through every code path.
 _default_rag = None
 
+_CROSS_PROVIDER_MODEL_PREFIXES = (
+    "openrouter/",
+    "anthropic/",
+    "openai/",
+    "google/",
+    "meta-llama/",
+    "mistralai/",
+    "deepseek/",
+    "qwen/",
+    "nvidia/",
+    "tencent/",
+    "stepfun/",
+    "xai/",
+)
+
 
 def _try_register_default(eb) -> None:
     global _default_event_bus
@@ -48,6 +63,20 @@ def install_default_rag(rag) -> None:
     """Explicit setter for the module-level fallback RAG instance."""
     global _default_rag
     _default_rag = rag
+
+
+def _drop_cross_provider_model_name(model: Optional[str]) -> Optional[str]:
+    """Drop provider-qualified model IDs before cross-backend failover.
+
+    ``openrouter/foo`` or ``anthropic/bar`` are valid only for those specific
+    providers. When we retry on a different backend, passing them through makes
+    the second backend fail immediately on model validation instead of using its
+    own default model.
+    """
+    if not model:
+        return None
+    lower = model.lower()
+    return None if lower.startswith(_CROSS_PROVIDER_MODEL_PREFIXES) else model
 
 
 @dataclass
@@ -177,11 +206,15 @@ class LLMClient:
         return None
 
     def _auto_cli_order(self) -> list[str]:
-        if self._routing_hint == "design":
-            return ["kimi_cli", "copilot_cli", "claude_cli", "openai_cli"]
-        if self._routing_hint == "code":
-            return ["copilot_cli", "claude_cli", "openai_cli", "kimi_cli"]
-        return ["claude_cli", "copilot_cli", "openai_cli", "kimi_cli"]
+        # Copilot-first because the Copilot CLI is effectively a
+        # multi-model proxy (--model gpt-4o / claude-sonnet / etc.).
+        # The user gets access to multiple models without us having to
+        # juggle three CLI dialects. Claude comes second as the
+        # large-subscription backup when Copilot has rate-limit or
+        # auth issues. Kimi is third because it has shown 180s
+        # streaming-idle hangs on architect/design calls. OpenAI CLI
+        # last because it requires an API key.
+        return ["copilot_cli", "claude_cli", "kimi_cli", "openai_cli"]
 
     async def _try_named_backend(self, name: str) -> bool:
         if name in getattr(self, "_skip_backends", ()):
@@ -289,9 +322,11 @@ class LLMClient:
                 and failed_backend
                 and failed_backend != "deterministic"
             ):
+                failover_default_model = _drop_cross_provider_model_name(self.default_model)
+                failover_explicit_model = _drop_cross_provider_model_name(model)
                 try:
                     retry_client = LLMClient(
-                        default_model=self.default_model,
+                        default_model=failover_default_model,
                         backend=None,
                         anthropic_api_key=self._anthropic_key,
                         openrouter_api_key=self._openrouter_key,
@@ -309,7 +344,7 @@ class LLMClient:
                     return await retry_client.complete(
                         prompt,
                         system=system,
-                        model=model,
+                        model=failover_explicit_model,
                         max_tokens=max_tokens,
                         temperature=temperature,
                         timeout=timeout,

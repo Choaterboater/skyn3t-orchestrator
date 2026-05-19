@@ -5,10 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
-from skyn3t.agents.stack_detector import StackDetection, detect
-
+from skyn3t.agents.stack_detector import detect
 
 # ---------------------------------------------------------------------------
 # Helpers
