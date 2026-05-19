@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Set
 @dataclass
 class ConsistencyIssue:
     severity: str  # "error" | "warning"
-    category: str  # "broken_import" | "missing_dep" | "orphan_export" | "hallucination" | "missing_mount" | "design_quality" | "todo_stub"
+    category: str  # "broken_import" | "missing_dep" | "orphan_export" | "hallucination" | "missing_mount" | "design_quality" | "todo_stub" | "cross_artifact_palette_drift" | "cross_artifact_font_drift" | "brand_kit_ignored_by_scaffold"
     file: str
     message: str
     suggestion: str = ""
@@ -892,6 +892,99 @@ def _scan_cross_artifact_drift(
                     ),
                 ))
 
+    # Collapsed-palette check: brand.md frequently ships with
+    # bg / surface / surface-2 / border all the same hex (e79bc0:
+    # all `#f5f5f0`; tactrax: `Border: #FFFFFF` on `Background:
+    # #FFFFFF`). The LLM's own commentary often acknowledges
+    # "warmth from the contrast between them" — but there's no
+    # contrast. Borders render invisibly, gentle-elevation
+    # surfaces look like flat blocks.
+    if brand_text:
+        issues.extend(_check_collapsed_brand_palette(brand_text))
+
+    return issues
+
+
+# Capture rows in brand.md's palette tables. Real examples:
+#   | `bg` | `#F5F5F0` | Canvas — warm off-white...
+#   | `surface` | `#f5f5f0` | Card surfaces...
+#   - **Background**`#FFFFFF`
+#   - **Border**`#FFFFFF`
+# Patterns: token name wrapped in backticks or **bold**, followed
+# by a hex literal in backticks or bare.
+_BRAND_TOKEN_LINE_RES = (
+    re.compile(
+        r"^\s*\|\s*[`*]+\s*(?P<token>[a-z][a-z0-9_-]*)\s*[`*]+\s*\|\s*"
+        r"[`*]*\s*(?P<hex>#[0-9a-fA-F]{3,8})\s*[`*]*",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+    re.compile(
+        r"^\s*[-*]\s*\*\*(?P<token>[A-Za-z][A-Za-z0-9_-]*)\*\*\s*"
+        r"[`]?\s*(?P<hex>#[0-9a-fA-F]{3,8})",
+        re.MULTILINE,
+    ),
+)
+
+# Tokens that MUST be distinct from `bg` for the layout to render
+# correctly. Border-same-as-bg is the headline bug; surface-same-
+# as-bg means the card-vs-canvas distinction disappears.
+_SURFACE_TOKENS = {"surface", "surface-1", "surface-2", "card"}
+_BORDER_TOKENS = {"border", "border-strong", "divider", "hairline"}
+
+
+def _check_collapsed_brand_palette(brand_text: str) -> List[ConsistencyIssue]:
+    """Parse brand.md's palette table and flag tokens collapsed to bg."""
+    issues: List[ConsistencyIssue] = []
+    tokens: Dict[str, str] = {}
+    for pattern in _BRAND_TOKEN_LINE_RES:
+        for m in pattern.finditer(brand_text):
+            name = m.group("token").lower()
+            hex_code = m.group("hex").lower()
+            tokens.setdefault(name, hex_code)
+
+    bg = tokens.get("bg") or tokens.get("background")
+    if not bg:
+        return issues
+
+    collapsed_borders = [t for t in _BORDER_TOKENS if t in tokens and tokens[t] == bg]
+    collapsed_surfaces = [t for t in _SURFACE_TOKENS if t in tokens and tokens[t] == bg]
+
+    if collapsed_borders:
+        names = ", ".join(sorted(collapsed_borders))
+        issues.append(ConsistencyIssue(
+            severity="warning",
+            category="design_quality",
+            file="brand.md",
+            message=(
+                f"brand.md declares {names} = {bg}, the same hex as "
+                f"`bg`. Borders rendered with this token will be "
+                f"invisible — `border-[{bg}]` on a `bg-[{bg}]` "
+                f"surface has no contrast."
+            ),
+            suggestion=(
+                "Pick a border color that's 5-10% darker/lighter than "
+                "`bg` (or a desaturated accent) so the hairline rules "
+                "the brand promises are actually visible."
+            ),
+        ))
+    if collapsed_surfaces:
+        names = ", ".join(sorted(collapsed_surfaces))
+        issues.append(ConsistencyIssue(
+            severity="warning",
+            category="design_quality",
+            file="brand.md",
+            message=(
+                f"brand.md declares {names} = {bg}, the same hex as "
+                f"`bg`. Cards using these tokens will be "
+                f"indistinguishable from the canvas — the 'gentle "
+                f"elevation' the doc promises won't render."
+            ),
+            suggestion=(
+                "Shift surface tokens 3-5% off `bg` so cards have "
+                "real elevation. For light themes, slightly darker; "
+                "for dark themes, slightly lighter."
+            ),
+        ))
     return issues
 
 
