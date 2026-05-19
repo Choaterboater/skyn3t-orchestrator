@@ -875,9 +875,20 @@ class TestReviewerAgent:
         assert "Verdict: no-go" not in review_text
 
     @pytest.mark.asyncio
-    async def test_execute_does_not_promote_llm_score_into_higher_verdict_bucket(
+    async def test_execute_uses_real_blended_score_after_bucket_floor_removal(
         self, tmp_path, monkeypatch
     ):
+        """The LLM-bucket ceiling (llm<50 → cap at 49, llm<75 → cap at 74)
+        was removed by user request — it was hiding real run-over-run
+        progress. verdict_score now equals the real blended value.
+
+        Setup: llm=69 + heuristic=100 + packaging at whatever the
+        fixture's _packaging_score produces. With the old ceiling
+        this build would have been clamped to verdict_score=74 and
+        stuck in the go-with-fixes bucket forever. Now the real blend
+        wins; with this fixture it comes out around 78 and the verdict
+        crosses into the "go" band (≥75) honestly — which is exactly
+        the run-over-run progress the floor was hiding."""
         from skyn3t.agents.reviewer import ReviewerAgent
 
         artifact_dir = tmp_path / "habit-tracker"
@@ -911,25 +922,27 @@ class TestReviewerAgent:
         )
 
         assert result.success is True
-        assert result.output["score"] == 74
-        assert result.output["verdict"] == "go-with-fixes"
-        # score_unclamped is the new field — for llm=69 + heuristic=100,
-        # the blend is round(69*0.54 + 100*0.36 + pkg*0.10). The
-        # ceiling clamps verdict-score to 74 but the displayed
-        # blended score may be higher.
-        assert "score_unclamped" in result.output
-        # The unclamped value should be >= verdict_score (the clamp
-        # only ever lowers, never raises).
-        assert result.output["score_unclamped"] >= result.output["score"]
+        # Score is the real blended value. No bucket clamp now means
+        # score == score_unclamped always.
+        assert result.output["score"] == result.output["score_unclamped"]
+        # With the floor removed, score crosses the 75 threshold the
+        # old behavior was hiding. Verdict gets the honest answer.
+        assert result.output["score"] >= 75
+        assert result.output["verdict"] == "go"
 
     @pytest.mark.asyncio
-    async def test_execute_displays_unclamped_score_separately_from_verdict_gate(
+    async def test_execute_low_llm_score_uses_blended_not_clamped_49(
         self, tmp_path, monkeypatch
     ):
-        """Per the studio-score-49-report: llm=29 and llm=42 both clamped
-        to 49 lost the signal that one run was 13 points better than the
-        other. Display the unclamped blended score; keep the verdict
-        gated. review.md should show both when they differ."""
+        """Regression for the original studio-score-49 report. llm=29
+        used to be floored to verdict_score=49 by the bucket ceiling;
+        now the real blended score wins. With llm=29 + heuristic=100 +
+        packaging=0 → blended ≈ 52, the build still goes no-go (LLM
+        verdict band kicks in via the bands below 50) but the
+        displayed and verdict scores are both the real 52 instead of
+        a misleading 49. review.md no longer carries the
+        'verdict gate: 49' annotation because there's nothing to
+        annotate — score and verdict_score are the same."""
         from skyn3t.agents.reviewer import ReviewerAgent
 
         artifact_dir = tmp_path / "low-llm-score"
@@ -948,10 +961,6 @@ class TestReviewerAgent:
             return None
 
         async def fake_llm_review(*, brief, contents, **_kwargs):
-            # llm=29 → ceiling=49 → verdict still no-go even with
-            # perfect heuristic. Without unclamping, user can't see
-            # whether a follow-up retry that produced llm=42 actually
-            # improved anything.
             return ("## Summary\n\nMany contradictions.\n", 29, None)
 
         monkeypatch.setattr(agent, "think", noop)
@@ -964,16 +973,15 @@ class TestReviewerAgent:
         )
 
         assert result.success is True
-        # verdict-gated score capped at 49 (llm=29 < 50 ceiling)
-        assert result.output["score"] == 49
-        # unclamped score = round(29*0.54 + 100*0.36 + packaging*0.10)
-        # which is well above 49.
-        assert result.output["score_unclamped"] > 49
-        # Verdict is still no-go (verdict_score < 50)
-        assert result.output["verdict"] == "no-go"
-        # review.md exposes the difference so users see progress signal
+        # No artificial 49 floor — score is the real blend.
+        assert result.output["score"] != 49 or result.output["score_unclamped"] != 49
+        assert result.output["score"] == result.output["score_unclamped"]
+        # Old ceiling would have clamped llm=29 to 49; new behavior
+        # uses the real blend which is around 52 with this fixture.
+        assert result.output["score"] > 49
+        # review.md no longer carries the gated-vs-unclamped split.
         review_text = (artifact_dir / "review.md").read_text(encoding="utf-8")
-        assert "verdict gate: 49" in review_text
+        assert "verdict gate:" not in review_text
 
     @pytest.mark.asyncio
     async def test_execute_keeps_go_bucket_when_llm_score_is_already_go(

@@ -60,11 +60,12 @@ _LLM_CRITIQUE_TIMEOUT_SECONDS = 90.0
 
 
 def _llm_bucket_ceiling(score: int) -> int:
-    """Keep blended scores inside the verdict bucket implied by the LLM."""
-    if score < 50:
-        return 49
-    if score < 75:
-        return 74
+    """Deprecated — bucket ceilings (49 / 74 / 100) used to clamp the
+    verdict-gate score so a strong heuristic couldn't paper over a weak
+    LLM review. That floor masked real progress between runs (every
+    build with llm<50 displayed the same ``49`` no matter how it
+    changed) and the user removed it. Kept as a no-op so any
+    out-of-tree callers don't break."""
     return 100
 
 
@@ -176,18 +177,16 @@ class ReviewerAgent(BaseAgent):
             else:
                 blended = int(round(heuristic_score * 1.00))
         blended = max(0, min(100, blended))
-        # Verdict gate: the bucket ceiling protects against a perfect
-        # heuristic checklist promoting a middling LLM review into a
-        # higher verdict bucket. We compute it separately from the
-        # DISPLAYED blended score so users can see real progress
-        # between runs (llm=29 → llm=42 should be visible) instead of
-        # both runs flattening to a hard 49. Verdict still uses the
-        # gated value so a no-go LLM verdict can't be papered over.
-        if llm_score is not None:
-            verdict_score = min(blended, _llm_bucket_ceiling(llm_score))
-        else:
-            verdict_score = blended
-        verdict_score = max(0, min(100, verdict_score))
+        # Verdict gate used to clamp `blended` into the bucket implied
+        # by the LLM's own score (llm<50 → cap at 49). That floor
+        # erased real run-over-run progress — every below-50 LLM
+        # review displayed the same `49` even when the underlying
+        # number moved from 28 → 42. Floor removed by user request;
+        # verdict_score now equals the real blended score, and the
+        # verdict text below buckets that single value directly. The
+        # "Missing core" hard guard right after still caps to 30 so a
+        # docs-only build can't sneak past on heuristic alone.
+        verdict_score = blended
 
         # Surface packaging gaps as soft risks so the reviewer markdown
         # explains why the score landed where it did. Skip when packaging
@@ -210,10 +209,8 @@ class ReviewerAgent(BaseAgent):
             blended = min(blended, 30)
             verdict_score = min(verdict_score, 30)
             verdict = "no-go"
-        # Verdict uses verdict_score (the bucket-clamped value), keeping
-        # ReviewWatcher-compatible lowercase strings. The displayed
-        # `blended` may be higher — that's intentional, so the user can
-        # see "your unclamped score was 64; verdict floor is 49".
+        # Verdict text buckets the real (un-floored) verdict_score.
+        # ReviewWatcher consumes the lowercase strings unchanged.
         elif verdict_score >= 75 and not any("Missing core" in r for r in risks):
             verdict = "go"
         elif verdict_score >= 50:
@@ -263,19 +260,15 @@ class ReviewerAgent(BaseAgent):
             output={
                 "files": [str(review_path)],
                 "verdict": verdict,
-                # output["score"] is the verdict-gated value — used
-                # downstream by _finalize_project_outcome's
-                # REVIEWER_SCORE_THRESHOLD=75 composite gate. Display
-                # score (`blended`) is surfaced only in review.md so the
-                # user can see ungated progress without lying to the
-                # composite-gate machinery.
+                # output["score"] feeds the downstream
+                # REVIEWER_SCORE_THRESHOLD=75 composite gate in
+                # _finalize_project_outcome. After the bucket-floor
+                # removal, verdict_score == blended; we still emit
+                # score_unclamped for any out-of-tree consumer that
+                # was reading the old name.
                 "score": verdict_score,
                 "score_unclamped": blended,
-                "summary": (
-                    f"Review complete: {verdict} ({verdict_score}/100"
-                    + (f", unclamped {blended}/100" if blended != verdict_score else "")
-                    + ")."
-                ),
+                "summary": f"Review complete: {verdict} ({verdict_score}/100).",
                 "sub_scores": llm_sub_scores,
             },
         )
