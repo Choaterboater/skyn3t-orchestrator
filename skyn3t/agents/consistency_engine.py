@@ -628,6 +628,66 @@ def _scan_tech_stack_claim_drift(scaffold_dir: Path) -> List[ConsistencyIssue]:
     return issues
 
 
+# Path-like first line in a code file is almost always the
+# CodeAgent per-file marker leaking into the body. Real shape:
+# `src/components/ProgressRing.jsx` (bare, with slashes, ends in .jsx).
+# We're conservative: must contain `/`, end in a known code extension,
+# have no whitespace, and not be inside a comment.
+_LEAKED_PATH_FIRST_LINE_RE = re.compile(
+    r"^(?!\s)(?!//|#|/\*)[A-Za-z0-9_\-./]+\.(?:jsx?|tsx?|mjs|cjs|css|html|py)\s*$"
+)
+
+
+def _scan_for_leaked_path_markers(
+    scaffold_dir: Path, file_index: Dict[str, Path]
+) -> List[ConsistencyIssue]:
+    """Detect files whose first line is a bare path string — almost
+    always the per-file marker leaking through CodeAgent's output
+    extraction. Vite / esbuild / node all fail on these as syntax
+    errors; flag them so the targeted-fix loop regenerates."""
+    issues: List[ConsistencyIssue] = []
+    seen: Set[Path] = set()
+    for rel, path in file_index.items():
+        if path in seen:
+            continue
+        if path.suffix not in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"):
+            continue
+        seen.add(path)
+        try:
+            head = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        if not head:
+            continue
+        first = head[0].rstrip()
+        if not first:
+            # Allow a leading blank line; check the next non-blank.
+            for line in head[1:5]:
+                line_stripped = line.rstrip()
+                if line_stripped:
+                    first = line_stripped
+                    break
+        if not _LEAKED_PATH_FIRST_LINE_RE.match(first):
+            continue
+        rel_with_ext = path.relative_to(scaffold_dir).as_posix()
+        issues.append(ConsistencyIssue(
+            severity="error",
+            category="broken_import",
+            file=rel_with_ext,
+            message=(
+                f"File starts with a bare path string `{first}` — "
+                "almost certainly the per-file marker leaked into the "
+                "output. Vite/esbuild/node will fail on this as a "
+                "syntax error."
+            ),
+            suggestion=(
+                "Delete the first line and regenerate the file (or "
+                "have the targeted-fix loop strip the marker)."
+            ),
+        ))
+    return issues
+
+
 def _scan_for_hallucinations(scaffold_dir: Path, allowed_services: Set[str]) -> List[ConsistencyIssue]:
     """Scan JS/JSX/MD files for mentions of services not in the allowed set.
 
@@ -1424,6 +1484,14 @@ def check_consistency(scaffold_dir: Path, brief: str = "") -> ConsistencyReport:
     # crash with "HabitCard is undefined" at runtime if anyone wired
     # it up.
     issues.extend(_scan_for_import_style_mismatch(scaffold_dir, file_index))
+
+    # ── 4c. Leaked path-marker as first line ──────────────────────────────
+    # When CodeAgent's per-file output extraction fails to strip the
+    # marker line (e.g. `// === src/components/ProgressRing.jsx ===`),
+    # the path string survives as the first line of the file body.
+    # Real bug from 3c6a98: ProgressRing.jsx shipped with literal
+    # "src/components/ProgressRing.jsx" as line 1. Vite build fails.
+    issues.extend(_scan_for_leaked_path_markers(scaffold_dir, file_index))
 
     # ── 5. Hallucination scan ────────────────────────────────────────────
     issues.extend(_scan_for_hallucinations(scaffold_dir, allowed_services))
