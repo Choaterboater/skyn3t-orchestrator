@@ -518,6 +518,116 @@ def _scan_for_import_style_mismatch(
     return issues
 
 
+def _scan_tech_stack_claim_drift(scaffold_dir: Path) -> List[ConsistencyIssue]:
+    """Detect when tech_stack.json's declared values don't have matching
+    artifacts in the scaffold.
+
+    Specifically checks the ``ci`` and ``db`` slots — both common
+    hallucinations. e79bc0 declared ``ci: github-actions`` but shipped
+    zero workflow files. tactrax declared ``db: better-sqlite3`` with
+    no SQLite usage in the code.
+
+    The check is conservative: we only flag when the architect
+    committed to a SPECIFIC implementation that has a deterministic
+    file footprint. Unknown / 'none' values are skipped.
+    """
+    issues: List[ConsistencyIssue] = []
+    # tech_stack.json lives at the project root (one level up from
+    # scaffold/).
+    project_dir = scaffold_dir.parent
+    tech_stack_path = project_dir / "tech_stack.json"
+    if not tech_stack_path.is_file():
+        return issues
+    try:
+        data = json.loads(tech_stack_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return issues
+    if not isinstance(data, dict):
+        return issues
+
+    ci = str(data.get("ci") or "").strip().lower()
+    db = str(data.get("db") or "").strip().lower()
+
+    # CI check: github-actions claim needs .github/workflows/*.yml
+    # somewhere. Look in both project_dir and scaffold_dir — different
+    # projects use different layouts.
+    if ci == "github-actions":
+        workflows_dirs = (
+            project_dir / ".github" / "workflows",
+            scaffold_dir / ".github" / "workflows",
+        )
+        has_workflow = any(
+            d.is_dir()
+            and any(f.suffix in (".yml", ".yaml") for f in d.iterdir() if f.is_file())
+            for d in workflows_dirs
+        )
+        if not has_workflow:
+            issues.append(ConsistencyIssue(
+                severity="warning",
+                category="hallucination",
+                file="tech_stack.json",
+                message=(
+                    "tech_stack.json declares `ci: github-actions` but no "
+                    ".github/workflows/*.yml files exist in either the "
+                    "scaffold or project root."
+                ),
+                suggestion=(
+                    "Either ship a workflow file (e.g. "
+                    ".github/workflows/ci.yml with build + test jobs) "
+                    "or change `ci` to `none` so the claim matches "
+                    "what was actually built."
+                ),
+            ))
+
+    # DB check: SQLite / better-sqlite3 claim needs at least one
+    # source file that references it.
+    if db in {"better-sqlite3", "sqlite", "sqlite3"}:
+        sqlite_referenced = False
+        # Check package.json deps (server side: import 'better-sqlite3').
+        for pkg in scaffold_dir.rglob("package.json"):
+            try:
+                pkg_data = json.loads(pkg.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            deps = {}
+            for key in ("dependencies", "devDependencies"):
+                if isinstance(pkg_data.get(key), dict):
+                    deps.update(pkg_data[key])
+            if any("sqlite" in name.lower() for name in deps):
+                sqlite_referenced = True
+                break
+        # Check code files for `import 'better-sqlite3'` / similar.
+        if not sqlite_referenced:
+            for path in scaffold_dir.rglob("*"):
+                if path.suffix not in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"):
+                    continue
+                try:
+                    source = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+                if "sqlite" in source.lower() or ".db" in source:
+                    sqlite_referenced = True
+                    break
+        if not sqlite_referenced:
+            issues.append(ConsistencyIssue(
+                severity="warning",
+                category="hallucination",
+                file="tech_stack.json",
+                message=(
+                    f"tech_stack.json declares `db: {db}` but no "
+                    f"SQLite reference (package dep, import, or .db "
+                    f"file) was found in the scaffold."
+                ),
+                suggestion=(
+                    f"Either ship the {db} integration "
+                    f"(add to package.json, import in the server, "
+                    f"create a schema) or change `db` to `none`."
+                ),
+            ))
+
+    return issues
+
+
 def _scan_for_hallucinations(scaffold_dir: Path, allowed_services: Set[str]) -> List[ConsistencyIssue]:
     """Scan JS/JSX/MD files for mentions of services not in the allowed set.
 
@@ -1326,6 +1436,12 @@ def check_consistency(scaffold_dir: Path, brief: str = "") -> ConsistencyReport:
 
     # ── 7b. Cross-artifact drift (palette / fonts / brand-kit usage) ────
     issues.extend(_scan_cross_artifact_drift(scaffold_dir, brief))
+
+    # ── 7c. tech_stack.json claims vs scaffold reality ────────────────────
+    # e79bc0's tech_stack.json declared `ci: github-actions` but the
+    # scaffold shipped no .github/workflows/*.yml. The reviewer flagged
+    # this as a hallucinated claim; this check catches it deterministically.
+    issues.extend(_scan_tech_stack_claim_drift(scaffold_dir))
 
     # ── 8. Orphan export check (lightweight) ─────────────────────────────
     # For each file that exports something, check if another file imports it.

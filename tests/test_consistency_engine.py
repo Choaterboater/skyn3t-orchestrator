@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from skyn3t.agents.consistency_engine import check_consistency
@@ -851,3 +852,140 @@ export default function App() {
 
     stubs = [i for i in report.issues if i.category == "todo_stub"]
     assert not stubs
+
+
+# ─── tech_stack.json claim drift ──────────────────────────────────────
+
+
+def test_tech_stack_drift_flags_missing_github_workflow(tmp_path: Path) -> None:
+    """e79bc0 declared `ci: github-actions` but shipped no workflow
+    files. The reviewer flagged it; this catches it deterministically."""
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    scaffold.mkdir()
+    _write(
+        project_dir / "tech_stack.json",
+        json.dumps({
+            "frontend": "react-vite-tailwind",
+            "backend": "express",
+            "db": "none",
+            "infra": "docker-compose",
+            "ci": "github-actions",
+        }),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    ci_issues = [
+        i for i in report.issues
+        if i.category == "hallucination"
+        and "ci: github-actions" in i.message
+    ]
+    assert ci_issues, [i.message for i in report.issues]
+
+
+def test_tech_stack_drift_clean_with_real_workflow(tmp_path: Path) -> None:
+    """When the workflow file actually exists, no finding."""
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    scaffold.mkdir()
+    _write(
+        project_dir / "tech_stack.json",
+        json.dumps({"ci": "github-actions", "db": "none"}),
+    )
+    _write(
+        project_dir / ".github" / "workflows" / "ci.yml",
+        "name: CI\non: push\njobs:\n  test:\n    runs-on: ubuntu-latest",
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    ci_issues = [
+        i for i in report.issues
+        if i.category == "hallucination" and "ci: github-actions" in i.message
+    ]
+    assert not ci_issues
+
+
+def test_tech_stack_drift_flags_missing_sqlite(tmp_path: Path) -> None:
+    """tactrax declared `db: better-sqlite3` with no SQLite usage in
+    the code. Catch it."""
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    scaffold.mkdir()
+    _write(
+        project_dir / "tech_stack.json",
+        json.dumps({"db": "better-sqlite3", "ci": "none"}),
+    )
+    _write(
+        scaffold / "package.json",
+        json.dumps({"dependencies": {"react": "^18"}}),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    db_issues = [
+        i for i in report.issues
+        if i.category == "hallucination"
+        and "better-sqlite3" in i.message
+    ]
+    assert db_issues
+
+
+def test_tech_stack_drift_clean_when_sqlite_in_deps(tmp_path: Path) -> None:
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    scaffold.mkdir()
+    _write(
+        project_dir / "tech_stack.json",
+        json.dumps({"db": "better-sqlite3", "ci": "none"}),
+    )
+    _write(
+        scaffold / "server" / "package.json",
+        json.dumps({"dependencies": {"better-sqlite3": "^11"}}),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    db_issues = [
+        i for i in report.issues
+        if i.category == "hallucination"
+        and "better-sqlite3" in i.message
+    ]
+    assert not db_issues
+
+
+def test_tech_stack_drift_none_values_skip_check(tmp_path: Path) -> None:
+    """`db: none` / `ci: none` should never trigger a hallucination
+    finding — those explicitly say nothing should ship."""
+    project_dir = tmp_path
+    scaffold = project_dir / "scaffold"
+    scaffold.mkdir()
+    _write(
+        project_dir / "tech_stack.json",
+        json.dumps({"db": "none", "ci": "none"}),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    drift_issues = [
+        i for i in report.issues
+        if i.category == "hallucination"
+        and i.file == "tech_stack.json"
+    ]
+    assert not drift_issues
+
+
+def test_tech_stack_drift_no_file_silent(tmp_path: Path) -> None:
+    """No tech_stack.json → no findings (don't crash)."""
+    scaffold = tmp_path / "scaffold"
+    scaffold.mkdir()
+
+    report = check_consistency(scaffold, brief="")
+
+    drift_issues = [
+        i for i in report.issues
+        if i.category == "hallucination"
+        and i.file == "tech_stack.json"
+    ]
+    assert not drift_issues
