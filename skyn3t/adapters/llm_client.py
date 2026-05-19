@@ -25,6 +25,21 @@ _default_event_bus = None
 # callers don't thread RAG through every code path.
 _default_rag = None
 
+_CROSS_PROVIDER_MODEL_PREFIXES = (
+    "openrouter/",
+    "anthropic/",
+    "openai/",
+    "google/",
+    "meta-llama/",
+    "mistralai/",
+    "deepseek/",
+    "qwen/",
+    "nvidia/",
+    "tencent/",
+    "stepfun/",
+    "xai/",
+)
+
 
 def _try_register_default(eb) -> None:
     global _default_event_bus
@@ -48,6 +63,20 @@ def install_default_rag(rag) -> None:
     """Explicit setter for the module-level fallback RAG instance."""
     global _default_rag
     _default_rag = rag
+
+
+def _drop_cross_provider_model_name(model: Optional[str]) -> Optional[str]:
+    """Drop provider-qualified model IDs before cross-backend failover.
+
+    ``openrouter/foo`` or ``anthropic/bar`` are valid only for those specific
+    providers. When we retry on a different backend, passing them through makes
+    the second backend fail immediately on model validation instead of using its
+    own default model.
+    """
+    if not model:
+        return None
+    lower = model.lower()
+    return None if lower.startswith(_CROSS_PROVIDER_MODEL_PREFIXES) else model
 
 
 @dataclass
@@ -293,9 +322,11 @@ class LLMClient:
                 and failed_backend
                 and failed_backend != "deterministic"
             ):
+                failover_default_model = _drop_cross_provider_model_name(self.default_model)
+                failover_explicit_model = _drop_cross_provider_model_name(model)
                 try:
                     retry_client = LLMClient(
-                        default_model=self.default_model,
+                        default_model=failover_default_model,
                         backend=None,
                         anthropic_api_key=self._anthropic_key,
                         openrouter_api_key=self._openrouter_key,
@@ -313,7 +344,7 @@ class LLMClient:
                     return await retry_client.complete(
                         prompt,
                         system=system,
-                        model=model,
+                        model=failover_explicit_model,
                         max_tokens=max_tokens,
                         temperature=temperature,
                         timeout=timeout,
