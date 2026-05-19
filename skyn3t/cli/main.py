@@ -455,6 +455,16 @@ def start(
     port: int = typer.Option(6660, "--port", "-p", help="Port to bind to"),
     reload: bool = typer.Option(False, "--reload", help="Enable auto-reload"),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of worker processes"),
+    access_log: bool = typer.Option(
+        False,
+        "--access-log/--no-access-log",
+        help=(
+            "Show one log line per HTTP request. Off by default — the "
+            "dashboard polls several endpoints per second and the access "
+            "log buries the orchestrator's own warning/info messages "
+            "(fast-path activations, critique timeouts, etc.)."
+        ),
+    ),
 ) -> None:
     """🚀 Start the SkyN3t orchestrator server."""
     import uvicorn
@@ -472,6 +482,7 @@ def start(
         reload=reload,
         workers=workers if not reload else 1,
         log_level="info",
+        access_log=access_log,
     )
 
 
