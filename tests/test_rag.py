@@ -219,6 +219,7 @@ class TestSanitizeMetadata:
 
     def test_sanitize_coerces_path_to_str(self):
         from pathlib import Path as _Path
+
         from skyn3t.rag.vector_store import _sanitize_metadata
         out = _sanitize_metadata({"file": _Path("/tmp/x")})
         assert isinstance(out["file"], str)

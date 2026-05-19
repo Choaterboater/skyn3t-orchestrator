@@ -301,7 +301,7 @@ class TestSubScoreParser:
     output — different models follow the format with varying precision."""
 
     def _parse(self, text: str):
-        from skyn3t.agents.reviewer import _SUB_SCORE_RES, _SCORE_RE
+        from skyn3t.agents.reviewer import _SCORE_RE, _SUB_SCORE_RES
         subs = {}
         for axis, rx in _SUB_SCORE_RES.items():
             m = rx.search(text)
