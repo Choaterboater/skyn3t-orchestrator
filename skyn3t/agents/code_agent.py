@@ -200,16 +200,26 @@ def _relevant_context(prior_context: str, rel_path: str) -> str:
     sections: list[str] = []
     current_name: Optional[str] = None
     current_lines: list[str] = []
+    # The "Upstream essentials" section (curated prior_summaries from
+    # the runner) is always relevant — it's a few hundred bytes at
+    # most and tells the model what each upstream stage decided. Keep
+    # it in every per-file call alongside the per-extension picks.
+    wanted_always = {"Upstream essentials"}
     for line in prior_context.split("\n"):
-        # Section header in _read_prior_artifacts is "### <name>"
-        if line.startswith("### ") and line.strip().endswith(".md"):
-            if current_name is not None and current_name in wanted:
+        # Section header is "### <name>" (artifacts end in ".md", the
+        # runner's essentials block uses a plain header).
+        if line.startswith("### "):
+            if current_name is not None and (
+                current_name in wanted or current_name in wanted_always
+            ):
                 sections.append("\n".join(current_lines).rstrip())
             current_name = line[4:].strip()
             current_lines = [line]
         else:
             current_lines.append(line)
-    if current_name is not None and current_name in wanted:
+    if current_name is not None and (
+        current_name in wanted or current_name in wanted_always
+    ):
         sections.append("\n".join(current_lines).rstrip())
     result = "\n\n".join(sections).strip()
 
@@ -901,6 +911,32 @@ class CodeAgent(BaseAgent):
         # to disk, then completely ignored when CodeAgent prompts the
         # model — which is why integration briefs produced fake demos.
         prior_context = self._read_prior_artifacts(artifact_dir)
+
+        # Prepend the runner's essential-output summaries (PR #21) when
+        # present. These are short, curated recaps of what each prior
+        # stage decided ("Architect picked react-vite + express on port
+        # 3000.") — much cheaper for the LLM to internalise than the
+        # full architecture.md. Goes FIRST in prior_context so it's
+        # what the model sees before the deeper artifact dumps.
+        prior_summaries = d.get("prior_summaries")
+        if isinstance(prior_summaries, dict) and prior_summaries:
+            summary_lines = [
+                f"- **{name}**: {summary}"
+                for name, summary in prior_summaries.items()
+                if isinstance(name, str) and isinstance(summary, str) and summary.strip()
+            ]
+            if summary_lines:
+                essentials_block = (
+                    "### Upstream essentials\n\n"
+                    "Brief, curated recaps from each completed prior stage. "
+                    "Treat these as the canonical 'what did upstream decide'.\n\n"
+                    + "\n".join(summary_lines)
+                )
+                prior_context = (
+                    essentials_block + "\n\n---\n\n" + prior_context
+                    if prior_context
+                    else essentials_block
+                )
 
         # Read palette.json once so the CSS prelude in brief_requirements
         # can lock in real brand colors instead of fallback defaults.
