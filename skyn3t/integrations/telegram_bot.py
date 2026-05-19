@@ -30,6 +30,7 @@ Inline buttons emit callback queries with ``approve:<slug>`` /
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from typing import Any, Optional
@@ -47,6 +48,27 @@ _LONG_POLL_TIMEOUT_SECONDS = 25
 _HTTP_TIMEOUT_SECONDS = 30.0  # > long-poll timeout
 _RECONNECT_BACKOFF_MIN = 2.0
 _RECONNECT_BACKOFF_MAX = 60.0
+_OFFSET_PATH = Path("data/telegram_offset.json")
+
+
+def _load_offset() -> int:
+    try:
+        if _OFFSET_PATH.exists():
+            data = json.loads(_OFFSET_PATH.read_text(encoding="utf-8"))
+            return int(data.get("offset", 0))
+    except Exception:
+        logger.warning("failed to read telegram offset; starting from 0", exc_info=True)
+    return 0
+
+
+def _save_offset(offset: int) -> None:
+    try:
+        _OFFSET_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _OFFSET_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"offset": int(offset)}), encoding="utf-8")
+        tmp.replace(_OFFSET_PATH)
+    except Exception:
+        logger.warning("failed to persist telegram offset", exc_info=True)
 
 
 def _help_text() -> str:
@@ -145,7 +167,11 @@ class TelegramBot:
         self.token = token
         self.allowed_user_id = str(allowed_user_id or "").strip()
         self.studio_runner = studio_runner
-        self._offset = 0
+        # Without persistence, restarts reset offset → 0 and Telegram replays
+        # the last ~24h of updates, re-firing handlers (approve taps, etc.)
+        # and producing duplicate notifications about finished projects.
+        self._offset = _load_offset()
+        self._offset_initialized = self._offset > 0
         self._stop = False
         self._pending_reject_slugs: dict[str, str] = {}  # user_id → slug awaiting reject feedback
 
@@ -167,6 +193,14 @@ class TelegramBot:
             asyncio.create_task(photos.extract_canonical_references())
         except Exception:
             logger.exception("canonical brand registration failed")
+        # First-run bootstrap: with no persisted offset, the default offset=0
+        # makes Telegram replay every queued update (up to ~24h). Skip the
+        # backlog by asking for the latest update_id and advancing past it.
+        if not self._offset_initialized:
+            try:
+                await self._bootstrap_offset()
+            except Exception:
+                logger.exception("telegram offset bootstrap failed; backlog may replay once")
         backoff = _RECONNECT_BACKOFF_MIN
         while not self._stop:
             try:
@@ -177,6 +211,14 @@ class TelegramBot:
                         await self._dispatch_update(update)
                     except Exception:
                         logger.exception("telegram update handling failed")
+                    finally:
+                        # Persist after each dispatch — successful or not —
+                        # so a handler crash doesn't cause the same update
+                        # to replay forever on the next poll.
+                        uid = int(update.get("update_id") or 0)
+                        if uid + 1 > self._offset:
+                            self._offset = uid + 1
+                        _save_offset(self._offset)
             except asyncio.CancelledError:
                 logger.info("Telegram bot cancelled")
                 raise
@@ -202,12 +244,26 @@ class TelegramBot:
         if not data.get("ok"):
             logger.warning("getUpdates not-ok: %s", data)
             return []
-        updates = data.get("result") or []
-        for u in updates:
-            uid = int(u.get("update_id") or 0)
-            if uid >= self._offset:
-                self._offset = uid + 1
-        return updates
+        return data.get("result") or []
+
+    async def _bootstrap_offset(self) -> None:
+        """First-run only: skip Telegram's queued backlog by advancing past
+        the most recent update. offset=-1 asks Telegram for the latest update;
+        we record its id+1 without processing the update itself."""
+        url = f"{_API_BASE}{self.token}/getUpdates"
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_SECONDS) as client:
+            response = await client.post(url, json={"offset": -1, "limit": 1, "timeout": 0})
+            response.raise_for_status()
+            data = response.json()
+        if not data.get("ok"):
+            return
+        latest = data.get("result") or []
+        if latest:
+            uid = int(latest[0].get("update_id") or 0)
+            self._offset = uid + 1
+        self._offset_initialized = True
+        _save_offset(self._offset)
+        logger.info("telegram offset bootstrapped to %d (backlog skipped)", self._offset)
 
     # ------------------------------------------------------------------
     # Update dispatching
