@@ -14,6 +14,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
+from skyn3t.agents.decisions import write_decisions
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
 
@@ -240,6 +241,14 @@ class ArchitectAgent(BaseAgent):
         stack_path.write_text(json.dumps(stack, indent=2), encoding="utf-8")
         await self.think(f"wrote {stack_path.name}")
 
+        # Decisions contract: emit a small, machine-readable file pinning
+        # the port/framework/language choices derived from the bundle.
+        # Downstream agents read this instead of re-deriving (which is
+        # how the swarm used to ship "three different port stories" in
+        # one build).
+        decisions_path = write_decisions(artifact_dir, stack)
+        await self.think(f"wrote {decisions_path.name}")
+
         # Deterministic sanitizer: Claude Opus consistently ignores the
         # "NEVER mention Python/FastAPI" prompt rule when writing the
         # architecture doc for "homelab dashboard" briefs. The result is
@@ -257,7 +266,7 @@ class ArchitectAgent(BaseAgent):
         except Exception:
             logger.exception("architecture.md sanitization failed (non-fatal)")
 
-        files = [str(arch_path), str(stack_path)]
+        files = [str(arch_path), str(stack_path), str(decisions_path)]
         summary = f"Architecture for '{brief[:60]}' on {target} stack drafted."
 
         if next_agent:
