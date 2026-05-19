@@ -989,3 +989,108 @@ def test_tech_stack_drift_no_file_silent(tmp_path: Path) -> None:
         and i.file == "tech_stack.json"
     ]
     assert not drift_issues
+
+
+# ─── leaked path-marker detection ─────────────────────────────────────
+
+
+def test_consistency_flags_leaked_path_marker_first_line(tmp_path: Path) -> None:
+    """3c6a98 shipped ProgressRing.jsx with literal
+    "src/components/ProgressRing.jsx" as line 1 (the marker leaked).
+    Vite build fails on this."""
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "src" / "components" / "ProgressRing.jsx",
+        """src/components/ProgressRing.jsx
+import React from 'react';
+
+export default function ProgressRing() {
+  return null;
+}
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    leaks = [
+        i for i in report.issues
+        if i.category == "broken_import"
+        and "bare path string" in i.message
+    ]
+    assert leaks, [i.message for i in report.issues]
+    assert leaks[0].severity == "error"
+
+
+def test_consistency_no_leak_on_normal_first_line(tmp_path: Path) -> None:
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "src" / "App.jsx",
+        """
+import React from 'react';
+export default function App() { return null; }
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    leaks = [
+        i for i in report.issues
+        if i.category == "broken_import"
+        and "bare path string" in i.message
+    ]
+    assert not leaks
+
+
+def test_consistency_no_leak_when_path_is_in_comment(tmp_path: Path) -> None:
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "src" / "App.jsx",
+        """
+// src/App.jsx
+import React from 'react';
+export default function App() { return null; }
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    leaks = [
+        i for i in report.issues
+        if i.category == "broken_import"
+        and "bare path string" in i.message
+    ]
+    assert not leaks
+
+
+def test_consistency_leak_check_skips_leading_blank_lines(tmp_path: Path) -> None:
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "src" / "Foo.jsx",
+        "\nsrc/Foo.jsx\nexport default function Foo() {}\n",
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    leaks = [
+        i for i in report.issues
+        if i.category == "broken_import"
+        and "bare path string" in i.message
+    ]
+    assert leaks
+
+
+def test_consistency_leak_check_only_on_code_files(tmp_path: Path) -> None:
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "README.md",
+        "src/App.jsx is the main entry point\n\nMore details...",
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    leaks = [
+        i for i in report.issues
+        if i.category == "broken_import"
+        and "bare path string" in i.message
+    ]
+    assert not leaks
