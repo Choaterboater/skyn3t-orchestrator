@@ -786,3 +786,68 @@ export default function Page() {
         and "page.tsx" in i.file
     ]
     assert drift_issues
+
+
+# ─── broader organic-stub patterns ────────────────────────────────────
+
+
+def test_consistency_flags_prefixed_replace_comment(tmp_path: Path) -> None:
+    """e79bc0's main.js shipped:
+        // Auto-generated placeholder — replace with real implementation.
+    The old regex required the phrase right after `//` with no prefix,
+    so this slipped past. Broadened pattern catches the phrase
+    anywhere in a line comment."""
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "src" / "main.js",
+        """
+// Auto-generated placeholder — replace with real implementation.
+export default function placeholder() {
+  return {};
+}
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    stubs = [i for i in report.issues if i.category == "todo_stub"]
+    assert stubs, [i.message for i in report.issues]
+
+
+def test_consistency_flags_auto_generated_placeholder_phrase(tmp_path: Path) -> None:
+    """Files with `auto-generated placeholder` (without the `replace with`
+    suffix) are also stubs — separate pattern catches them."""
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "src" / "Empty.jsx",
+        """
+// Auto-generated placeholder.
+export default function Empty() { return null; }
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    stubs = [i for i in report.issues if i.category == "todo_stub"]
+    assert stubs
+
+
+def test_consistency_doesnt_flag_normal_replace_phrase(tmp_path: Path) -> None:
+    """Defensive: the broadened pattern requires the FULL phrase
+    'replace with real implementation' — incidental uses of 'replace'
+    in normal code comments should not false-flag."""
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "src" / "App.jsx",
+        """
+// Helper to replace the user's name in the welcome banner.
+export default function App() {
+  return <div>Hello</div>;
+}
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    stubs = [i for i in report.issues if i.category == "todo_stub"]
+    assert not stubs
