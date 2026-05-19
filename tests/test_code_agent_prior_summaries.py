@@ -13,7 +13,10 @@ can tell which stage said what.
 
 from __future__ import annotations
 
-from skyn3t.agents.code_agent import _relevant_context
+from skyn3t.agents.code_agent import (
+    _entrypoint_import_instructions,
+    _relevant_context,
+)
 
 
 class TestRelevantContextKeepsEssentials:
@@ -81,3 +84,92 @@ class TestRelevantContextKeepsEssentials:
         out = _relevant_context(ctx, "src/App.jsx")
         assert "- **architect**: Picked react-vite + express on port 3000." in out
         assert "- **designer**: Brand pack written (7 files)." in out
+
+
+# ─── entrypoint "must import planned components" instructions ─────────
+
+
+class TestEntrypointImportInstructions:
+    """When generating an entrypoint (App.jsx / page.tsx) alongside
+    planned component files, the prompt must instruct the LLM to
+    IMPORT those components rather than reinvent inline. e79bc0
+    shipped App.jsx with inline HabitCard etc. while the planned
+    HabitCard.jsx (and 6 others) sat orphaned in components/."""
+
+    HABIT_PLAN = [
+        {"path": "src/App.jsx", "purpose": "entry"},
+        {"path": "src/components/HabitCard.jsx", "purpose": "habit row"},
+        {"path": "src/components/HabitList.jsx", "purpose": "list"},
+        {"path": "src/components/StreakBadge.jsx", "purpose": "badge"},
+        {"path": "src/components/WeeklyGrid.jsx", "purpose": "grid"},
+        {"path": "vite.config.js", "purpose": "vite config"},
+    ]
+
+    def test_app_jsx_gets_import_pin_when_components_planned(self):
+        out = _entrypoint_import_instructions(
+            rel="src/App.jsx",
+            file_specs=self.HABIT_PLAN,
+        )
+        assert out
+        assert "IMPORT, do NOT redefine" in out
+        # Should list at least the components/* files.
+        assert "components/HabitCard.jsx" in out
+        assert "components/HabitList.jsx" in out
+        # Non-component files like vite.config.js should NOT appear.
+        assert "vite.config.js" not in out
+
+    def test_main_jsx_also_gets_pin(self):
+        out = _entrypoint_import_instructions(
+            rel="src/main.jsx",
+            file_specs=self.HABIT_PLAN,
+        )
+        assert out
+        assert "IMPORT, do NOT redefine" in out
+
+    def test_next_page_tsx_also_gets_pin(self):
+        out = _entrypoint_import_instructions(
+            rel="app/page.tsx",
+            file_specs=self.HABIT_PLAN,
+        )
+        assert out
+
+    def test_non_entrypoint_file_gets_no_pin(self):
+        # A component file generating itself — no instruction needed
+        out = _entrypoint_import_instructions(
+            rel="src/components/HabitCard.jsx",
+            file_specs=self.HABIT_PLAN,
+        )
+        assert out == ""
+
+    def test_no_components_planned_gives_no_pin(self):
+        # CLI / static-site / API-only briefs may plan zero component files
+        plan_no_components = [
+            {"path": "src/App.jsx", "purpose": "entry"},
+            {"path": "vite.config.js", "purpose": "vite config"},
+            {"path": "package.json", "purpose": "deps"},
+        ]
+        out = _entrypoint_import_instructions(
+            rel="src/App.jsx",
+            file_specs=plan_no_components,
+        )
+        assert out == ""
+
+    def test_caps_listing_at_12_components(self):
+        # A huge component plan shouldn't blow up the entrypoint prompt.
+        big_plan = [
+            {"path": "src/App.jsx", "purpose": "entry"},
+        ] + [
+            {"path": f"src/components/C{i}.jsx", "purpose": f"comp {i}"}
+            for i in range(20)
+        ]
+        out = _entrypoint_import_instructions(
+            rel="src/App.jsx",
+            file_specs=big_plan,
+        )
+        assert out
+        # First 12 listed
+        assert "components/C0.jsx" in out
+        assert "components/C11.jsx" in out
+        # Beyond 12 referenced via summary, not listed
+        assert "components/C19.jsx" not in out
+        assert "and 8 more" in out
