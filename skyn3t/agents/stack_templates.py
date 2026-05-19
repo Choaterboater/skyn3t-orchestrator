@@ -1306,13 +1306,14 @@ def _manifest_react_vite(brief: str) -> str:
 
 def _manifest_index_html(brief: str) -> str:
     """Deterministic Vite entry HTML."""
+    title = _title_from_brief(brief)
     return (
         '<!doctype html>\n'
         '<html lang="en">\n'
         '  <head>\n'
         '    <meta charset="UTF-8" />\n'
         '    <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n'
-        '    <title>Homelab Dashboard</title>\n'
+        f'    <title>{title}</title>\n'
         '  </head>\n'
         '  <body>\n'
         '    <div id="root"></div>\n'
@@ -1320,6 +1321,83 @@ def _manifest_index_html(brief: str) -> str:
         '  </body>\n'
         '</html>\n'
     )
+
+
+def _title_from_brief(brief: str) -> str:
+    """Derive a short product title from the brief for use in
+    ``<title>`` tags and similar HTML headers.
+
+    Strategy:
+    1. Look for an explicit "called X" / "named X" / quoted-name
+       pattern (mirrors marketer._extract_product_name).
+    2. Strip a leading imperative verb (Build / Create / Make /
+       Launch / Design / Develop / Ship) plus any "a / an / the"
+       article, then title-case the next 2-5 words.
+    3. Fall back to "App" — anything is better than the hardcoded
+       "Homelab Dashboard" leftover that the consistency reviewer
+       has been flagging on every habit-tracker / todo / inventory
+       brief.
+    """
+    import re
+
+    text = (brief or "").strip()
+    if not text:
+        return "App"
+
+    # Explicit naming patterns win.
+    m = re.search(
+        r"\b(?:called|named)\s+['\"]?([A-Za-z0-9][A-Za-z0-9\- _.]{0,40})['\"]?",
+        text,
+    )
+    if m:
+        return _clean_title(m.group(1))
+    m = re.search(r"['\"]([A-Za-z0-9][A-Za-z0-9\s\-_.]{1,30})['\"]", text)
+    if m:
+        return _clean_title(m.group(1))
+
+    # Strip the imperative + article opening, then take the noun
+    # phrase that follows.
+    stripped = re.sub(
+        r"^(?:please\s+)?(?:build|create|make|launch|design|develop|ship|generate)\s+",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    stripped = re.sub(r"^(?:a|an|the)\s+", "", stripped, flags=re.IGNORECASE)
+
+    # Take the first phrase up to a connector word or punctuation.
+    # "habit tracker with streaks" → "habit tracker"
+    # "service dashboard for homelab" → "service dashboard"
+    phrase = re.split(
+        r"\s+(?:with|for|that|to|so|where|using|including|featuring)\b|[,.;:!?]",
+        stripped,
+        maxsplit=1,
+    )[0].strip()
+
+    # Cap at 5 words / 50 chars so a runaway brief can't blow up the
+    # tag.
+    words = phrase.split()[:5]
+    out = _clean_title(" ".join(words))
+    return out or "App"
+
+
+def _clean_title(raw: str) -> str:
+    """Title-case + collapse whitespace + cap length for use in
+    ``<title>`` etc. Returns "" if the cleaned string is empty."""
+    import re
+
+    cleaned = re.sub(r"\s+", " ", (raw or "").strip())
+    if not cleaned:
+        return ""
+    # Preserve all-caps acronyms; title-case ordinary words.
+    parts = []
+    for word in cleaned.split(" "):
+        if word.isupper() and len(word) <= 5:
+            parts.append(word)
+        else:
+            parts.append(word[:1].upper() + word[1:])
+    out = " ".join(parts)
+    return out[:50]
 
 
 def _manifest_vite_config(brief: str) -> str:
