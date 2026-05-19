@@ -343,3 +343,72 @@ async def test_apply_build_fix_round_times_out_whole_scaffold_llm(tmp_path, monk
 
     assert result is False
     assert (src_dir / "App.jsx").read_text(encoding="utf-8") == original_body
+
+
+def test_critique_timeout_for_covers_rounds_x_inner_budget(tmp_path) -> None:
+    """The outer critique-window timeout must be ≥ rounds × 180s + slack.
+
+    Regression: on fast profile + architect the old formula returned
+    180 * 0.6 = 108s — shorter than even ONE round's inner 180s budget.
+    Result: CRITIQUE_FAILED fired on every build mid-round. The new
+    formula anchors on `rounds × _CRITIQUE_ROUND_BUDGET_SECONDS +
+    overhead` and uses the old base × profile-multiplier only as a
+    FLOOR.
+    """
+    runner = StudioRunner(event_bus=EventBus(), projects_root=tmp_path / "projects")
+
+    # Fast + architect: 2 rounds × 180 + 20 = 380s. Was 108s.
+    fast_architect = runner._critique_timeout_for(
+        stage_name="architect",
+        execution_profile="fast",
+        brief="Build a habit tracker",
+    )
+    rounds_fast_architect = runner._critique_rounds_for(
+        "architect", "Build a habit tracker", execution_profile="fast"
+    )
+    assert fast_architect >= rounds_fast_architect * 180.0 + 20.0
+    # And meaningfully bigger than the old broken value.
+    assert fast_architect > 108.0
+
+    # Fast + code with visual signals: 3 rounds × 180 + 20 = 560s. Was 252s.
+    fast_code_visual = runner._critique_timeout_for(
+        stage_name="code",
+        execution_profile="fast",
+        brief="Build a polished dashboard UI",
+    )
+    rounds_fast_code = runner._critique_rounds_for(
+        "code", "Build a polished dashboard UI", execution_profile="fast"
+    )
+    assert fast_code_visual >= rounds_fast_code * 180.0 + 20.0
+    assert fast_code_visual > 252.0
+
+    # Balanced + architect: 3 rounds × 180 + 20 = 560s. Was 180s.
+    balanced_architect = runner._critique_timeout_for(
+        stage_name="architect",
+        execution_profile="balanced",
+        brief="Build a habit tracker",
+    )
+    assert balanced_architect >= 3 * 180.0 + 20.0
+
+    # Deep + code with visual: 4 rounds × 180 + 20 = 740s.
+    deep_code_visual = runner._critique_timeout_for(
+        stage_name="code",
+        execution_profile="deep",
+        brief="Build a polished dashboard UI",
+    )
+    assert deep_code_visual >= 4 * 180.0 + 20.0
+
+
+def test_critique_timeout_floor_respects_unknown_stages(tmp_path) -> None:
+    """Unknown / generic stage names should still get a sane floor
+    (the old fast-profile floor was max(60, base * 0.6))."""
+    runner = StudioRunner(event_bus=EventBus(), projects_root=tmp_path / "projects")
+
+    generic = runner._critique_timeout_for(
+        stage_name="unknown_stage",
+        execution_profile="fast",
+        brief="",
+    )
+    # Floor for unknown stages is 120 * 0.6 = 72; rounds-budget is 2 * 180 + 20 = 380.
+    # Outer must be at least the rounds-budget.
+    assert generic >= 380.0
