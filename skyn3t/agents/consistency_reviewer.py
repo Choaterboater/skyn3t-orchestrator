@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from skyn3t.agents.decisions import load_decisions
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
 
@@ -194,11 +196,22 @@ class ConsistencyReviewerAgent(BaseAgent):
             except Exception:
                 pass
 
+        # Architect's decisions.json (if present) is the single source of
+        # truth for ports/framework/language. Heuristic and LLM passes
+        # both use it as an anchor instead of inferring ground truth
+        # from scattered scaffold files.
+        artifact_dir_raw = data.get("artifact_dir") or str(scaffold_dir.parent)
+        decisions = load_decisions(artifact_dir_raw) or data.get("decisions")
+        if not isinstance(decisions, dict):
+            decisions = None
+
         # Heuristic pass (fast, no LLM) catches obvious issues
-        heuristic_findings = self._heuristic_check(scaffold_dir, brief)
+        heuristic_findings = self._heuristic_check(scaffold_dir, brief, decisions)
 
         # LLM pass for semantic gaps
-        llm_findings = await self._llm_check(scaffold_dir, brief, architecture_md, task)
+        llm_findings = await self._llm_check(
+            scaffold_dir, brief, architecture_md, task, decisions=decisions
+        )
 
         all_findings = heuristic_findings + llm_findings
         blockers = [f for f in all_findings if f.severity == "blocker"]
@@ -215,7 +228,12 @@ class ConsistencyReviewerAgent(BaseAgent):
             },
         )
 
-    def _heuristic_check(self, scaffold_dir: Path, brief: str) -> List[ConsistencyFinding]:
+    def _heuristic_check(
+        self,
+        scaffold_dir: Path,
+        brief: str,
+        decisions: Optional[Dict[str, Any]] = None,
+    ) -> List[ConsistencyFinding]:
         """Fast heuristic checks that don't need an LLM."""
         findings: List[ConsistencyFinding] = []
         brief_lower = brief.lower()
@@ -252,7 +270,6 @@ class ConsistencyReviewerAgent(BaseAgent):
             compose_ports = []
             for line in compose_text.splitlines():
                 if "ports:" in line or "- \"" in line:
-                    import re
                     m = re.search(r'"(\d+):\d+"', line)
                     if m:
                         compose_ports.append(m.group(1))
@@ -479,6 +496,64 @@ class ConsistencyReviewerAgent(BaseAgent):
                         ),
                     ))
 
+        # Check 8: decisions.json is the architect's port contract. Any
+        # scaffold port that disagrees with it is a contradiction the
+        # downstream agent introduced — flag as a blocker so the build
+        # cannot quietly ship "the architect said 3000 but compose
+        # exposes 8000" again.
+        if decisions:
+            decided_port = decisions.get("backend_port")
+            if isinstance(decided_port, int):
+                env_file = scaffold_dir / ".env.example"
+                if env_file.is_file():
+                    env_text = env_file.read_text(encoding="utf-8")
+                    for line in env_text.splitlines():
+                        if line.startswith("PORT="):
+                            try:
+                                env_port = int(line.split("=", 1)[1].strip())
+                            except (ValueError, IndexError):
+                                break
+                            if env_port != decided_port:
+                                findings.append(ConsistencyFinding(
+                                    severity="blocker",
+                                    category="contradiction",
+                                    file=".env.example",
+                                    message=(
+                                        f".env.example PORT={env_port} disagrees with "
+                                        f"decisions.json backend_port={decided_port}."
+                                    ),
+                                    suggestion=(
+                                        f"Set PORT={decided_port} in .env.example to "
+                                        f"match the architect's decisions contract."
+                                    ),
+                                ))
+                            break
+                compose_file = scaffold_dir / "docker-compose.yml"
+                if compose_file.is_file():
+                    compose_text = compose_file.read_text(encoding="utf-8")
+                    compose_ports: List[int] = []
+                    for line in compose_text.splitlines():
+                        m = re.search(r'"(\d+):\d+"', line)
+                        if m:
+                            try:
+                                compose_ports.append(int(m.group(1)))
+                            except ValueError:
+                                pass
+                    if compose_ports and decided_port not in compose_ports:
+                        findings.append(ConsistencyFinding(
+                            severity="blocker",
+                            category="contradiction",
+                            file="docker-compose.yml",
+                            message=(
+                                f"docker-compose.yml exposes {compose_ports} but "
+                                f"decisions.json backend_port={decided_port}."
+                            ),
+                            suggestion=(
+                                f"Map host:{decided_port} to the container port in "
+                                f"docker-compose.yml to match decisions.json."
+                            ),
+                        ))
+
         return findings
 
     async def _llm_check(
@@ -487,11 +562,16 @@ class ConsistencyReviewerAgent(BaseAgent):
         brief: str,
         architecture_md: str,
         task: TaskRequest,
+        decisions: Optional[Dict[str, Any]] = None,
     ) -> List[ConsistencyFinding]:
         """LLM-based semantic consistency check.
 
         We read a curated subset of files (not the whole scaffold, to stay
         within token budget) and ask the LLM for a structured critique.
+        ``decisions`` (when present) is the architect's machine-readable
+        contract — we surface it as DECISIONS in the prompt so the LLM
+        compares scaffold files against a single anchor instead of
+        guessing the intended truth from scattered clues.
         """
         findings: List[ConsistencyFinding] = []
         llm_client = self._resolve_llm_client(task)
@@ -537,6 +617,12 @@ class ConsistencyReviewerAgent(BaseAgent):
             prompt += (
                 "ARCHITECTURE DOCUMENT:\n"
                 f"{architecture_md[:3000]}\n\n"
+            )
+        if decisions:
+            prompt += (
+                "DECISIONS (source of truth — the architect committed to these. "
+                "Any scaffold file that disagrees with DECISIONS is a contradiction):\n"
+                f"{json.dumps(decisions, indent=2)}\n\n"
             )
         manifest_preview = "\n".join(file_manifest[:60])
         prompt += (
