@@ -131,7 +131,13 @@ def _looks_like_css_content_start(line: str) -> bool:
 
 
 _ENTRYPOINT_FILES = ("app.jsx", "app.tsx", "main.jsx", "main.tsx")
-_ENTRYPOINT_CONTEXT_HARD_CAP = 4000  # chars — tighter than other files
+# Doubled from 4000 once entrypoint generation moved off the CLI tiers
+# onto OpenRouter primary (see _is_problem_file path below): the CLI
+# timeout pressure that justified the tighter cap is gone, and the
+# task-aware OpenRouter ladder handles 8K context comfortably. Extra
+# context = fewer truncated brief/architecture sections leaking into
+# stub fallbacks on entrypoint files.
+_ENTRYPOINT_CONTEXT_HARD_CAP = 8000
 
 
 def _relevant_context(prior_context: str, rel_path: str) -> str:
@@ -1546,19 +1552,53 @@ class CodeAgent(BaseAgent):
                     await self.think(f"building file {i}/{len(file_specs)}: {rel}")
 
                     # Known-problematic files: skip CLIs entirely.
-                    # App.jsx, main.jsx, and other top-level entrypoints
-                    # have failed CLI generation repeatedly (Kimi+Copilot
-                    # streaming-idle timeouts, deterministic-stub
-                    # fallbacks). When OpenRouter is configured, route
-                    # these directly to a known-good API model and skip
-                    # the 8-minute CLI hang cycle.
+                    # App.jsx, main.jsx, server entrypoints, etc. fail CLI
+                    # generation repeatedly (Kimi+Copilot streaming-idle
+                    # timeouts, deterministic-stub fallbacks). When
+                    # OpenRouter is configured we route these directly to
+                    # the task-aware model ladder and skip the 8-minute
+                    # CLI hang cycle.
+                    #
+                    # The fast-path used to call ONE hardcoded model
+                    # (owl-alpha). It now iterates the same ladder tier 4
+                    # uses (project_type_router.ladder_for_file_and_brief),
+                    # so UI files get the UI_HEAVY ladder, server files
+                    # get BACKEND, etc. — no more "owl alpha rate-limited
+                    # → fall back to CLI → timeout" cascade.
                     import os as _os_route
                     _rl_route = rel.lower()
-                    _is_problem_file = _rl_route.endswith((
-                        "/app.jsx", "/app.tsx", "/main.jsx", "/main.tsx",
-                    )) or _rl_route in ("app.jsx", "app.tsx", "main.jsx", "main.tsx") \
-                        or _rl_route.endswith("src/app.jsx") \
+                    # Frontend entrypoints (App/main, with or without src/).
+                    _is_frontend_entry = (
+                        _rl_route.endswith((
+                            "/app.jsx", "/app.tsx", "/main.jsx", "/main.tsx",
+                        ))
+                        or _rl_route in ("app.jsx", "app.tsx", "main.jsx", "main.tsx")
+                        or _rl_route.endswith("src/app.jsx")
                         or _rl_route.endswith("src/main.jsx")
+                    )
+                    # Server entrypoints — same CLI-timeout failure mode
+                    # as frontend entrypoints (large prompt, complex
+                    # cross-file wiring expected) but were not in the
+                    # original fast-path. Adding them is the BR-038-ish
+                    # follow-up to Kimi's report on entrypoint generation.
+                    _is_server_entry = (
+                        _rl_route.endswith((
+                            "server/index.js", "server/index.ts",
+                            "server/app.js", "server/app.ts",
+                            "server/main.js", "server/main.ts",
+                        ))
+                        or _rl_route in ("server.js", "server.ts", "index.js", "index.ts")
+                        and "/" not in _rl_route  # only top-level server.js
+                    )
+                    _is_problem_file = _is_frontend_entry or _is_server_entry
+                    # Feature flag — default ON. Set
+                    # SKYN3T_ENTRYPOINT_OPENROUTER_FIRST=0 to disable
+                    # and force entrypoints back through the CLI tiers.
+                    _fast_path_enabled = (
+                        _os_route.environ.get(
+                            "SKYN3T_ENTRYPOINT_OPENROUTER_FIRST", "1"
+                        ).strip().lower() not in ("0", "false", "no", "off")
+                    )
                     # OPENROUTER_API_KEY may live in os.environ OR in .env
                     # (loaded by pydantic-settings into the Settings object).
                     # pydantic-settings does NOT inject .env values into
@@ -1571,103 +1611,127 @@ class CodeAgent(BaseAgent):
                             _or_key = getattr(_gs(), "openrouter_api_key", None)
                         except Exception:
                             _or_key = None
-                    if _is_problem_file and _or_key:
+                    if _is_problem_file and _or_key and _fast_path_enabled:
                         # Mirror into os.environ so OpenRouterBackend can
                         # see it without us threading the key everywhere.
                         _os_route.environ.setdefault("OPENROUTER_API_KEY", _or_key)
                         try:
                             logger.warning(
-                                "ENTRYPOINT FAST-PATH: %s routed directly to OpenRouter "
+                                "ENTRYPOINT FAST-PATH: %s routed to OpenRouter ladder "
                                 "(skipping CLI to avoid known timeout)",
                                 rel,
                             )
                             from skyn3t.adapters import LLMClient as _LLMCEntry
-                            # Owl Alpha: free, 1M ctx, designed for code
-                            # + agentic workloads. Empirical test gave
-                            # clean 4KB JSX for habit-tracker brief.
-                            # The fourth-tier fallback below has a ladder
-                            # of paid options if Owl rate-limits.
-                            file_client = _LLMCEntry(
-                                default_model="openrouter/owl-alpha",
-                                backend="openrouter",
-                                event_bus=self.event_bus,
-                                caller_name=self.name,
-                            )
+                            # Task-aware ladder. ladder_for_file_and_brief
+                            # picks UI_HEAVY for *.jsx, BACKEND for
+                            # server/*, DOCS for *.md, etc. — see
+                            # core/project_type_router.py for the full
+                            # mapping. Try each model in order; stop on
+                            # first usable response. Falls through to
+                            # CLI chain only if the whole ladder fails.
+                            try:
+                                from skyn3t.core.project_type_router import (
+                                    ladder_for_file_and_brief,
+                                )
+                                _fp_ladder = list(
+                                    ladder_for_file_and_brief(rel, brief or "")
+                                )
+                            except Exception:
+                                _fp_ladder = [
+                                    "openrouter/owl-alpha",
+                                    "deepseek/deepseek-v3.2",
+                                    "xiaomi/mimo-v2-flash",
+                                ]
                             # Use a SHORT focused prompt for OpenRouter.
                             # The full file_prompt is 18-25KB which is
                             # exactly what was killing CLI generation
                             # and would also stress OpenRouter (slower
                             # streaming for big inputs). For entrypoint
-                            # files, brief + purpose + stack + palette
-                            # is enough — every other context section
-                            # can be inferred by a real model.
+                            # files, brief + purpose + stack is enough.
                             _entry_prompt = (
                                 f"Implement the file `{rel}` for this product brief:\n\n"
                                 f"BRIEF:\n{(brief or '').strip()[:1200]}\n\n"
-                                f"PURPOSE OF THIS FILE: {purpose or 'Top-level React component implementing the brief.'}\n"
-                                f"STACK: react_vite (Vite + React, JSX, no TypeScript)\n\n"
+                                f"PURPOSE OF THIS FILE: {purpose or 'Top-level entrypoint implementing the brief.'}\n"
+                                f"STACK: {stack or 'react_vite'}\n\n"
                                 f"Output ONLY the file body. No fences, no markdown, no commentary. "
-                                f"Imports at the top, default export at the bottom. "
+                                f"Imports at the top, default export at the bottom for React components. "
                                 f"Write a complete, runnable implementation that matches the brief — "
                                 f"not a stub, not a placeholder, not a TODO comment."
                             )
-                            try:
-                                body_local = await file_client.complete(
-                                    _entry_prompt,
-                                    system=(
-                                        "You write production-grade React source code. "
-                                        "Never use TODO comments, placeholders, or "
-                                        "'replace with real implementation' language. "
-                                        "Output the complete file body only."
-                                    ),
-                                    max_tokens=6000,
-                                    temperature=0.2,
-                                    timeout=90.0,
+                            body_local = ""
+                            _accepted_model = ""
+                            for _fp_model in _fp_ladder:
+                                try:
+                                    file_client = _LLMCEntry(
+                                        default_model=_fp_model,
+                                        backend="openrouter",
+                                        event_bus=self.event_bus,
+                                        caller_name=self.name,
+                                    )
+                                    _try_body = await file_client.complete(
+                                        _entry_prompt,
+                                        system=(
+                                            "You write production-grade source code. "
+                                            "Never use TODO comments, placeholders, or "
+                                            "'replace with real implementation' language. "
+                                            "Output the complete file body only."
+                                        ),
+                                        max_tokens=8000,
+                                        temperature=0.2,
+                                        timeout=90.0,
+                                    )
+                                except Exception as _fp_exc:
+                                    logger.warning(
+                                        "ENTRYPOINT FAST-PATH %s failed for %s: %s",
+                                        _fp_model, rel, _fp_exc,
+                                    )
+                                    continue
+                                # Marker extraction + cleanup, same as
+                                # below in the CLI path. We keep this
+                                # inline because the per-model loop
+                                # needs to validate before moving on.
+                                _marked_fp = _extract_marked_files(_try_body or "")
+                                if _marked_fp:
+                                    _fp_match = (
+                                        _marked_fp.get(rel)
+                                        or _marked_fp.get(rel.lstrip("/"))
+                                        or _marked_fp.get(_Path(rel).name)
+                                    )
+                                    if not _fp_match and len(_marked_fp) == 1:
+                                        _fp_match = next(iter(_marked_fp.values()))
+                                    if _fp_match:
+                                        _try_body = _fp_match
+                                _try_body = _strip_cli_prelude((_try_body or "").strip(), rel)
+                                _try_body = _strip_fences(_try_body)
+                                _try_body = _strip_copilot_footer(_try_body)
+                                if (
+                                    _try_body
+                                    and "[deterministic-stub]" not in _try_body
+                                    and "TODO[skyn3t]" not in _try_body
+                                    and _syntax_ok(_try_body, rel)
+                                    and _stack_ok(_try_body, rel, stack)
+                                ):
+                                    body_local = _try_body
+                                    _accepted_model = _fp_model
+                                    break
+                                logger.warning(
+                                    "ENTRYPOINT FAST-PATH %s returned unusable body for %s (len=%d)",
+                                    _fp_model, rel, len(_try_body or ""),
                                 )
-                            except Exception:
-                                body_local = ""
-                            # Proceed to the existing marker-extraction +
-                            # cleanup flow below by falling through.
-                            marked_local = _extract_marked_files(body_local or "")
-                            if marked_local:
-                                body_match = (
-                                    marked_local.get(rel)
-                                    or marked_local.get(rel.lstrip("/"))
-                                    or marked_local.get(_Path(rel).name)
+                            if body_local:
+                                logger.warning(
+                                    "ENTRYPOINT FAST-PATH ACCEPTED for %s via %s",
+                                    rel, _accepted_model,
                                 )
-                                if not body_match and len(marked_local) == 1:
-                                    body_match = next(iter(marked_local.values()))
-                                if body_match:
-                                    body_local = body_match
-                            body_local = _strip_cli_prelude((body_local or "").strip(), rel)
-                            body_local = _strip_fences(body_local)
-                            body_local = _strip_copilot_footer(body_local)
-                            # If it worked, hand off (rel, body, target).
-                            # The outer per-file gather loop writes to disk;
-                            # we don't need to write here. Earlier version
-                            # referenced an undefined `scaffold_dir` and
-                            # crashed every fast-path call with NameError —
-                            # which is why every entrypoint fast-path fell
-                            # back to CLI even when OpenRouter returned
-                            # valid code.
-                            if (
-                                body_local
-                                and "[deterministic-stub]" not in body_local
-                                and "TODO[skyn3t]" not in body_local
-                                and _syntax_ok(body_local, rel)
-                                and _stack_ok(body_local, rel, stack)
-                            ):
                                 await self.think(
-                                    f"entrypoint fast-path SUCCESS for {rel} via OpenRouter"
+                                    f"entrypoint fast-path SUCCESS for {rel} via {_accepted_model}"
                                 )
                                 return rel, body_local, target
                             else:
                                 logger.warning(
-                                    "ENTRYPOINT FAST-PATH failed for %s — falling back to CLI chain",
+                                    "ENTRYPOINT FAST-PATH ladder exhausted for %s — falling back to CLI chain",
                                     rel,
                                 )
-                                # Reset and continue to CLI path below.
-                                body_local = ""
                         except Exception:
                             logger.exception(
                                 "entrypoint fast-path errored for %s; continuing with CLI", rel,
