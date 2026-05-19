@@ -16,10 +16,7 @@ scaffold. This pins the contract surface:
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-
-import pytest
 
 from skyn3t.agents.consistency_reviewer import ConsistencyReviewerAgent
 from skyn3t.agents.decisions import (
