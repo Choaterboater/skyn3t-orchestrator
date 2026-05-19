@@ -113,7 +113,7 @@ class ReviewWatcher:
                     "target_file": primary_artifact,
                     "verdict": verdict,
                     "risks": risks,
-                    "review_path": str(review.relative_to(Path("."))),
+                    "review_path": str(review),
                 },
                 source="review_watcher",
             )
