@@ -183,3 +183,144 @@ def test_consistency_review_serializes_to_json():
     assert parsed["ok"] is False
     assert len(parsed["findings"]) == 1
     assert parsed["findings"][0]["category"] == "missing_feature"
+
+
+# ─── Check 4: backend deps without server code ────────────────────────
+
+
+def test_backend_deps_without_server_dir_flags_blocker(tmp_path: Path):
+    """package.json declares express + better-sqlite3 but no server/ dir
+    or server.js — the "looks fullstack but ships frontend-only" pattern
+    that repeatedly tanked LLM scores in production (e75f28, beea80)."""
+    import json as _json
+    agent = _make_agent()
+    (tmp_path / "package.json").write_text(_json.dumps({
+        "dependencies": {"express": "^4.0", "better-sqlite3": "^9.0", "react": "^18.0"},
+    }))
+    findings = agent._heuristic_check(tmp_path, brief="Build a frontend.")
+    matching = [f for f in findings if "Backend dependencies" in f.message]
+    assert matching, f"expected backend-deps-without-server finding, got {findings}"
+    assert matching[0].severity == "blocker"
+    assert "express" in matching[0].message
+    assert "better-sqlite3" in matching[0].message
+
+
+def test_backend_deps_with_server_dir_passes(tmp_path: Path):
+    import json as _json
+    agent = _make_agent()
+    (tmp_path / "package.json").write_text(_json.dumps({
+        "dependencies": {"express": "^4.0", "react": "^18.0"},
+    }))
+    (tmp_path / "server").mkdir()
+    (tmp_path / "server" / "index.js").write_text("// server")
+    findings = agent._heuristic_check(tmp_path, brief="Build a fullstack app.")
+    assert not [f for f in findings if "Backend dependencies" in f.message]
+
+
+# ─── Check 5: planned components not imported from entrypoint ─────────
+
+
+def test_planned_components_not_imported_flags_blocker(tmp_path: Path):
+    """Repro of beea80: component_file_plan.json declares HabitCard,
+    HabitList, StreakBadge, WeekStrip — App.jsx is a localStorage demo
+    importing none of them."""
+    import json as _json
+    artifact_root = tmp_path / "habit-tracker"
+    scaffold = artifact_root / "scaffold"
+    scaffold.mkdir(parents=True)
+    (artifact_root / "component_file_plan.json").write_text(_json.dumps({
+        "files": [
+            {"path": "src/components/HabitCard.jsx"},
+            {"path": "src/components/HabitList.jsx"},
+            {"path": "src/components/StreakBadge.jsx"},
+            {"path": "src/components/WeekStrip.jsx"},
+        ],
+    }))
+    (scaffold / "src").mkdir()
+    (scaffold / "src" / "App.jsx").write_text(
+        "import { useState } from 'react'\n"
+        "function App() { const [h, setH] = useState([]) }\n"
+    )
+    agent = _make_agent()
+    findings = agent._heuristic_check(scaffold, brief="Habit tracker.")
+    matching = [f for f in findings if "ignores" in f.message and "planned components" in f.message]
+    assert matching, f"expected planned-components-missing finding, got {findings}"
+    assert matching[0].severity == "blocker"
+
+
+def test_planned_components_mostly_imported_passes(tmp_path: Path):
+    import json as _json
+    artifact_root = tmp_path / "habit-tracker"
+    scaffold = artifact_root / "scaffold"
+    scaffold.mkdir(parents=True)
+    (artifact_root / "component_file_plan.json").write_text(_json.dumps({
+        "files": [
+            {"path": "src/components/HabitCard.jsx"},
+            {"path": "src/components/HabitList.jsx"},
+        ],
+    }))
+    (scaffold / "src").mkdir()
+    (scaffold / "src" / "App.jsx").write_text(
+        "import HabitCard from './components/HabitCard'\n"
+        "import HabitList from './components/HabitList'\n"
+        "function App() { return <HabitList /> }\n"
+    )
+    agent = _make_agent()
+    findings = agent._heuristic_check(scaffold, brief="Habit tracker.")
+    assert not [f for f in findings if "ignores" in f.message and "planned components" in f.message]
+
+
+# ─── Check 6: index.html title is a template leftover ─────────────────
+
+
+def test_template_title_leftover_flags_warning(tmp_path: Path):
+    """e75f28, beea80, and 2d4498 all shipped <title>Homelab Dashboard</title>
+    despite being habit tracker / inventory app. Brief shares no words
+    with the title → almost certainly a template leftover."""
+    agent = _make_agent()
+    (tmp_path / "index.html").write_text(
+        "<!doctype html><html><head><title>Homelab Dashboard</title></head></html>"
+    )
+    findings = agent._heuristic_check(tmp_path, brief="Build a habit tracker with streaks.")
+    matching = [f for f in findings if "template leftover" in f.message]
+    assert matching, f"expected template-title finding, got {findings}"
+
+
+def test_matching_title_passes(tmp_path: Path):
+    agent = _make_agent()
+    (tmp_path / "index.html").write_text(
+        "<!doctype html><html><head><title>Habit Tracker</title></head></html>"
+    )
+    findings = agent._heuristic_check(tmp_path, brief="Build a habit tracker with streaks.")
+    assert not [f for f in findings if "template leftover" in f.message]
+
+
+# ─── Check 7: tech_stack.json declared vs reality ─────────────────────
+
+
+def test_tech_stack_declares_express_without_server_flags_blocker(tmp_path: Path):
+    import json as _json
+    artifact_root = tmp_path / "proj"
+    scaffold = artifact_root / "scaffold"
+    scaffold.mkdir(parents=True)
+    (artifact_root / "tech_stack.json").write_text(_json.dumps({
+        "backend": "express",
+        "frontend": "react",
+    }))
+    (scaffold / "package.json").write_text(_json.dumps({"dependencies": {"react": "^18.0"}}))
+    agent = _make_agent()
+    findings = agent._heuristic_check(scaffold, brief="Build something.")
+    matching = [f for f in findings if "tech_stack.json declares backend" in f.message]
+    assert matching, f"expected hallucinated-stack finding, got {findings}"
+    assert matching[0].severity == "blocker"
+
+
+def test_tech_stack_declares_frontend_only_passes(tmp_path: Path):
+    import json as _json
+    artifact_root = tmp_path / "proj"
+    scaffold = artifact_root / "scaffold"
+    scaffold.mkdir(parents=True)
+    (artifact_root / "tech_stack.json").write_text(_json.dumps({"backend": "none"}))
+    agent = _make_agent()
+    findings = agent._heuristic_check(scaffold, brief="Frontend-only.")
+    assert not [f for f in findings if "tech_stack.json" in f.message]

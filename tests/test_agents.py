@@ -908,6 +908,67 @@ class TestReviewerAgent:
         assert result.success is True
         assert result.output["score"] == 74
         assert result.output["verdict"] == "go-with-fixes"
+        # score_unclamped is the new field — for llm=69 + heuristic=100,
+        # the blend is round(69*0.54 + 100*0.36 + pkg*0.10). The
+        # ceiling clamps verdict-score to 74 but the displayed
+        # blended score may be higher.
+        assert "score_unclamped" in result.output
+        # The unclamped value should be >= verdict_score (the clamp
+        # only ever lowers, never raises).
+        assert result.output["score_unclamped"] >= result.output["score"]
+
+    @pytest.mark.asyncio
+    async def test_execute_displays_unclamped_score_separately_from_verdict_gate(
+        self, tmp_path, monkeypatch
+    ):
+        """Per the studio-score-49-report: llm=29 and llm=42 both clamped
+        to 49 lost the signal that one run was 13 points better than the
+        other. Display the unclamped blended score; keep the verdict
+        gated. review.md should show both when they differ."""
+        from skyn3t.agents.reviewer import ReviewerAgent
+
+        artifact_dir = tmp_path / "low-llm-score"
+        artifact_dir.mkdir()
+        (artifact_dir / "architecture.md").write_text(
+            "## Overview\n\nA habit tracker.\n", encoding="utf-8",
+        )
+        (artifact_dir / "scaffold").mkdir()
+        (artifact_dir / "scaffold" / "index.html").write_text(
+            "<!doctype html><html><body></body></html>\n", encoding="utf-8",
+        )
+
+        agent = ReviewerAgent(event_bus=EventBus())
+
+        async def noop(*args, **kwargs):
+            return None
+
+        async def fake_llm_review(*, brief, contents, **_kwargs):
+            # llm=29 → ceiling=49 → verdict still no-go even with
+            # perfect heuristic. Without unclamping, user can't see
+            # whether a follow-up retry that produced llm=42 actually
+            # improved anything.
+            return ("## Summary\n\nMany contradictions.\n", 29, None)
+
+        monkeypatch.setattr(agent, "think", noop)
+        monkeypatch.setattr(agent, "share_learning", noop)
+        monkeypatch.setattr(agent, "_llm_review", fake_llm_review)
+        monkeypatch.setattr(agent, "_verdict", lambda completeness, consistency, risks: ("go", 100))
+
+        result = await agent.execute(
+            TaskRequest(title="Review", input_data={"artifact_dir": str(artifact_dir)})
+        )
+
+        assert result.success is True
+        # verdict-gated score capped at 49 (llm=29 < 50 ceiling)
+        assert result.output["score"] == 49
+        # unclamped score = round(29*0.54 + 100*0.36 + packaging*0.10)
+        # which is well above 49.
+        assert result.output["score_unclamped"] > 49
+        # Verdict is still no-go (verdict_score < 50)
+        assert result.output["verdict"] == "no-go"
+        # review.md exposes the difference so users see progress signal
+        review_text = (artifact_dir / "review.md").read_text(encoding="utf-8")
+        assert "verdict gate: 49" in review_text
 
     @pytest.mark.asyncio
     async def test_execute_keeps_go_bucket_when_llm_score_is_already_go(

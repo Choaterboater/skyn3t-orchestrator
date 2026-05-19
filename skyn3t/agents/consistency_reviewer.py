@@ -216,6 +216,191 @@ class ConsistencyReviewerAgent(BaseAgent):
                     suggestion=f"Add a section documenting the {svc} integration.",
                 ))
 
+        # Check 4: Backend deps in package.json but no server/ directory.
+        # Catches the "looks fullstack but ships frontend-only" pattern that
+        # repeatedly tanked LLM scores (e75f28, beea80, 2d4498 all had this).
+        # When express + better-sqlite3 / fastify / koa / etc. are declared
+        # but no server source exists, packaging looks fullstack to the
+        # outside world while runtime is frontend-only.
+        pkg_file = scaffold_dir / "package.json"
+        if pkg_file.exists():
+            try:
+                import json as _json_pkg
+                pkg_data = _json_pkg.loads(pkg_file.read_text(encoding="utf-8"))
+            except Exception:
+                pkg_data = {}
+            deps = {**(pkg_data.get("dependencies") or {}), **(pkg_data.get("devDependencies") or {})}
+            backend_markers = {"express", "fastify", "koa", "better-sqlite3", "pg", "mysql", "mongodb"}
+            backend_deps = sorted(set(deps.keys()) & backend_markers)
+            if backend_deps:
+                # Look for any server-side source file
+                has_server = (
+                    (scaffold_dir / "server").is_dir()
+                    or any(scaffold_dir.glob("server.*"))
+                    or any(scaffold_dir.glob("server/**/*.js"))
+                    or any(scaffold_dir.glob("server/**/*.ts"))
+                )
+                if not has_server:
+                    findings.append(ConsistencyFinding(
+                        severity="blocker",
+                        category="hallucination",
+                        file="package.json",
+                        message=(
+                            f"Backend dependencies declared ({', '.join(backend_deps)}) "
+                            f"but no server/ directory or server.* file exists."
+                        ),
+                        suggestion=(
+                            "Either remove the unused backend dependencies, or add "
+                            "the server code they imply (server/index.js, routes, etc.)."
+                        ),
+                    ))
+
+        # Check 5: Planned components in component_file_plan.json not
+        # imported from the entrypoint. The pattern that produced beea80:
+        # planner declared HabitCard, HabitList, StreakBadge, etc. — but
+        # App.jsx shipped a self-contained localStorage demo importing
+        # none of them. To the user, the "designed app" never existed.
+        # component_file_plan.json and tech_stack.json live in the
+        # artifact_dir (parent of scaffold/). When scaffold_dir == artifact_dir
+        # (no scaffold subdir), look there directly.
+        _artifact_root = scaffold_dir.parent if scaffold_dir.name == "scaffold" else scaffold_dir
+        plan_file = _artifact_root / "component_file_plan.json"
+        if plan_file.exists():
+            try:
+                import json as _json_plan
+                plan_data = _json_plan.loads(plan_file.read_text(encoding="utf-8"))
+            except Exception:
+                plan_data = {}
+            # Plan format: {"files": [{"path": "src/components/X.jsx", ...}]}
+            planned_components: List[str] = []
+            for entry in (plan_data.get("files") or []):
+                p = str(entry.get("path") or "")
+                if "/components/" in p or p.endswith(("Card.jsx", "List.jsx", "Form.jsx")):
+                    name = Path(p).stem
+                    if name and name != "index":
+                        planned_components.append(name)
+            if planned_components:
+                # Read the actual App.jsx (or main.jsx if App not present)
+                app_paths = [
+                    scaffold_dir / "src" / "App.jsx",
+                    scaffold_dir / "src" / "App.tsx",
+                    scaffold_dir / "App.jsx",
+                ]
+                app_text = ""
+                for ap in app_paths:
+                    if ap.exists():
+                        try:
+                            app_text = ap.read_text(encoding="utf-8")
+                            break
+                        except Exception:
+                            continue
+                if app_text:
+                    missing = [
+                        name for name in planned_components
+                        if name not in app_text
+                    ]
+                    # Only fire if MOST planned components are missing — a
+                    # single missing import is normal. A near-total
+                    # mismatch is the pattern this check exists for.
+                    if missing and len(missing) >= max(2, len(planned_components) * 2 // 3):
+                        findings.append(ConsistencyFinding(
+                            severity="blocker",
+                            category="missing_feature",
+                            file="src/App.jsx",
+                            message=(
+                                f"Entrypoint ignores {len(missing)}/{len(planned_components)} "
+                                f"planned components ({', '.join(missing[:5])}"
+                                + (f", and {len(missing) - 5} more" if len(missing) > 5 else "")
+                                + ")."
+                            ),
+                            suggestion=(
+                                "Import and render the planned components from App.jsx, "
+                                "or remove them from component_file_plan.json if the "
+                                "design changed."
+                            ),
+                        ))
+
+        # Check 6: index.html title is the project name, not a template
+        # leftover. Caught in every failing review ("Homelab Dashboard"
+        # title on a habit tracker, inventory app, etc.). A regex match
+        # against `<title>` keeps it simple.
+        idx_html = scaffold_dir / "index.html"
+        if idx_html.exists():
+            try:
+                idx_text = idx_html.read_text(encoding="utf-8")
+            except Exception:
+                idx_text = ""
+            import re as _re_title
+            m = _re_title.search(r"<title>([^<]*)</title>", idx_text, _re_title.IGNORECASE)
+            if m:
+                title = m.group(1).strip()
+                # Pull a few keywords from the brief to compare
+                brief_words = {
+                    w.lower() for w in (brief or "").split()
+                    if len(w) > 3 and w.lower() not in {"with", "that", "this", "from", "your", "build", "make"}
+                }
+                title_words = {w.lower() for w in title.split() if len(w) > 3}
+                # If the title shares NO content-word with the brief, it's
+                # almost certainly a template leftover.
+                if brief_words and not (brief_words & title_words):
+                    findings.append(ConsistencyFinding(
+                        severity="warning",
+                        category="readme_drift",
+                        file="index.html",
+                        message=(
+                            f"<title>{title}</title> looks like a template leftover — "
+                            f"it shares no words with the brief."
+                        ),
+                        suggestion=(
+                            f"Set <title> to something descriptive of the actual product "
+                            f"(e.g. derived from the brief)."
+                        ),
+                    ))
+
+        # Check 7: tech_stack.json declared stack vs files actually present.
+        # If tech_stack says backend=express but no express dep + no server
+        # code, that's hallucinated stack signaling.
+        stack_file = _artifact_root / "tech_stack.json"
+        if stack_file.exists():
+            try:
+                import json as _json_stack
+                stack_data = _json_stack.loads(stack_file.read_text(encoding="utf-8"))
+            except Exception:
+                stack_data = {}
+            declared_backend = str(stack_data.get("backend") or "").lower()
+            if declared_backend and declared_backend not in ("", "none", "static", "frontend"):
+                # Map declared backend to expected evidence
+                evidence = {
+                    "express": [
+                        (scaffold_dir / "server").is_dir(),
+                        "express" in str(pkg_file.exists() and pkg_file.read_text(encoding="utf-8") or ""),
+                    ],
+                    "fastapi": [
+                        any(scaffold_dir.glob("**/main.py")),
+                        any(scaffold_dir.glob("**/requirements.txt")),
+                    ],
+                    "django": [any(scaffold_dir.glob("**/manage.py"))],
+                    "flask": [
+                        any(scaffold_dir.glob("**/app.py")),
+                        any(scaffold_dir.glob("**/requirements.txt")),
+                    ],
+                }
+                checks = evidence.get(declared_backend, [])
+                if checks and not any(checks):
+                    findings.append(ConsistencyFinding(
+                        severity="blocker",
+                        category="hallucination",
+                        file="tech_stack.json",
+                        message=(
+                            f"tech_stack.json declares backend='{declared_backend}' "
+                            f"but no corresponding source files were found."
+                        ),
+                        suggestion=(
+                            f"Either ship the {declared_backend} backend implementation, "
+                            f"or change tech_stack.json to reflect what was actually built."
+                        ),
+                    ))
+
         return findings
 
     async def _llm_check(
