@@ -222,6 +222,119 @@ def _extract_js_imports(source: str) -> Set[str]:
     return found
 
 
+# Captures `import { Foo, Bar as B } from './baz'` and
+# `import Default, { Named } from './baz'` and the plain default
+# `import Default from './baz'`. We need the FULL specifier shape
+# (not just the path) to validate that the target file actually
+# exports under the name we're trying to import.
+_DETAILED_IMPORT_RE = re.compile(
+    r"""
+    ^\s*import\s+
+    (?P<specifiers>
+        (?:[A-Za-z_$][\w$]*\s*,\s*)?       # optional `Default,`
+        \{[^}]*\}                            # the `{ Named, ... }` block
+        |
+        \{[^}]*\}                            # bare `{ Named, ... }`
+        |
+        [A-Za-z_$][\w$]*                    # bare `Default`
+    )
+    \s+from\s+['"](?P<path>[^'"]+)['"]\s*;?
+    """,
+    re.VERBOSE | re.MULTILINE,
+)
+
+
+def _extract_js_imports_detailed(source: str) -> List[tuple]:
+    """Extract `(target_path, default_name_or_None, named_imports)`
+    tuples from a JS/TS source.
+
+    Returns:
+        List of (path, default_local_name, frozenset(named_imports))
+        for each import statement that has at least one specifier.
+        Side-effect-only imports (`import './foo.css';`) are NOT
+        returned — they're handled by `_extract_js_imports`.
+    """
+    out: List[tuple] = []
+    for m in _DETAILED_IMPORT_RE.finditer(source):
+        path = m.group("path")
+        spec = m.group("specifiers").strip()
+
+        default_name: Optional[str] = None
+        named: Set[str] = set()
+
+        # Split off the named-import block (the `{...}` part).
+        brace_open = spec.find("{")
+        if brace_open >= 0:
+            # `Default, { A, B as bb }` shape
+            if brace_open > 0:
+                lead = spec[:brace_open].rstrip().rstrip(",").strip()
+                if lead:
+                    default_name = lead
+            brace_close = spec.find("}", brace_open)
+            if brace_close > brace_open:
+                inner = spec[brace_open + 1 : brace_close]
+                for piece in inner.split(","):
+                    name = piece.strip()
+                    if not name:
+                        continue
+                    # `Foo as Bar` — the *source* name is what matters
+                    # for export validation; the local rename is
+                    # irrelevant here.
+                    if " as " in name:
+                        name = name.split(" as ", 1)[0].strip()
+                    if name:
+                        named.add(name)
+        else:
+            # Pure default import: `import Default from './x'`.
+            default_name = spec
+
+        out.append((path, default_name, frozenset(named)))
+    return out
+
+
+# Captures the kinds of exports we care about for validation:
+#   export default <expr>
+#   export default function Foo(...) {}
+#   export default class Foo {}
+#   export const Foo = ...
+#   export let Foo = ...
+#   export var Foo = ...
+#   export function Foo(...) {}
+#   export class Foo {}
+#   export { Foo, Bar as B }      ← re-exports also count as named
+_EXPORT_DEFAULT_RE = re.compile(r"\bexport\s+default\b")
+_EXPORT_NAMED_DECL_RE = re.compile(
+    r"\bexport\s+(?:async\s+)?"
+    r"(?:const|let|var|function|class)\s+([A-Za-z_$][\w$]*)"
+)
+_EXPORT_NAMED_BLOCK_RE = re.compile(r"\bexport\s*\{([^}]*)\}")
+
+
+def _extract_js_exports(source: str) -> tuple:
+    """Return ``(has_default, frozenset(named_exports))`` for a JS/TS
+    source. Conservative — relies on regex, so weird patterns like
+    `module.exports = { foo, bar }` get reported as having no
+    detectable exports (treated the same as a plain script).
+    """
+    has_default = bool(_EXPORT_DEFAULT_RE.search(source))
+    named: Set[str] = set()
+    for m in _EXPORT_NAMED_DECL_RE.finditer(source):
+        named.add(m.group(1))
+    for m in _EXPORT_NAMED_BLOCK_RE.finditer(source):
+        block = m.group(1)
+        for piece in block.split(","):
+            name = piece.strip()
+            if not name:
+                continue
+            # `foo as Foo` — the EXPORTED name (after `as`) is what
+            # importers see.
+            if " as " in name:
+                name = name.split(" as ", 1)[1].strip()
+            if name and name != "default":
+                named.add(name)
+    return has_default, frozenset(named)
+
+
 def _extract_py_imports(source: str) -> Set[str]:
     """Extract top-level import/module names from Python source."""
     found: Set[str] = set()
@@ -286,6 +399,116 @@ def _read_package_json_deps(scaffold_dir: Path) -> Set[str]:
             if isinstance(data.get(key), dict):
                 deps.update(data[key].keys())
     return deps
+
+
+def _scan_for_import_style_mismatch(
+    scaffold_dir: Path, file_index: Dict[str, Path]
+) -> List[ConsistencyIssue]:
+    """Detect import-style mismatches between importer and target.
+
+    Specifically: `import { Foo } from './bar'` when bar.js doesn't
+    have a named export `Foo` — only `export default Foo`. The
+    target file resolves, the import compiles, but at runtime `Foo`
+    is `undefined` and any use crashes.
+
+    This is a fairly narrow check by design — we only flag the case
+    where the target file has detectable named exports + a default
+    export, and the importer asks for a name that's missing from
+    named but matches the default's identifier. Outside that
+    pattern (re-exports through index files, type-only imports,
+    weird module patterns), we stay silent rather than false-flag.
+    """
+    issues: List[ConsistencyIssue] = []
+
+    # Cache resolved exports per file so we don't re-parse the same
+    # target on every importer's reference.
+    exports_cache: Dict[Path, tuple] = {}
+
+    def _get_exports(path: Path) -> tuple:
+        if path in exports_cache:
+            return exports_cache[path]
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            exports_cache[path] = (False, frozenset())
+            return exports_cache[path]
+        exports_cache[path] = _extract_js_exports(text)
+        return exports_cache[path]
+
+    for rel, path in file_index.items():
+        if path.suffix not in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"):
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for import_path, default_name, named in _extract_js_imports_detailed(source):
+            if not named:
+                continue  # only the `import { X }` case is interesting
+            if not import_path.startswith("."):
+                continue  # external modules — can't validate without traversal
+            resolved = _resolve_relative(path, import_path)
+            if resolved is None:
+                continue
+            # Try the same extension fallback as the broken_import
+            # check so target.jsx resolves from `./target`.
+            target = resolved if resolved.exists() else None
+            if target is None:
+                for ext in (".jsx", ".js", ".tsx", ".ts", ".mjs", ".cjs"):
+                    candidate = resolved.with_suffix(ext)
+                    if candidate.exists():
+                        target = candidate
+                        break
+            if target is None:
+                continue  # broken_import check already flagged this
+            has_default, named_exports = _get_exports(target)
+
+            missing = [name for name in named if name not in named_exports]
+            if not missing:
+                continue
+            for missing_name in missing:
+                # Don't flag if the target has no detectable named OR
+                # default — likely a non-standard module pattern
+                # (CommonJS module.exports = {...}) we can't validate.
+                if not has_default and not named_exports:
+                    continue
+                # The high-signal case: target HAS a default export
+                # that probably matches the importer's intent, but
+                # the importer used named-import syntax.
+                if has_default:
+                    suggestion = (
+                        f"Change `import {{ {missing_name} }} from "
+                        f"'{import_path}'` to `import {missing_name} "
+                        f"from '{import_path}'`, or add "
+                        f"`export {{ {missing_name} }}` to "
+                        f"{target.relative_to(scaffold_dir).as_posix()}."
+                    )
+                else:
+                    suggestion = (
+                        f"Either add `export {{ {missing_name} }}` "
+                        f"or `export const {missing_name} = ...` to "
+                        f"{target.relative_to(scaffold_dir).as_posix()}, "
+                        f"or remove the import."
+                    )
+                issues.append(
+                    ConsistencyIssue(
+                        severity="error",
+                        category="broken_import",
+                        file=rel,
+                        message=(
+                            f"Named import {{ {missing_name} }} from "
+                            f"'{import_path}' — the target file does not "
+                            f"export `{missing_name}` "
+                            + (
+                                "(it has a default export instead)."
+                                if has_default
+                                else "(no matching named export found)."
+                            )
+                        ),
+                        suggestion=suggestion,
+                    )
+                )
+    return issues
 
 
 def _scan_for_hallucinations(scaffold_dir: Path, allowed_services: Set[str]) -> List[ConsistencyIssue]:
@@ -871,6 +1094,16 @@ def check_consistency(scaffold_dir: Path, brief: str = "") -> ConsistencyReport:
                                 suggestion="Create the missing file or fix the import path.",
                             )
                         )
+
+    # ── 4b. Default-vs-named import-style mismatch ───────────────────────
+    # The "file exists" check above catches missing files, but not the
+    # subtler case where the target file exists but doesn't export
+    # under the name we're trying to import. Real bug from e79bc0
+    # review: HabitList.jsx does `import { HabitCard } from './HabitCard'`
+    # (named) but HabitCard.jsx is `export default HabitCard` — would
+    # crash with "HabitCard is undefined" at runtime if anyone wired
+    # it up.
+    issues.extend(_scan_for_import_style_mismatch(scaffold_dir, file_index))
 
     # ── 5. Hallucination scan ────────────────────────────────────────────
     issues.extend(_scan_for_hallucinations(scaffold_dir, allowed_services))
