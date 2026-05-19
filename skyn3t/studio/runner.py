@@ -840,6 +840,13 @@ class StudioRunner:
             if isinstance(extra, dict):
                 extra = {**extra, "execution_profile": execution_profile}
 
+            # Essential-output contract: accumulate each completed stage's
+            # `output["summary"]` so downstream agents can see WHAT prior
+            # stages decided without reading every artifact file. Capped
+            # per-summary so a runaway agent can't bloat the next stage's
+            # input_data. Kimi K2.6 calls this "context sharding" — pass
+            # essential outputs, not full traces.
+            prior_summaries: Dict[str, str] = {}
             for stage_idx, stage in enumerate(stages):
                 if stage_idx < (_start_from_index or 0):
                     continue
@@ -856,6 +863,11 @@ class StudioRunner:
                     **(extra or {}),
                     **stage.input_extra,
                 }
+                # Pass the prior stage summaries as a stable dict. Agents
+                # that want a "what did upstream decide?" recap can read
+                # this directly instead of crawling artifact files.
+                if prior_summaries:
+                    input_data["prior_summaries"] = dict(prior_summaries)
                 # Inject scoreboard-derived pre-warnings into the code
                 # stage. If this (stack, planned-shape) has lost the
                 # router mount in past runs, tell the CodeAgent to
@@ -1718,6 +1730,13 @@ class StudioRunner:
                     message=stage_summary or manifest["next_action"],
                 )
                 self._save_manifest(artifact_dir, manifest)
+                # Accumulate this stage's essential output for downstream
+                # stages. _bound_essential_summary caps at 2000 chars per
+                # stage to prevent a runaway agent from bloating the next
+                # stage's input_data. Skip empty — no signal value.
+                _stage_essential = self._bound_essential_summary(stage_summary)
+                if _stage_essential:
+                    prior_summaries[stage.name] = _stage_essential
                 # Record stage duration in the aggregate scoreboard so
                 # we can see "Architect: avg 187s across N runs" at a
                 # glance without crawling every project.json.
@@ -5284,6 +5303,23 @@ class StudioRunner:
         if reason:
             return reason[:240]
         return ""
+
+    # Essential-output cap per Kimi K2.6 context-sharding pattern. 2000 chars
+    # is generous enough for "what did this stage decide" recaps but tight
+    # enough that 8 stages chained together stay under ~16KB combined.
+    _PRIOR_SUMMARY_CAP = 2000
+
+    @classmethod
+    def _bound_essential_summary(cls, summary: Any) -> str:
+        """Trim a stage's essential output to the per-stage cap. Used to
+        accumulate `prior_summaries` across stages so downstream agents
+        see a recap without crawling artifact files."""
+        text = str(summary or "").strip()
+        if not text:
+            return ""
+        if len(text) <= cls._PRIOR_SUMMARY_CAP:
+            return text
+        return text[: max(0, cls._PRIOR_SUMMARY_CAP - 3)].rstrip() + "..."
 
     async def _maybe_auto_retry(self, manifest: Dict[str, Any], brief: str, slug: str) -> None:
         """If a project failed and hasn't already been retried, launch a second
