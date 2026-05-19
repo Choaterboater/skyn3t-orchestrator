@@ -34,8 +34,20 @@ def _write(root: Path, rel: str, content: str) -> Path:
     return path
 
 
-def _make_react_vite_scaffold(tmp_path: Path, app_jsx: str = None) -> Path:
-    """Create a minimal react_vite scaffold for PackagingAgent to consume."""
+def _make_react_vite_scaffold(
+    tmp_path: Path,
+    app_jsx: str = None,
+    *,
+    with_env_vars: bool = True,
+) -> Path:
+    """Create a minimal react_vite scaffold for PackagingAgent to consume.
+
+    By default the scaffold contains a small src/api.js with two env-var
+    references (VITE_API_URL, VITE_API_KEY) so the configurable-tier
+    files (useConfig.js + Settings.jsx) ship — this matches the
+    typical "app has something to configure" case most tests want to
+    exercise. Pass ``with_env_vars=False`` to test the zero-vars
+    skip path (Settings UI should NOT generate)."""
     artifact = tmp_path / "build-a-habit-tracker-with-streaks-a6f6c0"
     scaffold = artifact / "scaffold"
     _write(scaffold, "package.json", json.dumps({
@@ -59,6 +71,11 @@ def _make_react_vite_scaffold(tmp_path: Path, app_jsx: str = None) -> Path:
         "import App from './App.jsx';\n"
         "ReactDOM.createRoot(document.getElementById('root')).render(<App />);\n"
     ))
+    if with_env_vars:
+        _write(scaffold, "src/api.js", (
+            "const url = import.meta.env.VITE_API_URL;\n"
+            "const key = import.meta.env.VITE_API_KEY;\n"
+        ))
     return artifact
 
 
@@ -138,12 +155,20 @@ class TestWebFileGeneration:
         assert "copy .env.example" not in lower
 
     @pytest.mark.asyncio
-    async def test_settings_jsx_has_empty_fields_when_no_env_vars(self, tmp_path: Path) -> None:
-        artifact = _make_react_vite_scaffold(tmp_path)
-        await _run_packaging(artifact)
-        settings = (artifact / "scaffold/src/Settings.jsx").read_text()
-        assert "const FIELDS = []" in settings
-        assert "No configuration needed" in settings
+    async def test_skips_settings_jsx_when_no_env_vars(self, tmp_path: Path) -> None:
+        """Zero-env-var apps (e.g. habit tracker, localStorage-only)
+        don't need a Settings UI. The agent should skip Settings.jsx
+        + useConfig.js entirely — shipping `FIELDS = []` Settings
+        was scaffolding cruft the reviewer correctly flagged on e79bc0."""
+        artifact = _make_react_vite_scaffold(tmp_path, with_env_vars=False)
+        output = await _run_packaging(artifact)
+        files = output["files_written"]
+        assert "scaffold/src/Settings.jsx" not in files
+        assert "scaffold/src/hooks/useConfig.js" not in files
+        assert not (artifact / "scaffold/src/Settings.jsx").exists()
+        assert not (artifact / "scaffold/src/hooks/useConfig.js").exists()
+        notes = " ".join(output["notes"])
+        assert "No env vars" in notes or "nothing to configure" in notes
 
     @pytest.mark.asyncio
     async def test_settings_jsx_has_fields_when_env_vars_present(self, tmp_path: Path) -> None:

@@ -228,26 +228,40 @@ class PackagingAgent(BaseAgent):
         files_patched: List[str] = []
         notes: List[str] = []
 
-        # 1. useConfig hook
-        hook_path = scaffold_dir / "src" / "hooks" / "useConfig.js"
-        hook_path.parent.mkdir(parents=True, exist_ok=True)
-        hook_path.write_text(_USE_CONFIG_JS, encoding="utf-8")
-        files_written.append(str(hook_path.relative_to(artifact_dir)))
+        # Skip the Settings UI + useConfig hook entirely when there are
+        # no env vars to configure. e79bc0 (habit tracker, localStorage-
+        # only, zero env vars) shipped a Settings.jsx with `FIELDS = []`
+        # and a useless gear icon — the reviewer correctly flagged it as
+        # "scaffolding cruft." A zero-config app has nothing to configure.
+        has_configurable_vars = bool(env_scan.vars)
 
-        # 2. Settings.jsx — generated from scanner output
-        settings_path = scaffold_dir / "src" / "Settings.jsx"
-        settings_path.write_text(
-            _render_settings_jsx(env_scan, app_name=_infer_app_name(detection, artifact_dir)),
-            encoding="utf-8",
-        )
-        files_written.append(str(settings_path.relative_to(artifact_dir)))
+        if has_configurable_vars:
+            # 1. useConfig hook
+            hook_path = scaffold_dir / "src" / "hooks" / "useConfig.js"
+            hook_path.parent.mkdir(parents=True, exist_ok=True)
+            hook_path.write_text(_USE_CONFIG_JS, encoding="utf-8")
+            files_written.append(str(hook_path.relative_to(artifact_dir)))
 
-        # 3. App.jsx — patch only if simple/safe; otherwise leave a README note
-        app_patched, patch_note = self._maybe_patch_app(scaffold_dir)
-        if app_patched:
-            files_patched.append("scaffold/src/App.jsx")
-        elif patch_note:
-            notes.append(patch_note)
+            # 2. Settings.jsx — generated from scanner output
+            settings_path = scaffold_dir / "src" / "Settings.jsx"
+            settings_path.write_text(
+                _render_settings_jsx(env_scan, app_name=_infer_app_name(detection, artifact_dir)),
+                encoding="utf-8",
+            )
+            files_written.append(str(settings_path.relative_to(artifact_dir)))
+
+            # 3. App.jsx — patch only if simple/safe; otherwise leave a README note
+            app_patched, patch_note = self._maybe_patch_app(scaffold_dir)
+            if app_patched:
+                files_patched.append("scaffold/src/App.jsx")
+            elif patch_note:
+                notes.append(patch_note)
+        else:
+            notes.append(
+                "No env vars detected — skipped Settings.jsx + useConfig hook "
+                "(this app has nothing to configure from a settings UI)."
+            )
+            app_patched, patch_note = False, None
         # 4. .gitignore (stack-aware, web-tier)
         gitignore_path = artifact_dir / ".gitignore"
         if not gitignore_path.is_file():
@@ -971,9 +985,7 @@ def _render_web_readme(
             )
     else:
         config_section = (
-            "No configuration is required — **open the app** and use it. "
-            "If you add env-var references later, they will appear in the "
-            "auto-generated **Settings** page (no `.env` file needed).\n"
+            "No configuration is required — **open the app** and use it.\n"
         )
 
     manual_note = ""
