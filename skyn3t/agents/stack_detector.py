@@ -60,6 +60,11 @@ class StackDetection:
     # Useful for downstream messaging — populated when we can find a
     # specific marker file but couldn't fully classify.
     confidence_notes: List[str] = field(default_factory=list)
+    # Architect-declared port override from decisions.json. When set,
+    # _server_port returns this instead of looking up the per-stack
+    # default — keeping Dockerfile/compose/READMEs in sync with the
+    # architect's contract.
+    port_override: Optional[int] = None
 
     @property
     def is_web(self) -> bool:

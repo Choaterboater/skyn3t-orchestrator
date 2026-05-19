@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from skyn3t.agents.decisions import load_decisions
 from skyn3t.agents.env_scanner import EnvVarRef, ScanResult
 from skyn3t.agents.env_scanner import scan as scan_env
 from skyn3t.agents.stack_detector import StackDetection
@@ -114,6 +115,15 @@ class PackagingAgent(BaseAgent):
         verify_enabled = bool(data.get("packaging_verify", True))
 
         detection = detect_stack(artifact_dir)
+        # Honour the architect's decisions.json contract: if a backend
+        # port was pinned upstream, every Dockerfile/compose/README
+        # rendered downstream uses it (instead of re-deriving from a
+        # local lookup table that may disagree).
+        decisions = load_decisions(artifact_dir)
+        if decisions is not None:
+            decided_port = decisions.get("backend_port")
+            if isinstance(decided_port, int):
+                detection.port_override = decided_port
         # Scan both the scaffold dir (frontend) AND the artifact root
         # (backend, in monorepo layouts). The scanner aggregates by var
         # name, so vars referenced in both places just get more entries
@@ -1270,7 +1280,14 @@ _DEFAULT_PORT_BY_STACK: Dict[str, int] = {
 
 
 def _server_port(detection: StackDetection) -> int:
-    """Pick the run port from the stack hint, default to 8000."""
+    """Pick the run port from the stack hint, default to 8000.
+
+    Prefers ``detection.port_override`` when the architect's decisions
+    contract pinned a port — that contract is the single source of
+    truth for ports across the build.
+    """
+    if detection.port_override is not None:
+        return detection.port_override
     if detection.stack and detection.stack in _DEFAULT_PORT_BY_STACK:
         return _DEFAULT_PORT_BY_STACK[detection.stack]
     return 8000

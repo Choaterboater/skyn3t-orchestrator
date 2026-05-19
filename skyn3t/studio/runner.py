@@ -18,6 +18,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from skyn3t.agents.decisions import load_decisions
 from skyn3t.config.settings import get_settings
 from skyn3t.core.agent import AgentCapability, TaskRequest, TaskResult
 from skyn3t.core.event_context import push_event_context
@@ -868,6 +869,15 @@ class StudioRunner:
                 # this directly instead of crawling artifact files.
                 if prior_summaries:
                     input_data["prior_summaries"] = dict(prior_summaries)
+                # Pass the architect's decisions.json (when it exists)
+                # to every downstream stage. PackagingAgent and
+                # ConsistencyReviewerAgent already read it directly off
+                # disk; threading it through input_data lets future
+                # agents pick it up via task.input_data without learning
+                # the artifact_dir convention.
+                _decisions = load_decisions(artifact_dir)
+                if _decisions:
+                    input_data["decisions"] = _decisions
                 # Inject scoreboard-derived pre-warnings into the code
                 # stage. If this (stack, planned-shape) has lost the
                 # router mount in past runs, tell the CodeAgent to
