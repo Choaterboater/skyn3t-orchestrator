@@ -1853,7 +1853,10 @@ class StudioRunner:
                     _notify_dispatch = None  # type: ignore[assignment]
                 if _load_gate_cfg is not None and _should_gate is not None:
                     _gate_cfg = _load_gate_cfg()
-                    if _should_gate(stage.agent, brief):
+                    _autonomy = (
+                        (manifest.get("mission_setup") or {}).get("autonomy")
+                    )
+                    if _should_gate(stage.agent, brief, autonomy=_autonomy):
                         manifest["status"] = "awaiting_approval"
                         manifest["awaiting_approval_for"] = {
                             "stage": stage.name,
