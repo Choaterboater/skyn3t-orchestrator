@@ -59,7 +59,7 @@ def test_backfill_falls_back_to_stub_when_no_generator(tmp_path: Path) -> None:
         "import Mystery from './components/Mystery.jsx';\nexport default Mystery;\n",
     )
     agent = _new_agent()
-    out = agent._backfill_unresolved_local_imports(
+    agent._backfill_unresolved_local_imports(
         out_dir=out_dir,
         files_written=[str(out_dir / "src" / "App.jsx")],
         stack="react_vite",
@@ -125,7 +125,7 @@ def test_backfill_ignores_bare_package_specifiers(tmp_path: Path) -> None:
         "import React from 'react';\nimport { useState } from 'react';\nexport default React;\n",
     )
     agent = _new_agent()
-    out = agent._backfill_unresolved_local_imports(
+    agent._backfill_unresolved_local_imports(
         out_dir=out_dir,
         files_written=[str(out_dir / "src" / "App.jsx")],
         stack="react_vite",
@@ -169,7 +169,7 @@ def test_backfill_writes_activity_feed_and_service_detail(tmp_path: Path) -> Non
         "export default function App(){return <CommandPalette/>;}\n",
     )
     agent = _new_agent()
-    out = agent._backfill_unresolved_local_imports(
+    agent._backfill_unresolved_local_imports(
         out_dir=out_dir,
         files_written=[str(out_dir / "src" / "App.jsx")],
         stack="react_vite",

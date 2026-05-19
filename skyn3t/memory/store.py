@@ -695,7 +695,11 @@ class MemoryStore:
                     "attempts": stats["attempts"],
                     "rate": rate,
                 })
-        losers.sort(key=lambda r: (r["rate"], -r["attempts"]))
+        # Sort primarily by win-rate (ascending — worst first), then by
+        # attempts (most-tried first as a tiebreaker). The cast keeps mypy
+        # happy on the unary minus; the dict values are populated above.
+        from typing import cast
+        losers.sort(key=lambda r: (cast(float, r["rate"]), -cast(int, r["attempts"])))
         return losers[: max(0, int(limit))]
 
     # ------------------------------------------------------------------

@@ -25,15 +25,16 @@ _CLUSTER_BUILD_TIMEOUT_SECONDS = 240.0
 
 
 def _strip_fences(body: str) -> str:
-    """Strip a single fenced code block, even when prose surrounds it.
+    """Strip a single fenced code block, even when prose surrounds it
+    or when the LLM forgot to close the fence.
 
     The model is told to return raw file contents, but CLI backends
     sometimes wrap the output in a fenced ``` block, with optional
     leading/trailing prose ("Here is the file:\n```js\n...\n```\nLet
     me know if..."). The narrow whole-string match only handled the
     case where prose was absent — leaving an unclosed ``` at the top
-    of the file when prose was present, which then fails ``node
-    --check`` (or its language equivalent) before the user sees it.
+    of the file when prose was present, which then fails the syntax
+    check before the user sees it.
     """
     if not body:
         return body
@@ -47,6 +48,15 @@ def _strip_fences(body: str) -> str:
     stripped = body.rstrip()
     if stripped.endswith("\n```"):
         return stripped[:-4].rstrip()
+    # v44: LLM sometimes opens with ```lang and forgets to close.
+    # The opening fence then sits as the first line of the file and
+    # node --check / the structural syntax gate trips on it. If the
+    # body starts with ```... followed by what looks like code, drop
+    # the opening fence line. Symmetrically with the closing-fence
+    # case above.
+    open_match = _RE.match(r"^```[a-zA-Z0-9_+\-]*\s*\n", body)
+    if open_match:
+        return body[open_match.end():]
     return body
 
 
@@ -86,8 +96,42 @@ _CSS_CONTENT_START_RE = _RE.compile(
 )
 
 
+# Copilot CLI's non-interactive output ends with a stats footer block:
+#
+#   Changes   +0 -0
+#   Requests  1 Premium (3s)
+#   Tokens    ↑ 20.8k • ↓ 30 • 9.7k (cached) • 23 (reasoning)
+#
+# When the model's response is appended above this footer, the footer
+# leaks into the file body — making the file syntactically broken
+# (e.g. JSX gets "Tokens" at the bottom and refuses to parse). This
+# regex matches the start of that footer so we can truncate everything
+# from it on. The pattern is intentionally narrow — we only trim when
+# all three rows appear in their canonical order.
+_COPILOT_FOOTER_RE = _RE.compile(
+    r"\n+Changes\s+[+\-]?\d+\s+[\-+]?\d+\s*\n+"
+    r"Requests\s+\d+",
+    _RE.MULTILINE,
+)
+
+
+def _strip_copilot_footer(body: str) -> str:
+    """Remove the Copilot CLI stats footer if it leaked into the body.
+    Returns the body unchanged when the footer isn't present."""
+    if not body or "Tokens" not in body:
+        return body
+    m = _COPILOT_FOOTER_RE.search(body)
+    if m:
+        return body[: m.start()].rstrip()
+    return body
+
+
 def _looks_like_css_content_start(line: str) -> bool:
     return bool(_CSS_CONTENT_START_RE.match(line.strip()))
+
+
+_ENTRYPOINT_FILES = ("app.jsx", "app.tsx", "main.jsx", "main.tsx")
+_ENTRYPOINT_CONTEXT_HARD_CAP = 4000  # chars — tighter than other files
 
 
 def _relevant_context(prior_context: str, rel_path: str) -> str:
@@ -102,6 +146,13 @@ def _relevant_context(prior_context: str, rel_path: str) -> str:
     The strategy is per-extension: only the sections likely to inform
     THIS file get included. Other sections become a one-line skipped
     note so the model knows they exist if it needs them.
+
+    Special case: entrypoint files (App.jsx, main.jsx) get a HARD CAP
+    on context size. Both Kimi and Copilot CLIs time out on prompts
+    larger than ~15KB, and for entrypoints we've been hitting 18-25KB
+    once brand.md + components.md + architecture.md are concatenated.
+    The cap means a slightly less-informed entrypoint, but a written
+    one beats a stub.
     """
     if not prior_context:
         return prior_context
@@ -154,7 +205,19 @@ def _relevant_context(prior_context: str, rel_path: str) -> str:
             current_lines.append(line)
     if current_name is not None and current_name in wanted:
         sections.append("\n".join(current_lines).rstrip())
-    return "\n\n".join(sections).strip()
+    result = "\n\n".join(sections).strip()
+
+    # Entrypoint hard cap. Both Kimi and Copilot CLIs have empirically
+    # timed out on App.jsx prompts that include the full brand kit +
+    # components doc — the streaming-mode CLIs choke when input is
+    # 15KB+ AND output is also large (~5-8KB for a full App.jsx). For
+    # entrypoints we truncate aggressively; the resulting file may be
+    # less polished but it actually gets written instead of stub'd.
+    if any(rl.endswith(ep) for ep in _ENTRYPOINT_FILES) and len(result) > _ENTRYPOINT_CONTEXT_HARD_CAP:
+        head = result[: _ENTRYPOINT_CONTEXT_HARD_CAP].rstrip()
+        result = head + "\n\n[...context truncated to keep entrypoint prompt small enough for CLI backends...]"
+
+    return result
 
 
 def _strip_cli_prelude(body: str, rel_path: str) -> str:
@@ -306,11 +369,48 @@ def _syntax_ok(body: str, rel_path: str, timeout: float = 5.0) -> bool:
             return False
         except Exception:
             return True  # other ast errors → don't block
-    if rl.endswith((".js", ".mjs", ".cjs", ".jsx")):
-        # `node --check` requires a real file path; `node --check -`
-        # reads nothing useful from stdin (silent pass). Write to a
-        # temp file with the right extension so node treats it as
-        # ESM/CJS correctly.
+    if rl.endswith((".jsx", ".tsx")):
+        # JSX/TSX cannot be parsed by node's built-in checker — it
+        # only understands plain JS/ESM. node --check on a .jsx file
+        # bails with ERR_UNKNOWN_FILE_EXTENSION, and previously this
+        # rejected EVERY JSX file the LLMs generated, dropping working
+        # 7-15KB App.jsx outputs from deepseek, qwen3-coder, and
+        # gpt-5-mini. Without a Babel/esbuild parser available, we
+        # fall back to cheap structural checks that catch the common
+        # failure shapes (unbalanced braces, missing return/export,
+        # leftover markdown fences, prose-as-code) without falsely
+        # rejecting valid JSX.
+        text = body.strip()
+        if not text:
+            return False
+        # Catch markdown fences that survived stripping (already
+        # checked above but redundant safety is cheap).
+        if "```" in text:
+            return False
+        # JSX/React files should contain at least one of these signals.
+        # An LLM hallucinating prose won't have any of these.
+        signals = (
+            "import ", "from ", "export ",
+            "function ", "const ", "let ", "var ",
+            "return ", "=>",
+        )
+        if not any(sig in text for sig in signals):
+            return False
+        # Balanced braces (a coarse syntax check). Off-by-one or worse
+        # almost always means truncation or mid-stream content.
+        if text.count("{") != text.count("}"):
+            return False
+        if text.count("(") != text.count(")"):
+            return False
+        # `export default const|let|var` is invalid ES syntax — the
+        # declaration after `export default` must be an expression or
+        # a function/class declaration. Catches an LLM failure mode
+        # where the model generates the keyword but not a usable rhs.
+        if _RE.search(r"\bexport\s+default\s+(const|let|var)\b", text):
+            return False
+        return True
+    if rl.endswith((".js", ".mjs", ".cjs")):
+        # Plain JS/ESM: node --check works correctly for these.
         try:
             suffix = "." + rl.rsplit(".", 1)[-1]
             with tempfile.NamedTemporaryFile(
@@ -994,6 +1094,50 @@ class CodeAgent(BaseAgent):
             else:
                 file_specs = file_specs[:MAX_FILES]
 
+            # Component breakdown: if Designer produced a structured
+            # component_file_plan.json (#113), merge those component files
+            # into the file_specs list. Small per-file generations succeed
+            # where one massive App.jsx call times out. We extend rather
+            # than replace because the original file_specs still includes
+            # config files (package.json, vite.config.js, etc) that we
+            # need.
+            try:
+                plan_path = artifact_dir / "component_file_plan.json"
+                if plan_path.is_file():
+                    import json as _json_plan
+                    plan_data = _json_plan.loads(plan_path.read_text(encoding="utf-8"))
+                    existing_paths = {
+                        (s.get("path") or "").strip()
+                        for s in file_specs
+                        if isinstance(s, dict)
+                    }
+                    added = 0
+                    for entry in (plan_data.get("files") or []):
+                        if not isinstance(entry, dict):
+                            continue
+                        path = str(entry.get("path") or "").strip()
+                        purpose = str(entry.get("purpose") or "").strip()
+                        if not path or not purpose:
+                            continue
+                        if path in existing_paths:
+                            continue
+                        props = entry.get("props") or []
+                        if isinstance(props, list) and props:
+                            purpose = (
+                                f"{purpose} Props: {', '.join(str(p) for p in props)}."
+                            )
+                        file_specs.append({"path": path, "purpose": purpose})
+                        existing_paths.add(path)
+                        added += 1
+                        if len(file_specs) >= MAX_FILES:
+                            break
+                    if added:
+                        await self.think(
+                            f"merged {added} component file(s) from component_file_plan.json"
+                        )
+            except Exception:
+                logger.debug("component_file_plan merge failed", exc_info=True)
+
             # ── Phase 2: build one file at a time ───────────────────────
             file_index = "\n".join(
                 f"- {(s.get('path') or '').strip()}: {(s.get('purpose') or '').strip()}"
@@ -1401,6 +1545,134 @@ class CodeAgent(BaseAgent):
                     file_prompt = "".join(file_prompt_parts)
                     await self.think(f"building file {i}/{len(file_specs)}: {rel}")
 
+                    # Known-problematic files: skip CLIs entirely.
+                    # App.jsx, main.jsx, and other top-level entrypoints
+                    # have failed CLI generation repeatedly (Kimi+Copilot
+                    # streaming-idle timeouts, deterministic-stub
+                    # fallbacks). When OpenRouter is configured, route
+                    # these directly to a known-good API model and skip
+                    # the 8-minute CLI hang cycle.
+                    import os as _os_route
+                    _rl_route = rel.lower()
+                    _is_problem_file = _rl_route.endswith((
+                        "/app.jsx", "/app.tsx", "/main.jsx", "/main.tsx",
+                    )) or _rl_route in ("app.jsx", "app.tsx", "main.jsx", "main.tsx") \
+                        or _rl_route.endswith("src/app.jsx") \
+                        or _rl_route.endswith("src/main.jsx")
+                    # OPENROUTER_API_KEY may live in os.environ OR in .env
+                    # (loaded by pydantic-settings into the Settings object).
+                    # pydantic-settings does NOT inject .env values into
+                    # os.environ, so a plain os.environ.get() check would
+                    # return None even when the key is configured.
+                    _or_key = _os_route.environ.get("OPENROUTER_API_KEY")
+                    if not _or_key:
+                        try:
+                            from skyn3t.config.settings import get_settings as _gs
+                            _or_key = getattr(_gs(), "openrouter_api_key", None)
+                        except Exception:
+                            _or_key = None
+                    if _is_problem_file and _or_key:
+                        # Mirror into os.environ so OpenRouterBackend can
+                        # see it without us threading the key everywhere.
+                        _os_route.environ.setdefault("OPENROUTER_API_KEY", _or_key)
+                        try:
+                            logger.warning(
+                                "ENTRYPOINT FAST-PATH: %s routed directly to OpenRouter "
+                                "(skipping CLI to avoid known timeout)",
+                                rel,
+                            )
+                            from skyn3t.adapters import LLMClient as _LLMCEntry
+                            # Owl Alpha: free, 1M ctx, designed for code
+                            # + agentic workloads. Empirical test gave
+                            # clean 4KB JSX for habit-tracker brief.
+                            # The fourth-tier fallback below has a ladder
+                            # of paid options if Owl rate-limits.
+                            file_client = _LLMCEntry(
+                                default_model="openrouter/owl-alpha",
+                                backend="openrouter",
+                                event_bus=self.event_bus,
+                                caller_name=self.name,
+                            )
+                            # Use a SHORT focused prompt for OpenRouter.
+                            # The full file_prompt is 18-25KB which is
+                            # exactly what was killing CLI generation
+                            # and would also stress OpenRouter (slower
+                            # streaming for big inputs). For entrypoint
+                            # files, brief + purpose + stack + palette
+                            # is enough — every other context section
+                            # can be inferred by a real model.
+                            _entry_prompt = (
+                                f"Implement the file `{rel}` for this product brief:\n\n"
+                                f"BRIEF:\n{(brief or '').strip()[:1200]}\n\n"
+                                f"PURPOSE OF THIS FILE: {purpose or 'Top-level React component implementing the brief.'}\n"
+                                f"STACK: react_vite (Vite + React, JSX, no TypeScript)\n\n"
+                                f"Output ONLY the file body. No fences, no markdown, no commentary. "
+                                f"Imports at the top, default export at the bottom. "
+                                f"Write a complete, runnable implementation that matches the brief — "
+                                f"not a stub, not a placeholder, not a TODO comment."
+                            )
+                            try:
+                                body_local = await file_client.complete(
+                                    _entry_prompt,
+                                    system=(
+                                        "You write production-grade React source code. "
+                                        "Never use TODO comments, placeholders, or "
+                                        "'replace with real implementation' language. "
+                                        "Output the complete file body only."
+                                    ),
+                                    max_tokens=6000,
+                                    temperature=0.2,
+                                    timeout=90.0,
+                                )
+                            except Exception:
+                                body_local = ""
+                            # Proceed to the existing marker-extraction +
+                            # cleanup flow below by falling through.
+                            marked_local = _extract_marked_files(body_local or "")
+                            if marked_local:
+                                body_match = (
+                                    marked_local.get(rel)
+                                    or marked_local.get(rel.lstrip("/"))
+                                    or marked_local.get(_Path(rel).name)
+                                )
+                                if not body_match and len(marked_local) == 1:
+                                    body_match = next(iter(marked_local.values()))
+                                if body_match:
+                                    body_local = body_match
+                            body_local = _strip_cli_prelude((body_local or "").strip(), rel)
+                            body_local = _strip_fences(body_local)
+                            body_local = _strip_copilot_footer(body_local)
+                            # If it worked, hand off (rel, body, target).
+                            # The outer per-file gather loop writes to disk;
+                            # we don't need to write here. Earlier version
+                            # referenced an undefined `scaffold_dir` and
+                            # crashed every fast-path call with NameError —
+                            # which is why every entrypoint fast-path fell
+                            # back to CLI even when OpenRouter returned
+                            # valid code.
+                            if (
+                                body_local
+                                and "[deterministic-stub]" not in body_local
+                                and "TODO[skyn3t]" not in body_local
+                                and _syntax_ok(body_local, rel)
+                                and _stack_ok(body_local, rel, stack)
+                            ):
+                                await self.think(
+                                    f"entrypoint fast-path SUCCESS for {rel} via OpenRouter"
+                                )
+                                return rel, body_local, target
+                            else:
+                                logger.warning(
+                                    "ENTRYPOINT FAST-PATH failed for %s — falling back to CLI chain",
+                                    rel,
+                                )
+                                # Reset and continue to CLI path below.
+                                body_local = ""
+                        except Exception:
+                            logger.exception(
+                                "entrypoint fast-path errored for %s; continuing with CLI", rel,
+                            )
+
                     # Per-file routing: pick the BACKEND best for THIS
                     # file's type. Frontend (.jsx, components/, pages/,
                     # hooks/) → kimi_cli (pretty UI). Backend (server/,
@@ -1476,6 +1748,7 @@ class CodeAgent(BaseAgent):
                     #     the prompt explicitly forbidding it.
                     body_local = _strip_cli_prelude((body_local or "").strip(), rel)
                     body_local = _strip_fences(body_local)
+                    body_local = _strip_copilot_footer(body_local)
 
                     # Determine whether we need a fallback-backend retry.
                     # Two trigger conditions, both treated the same way:
@@ -1533,6 +1806,7 @@ class CodeAgent(BaseAgent):
                                     retry_body = retry_match
                             retry_body = _strip_cli_prelude((retry_body or "").strip(), rel)
                             retry_body = _strip_fences(retry_body)
+                            retry_body = _strip_copilot_footer(retry_body)
                         except Exception:
                             retry_body = ""
 
@@ -1551,6 +1825,261 @@ class CodeAgent(BaseAgent):
                         elif not body_local:
                             body_local = retry_body  # nothing to lose
 
+                    # Third-tier retry — last chance to get a real file
+                    # before we fall back to a TODO placeholder.
+                    # Different from the second retry above in three ways:
+                    #   (1) Uses a more focused, file-specific prompt
+                    #       (no global ceremony, just "implement this file
+                    #       for this brief").
+                    #   (2) Allows backend failover so we try every
+                    #       configured provider.
+                    #   (3) Includes the brief and key context lines so
+                    #       the model isn't generating in a vacuum.
+                    # This was added because users were seeing the
+                    # "Generated scaffold still contains unresolved TODO
+                    # stubs: src/App.jsx" failure repeatedly — the
+                    # second retry shares too much prompt scaffolding
+                    # with the first, so the same failure mode recurs.
+                    if (
+                        not body_local
+                        or "[deterministic-stub]" in body_local
+                        or not _syntax_ok(body_local, rel)
+                    ):
+                        # FIRED — log loudly so we can tell from history
+                        # whether this path actually ran (previous bug:
+                        # silent failures hid the third-tier from logs).
+                        logger.warning(
+                            "THIRD-TIER RETRY FIRED for %s — reason: body_empty=%s stub=%s syntax_bad=%s",
+                            rel,
+                            not body_local,
+                            "[deterministic-stub]" in (body_local or ""),
+                            not _syntax_ok(body_local or "", rel),
+                        )
+                        try:
+                            await self.think(
+                                f"third-tier focused retry for {rel}"
+                            )
+                            from skyn3t.adapters import LLMClient as _LLMClient3
+                            # Skip the backends that already failed on
+                            # this file. Previously we created a fresh
+                            # client with no skip list, so it tried
+                            # Copilot first AGAIN and timed out on the
+                            # same prompt. Reusing skip_backends from
+                            # the primary client gives the third-tier
+                            # retry a real chance to land on a
+                            # different CLI.
+                            _primary_skip = set(
+                                getattr(file_client, "_skip_backends", None)
+                                or getattr(client, "_skip_backends", None) or []
+                            )
+                            # Also explicitly skip whatever backend
+                            # produced the failed body, if recorded.
+                            _last_failed = (
+                                getattr(file_client, "_last_failed_backend", None)
+                                or getattr(client, "_last_failed_backend", None)
+                            )
+                            if _last_failed:
+                                _primary_skip.add(_last_failed)
+                            focused_client = _LLMClient3(
+                                default_model=None,
+                                backend=None,
+                                skip_backends=sorted(_primary_skip) if _primary_skip else None,
+                            )
+                            if _primary_skip:
+                                logger.warning(
+                                    "third-tier skipping failed backends: %s",
+                                    sorted(_primary_skip),
+                                )
+                            focused_prompt = (
+                                f"Implement the file `{rel}` for this product brief:\n\n"
+                                f"BRIEF:\n{(brief or '').strip()[:1500]}\n\n"
+                                f"PURPOSE OF THIS FILE: {purpose or 'no purpose specified'}\n"
+                                f"STACK: {stack or 'react_vite'}\n\n"
+                                f"Output ONLY the file body (no fences, no markdown, no commentary). "
+                                f"Write a complete, runnable implementation — not a stub, not a placeholder. "
+                                f"Imports at the top, default export at the bottom for React components. "
+                                f"Match the brief's actual product — do not invent unrelated functionality."
+                            )
+                            focused_body = await focused_client.complete(
+                                focused_prompt,
+                                system=(
+                                    "You write production-grade source code. "
+                                    "Never use TODO comments, placeholders, or 'replace with real implementation' "
+                                    "language. Generate the complete, working file. If the file is a React "
+                                    "component, build the actual UI the brief describes."
+                                ),
+                                max_tokens=8000,
+                                temperature=0.2,
+                                timeout=_FILE_RETRY_TIMEOUT_SECONDS,
+                            )
+                            focused_body = _strip_cli_prelude((focused_body or "").strip(), rel)
+                            focused_body = _strip_fences(focused_body)
+                            focused_body = _strip_copilot_footer(focused_body)
+                            # Diagnostic: what did the LLM actually return?
+                            _len = len(focused_body or "")
+                            _has_stub = "[deterministic-stub]" in (focused_body or "")
+                            _has_todo = "TODO[skyn3t]" in (focused_body or "")
+                            _syn_ok = _syntax_ok(focused_body or "", rel)
+                            _stk_ok = _stack_ok(focused_body or "", rel, stack)
+                            logger.warning(
+                                "THIRD-TIER RETRY RESULT for %s — len=%d stub=%s todo=%s syntax_ok=%s stack_ok=%s",
+                                rel, _len, _has_stub, _has_todo, _syn_ok, _stk_ok,
+                            )
+                            if focused_body and _len < 200:
+                                # If it's tiny, dump it so we can see what the LLM actually said.
+                                logger.warning("THIRD-TIER RETRY BODY for %s: %r", rel, focused_body[:500])
+                            if (
+                                focused_body
+                                and not _has_stub
+                                and not _has_todo
+                                and _syn_ok
+                                and _stk_ok
+                            ):
+                                body_local = focused_body
+                                await self.think(f"third-tier retry succeeded for {rel}")
+                                logger.warning("THIRD-TIER RETRY ACCEPTED for %s", rel)
+                            else:
+                                logger.warning(
+                                    "THIRD-TIER RETRY REJECTED for %s — falling back to placeholder",
+                                    rel,
+                                )
+                        except Exception as _3rd_exc:
+                            logger.warning(
+                                "THIRD-TIER RETRY EXCEPTION for %s: %s",
+                                rel, _3rd_exc, exc_info=True
+                            )
+                            # Also keep the original debug log
+                            logger.debug(
+                                "third-tier retry failed for %s", rel, exc_info=True
+                            )
+
+                    # Fourth-tier: OpenRouter API. When CLIs all
+                    # failed/timed out (the App.jsx-stub failure mode),
+                    # bypass the CLI subprocess problem entirely by
+                    # calling OpenRouter directly. Uses a small model
+                    # ladder so most calls land on cheap models. Only
+                    # fires when OPENROUTER_API_KEY is configured; the
+                    # placeholder fallback below still catches when
+                    # OpenRouter is unavailable.
+                    if (
+                        not body_local
+                        or "[deterministic-stub]" in body_local
+                        or not _syntax_ok(body_local, rel)
+                    ):
+                        try:
+                            import os as _os
+                            _or_key_4 = _os.environ.get("OPENROUTER_API_KEY")
+                            if not _or_key_4:
+                                try:
+                                    from skyn3t.config.settings import get_settings as _gs4
+                                    _or_key_4 = getattr(_gs4(), "openrouter_api_key", None)
+                                except Exception:
+                                    _or_key_4 = None
+                            if _or_key_4:
+                                # Make sure the OpenRouter backend can see it
+                                _os.environ.setdefault("OPENROUTER_API_KEY", _or_key_4)
+                                logger.warning(
+                                    "FOURTH-TIER (OpenRouter) FIRED for %s — CLIs exhausted",
+                                    rel,
+                                )
+                                await self.think(
+                                    f"fourth-tier OpenRouter retry for {rel}"
+                                )
+                                from skyn3t.adapters import LLMClient as _LLMClient4
+                                # Model ladder, cheapest first.
+                                # Skip free tier — empirical test
+                                # showed it's currently rate-limited.
+                                # deepseek-v3.2 is ~$0.25/M in, $0.38/M out;
+                                # a typical 5KB file uses ~2K in + 2K out
+                                # ≈ $0.001/call. A full build is ~$0.02.
+                                # Project-type aware ladder. UI files
+                                # get Mimo Flash second; backend files
+                                # get Qwen3-Coder second; games get
+                                # Hunyuan-3 second. Free Owl Alpha is
+                                # always the first try regardless of
+                                # type. See skyn3t/core/project_type_router
+                                # for the full mapping.
+                                try:
+                                    from skyn3t.core.project_type_router import (
+                                        ladder_for_file_and_brief,
+                                    )
+                                    _model_ladder = list(
+                                        ladder_for_file_and_brief(rel, brief or "")
+                                    )
+                                except Exception:
+                                    _model_ladder = [
+                                        "openrouter/owl-alpha",
+                                        "xiaomi/mimo-v2-flash",
+                                        "deepseek/deepseek-v3.2",
+                                        "xiaomi/mimo-v2.5-pro",
+                                    ]
+                                _focused_prompt_or = (
+                                    f"Implement the file `{rel}` for this product brief:\n\n"
+                                    f"BRIEF:\n{(brief or '').strip()[:1500]}\n\n"
+                                    f"PURPOSE OF THIS FILE: {purpose or 'no purpose specified'}\n"
+                                    f"STACK: {stack or 'react_vite'}\n\n"
+                                    f"Output ONLY the file body (no fences, no markdown, no commentary). "
+                                    f"Write a complete, runnable implementation — not a stub, not a placeholder. "
+                                    f"Imports at the top, default export at the bottom for React components. "
+                                    f"Match the brief's actual product — do not invent unrelated functionality."
+                                )
+                                _or_body = ""
+                                _or_model = ""
+                                for _m in _model_ladder:
+                                    try:
+                                        or_client = _LLMClient4(
+                                            default_model=_m,
+                                            backend="openrouter",
+                                        )
+                                        _or_body = await or_client.complete(
+                                            _focused_prompt_or,
+                                            system=(
+                                                "You write production-grade source code. "
+                                                "Never use TODO comments, placeholders, or "
+                                                "'replace with real implementation' language. "
+                                                "Generate the complete, working file."
+                                            ),
+                                            max_tokens=8000,
+                                            temperature=0.2,
+                                            timeout=90.0,
+                                        )
+                                        _or_body = _strip_cli_prelude((_or_body or "").strip(), rel)
+                                        _or_body = _strip_fences(_or_body)
+                                        if (
+                                            _or_body
+                                            and "[deterministic-stub]" not in _or_body
+                                            and "TODO[skyn3t]" not in _or_body
+                                            and _syntax_ok(_or_body, rel)
+                                        ):
+                                            _or_model = _m
+                                            break
+                                        else:
+                                            logger.warning(
+                                                "FOURTH-TIER %s returned unusable body for %s (len=%d)",
+                                                _m, rel, len(_or_body or ""),
+                                            )
+                                            _or_body = ""
+                                    except Exception as _or_exc:
+                                        logger.warning(
+                                            "FOURTH-TIER %s failed for %s: %s",
+                                            _m, rel, _or_exc,
+                                        )
+                                        _or_body = ""
+                                        continue
+                                if _or_body:
+                                    body_local = _or_body
+                                    logger.warning(
+                                        "FOURTH-TIER ACCEPTED for %s via %s",
+                                        rel, _or_model,
+                                    )
+                                    await self.think(
+                                        f"OpenRouter ({_or_model}) generated {rel}"
+                                    )
+                        except Exception:
+                            logger.exception(
+                                "fourth-tier OpenRouter retry failed for %s", rel,
+                            )
+
                     # If we STILL have nothing usable, write a visible
                     # placeholder so downstream imports resolve. The reviewer
                     # / verifier will flag this and the fix loop gets a real
@@ -1567,6 +2096,112 @@ class CodeAgent(BaseAgent):
                         body_local = _placeholder_for(rel, purpose, stack)
 
                     return rel, (body_local or ""), target
+
+            async def _build_one_monitored(
+                i: int, rel: str, purpose: str, target: "_Path",
+            ) -> Tuple[str, str, "_Path"]:
+                """MONITOR-wrapped version of _build_one.
+
+                Two protections on top of the existing retry tiers:
+                1. Hard wall-clock timeout — 900s. Even if every CLI
+                   plus every OpenRouter retry hangs, the file
+                   eventually returns (with a placeholder) instead of
+                   stalling the entire stage.
+                2. One per-file final retry via OpenRouter — if
+                   _build_one raises or returns an empty body, we run
+                   ONE more call straight to Owl Alpha with a tight
+                   focused prompt. Cheaper + simpler than letting the
+                   stage timeout cascade.
+
+                Stall detection happens implicitly: when wait_for
+                triggers, _build_one is cancelled and we move to the
+                per-file retry. No "monitor task" needs to poll
+                progress — asyncio handles the cancellation.
+                """
+                import asyncio as _asyncio_mon
+                _STAGE_WALL_CLOCK = 900.0
+                try:
+                    return await _asyncio_mon.wait_for(
+                        _build_one(i, rel, purpose, target),
+                        timeout=_STAGE_WALL_CLOCK,
+                    )
+                except _asyncio_mon.TimeoutError:
+                    logger.warning(
+                        "PER-FILE WALL-CLOCK timeout for %s after %.0fs — "
+                        "running last-resort OpenRouter retry",
+                        rel, _STAGE_WALL_CLOCK,
+                    )
+                except Exception:
+                    logger.warning(
+                        "_build_one raised for %s — running last-resort OpenRouter retry",
+                        rel, exc_info=True,
+                    )
+
+                # Last-resort retry — straight to OpenRouter / Owl Alpha,
+                # short focused prompt. Bypasses the CLI chain entirely
+                # because by this point we know the CLIs aren't getting
+                # this file done. Capped at 60s.
+                import os as _os_lr
+                _or_key_lr = _os_lr.environ.get("OPENROUTER_API_KEY")
+                if not _or_key_lr:
+                    try:
+                        from skyn3t.config.settings import get_settings as _gs_lr
+                        _or_key_lr = getattr(_gs_lr(), "openrouter_api_key", None)
+                        if _or_key_lr:
+                            _os_lr.environ.setdefault("OPENROUTER_API_KEY", _or_key_lr)
+                    except Exception:
+                        _or_key_lr = None
+                if _or_key_lr:
+                    try:
+                        from skyn3t.adapters import LLMClient as _LLMCLR
+                        last_client = _LLMCLR(
+                            default_model="openrouter/owl-alpha",
+                            backend="openrouter",
+                            event_bus=self.event_bus,
+                            caller_name=self.name,
+                        )
+                        last_prompt = (
+                            f"Write the file `{rel}` for this brief:\n\n"
+                            f"BRIEF: {(brief or '').strip()[:1000]}\n\n"
+                            f"PURPOSE: {purpose or 'no purpose specified'}\n"
+                            f"STACK: {stack or 'react_vite'}\n\n"
+                            "Output ONLY the file body — no fences, no commentary. "
+                            "Complete, runnable implementation. No TODO, no stubs."
+                        )
+                        try:
+                            last_body = await last_client.complete(
+                                last_prompt,
+                                system="You write production-grade source code. Output only the file body.",
+                                max_tokens=6000,
+                                temperature=0.2,
+                                timeout=60.0,
+                            )
+                        finally:
+                            try:
+                                await last_client.aclose()
+                            except Exception:
+                                pass
+                        last_body = _strip_cli_prelude((last_body or "").strip(), rel)
+                        last_body = _strip_fences(last_body)
+                        last_body = _strip_copilot_footer(last_body)
+                        if (
+                            last_body
+                            and "[deterministic-stub]" not in last_body
+                            and "TODO[skyn3t]" not in last_body
+                            and _syntax_ok(last_body, rel)
+                        ):
+                            logger.warning(
+                                "PER-FILE LAST-RESORT succeeded for %s (via Owl Alpha)",
+                                rel,
+                            )
+                            return rel, last_body, target
+                    except Exception:
+                        logger.warning(
+                            "per-file last-resort retry failed for %s", rel, exc_info=True
+                        )
+                # Everything failed. Write a placeholder so the stage can
+                # continue and the reviewer sees the gap.
+                return rel, _placeholder_for(rel, purpose, stack), target
 
             async def _build_cluster(
                 cluster: List[Tuple[int, str, str, "_Path"]],
@@ -1750,8 +2385,14 @@ class CodeAgent(BaseAgent):
                 # return_exceptions=True so one slow/exploded backend
                 # doesn't tank the whole scaffold — surviving jobs still
                 # get written to disk.
+                # Use the monitored wrapper so individual files can fail
+                # or stall without killing the whole stage. Each file
+                # gets up to 900s wall-clock + one last-resort OpenRouter
+                # retry before placeholder. Clusters keep using the
+                # original _build_cluster (they have their own internal
+                # fallback path).
                 coros = [
-                    _build_one(i, rel, purpose, target)
+                    _build_one_monitored(i, rel, purpose, target)
                     for i, rel, purpose, target in solo_jobs
                 ] + [
                     _build_cluster(cluster) for cluster in batch_clusters
@@ -2002,6 +2643,7 @@ class CodeAgent(BaseAgent):
              minimal placeholder so the build at least succeeds.
         """
         from pathlib import Path as _Path
+
         from skyn3t.agents.stack_templates import manifest_for
 
         out_dir = _Path(out_dir).resolve()
@@ -2132,15 +2774,15 @@ class CodeAgent(BaseAgent):
             )
         if ext in ("ts", "tsx"):
             return (
-                f"// @skyn3t-backfill-stub: for missing import.\n"
-                f"export default {{}};\n"
+                "// @skyn3t-backfill-stub: for missing import.\n"
+                "export default {};\n"
             )
         if ext in ("css", "scss"):
             return f"/* @skyn3t-backfill-stub: for missing import ({rel_path}) */\n"
         # js / mjs / cjs / fallback
         return (
-            f"// @skyn3t-backfill-stub: for missing import.\n"
-            f"export default {{}};\n"
+            "// @skyn3t-backfill-stub: for missing import.\n"
+            "export default {};\n"
         )
 
     # Packages we WILL strip from a package.json if no source file imports
@@ -2168,9 +2810,9 @@ class CodeAgent(BaseAgent):
         dependencies/devDependencies. Leaves package-lock.json
         untouched — operator can run `npm install` again to reconcile.
         """
-        from pathlib import Path as _Path
         import json as _json
         import re as _RE
+        from pathlib import Path as _Path
         out_dir = _Path(out_dir).resolve()
 
         # Build the source body once (skipping node_modules / dist etc.)
