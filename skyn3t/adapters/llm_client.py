@@ -625,13 +625,17 @@ async def _run_capture(args: list[str], cwd: Optional[str] = None) -> str:
     import shutil as _sh
     import sys as _sys
     start_wall = time.time()
-    use_caller_cwd = bool(cwd) and Path(cwd).is_dir()
+    use_caller_cwd = cwd is not None and Path(cwd).is_dir()
     if cwd and not use_caller_cwd:
         logger.warning(
             "LLM caller-provided cwd does not exist; falling back to sandbox. cwd=%r",
             cwd,
         )
-    sandbox_cwd = cwd if use_caller_cwd else _make_llm_cli_sandbox_cwd()
+    # When use_caller_cwd is True, cwd is guaranteed non-None
+    # (the predicate is `cwd is not None and Path(cwd).is_dir()`).
+    # Annotated explicitly so the downstream calls (harvest, rmtree)
+    # don't get flagged as Optional[str].
+    sandbox_cwd: str = cwd if (use_caller_cwd and cwd is not None) else _make_llm_cli_sandbox_cwd()
 
     # Build subprocess env with Python unbuffered mode — critical for
     # Python-based CLIs (kimi, openai) that otherwise block-buffer

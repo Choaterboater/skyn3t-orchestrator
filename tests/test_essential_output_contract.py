@@ -14,8 +14,6 @@ pin both pieces down so future regressions show up locally.
 
 from __future__ import annotations
 
-import pytest
-
 from skyn3t.studio.runner import StudioRunner
 
 
