@@ -150,6 +150,11 @@ python -m skyn3t.cli.main start
 
 Open http://localhost:6660 for the cyberpunk dashboard.
 
+> **Note:** `skyn3t start` runs with HTTP access logs **off** by default,
+> so the orchestrator's own warning/info messages (fast-path activations,
+> critique timeouts, build verifier output) stay visible. Pass
+> `--access-log` if you want to see per-request lines.
+
 ### Register Agents
 
 Via the CLI:
