@@ -229,6 +229,10 @@ class TestAppPatching:
         assert "scaffold/src/App.jsx" in output["files_patched"]
         patched = (artifact / "scaffold/src/App.jsx").read_text()
         assert "SkynPackagingWrapper" in patched
+        # Regression: the @skyn3t-packaging marker should appear exactly
+        # once, not twice. Earlier bug: function-form patch path added the
+        # marker AND _inject_settings_wrapper added it again.
+        assert patched.count("@skyn3t-packaging:") == 1
 
     @pytest.mark.asyncio
     async def test_no_app_jsx_leaves_helpful_note(self, tmp_path: Path) -> None:
