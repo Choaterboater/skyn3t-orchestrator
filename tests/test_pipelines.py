@@ -1399,7 +1399,11 @@ class TestStudioRunner:
 
         manifest = await runner.start("demo", "Build a dashboard", slug="quality-no-go")
 
-        assert calls == ["build", "boot", "integration", "retry"]
+        # Auto-retry was intentionally disabled by user — failed projects
+        # stay failed; the user starts a fresh build explicitly. The
+        # build/boot/integration verifiers still run; only the retry
+        # tail is removed.
+        assert calls == ["build", "boot", "integration"]
         assert manifest["status"] == "failed"
         assert manifest["error"] == "Reviewer found launch-blocking gaps."
         assert manifest["quality_summary"]["verdict"] == "no-go"

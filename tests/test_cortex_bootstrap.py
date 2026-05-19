@@ -13,13 +13,11 @@ cortex. Tests focus on the contract operators rely on:
 from __future__ import annotations
 
 import asyncio
-import os
 from types import SimpleNamespace
 
 import pytest
 
 from skyn3t.cortex.bootstrap import CortexBootstrap, _disabled_set
-
 
 # ---------------------------------------------------------------------
 # Fakes
