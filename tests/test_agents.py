@@ -842,7 +842,7 @@ class TestReviewerAgent:
         async def noop(*args, **kwargs):
             return None
 
-        async def fake_llm_review(*, brief, contents):
+        async def fake_llm_review(*, brief, contents, **_kwargs):
             assert brief == ""
             assert "scaffold/index.html" in contents
             return (
@@ -891,7 +891,7 @@ class TestReviewerAgent:
         async def noop(*args, **kwargs):
             return None
 
-        async def fake_llm_review(*, brief, contents):
+        async def fake_llm_review(*, brief, contents, **_kwargs):
             assert "scaffold/index.html" in contents
             return ("## Summary\n\nStill has important gaps.\n", 69)
 
@@ -931,7 +931,7 @@ class TestReviewerAgent:
         async def noop(*args, **kwargs):
             return None
 
-        async def fake_llm_review(*, brief, contents):
+        async def fake_llm_review(*, brief, contents, **_kwargs):
             assert "scaffold/index.html" in contents
             return ("## Summary\n\nLooks good overall.\n", 82)
 
@@ -980,7 +980,7 @@ class TestReviewerAgent:
         calls = {"count": 0}
 
         class SlowLLMClient:
-            async def complete(self, prompt, max_tokens, temperature):  # noqa: ARG002
+            async def complete(self, prompt, max_tokens, temperature, **_kwargs):  # noqa: ARG002
                 calls["count"] += 1
                 await asyncio.sleep(1)
                 return "1. brand.md: this should never land"
