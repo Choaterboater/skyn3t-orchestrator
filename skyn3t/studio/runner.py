@@ -4334,6 +4334,8 @@ class StudioRunner:
             sub_scores = {}
             for axis in ("completeness", "correctness", "consistency", "packaging"):
                 v = raw_sub.get(axis)
+                if v is None:
+                    continue
                 try:
                     iv = int(v)
                 except (TypeError, ValueError):
@@ -4878,6 +4880,8 @@ class StudioRunner:
             sub_scores = {}
             for axis in ("completeness", "correctness", "consistency", "packaging"):
                 v = raw_sub.get(axis)
+                if v is None:
+                    continue
                 try:
                     iv = int(v)
                 except (TypeError, ValueError):
