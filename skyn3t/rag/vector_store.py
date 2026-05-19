@@ -212,6 +212,9 @@ class VectorStore:
         if not self._initialized:
             await self.initialize()
 
+        if metadatas is not None:
+            metadatas = [_sanitize_metadata(m) for m in metadatas]
+
         collection = self._require_collection()
         collection.update(
             ids=ids,

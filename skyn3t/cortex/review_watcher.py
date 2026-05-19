@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict
 
@@ -10,6 +11,16 @@ from skyn3t.config.settings import get_settings
 from skyn3t.cortex.review_utils import parse_review_markdown
 
 logger = logging.getLogger("skyn3t.cortex.review_watcher")
+
+# Project slugs are kebab-case alphanumerics (e.g. "build-a-habit-tracker-e75f28",
+# "carnary-138"). Reject anything else before using the value in a filesystem
+# path — a slug like "../../etc/passwd" from a malformed event payload would
+# otherwise escape projects_dir.
+_SAFE_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
+def _is_safe_slug(slug: Any) -> bool:
+    return isinstance(slug, str) and bool(_SAFE_SLUG_RE.match(slug))
 
 
 class ReviewWatcher:
@@ -79,6 +90,9 @@ class ReviewWatcher:
 
     async def _inspect(self, slug: str, payload: Dict[str, Any]) -> None:
         try:
+            if not _is_safe_slug(slug):
+                logger.warning("ReviewWatcher: rejecting unsafe slug %r", slug)
+                return
             root = get_settings().projects_dir / slug
             review = root / "review.md"
             if not review.exists():
@@ -92,10 +106,12 @@ class ReviewWatcher:
             needs_fix = any(k in v for k in ("no-go", "blocked"))
             if not needs_fix or not risks:
                 return
-            self._seen.add(slug)
-            self._save_seen()
             from skyn3t.cortex import get_store
             primary_artifact = self._guess_target(root)
+            # Create the proposal FIRST. Only mark the slug as seen after
+            # the store accepts the record — otherwise a transient DB
+            # failure would silently drop the review forever because the
+            # slug would be in _seen on the next event.
             get_store().create(
                 kind="studio_debug",
                 title=f"Reviewer flagged issues in {slug}",
@@ -117,6 +133,8 @@ class ReviewWatcher:
                 },
                 source="review_watcher",
             )
+            self._seen.add(slug)
+            self._save_seen()
         except Exception:
             logger.exception("ReviewWatcher._inspect failed for %s", slug)
 
