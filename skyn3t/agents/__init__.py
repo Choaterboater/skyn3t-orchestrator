@@ -17,6 +17,7 @@ from skyn3t.agents.github_explorer import GitHubExplorerAgent
 from skyn3t.agents.github_ingestor import GitHubIngestorAgent
 from skyn3t.agents.integration_verifier import IntegrationContractVerifierAgent
 from skyn3t.agents.marketer import MarketerAgent
+from skyn3t.agents.packaging_agent import PackagingAgent
 from skyn3t.agents.project_memory import ProjectMemoryAgent
 from skyn3t.agents.research_agent import ResearchAgent
 from skyn3t.agents.reviewer import ReviewerAgent
@@ -45,6 +46,7 @@ __all__ = [
     "GitHubIngestorAgent",
     "KimiCLIAgent",
     "MarketerAgent",
+    "PackagingAgent",
     "ProjectMemoryAgent",
     "ResearchAgent",
     "ReviewerAgent",
