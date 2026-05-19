@@ -139,6 +139,78 @@ _ENTRYPOINT_FILES = ("app.jsx", "app.tsx", "main.jsx", "main.tsx")
 # stub fallbacks on entrypoint files.
 _ENTRYPOINT_CONTEXT_HARD_CAP = 8000
 
+# Entry-file paths that should be pinned to USE planned components
+# rather than reinvent them inline. Mirrors _ENTRYPOINT_FILES plus
+# Next.js' `page.{jsx,tsx}`. Centralized so the prompt and the
+# consistency engine's entry-file drift detector stay aligned.
+_ENTRYPOINT_PROMPT_TAIL = (
+    "app.jsx", "app.tsx",
+    "main.jsx", "main.tsx",
+    "page.tsx", "page.jsx",
+)
+
+
+def _entrypoint_import_instructions(
+    *,
+    rel: str,
+    file_specs: List[Dict[str, Any]],
+) -> str:
+    """Return a prompt fragment that pins entry-file generation to USE
+    the planned component files rather than reinvent them inline.
+
+    Returns "" when ``rel`` isn't an entry file, or when no components
+    are planned alongside it. The fragment lists up to 12 planned
+    component paths and tells the LLM:
+
+    1. For every component rendered, import from the planned path.
+    2. Don't invent NEW components when a planned sibling exists.
+    3. Adapt via props if the API doesn't fit — never reinvent.
+
+    Pulled out of the inline per-file prompt builder so the contract
+    is unit-testable without spinning the whole scaffold loop.
+    """
+    rl_lower = (rel or "").lower()
+    if not rl_lower.endswith(_ENTRYPOINT_PROMPT_TAIL):
+        return ""
+    component_paths: List[str] = []
+    for spec in file_specs:
+        if not isinstance(spec, dict):
+            continue
+        path = (spec.get("path") or "").strip()
+        if not path:
+            continue
+        if "components/" not in path.lower():
+            continue
+        if not path.endswith((".jsx", ".tsx")):
+            continue
+        component_paths.append(path)
+    if not component_paths:
+        return ""
+    listed = "\n".join(f"  - {p}" for p in component_paths[:12])
+    more = (
+        f"\n  ...and {len(component_paths) - 12} more"
+        if len(component_paths) > 12
+        else ""
+    )
+    return (
+        "IMPORT, do NOT redefine. The plan includes "
+        "these component files alongside this entry:\n"
+        f"{listed}{more}\n\n"
+        "Rules:\n"
+        "- For every component you render in this "
+        "file that maps to a planned path above, "
+        "`import` it from the planned path. Do not "
+        "redefine inline.\n"
+        "- Do not invent NEW components inside this "
+        "file when a planned sibling already covers "
+        "the same shape (e.g. don't write an inline "
+        "`function HabitCard(...)` when "
+        "`components/HabitCard.jsx` is planned).\n"
+        "- If a planned component's API doesn't fit, "
+        "still import and adapt with props, not "
+        "reinvent.\n\n"
+    )
+
 
 def _relevant_context(prior_context: str, rel_path: str) -> str:
     """Filter prior_context down to just the sections this file needs.
@@ -1597,6 +1669,20 @@ class CodeAgent(BaseAgent):
                                 exc_info=True,
                             )
 
+                    # When writing an entrypoint (App.jsx / main.jsx /
+                    # page.tsx), pin the LLM to USE the planned
+                    # component files rather than reinvent them inline.
+                    # Real bug from e79bc0: planned HabitCard / HabitList /
+                    # WeeklyGrid / etc. all shipped but App.jsx redefined
+                    # its own inline versions and never imported them.
+                    # Reviewer correctly flagged "two parallel component
+                    # trees, one orphaned." This is the prompt fix.
+                    entrypoint_instructions = _entrypoint_import_instructions(
+                        rel=rel,
+                        file_specs=file_specs,
+                    )
+                    if entrypoint_instructions:
+                        file_prompt_parts.append(entrypoint_instructions)
                     file_prompt_parts.extend([
                         f"Full file plan:\n{file_index}\n\n",
                         f"Now write the COMPLETE contents of: `{rel}`\n",
