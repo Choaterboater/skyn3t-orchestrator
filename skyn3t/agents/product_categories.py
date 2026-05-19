@@ -28,8 +28,11 @@ Why this is the right shape:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
+
+logger = logging.getLogger(__name__)
 
 _SPARSE_EXPANSION_MARKER = "## Auto-expanded product baseline"
 
@@ -292,6 +295,14 @@ def enrich_brief(brief: str) -> Tuple[str, ProductCategoryDefaults]:
 def expand_sparse_brief(brief: str) -> str:
     """Expand one-line briefs into a minimal product baseline.
 
+    Two paths:
+    1. **LLM expansion (OpenRouter)** — when ``OPENROUTER_API_KEY`` is
+       configured, ask a cheap model to write a real 150-200 word
+       product spec tailored to this specific brief. Better signal for
+       the architect downstream.
+    2. **Template expansion (offline fallback)** — appends a static
+       baseline so the architect always sees production-grade hints.
+
     The expansion is marker-guarded to stay idempotent across retries.
     """
     text = (brief or "").strip()
@@ -301,8 +312,14 @@ def expand_sparse_brief(brief: str) -> str:
         return text
 
     words = [w for w in text.split() if w.strip()]
+    # Don't expand briefs the user already wrote in detail.
     if len(words) > 14:
         return text
+
+    # Try LLM expansion first; fall through to template on any error.
+    llm_text = _llm_expand_brief(text)
+    if llm_text:
+        return f"{text}\n\n{_SPARSE_EXPANSION_MARKER}\n{llm_text}"
 
     baseline = [
         "Primary user flow is complete end-to-end (create/read/update/delete where applicable).",
@@ -316,3 +333,80 @@ def expand_sparse_brief(brief: str) -> str:
         f"{_SPARSE_EXPANSION_MARKER}\n"
         + "\n".join(f"- {line}" for line in baseline)
     )
+
+
+def _llm_expand_brief(brief: str) -> str:
+    """Ask OpenRouter to expand a terse brief into a 150-200 word spec.
+
+    Returns the expansion body (no header markers — the caller wraps it).
+    Returns empty string on any failure so the template path can take over.
+    Uses ``openrouter/owl-alpha`` — free, 1M context, agentic-focused.
+    """
+    import os
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        try:
+            from skyn3t.config.settings import get_settings
+            api_key = getattr(get_settings(), "openrouter_api_key", None)
+            if api_key:
+                os.environ.setdefault("OPENROUTER_API_KEY", api_key)
+        except Exception:  # noqa: BLE001
+            api_key = None
+    if not api_key:
+        return ""
+
+    prompt = f"""User brief: "{brief.strip()}"
+
+Expand this terse brief into a 150-200 word product specification. Output ONLY a structured list (no preamble, no headings). Include exactly these sections, in this order:
+
+- **Target user**: one sentence describing who uses this
+- **Primary flow**: the single most important user journey, end-to-end, in 2-3 sentences
+- **Core features**: 4-6 bullets, each one concrete and testable (e.g. "user can mark a habit complete with one tap on the day's cell")
+- **Out of scope**: 2-3 things this version explicitly does NOT include (helps architect bound the work)
+- **Success criteria**: 2 measurable signals (e.g. "user adds a habit in <10 seconds", "streak count visible on every habit card")
+
+Output format: plain markdown bullets only. Each section starts with `**Label**:` on its own line, followed by the content.
+Do not include the verbatim brief. Do not add commentary. Do not wrap output in code fences."""
+
+    try:
+        import asyncio
+
+        from skyn3t.adapters import LLMClient
+
+        async def _run() -> str:
+            client = LLMClient(default_model="openrouter/owl-alpha", backend="openrouter")
+            try:
+                out = await client.complete(
+                    prompt,
+                    system=(
+                        "You are a senior product manager turning vague briefs into "
+                        "actionable specs. Be concrete and specific. No marketing fluff."
+                    ),
+                    max_tokens=600,
+                    temperature=0.2,
+                    timeout=45.0,
+                )
+                return (out or "").strip()
+            finally:
+                try:
+                    await client.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # Run synchronously — this function is called from a sync code path.
+        try:
+            # Probe for a running loop. We don't need the loop object, just
+            # the RuntimeError it raises when there isn't one.
+            asyncio.get_running_loop()
+            # Already inside an async context — run the coro in a thread
+            # so we don't deadlock on the existing loop.
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(asyncio.run, _run())
+                return future.result(timeout=60) or ""
+        except RuntimeError:
+            # No running loop — safe to call asyncio.run directly.
+            return asyncio.run(_run()) or ""
+    except Exception:  # noqa: BLE001
+        logger.debug("LLM brief expansion failed; falling back to template", exc_info=True)
+        return ""

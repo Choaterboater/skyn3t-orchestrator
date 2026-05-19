@@ -81,12 +81,21 @@ async def test_plan_pipeline_does_not_inject_code_for_nonsoftware_build_language
 
 
 @pytest.mark.asyncio
-async def test_plan_pipeline_heuristics_do_not_treat_build_as_ui():
+async def test_plan_pipeline_software_build_includes_full_pipeline():
+    """Every code-build brief should run the full pipeline including
+    DesignerAgent, regardless of whether the brief mentions visual cues.
+
+    Previous behavior required explicit "design"/"ui"/"dashboard" words
+    to include Designer — that caused builds like "todo app" to skip
+    brand.md generation entirely, leaving the resulting scaffold with
+    hollow palettes and no design tokens. Every UI-bearing build now
+    gets Architect + Designer by default."""
     stages = await plan_pipeline(brief="Build a small todo app", llm_client=None)
 
     assert [stage.agent for stage in stages] == [
         "BrainstormAgent",
         "ArchitectAgent",
+        "DesignerAgent",
         "CodeAgent",
         "ReviewerAgent",
     ]

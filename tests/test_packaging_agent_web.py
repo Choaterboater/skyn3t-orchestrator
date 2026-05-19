@@ -14,15 +14,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
-from skyn3t.agents.packaging_agent import PackagingAgent, _render_settings_jsx, _humanize_var_name
 from skyn3t.agents.env_scanner import EnvVarRef, ScanResult
+from skyn3t.agents.packaging_agent import PackagingAgent, _humanize_var_name, _render_settings_jsx
 from skyn3t.core.agent import TaskRequest
 from skyn3t.core.events import EventBus
-
 
 # ---------------------------------------------------------------------------
 # Fixture builders
@@ -229,6 +228,7 @@ class TestAppPatching:
         assert "scaffold/src/App.jsx" in output["files_patched"]
         patched = (artifact / "scaffold/src/App.jsx").read_text()
         assert "SkynPackagingWrapper" in patched
+        assert patched.count("@skyn3t-packaging") == 1
 
     @pytest.mark.asyncio
     async def test_no_app_jsx_leaves_helpful_note(self, tmp_path: Path) -> None:

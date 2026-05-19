@@ -24,7 +24,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
-
 # ---------------------------------------------------------------------------
 # Public dataclasses
 # ---------------------------------------------------------------------------
@@ -136,9 +135,12 @@ _SERVICE_BY_DEP: Dict[str, str] = {
 # Manifest readers
 # ---------------------------------------------------------------------------
 
-def _read_json(path: Path) -> Optional[dict]:
+def _read_json(path: Path) -> Optional[Dict[str, object]]:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {str(k): v for k, v in data.items()}
+        return None
     except (OSError, ValueError, UnicodeDecodeError):
         return None
 
@@ -150,7 +152,7 @@ def _read_text(path: Path) -> Optional[str]:
         return None
 
 
-def _node_deps(pkg: dict) -> Dict[str, str]:
+def _node_deps(pkg: Dict[str, object]) -> Dict[str, str]:
     """Union of dependencies + devDependencies + peerDependencies."""
     out: Dict[str, str] = {}
     for key in ("dependencies", "devDependencies", "peerDependencies"):

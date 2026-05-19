@@ -32,7 +32,6 @@ from skyn3t.core.model_router import (
 )
 from skyn3t.intelligence.build_patterns import BuildPatternScoreboard
 
-
 # ---------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------
