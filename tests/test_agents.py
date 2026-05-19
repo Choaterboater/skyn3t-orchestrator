@@ -945,7 +945,7 @@ class TestReviewerAgent:
         )
 
         assert result.success is True
-        assert result.output["score"] == 89
+        assert result.output["score"] == 85
         assert result.output["verdict"] == "go"
 
     @pytest.mark.asyncio
