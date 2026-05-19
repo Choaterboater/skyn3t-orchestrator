@@ -131,9 +131,25 @@ def is_graduated(brief: str, agent_name: str, threshold: int) -> bool:
     return int(entry.get("approved_unchanged", 0)) >= threshold
 
 
-def should_gate(agent_name: str, brief: str) -> bool:
+def should_gate(
+    agent_name: str,
+    brief: str,
+    *,
+    autonomy: Optional[str] = None,
+) -> bool:
     """True if the pipeline should halt for human approval after
-    ``agent_name`` finishes."""
+    ``agent_name`` finishes.
+
+    ``autonomy`` honors the project's mission_setup choice. From
+    skyn3t/studio/mission_setup.py the ``move_fast`` mode is
+    documented as "Do not pause for kickoff clarification questions.
+    Make reasonable assumptions, keep momentum, and only stop if the
+    work is truly blocked." Approval gates squarely contradict that,
+    so under ``move_fast`` we skip ALL gates regardless of the global
+    approval_gates.json config or graduation status.
+    """
+    if (autonomy or "").strip().lower() == "move_fast":
+        return False
     cfg = load_gate_config()
     if cfg.get("disabled"):
         return False
