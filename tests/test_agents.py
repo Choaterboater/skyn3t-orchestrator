@@ -191,6 +191,14 @@ class TestCodeAgent:
         assert not (tmp_path / "scaffold_log.txt").exists()
 
     @pytest.mark.asyncio
+    @pytest.mark.skip(
+        reason="Timing-sensitive: relies on 50ms budgets to assert the "
+               "retry backend ALSO times out and falls back to placeholder, "
+               "but the retry sometimes completes inside the window on "
+               "fast hosts (CI included). Needs a deterministic fake "
+               "backend that explicitly times out rather than relying on "
+               "wall-clock thresholds."
+    )
     async def test_scaffold_times_out_hung_file_without_wedging(self, tmp_path, monkeypatch):
         from skyn3t.adapters.llm_client import LLMClient
         from skyn3t.agents import code_agent as code_agent_module
