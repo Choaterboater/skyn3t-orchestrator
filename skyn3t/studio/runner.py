@@ -4306,7 +4306,25 @@ class StudioRunner:
             updated_at = None
 
         review_file = str(value.get("review_file") or "").strip() or None
-        return {
+
+        # Preserve sub_scores when present + well-formed. Drop silently
+        # otherwise — partial sub-scores aren't useful downstream.
+        raw_sub = value.get("sub_scores")
+        sub_scores: Optional[Dict[str, int]] = None
+        if isinstance(raw_sub, dict):
+            sub_scores = {}
+            for axis in ("completeness", "correctness", "consistency", "packaging"):
+                v = raw_sub.get(axis)
+                try:
+                    iv = int(v)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= iv <= 25:
+                    sub_scores[axis] = iv
+            if len(sub_scores) != 4:
+                sub_scores = None
+
+        normalized: Dict[str, Any] = {
             "source": source,
             "verdict": verdict,
             "raw_verdict": raw_verdict or verdict,
@@ -4315,6 +4333,9 @@ class StudioRunner:
             "review_file": review_file,
             "updated_at": updated_at,
         }
+        if sub_scores:
+            normalized["sub_scores"] = sub_scores
+        return normalized
 
     # Composite gate threshold — final project outcome is "done" only
     # when every signal lines up. The reviewer's verdict alone isn't
@@ -4829,6 +4850,24 @@ class StudioRunner:
                     review_file = self._relativize_artifact_path(artifact_dir, file_path)
                     break
 
+        # Reviewer's structured rubric: 4-axis sub-scores, each /25.
+        # Persisting them on the manifest lets the golden-set harness +
+        # future learning signal see WHICH dimension dragged the score.
+        raw_sub = output.get("sub_scores") if source == "reviewer" else None
+        sub_scores: Optional[Dict[str, int]] = None
+        if isinstance(raw_sub, dict):
+            sub_scores = {}
+            for axis in ("completeness", "correctness", "consistency", "packaging"):
+                v = raw_sub.get(axis)
+                try:
+                    iv = int(v)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= iv <= 25:
+                    sub_scores[axis] = iv
+            if len(sub_scores) != 4:
+                sub_scores = None
+
         return self._normalize_quality_summary(
             {
                 "source": source,
@@ -4837,6 +4876,7 @@ class StudioRunner:
                 "score": score,
                 "summary": summary,
                 "review_file": review_file,
+                "sub_scores": sub_scores,
                 "updated_at": time.time(),
             }
         )
