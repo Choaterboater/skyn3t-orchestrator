@@ -183,3 +183,66 @@ class MockVectorStore:
 
     async def get_collection_stats(self):
         return {"count": len(self.docs)}
+
+
+class TestSanitizeMetadata:
+    """ChromaDB rejects metadata values that aren't str/int/float/bool with
+    `TypeError: argument 'metadatas': Cannot convert Python object to
+    MetadataValue`. PR #12 sanitized add_documents; PR #14 sanitized
+    update(). These tests guarantee both paths handle the adversarial
+    cases ingestion has thrown in production:
+      - None values (filtered out)
+      - dict values (coerced to str)
+      - list values (coerced to str)
+      - Path objects (coerced to str)
+      - empty dict (passes through as-is)
+      - empty list of metadatas (no-op)
+    Regression gate: future paths that hit collection.add/.update
+    without sanitizing will need their own coverage here too.
+    """
+
+    def test_sanitize_drops_none_values(self):
+        from skyn3t.rag.vector_store import _sanitize_metadata
+        out = _sanitize_metadata({"a": 1, "b": None, "c": "x"})
+        assert out == {"a": 1, "c": "x"}
+
+    def test_sanitize_coerces_dict_to_str(self):
+        from skyn3t.rag.vector_store import _sanitize_metadata
+        out = _sanitize_metadata({"nested": {"k": "v"}})
+        assert isinstance(out["nested"], str)
+        assert "k" in out["nested"]
+
+    def test_sanitize_coerces_list_to_str(self):
+        from skyn3t.rag.vector_store import _sanitize_metadata
+        out = _sanitize_metadata({"items": [1, 2, 3]})
+        assert isinstance(out["items"], str)
+
+    def test_sanitize_coerces_path_to_str(self):
+        from pathlib import Path as _Path
+        from skyn3t.rag.vector_store import _sanitize_metadata
+        out = _sanitize_metadata({"file": _Path("/tmp/x")})
+        assert isinstance(out["file"], str)
+        assert "/tmp/x" in out["file"]
+
+    def test_sanitize_passes_through_scalars(self):
+        from skyn3t.rag.vector_store import _sanitize_metadata
+        out = _sanitize_metadata({
+            "s": "hello",
+            "i": 42,
+            "f": 3.14,
+            "b": True,
+        })
+        assert out == {"s": "hello", "i": 42, "f": 3.14, "b": True}
+
+    def test_sanitize_handles_none_input(self):
+        from skyn3t.rag.vector_store import _sanitize_metadata
+        assert _sanitize_metadata(None) == {}
+
+    def test_sanitize_handles_empty_dict(self):
+        from skyn3t.rag.vector_store import _sanitize_metadata
+        assert _sanitize_metadata({}) == {}
+
+    def test_sanitize_stringifies_non_str_keys(self):
+        from skyn3t.rag.vector_store import _sanitize_metadata
+        out = _sanitize_metadata({1: "one", 2: "two"})
+        assert out == {"1": "one", "2": "two"}
