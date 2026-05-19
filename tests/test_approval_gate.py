@@ -192,7 +192,15 @@ async def test_full_gate_lifecycle_in_runner(tmp_path, monkeypatch, event_bus):
     monkeypatch.setattr("skyn3t.studio.runner.get_template", lambda _key: template)
 
     runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
-    manifest = await runner.start("demo", "Build a homelab dashboard", slug="gate-1")
+    # Explicitly pass autonomy="balanced" — the default mission_setup
+    # is move_fast which now bypasses gates by design (see
+    # `test_move_fast_runs_through_without_pausing_for_approval`).
+    manifest = await runner.start(
+        "demo",
+        "Build a homelab dashboard",
+        slug="gate-1",
+        mission_setup={"autonomy": "balanced"},
+    )
 
     assert manifest["status"] == "awaiting_approval"
     assert manifest["awaiting_approval_for"]["agent"] == "ArchitectAgent"
@@ -229,7 +237,14 @@ async def test_resume_with_edits_overwrites_architecture_md(
     monkeypatch.setattr("skyn3t.studio.runner.get_template", lambda _key: template)
 
     runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
-    await runner.start("demo", "Build a homelab dashboard", slug="gate-edits")
+    # See note in test_full_gate_lifecycle_in_runner — gates only
+    # fire when autonomy isn't move_fast.
+    await runner.start(
+        "demo",
+        "Build a homelab dashboard",
+        slug="gate-edits",
+        mission_setup={"autonomy": "balanced"},
+    )
 
     edited_md = "# Edited architecture — auth added\n"
     await runner.resume_after_approval(
@@ -267,7 +282,14 @@ async def test_resume_after_rejection_reruns_architect_with_feedback(
     monkeypatch.setattr("skyn3t.studio.runner.get_template", lambda _key: template)
 
     runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
-    await runner.start("demo", "Build a homelab dashboard", slug="gate-reject")
+    # See note in test_full_gate_lifecycle_in_runner — gates only
+    # fire when autonomy isn't move_fast.
+    await runner.start(
+        "demo",
+        "Build a homelab dashboard",
+        slug="gate-reject",
+        mission_setup={"autonomy": "balanced"},
+    )
 
     assert architect.calls == 1
     await runner.resume_after_approval(
@@ -306,8 +328,137 @@ async def test_disabled_config_lets_pipeline_run_through(
     monkeypatch.setattr("skyn3t.studio.runner.get_template", lambda _key: template)
 
     runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
-    manifest = await runner.start("demo", "Build a homelab dashboard", slug="gate-off")
+    # Pass balanced explicitly so this test verifies the disabled-config
+    # path specifically, not the autonomy-bypass path (which would
+    # produce the same outcome but for a different reason).
+    manifest = await runner.start(
+        "demo",
+        "Build a homelab dashboard",
+        slug="gate-off",
+        mission_setup={"autonomy": "balanced"},
+    )
 
     assert manifest["status"] != "awaiting_approval"
     assert architect.calls == 1
     assert designer.calls == 1
+
+
+# Mission-setup autonomy bypass — move_fast must skip approval gates.
+# Per mission_setup.py move_fast is documented as "Do not pause for
+# kickoff clarification questions… only stop if the work is truly
+# blocked." Approval gates contradict that, so move_fast skips them.
+
+def test_should_gate_false_under_move_fast_autonomy(tmp_path, monkeypatch):
+    _reset_paths(tmp_path, monkeypatch)
+    approval_gate.save_gate_config(
+        {"gates": ["ArchitectAgent"], "disabled": False, "graduate_after": 5}
+    )
+    assert approval_gate.should_gate(
+        "ArchitectAgent", "Build a dashboard", autonomy="move_fast"
+    ) is False
+
+
+def test_should_gate_true_under_balanced_autonomy(tmp_path, monkeypatch):
+    _reset_paths(tmp_path, monkeypatch)
+    approval_gate.save_gate_config(
+        {"gates": ["ArchitectAgent"], "disabled": False, "graduate_after": 5}
+    )
+    # Non-move_fast autonomy (balanced, confirm_first, missing) all
+    # respect the global gate config.
+    assert approval_gate.should_gate(
+        "ArchitectAgent", "Build a dashboard", autonomy="balanced"
+    ) is True
+    assert approval_gate.should_gate(
+        "ArchitectAgent", "Build a dashboard", autonomy="confirm_first"
+    ) is True
+    assert approval_gate.should_gate(
+        "ArchitectAgent", "Build a dashboard", autonomy=None
+    ) is True
+
+
+def test_should_gate_move_fast_is_case_insensitive(tmp_path, monkeypatch):
+    _reset_paths(tmp_path, monkeypatch)
+    approval_gate.save_gate_config(
+        {"gates": ["ArchitectAgent"], "disabled": False, "graduate_after": 5}
+    )
+    # Whitespace + casing tolerance so a stray "Move_Fast" or
+    # " move_fast " from the API still bypasses.
+    assert approval_gate.should_gate(
+        "ArchitectAgent", "Build a dashboard", autonomy=" Move_Fast "
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_move_fast_runs_through_without_pausing_for_approval(
+    tmp_path, monkeypatch, event_bus
+):
+    """End-to-end: a project started with mission_setup.autonomy=move_fast
+    must NOT halt at PROJECT_AWAITING_APPROVAL after the architect, even
+    when the global config has ArchitectAgent on the gates list and the
+    brief hasn't graduated yet."""
+    _reset_paths(tmp_path / "gate_data", monkeypatch)
+    approval_gate.save_gate_config(
+        {"gates": ["ArchitectAgent"], "disabled": False, "graduate_after": 5}
+    )
+
+    from skyn3t.studio.runner import StudioRunner
+
+    architect = _StubAgent()
+    designer = _StubAgent()
+
+    def fake_get_agent(name, *args, **kwargs):
+        return architect if name == "ArchitectAgent" else designer
+
+    monkeypatch.setattr("skyn3t.studio.runner.get_agent", fake_get_agent)
+    template = _two_stage_template()
+    monkeypatch.setattr("skyn3t.studio.runner.get_template", lambda _key: template)
+
+    runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
+    manifest = await runner.start(
+        "demo",
+        "Build a homelab dashboard",
+        slug="gate-movefast",
+        mission_setup={"autonomy": "move_fast"},
+    )
+
+    assert manifest["status"] != "awaiting_approval"
+    # Both stages must have run; the gate that normally stops the
+    # pipeline after architect was bypassed.
+    assert architect.calls == 1
+    assert designer.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_balanced_autonomy_still_pauses_for_approval(
+    tmp_path, monkeypatch, event_bus
+):
+    """Regression guard for the other direction — move_fast bypass must
+    NOT accidentally affect balanced/confirm_first runs."""
+    _reset_paths(tmp_path / "gate_data", monkeypatch)
+    approval_gate.save_gate_config(
+        {"gates": ["ArchitectAgent"], "disabled": False, "graduate_after": 5}
+    )
+
+    from skyn3t.studio.runner import StudioRunner
+
+    architect = _StubAgent()
+    designer = _StubAgent()
+
+    def fake_get_agent(name, *args, **kwargs):
+        return architect if name == "ArchitectAgent" else designer
+
+    monkeypatch.setattr("skyn3t.studio.runner.get_agent", fake_get_agent)
+    template = _two_stage_template()
+    monkeypatch.setattr("skyn3t.studio.runner.get_template", lambda _key: template)
+
+    runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
+    manifest = await runner.start(
+        "demo",
+        "Build a homelab dashboard",
+        slug="gate-balanced",
+        mission_setup={"autonomy": "balanced"},
+    )
+
+    assert manifest["status"] == "awaiting_approval"
+    assert architect.calls == 1
+    assert designer.calls == 0
