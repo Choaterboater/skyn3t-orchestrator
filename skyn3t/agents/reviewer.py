@@ -175,13 +175,19 @@ class ReviewerAgent(BaseAgent):
                 blended = int(round(llm_score * 0.60 + heuristic_score * 0.40))
             else:
                 blended = int(round(heuristic_score * 1.00))
-        if llm_score is not None:
-            # Don't let a perfect heuristic checklist promote a middling
-            # LLM review into a higher verdict bucket. The blend may still
-            # improve the score within the same bucket, but a 69-quality
-            # artifact should not become a `go`.
-            blended = min(blended, _llm_bucket_ceiling(llm_score))
         blended = max(0, min(100, blended))
+        # Verdict gate: the bucket ceiling protects against a perfect
+        # heuristic checklist promoting a middling LLM review into a
+        # higher verdict bucket. We compute it separately from the
+        # DISPLAYED blended score so users can see real progress
+        # between runs (llm=29 → llm=42 should be visible) instead of
+        # both runs flattening to a hard 49. Verdict still uses the
+        # gated value so a no-go LLM verdict can't be papered over.
+        if llm_score is not None:
+            verdict_score = min(blended, _llm_bucket_ceiling(llm_score))
+        else:
+            verdict_score = blended
+        verdict_score = max(0, min(100, verdict_score))
 
         # Surface packaging gaps as soft risks so the reviewer markdown
         # explains why the score landed where it did. Skip when packaging
@@ -202,12 +208,15 @@ class ReviewerAgent(BaseAgent):
                 "files were produced (docs-only output)."
             )
             blended = min(blended, 30)
+            verdict_score = min(verdict_score, 30)
             verdict = "no-go"
-        # Re-derive verdict from blended score, keeping ReviewWatcher-compatible
-        # lowercase strings.
-        elif blended >= 75 and not any("Missing core" in r for r in risks):
+        # Verdict uses verdict_score (the bucket-clamped value), keeping
+        # ReviewWatcher-compatible lowercase strings. The displayed
+        # `blended` may be higher — that's intentional, so the user can
+        # see "your unclamped score was 64; verdict floor is 49".
+        elif verdict_score >= 75 and not any("Missing core" in r for r in risks):
             verdict = "go"
-        elif blended >= 50:
+        elif verdict_score >= 50:
             verdict = "go-with-fixes"
         else:
             verdict = "no-go"
@@ -220,6 +229,7 @@ class ReviewerAgent(BaseAgent):
             risks=risks,
             verdict=verdict,
             score=blended,
+            verdict_score=verdict_score,
             llm_review_md=llm_review_md,
             heuristic_score=heuristic_score,
             llm_score=llm_score,
@@ -237,7 +247,7 @@ class ReviewerAgent(BaseAgent):
                 to=next_agent,
                 kind="info",
                 content=f"{self.name} done; artifacts in {artifact_dir}",
-                payload={"verdict": verdict, "score": blended, "review": str(review_path)},
+                payload={"verdict": verdict, "score": verdict_score, "review": str(review_path)},
             )
 
         await self.share_learning(
@@ -253,8 +263,19 @@ class ReviewerAgent(BaseAgent):
             output={
                 "files": [str(review_path)],
                 "verdict": verdict,
-                "score": blended,
-                "summary": f"Review complete: {verdict} ({blended}/100).",
+                # output["score"] is the verdict-gated value — used
+                # downstream by _finalize_project_outcome's
+                # REVIEWER_SCORE_THRESHOLD=75 composite gate. Display
+                # score (`blended`) is surfaced only in review.md so the
+                # user can see ungated progress without lying to the
+                # composite-gate machinery.
+                "score": verdict_score,
+                "score_unclamped": blended,
+                "summary": (
+                    f"Review complete: {verdict} ({verdict_score}/100"
+                    + (f", unclamped {blended}/100" if blended != verdict_score else "")
+                    + ")."
+                ),
                 "sub_scores": llm_sub_scores,
             },
         )
@@ -995,6 +1016,7 @@ class ReviewerAgent(BaseAgent):
         risks: List[str],
         verdict: str,
         score: int,
+        verdict_score: Optional[int] = None,
         llm_review_md: Optional[str] = None,
         heuristic_score: Optional[int] = None,
         llm_score: Optional[int] = None,
@@ -1006,7 +1028,16 @@ class ReviewerAgent(BaseAgent):
         out: List[str] = []
         out.append(f"# Review - {artifact_dir.name}")
         out.append("")
-        out.append(f"**Verdict:** `{verdict}`  **Score:** {score}/100")
+        # Show the unclamped blended score so users can see progress
+        # between runs. When the bucket ceiling pulled the verdict down,
+        # also show the gated value so the verdict isn't surprising.
+        if verdict_score is not None and verdict_score != score:
+            out.append(
+                f"**Verdict:** `{verdict}`  **Score:** {score}/100  "
+                f"_(verdict gate: {verdict_score}/100)_"
+            )
+        else:
+            out.append(f"**Verdict:** `{verdict}`  **Score:** {score}/100")
         if heuristic_score is not None or llm_score is not None or packaging_score is not None:
             parts = []
             if heuristic_score is not None:
