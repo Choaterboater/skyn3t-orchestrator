@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
 
 import pytest
 
@@ -282,7 +281,6 @@ async def test_mark_latest_unresolved_resolves_newest_row():
     """When several unresolved rows share a signature, resolution
     lands on the NEWEST one — the verifier outcome reflects the most
     recent fix attempt, not a stale one."""
-    import asyncio
     store = MemoryStore()
     # Three unresolved rows, same signature, distinct embedding ids.
     for i in range(3):

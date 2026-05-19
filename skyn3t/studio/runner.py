@@ -601,6 +601,12 @@ class StudioRunner:
                 "PROJECT_RESUMED_AFTER_APPROVAL",
                 {"slug": slug, "stage": stage_name, "edited": edited},
             )
+            await self._post_discord_thread_update(
+                manifest,
+                "✅ **Approved** — pipeline resuming"
+                + (" (with edits)" if edited else "")
+                + ".",
+            )
             return await self._resume_pipeline_from(slug, stage_idx + 1)
 
         if decision == "reject":
@@ -629,9 +635,36 @@ class StudioRunner:
                 "PROJECT_REJECTED_AFTER_APPROVAL",
                 {"slug": slug, "stage": stage_name},
             )
+            await self._post_discord_thread_update(
+                manifest,
+                f"❌ **Rejected** — {stage_name} re-running with feedback:\n> {(feedback or '(no feedback)')[:400]}",
+            )
             return await self._resume_pipeline_from(slug, stage_idx)
 
         return manifest
+
+    async def _post_discord_thread_update(self, manifest: dict, content: str) -> None:
+        """Reply into the project's Discord thread (if one exists) and/or
+        Telegram thread (if one exists). Both calls are best-effort —
+        failures are logged but never raised."""
+        # Discord
+        discord_meta = manifest.get("discord") or {}
+        thread_id = str(discord_meta.get("thread_id") or "")
+        if thread_id:
+            try:
+                from skyn3t.studio.notify_dispatcher import post_to_thread
+                await post_to_thread(thread_id, content)
+            except Exception:
+                logger.exception("discord thread update failed")
+        # Telegram
+        telegram_meta = manifest.get("telegram") or {}
+        starter_id = telegram_meta.get("starter_message_id")
+        if starter_id:
+            try:
+                from skyn3t.integrations.telegram_dispatch import post_thread_reply
+                await post_thread_reply(int(starter_id), content)
+            except Exception:
+                logger.exception("telegram thread update failed")
 
     async def _resume_pipeline_from(self, slug: str, start_index: int) -> dict:
         """Re-enter ``_run_pipeline`` skipping the first ``start_index``
@@ -776,7 +809,11 @@ class StudioRunner:
                     name="contract_verifier",
                     agent="ContractVerifierAgent",
                     capability="review",
-                    handoff_to="packaging_agent",
+                    handoff_to=(
+                        "packaging_agent"
+                        if not (isinstance(extra, dict) and extra.get("packaging_enabled") is False)
+                        else "consistency_reviewer"
+                    ),
                     input_extra={},
                 )
                 # PackagingAgent runs between contract_verifier and
@@ -880,6 +917,15 @@ class StudioRunner:
                     "PROJECT_STAGE_STARTED",
                     {"slug": slug, "stage": stage.name, "agent": stage.agent},
                 )
+                # Stream progress into the project's chat thread so the
+                # user can follow along without opening the dashboard.
+                try:
+                    await self._post_discord_thread_update(
+                        manifest,
+                        f"▶️ `{stage.name}` started ({stage.agent})",
+                    )
+                except Exception:
+                    logger.debug("stage-started thread post failed", exc_info=True)
                 try:
                     import asyncio as _asyncio
                     _stage_to: Optional[float] = (extra or {}).get("stage_timeout") if isinstance(extra, dict) else None
@@ -1672,6 +1718,17 @@ class StudioRunner:
                     message=stage_summary or manifest["next_action"],
                 )
                 self._save_manifest(artifact_dir, manifest)
+                # Record stage duration in the aggregate scoreboard so
+                # we can see "Architect: avg 187s across N runs" at a
+                # glance without crawling every project.json.
+                try:
+                    _stage_duration = max(0.0, time.time() - stage_started_at)
+                    from skyn3t.intelligence.stage_latency import (
+                        record_stage_duration,
+                    )
+                    record_stage_duration(stage.name, _stage_duration)
+                except Exception:
+                    logger.debug("stage_latency record failed", exc_info=True)
                 self._publish(
                     "PROJECT_STAGE_COMPLETED",
                     {
@@ -1681,6 +1738,73 @@ class StudioRunner:
                         "summary": stage_summary,
                     },
                 )
+                # Stream stage completion to the project's chat thread.
+                try:
+                    _short = (stage_summary or manifest.get("next_action") or "").strip()
+                    if len(_short) > 400:
+                        _short = _short[:400].rstrip() + "…"
+                    await self._post_discord_thread_update(
+                        manifest,
+                        f"✅ `{stage.name}` done\n{_short}" if _short else f"✅ `{stage.name}` done",
+                    )
+                except Exception:
+                    logger.debug("stage-complete thread post failed", exc_info=True)
+
+                # Reviewer-driven targeted fixes (#130). When the reviewer
+                # came back with go-with-fixes, parse review.md for
+                # specific file complaints and ask OpenRouter to
+                # regenerate just those files with the reviewer's
+                # complaint as guidance. Capped to 3 files / $0.20.
+                # Hook into the next-stage flow by NOT yet declaring the
+                # project done — the loop will keep iterating to any
+                # remaining stages (typically none after reviewer) and
+                # the final outcome path picks up the post-fix state.
+                if stage.name == "reviewer" or stage.agent == "ReviewerAgent":
+                    try:
+                        qs = manifest.get("quality_summary") or {}
+                        verdict = str(qs.get("verdict") or "").lower()
+                        if verdict == "go-with-fixes":
+                            review_md = artifact_dir / "review.md"
+                            scaffold_dir = artifact_dir / "scaffold"
+                            if review_md.is_file() and scaffold_dir.is_dir():
+                                from skyn3t.agents.reviewer_fixes import apply_reviewer_fixes
+                                summary = await apply_reviewer_fixes(
+                                    review_md_path=review_md,
+                                    scaffold_dir=scaffold_dir,
+                                    brief=brief or "",
+                                )
+                                manifest.setdefault("auto_fixes", {})["reviewer_targeted"] = {
+                                    "candidates_found": summary.candidates_found,
+                                    "candidates_attempted": summary.candidates_attempted,
+                                    "fixes_applied": summary.fixes_applied,
+                                    "details": [
+                                        {
+                                            "file": r.candidate.file_path,
+                                            "issue": r.candidate.issue,
+                                            "ok": r.ok,
+                                            "model": r.model_used,
+                                            "error": r.error,
+                                        }
+                                        for r in summary.results
+                                    ],
+                                    "skipped_reason": summary.skipped_reason,
+                                }
+                                if summary.fixes_applied > 0:
+                                    logger.info(
+                                        "reviewer-driven fixes: %d/%d files regenerated",
+                                        summary.fixes_applied, summary.candidates_attempted,
+                                    )
+                                    try:
+                                        await self._post_discord_thread_update(
+                                            manifest,
+                                            f"🔧 Reviewer-driven fixes: {summary.fixes_applied} "
+                                            f"file(s) regenerated via OpenRouter.",
+                                        )
+                                    except Exception:
+                                        pass
+                                    self._save_manifest(artifact_dir, manifest)
+                    except Exception:
+                        logger.exception("reviewer-driven targeted fixes failed")
 
                 # Human approval gate: halt the pipeline after stages
                 # whose agent is listed in approval_gates.json. The user
@@ -1689,6 +1813,8 @@ class StudioRunner:
                 try:
                     from skyn3t.studio.approval_gate import (
                         load_gate_config as _load_gate_cfg,
+                    )
+                    from skyn3t.studio.approval_gate import (
                         should_gate as _should_gate,
                     )
                     from skyn3t.studio.notify_dispatcher import dispatch as _notify_dispatch
@@ -1729,17 +1855,50 @@ class StudioRunner:
                         )
                         if _notify_dispatch is not None:
                             try:
-                                notify_task = asyncio.create_task(
-                                    _notify_dispatch(
-                                        slug, stage.agent, f"/studio/{slug}", _gate_cfg,
-                                    )
+                                from skyn3t.config.settings import get_settings as _get_settings
+                                _settings = _get_settings()
+                                _base = (_settings.public_url or "").rstrip("/")
+                                if not _base:
+                                    _port = _settings.web_port
+                                    _host = "localhost" if _settings.web_host in ("0.0.0.0", "") else _settings.web_host
+                                    _base = f"http://{_host}:{_port}"
+                                _dashboard_url = f"{_base}/studio?slug={slug}"
+                                # We dispatch synchronously here so the returned
+                                # thread_id can be persisted on the manifest.
+                                # The dispatcher is throttled and bounded
+                                # (5s HTTP timeout) so this won't block long.
+                                _notify_result = await _notify_dispatch(
+                                    slug, stage.agent, _dashboard_url, _gate_cfg,
+                                    artifact_dir=artifact_dir,
                                 )
-                                # Stash a strong ref so the task isn't GC'd before it sends.
-                                self._notify_tasks = getattr(self, "_notify_tasks", set())
-                                self._notify_tasks.add(notify_task)
-                                notify_task.add_done_callback(self._notify_tasks.discard)
+                                if isinstance(_notify_result, dict) and _notify_result.get("thread_id"):
+                                    manifest.setdefault("discord", {}).update({
+                                        "thread_id": str(_notify_result.get("thread_id")),
+                                        "channel_id": str(_notify_result.get("channel_id") or ""),
+                                        "starter_message_id": str(_notify_result.get("message_id") or ""),
+                                    })
+                                    self._save_manifest(artifact_dir, manifest)
                             except Exception:
                                 logger.exception("approval-gate notify dispatch failed")
+                            # Telegram approval — runs alongside Discord. The
+                            # message_id is persisted on the manifest so
+                            # subsequent stage / approval / completion
+                            # updates reply to the same chat thread.
+                            try:
+                                from skyn3t.integrations.telegram_dispatch import (
+                                    dispatch_approval as _tg_dispatch,
+                                )
+                                _tg_result = await _tg_dispatch(
+                                    slug, stage.agent, _dashboard_url, artifact_dir=artifact_dir,
+                                )
+                                if isinstance(_tg_result, dict) and _tg_result.get("ok"):
+                                    manifest.setdefault("telegram", {}).update({
+                                        "chat_id": str(_tg_result.get("chat_id") or ""),
+                                        "starter_message_id": int(_tg_result.get("message_id") or 0),
+                                    })
+                                    self._save_manifest(artifact_dir, manifest)
+                            except Exception:
+                                logger.exception("telegram approval dispatch failed")
                         return manifest
 
             # If no stage failed, derive the final project outcome from the
@@ -1811,7 +1970,7 @@ class StudioRunner:
                     build_result = None
                 if build_result is not None:
                     manifest["build_verification"] = build_result
-                    verdict = build_result.get("verdict")
+                    verdict = str(build_result.get("verdict") or "")
                     if not skip_fix_loops:
                         FIX_ATTEMPTS = 2
                         attempt = 0
@@ -1834,7 +1993,7 @@ class StudioRunner:
                                 logger.exception("re-verify after fix failed")
                                 break
                             manifest["build_verification"] = build_result
-                            verdict = build_result.get("verdict")
+                            verdict = str(build_result.get("verdict") or "")
                             manifest.setdefault("build_fix_attempts", []).append({
                                 "attempt": attempt,
                                 "verdict": verdict,
@@ -1845,7 +2004,7 @@ class StudioRunner:
                             # re-verify tells us whether it worked.
                             pending_build = getattr(self, "_pending_build_fix", None)
                             if pending_build:
-                                self._pending_build_fix = None
+                                self._pending_build_fix: Optional[Dict[str, Any]] = None
                                 prior_sig = pending_build.get("error_signature") or ""
                                 if prior_sig:
                                     try:
@@ -2131,6 +2290,19 @@ class StudioRunner:
                     "message": completion_message,
                 },
             )
+            # Post final outcome into the Discord thread (if one exists).
+            try:
+                _qs = manifest.get("quality_summary") or {}
+                _verdict = str(_qs.get("verdict") or "").lower()
+                _score = _qs.get("score")
+                _emoji = "🎉" if _verdict == "go" else ("⚠️" if _verdict == "needs_fixes" else "❌")
+                _score_str = f" — score {_score}/100" if isinstance(_score, (int, float)) else ""
+                await self._post_discord_thread_update(
+                    manifest,
+                    f"{_emoji} **{manifest['status'].upper()}**{_score_str}\n{completion_message[:600]}",
+                )
+            except Exception:
+                logger.exception("discord completion post failed")
             # Retry-success skill capture: when a `-retry` project finishes
             # well (status done / needs_fixes), the original failure that
             # triggered the retry is now a solved problem. Persist the
@@ -2145,16 +2317,19 @@ class StudioRunner:
                 except Exception:
                     logger.exception("persist retry-as-skill failed for slug=%s", slug)
 
-            # Auto-retry hook: if this attempt failed and we haven't already
-            # retried, launch a second attempt with the dynamic "auto" planner
-            # and inject the failure context as a lesson. The retry runs as a
-            # background task so the original call returns immediately.
-            if manifest.get("status") == "failed":
-                await self._maybe_auto_retry(
-                    manifest,
-                    str(manifest.get("brief_raw") or manifest.get("brief") or brief),
-                    slug,
-                )
+            # Auto-retry DISABLED by user — endless retry cycles were
+            # wasting wall-clock and burning CLI quota without producing
+            # better output. When a project fails, it stays failed; the
+            # user starts a fresh build explicitly via Telegram.
+            #
+            # Original behavior (preserved here for re-enable):
+            #
+            #   if manifest.get("status") == "failed":
+            #       await self._maybe_auto_retry(
+            #           manifest,
+            #           str(manifest.get("brief_raw") or manifest.get("brief") or brief),
+            #           slug,
+            #       )
             return manifest
         except Exception as exc:
             # The runner itself crashed (agent init blew up, get_agent raised, etc).
@@ -3573,7 +3748,30 @@ class StudioRunner:
         scaffold_dir = artifact_dir / "scaffold"
         if not scaffold_dir.exists():
             return
-        from skyn3t.agents.consistency_engine import check_consistency
+        from skyn3t.agents.consistency_engine import (
+            auto_fix_cross_artifact_drift,
+            check_consistency,
+        )
+
+        # Auto-fix cross-artifact drift BEFORE running consistency check.
+        # Rewrites tokens.css / components.md / scaffold hex literals to
+        # match palette.json by nearest-neighbor. No LLM call. Pure data
+        # sync. This is the deterministic counterpart to #101.
+        try:
+            edits = await asyncio.to_thread(auto_fix_cross_artifact_drift, scaffold_dir)
+            if edits:
+                total = sum(edits.values())
+                logger.info(
+                    "auto-fix cross-artifact drift: %d color literal(s) "
+                    "synced to palette.json across %d file(s): %s",
+                    total, len(edits), list(edits.keys())[:5],
+                )
+                manifest.setdefault("auto_fixes", {})["color_drift"] = {
+                    "total_replacements": total,
+                    "files": edits,
+                }
+        except Exception:
+            logger.exception("auto-fix cross-artifact drift failed")
 
         try:
             consistency_task = asyncio.to_thread(check_consistency, scaffold_dir, brief)
