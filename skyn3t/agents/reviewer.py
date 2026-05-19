@@ -115,18 +115,38 @@ class ReviewerAgent(BaseAgent):
         llm_review_md, llm_score = await self._llm_review(brief=brief, contents=contents)
         llm_review_md = self._sanitize_llm_review_md(llm_review_md)
 
-        # Blend scores. If LLM produced a usable score, weight it 60/40 with
-        # the heuristic; otherwise fall back to the heuristic alone.
+        # Packaging axis (0-10) — does this scaffold ship as a runnable
+        # product? Scored against the project's detected stack family
+        # so a CLI tool doesn't get docked for missing a Settings UI.
+        packaging_score, packaging_gaps, packaging_family = self._packaging_score(artifact_dir)
+
+        # Blend scores. If LLM produced a usable score, weight it 54/36/10
+        # with the heuristic and the packaging axis; otherwise 90/10
+        # against just the heuristic + packaging.
+        # Rationale: packaging-completeness deserves ~10% of the final
+        # score — small enough to not dominate, large enough to nudge
+        # the swarm toward shipping runnable artifacts.
+        packaging_pct = packaging_score * 10  # rescale 0-10 to 0-100
         if llm_score is not None:
-            blended = int(round(llm_score * 0.6 + heuristic_score * 0.4))
+            blended = int(round(
+                llm_score * 0.54
+                + heuristic_score * 0.36
+                + packaging_pct * 0.10
+            ))
             # Don't let a perfect heuristic checklist promote a middling
             # LLM review into a higher verdict bucket. The blend may still
             # improve the score within the same bucket, but a 69-quality
             # artifact should not become a `go`.
             blended = min(blended, _llm_bucket_ceiling(llm_score))
         else:
-            blended = heuristic_score
+            blended = int(round(heuristic_score * 0.90 + packaging_pct * 0.10))
         blended = max(0, min(100, blended))
+
+        # Surface packaging gaps as soft risks so the reviewer markdown
+        # explains why the score landed where it did.
+        if packaging_gaps:
+            for gap in packaging_gaps:
+                risks.append(f"Packaging: {gap}")
 
         # Hard guard: if the brief explicitly asks for runnable code
         # ("build a … app/dashboard/site/api/script/cli with React/FastAPI/etc.")
@@ -160,6 +180,9 @@ class ReviewerAgent(BaseAgent):
             llm_review_md=llm_review_md,
             heuristic_score=heuristic_score,
             llm_score=llm_score,
+            packaging_score=packaging_score,
+            packaging_gaps=packaging_gaps,
+            packaging_family=packaging_family,
         )
         review_path = artifact_dir / "review.md"
         review_path.write_text(review_md, encoding="utf-8")
@@ -728,6 +751,123 @@ class ReviewerAgent(BaseAgent):
                     risks.append(f"{label} stage produced partial output — missing: {', '.join(missing)}")
         return risks
 
+    # ------------------------------------------------------------------
+    # Packaging axis — 0-10 score for "is this scaffold a runnable product?"
+    # ------------------------------------------------------------------
+
+    def _packaging_score(self, artifact_dir: Path) -> Tuple[int, List[str], Optional[str]]:
+        """Score the project's packaging completeness against its family.
+
+        Returns ``(score 0-10, list_of_gaps, family)``. A perfect score
+        means: README is non-trivial, the right per-family artifacts
+        exist, .gitignore is present. Tier-aware: a CLI tool doesn't
+        get docked for missing a Settings UI; a web app does.
+
+        Late-imported so the reviewer module stays decoupled from
+        packaging (which lives in a sibling agent module).
+        """
+        try:
+            from skyn3t.agents.stack_detector import detect as detect_stack
+        except Exception:
+            return 0, ["stack_detector unavailable — packaging not scored"], None
+
+        detection = detect_stack(artifact_dir)
+        family = detection.family
+
+        score = 0
+        gaps: List[str] = []
+        scaffold_dir = artifact_dir / "scaffold"
+
+        # README: present + non-trivial (>200 chars). 3 points across
+        # all tiers.
+        readme = artifact_dir / "README.md"
+        if readme.is_file():
+            try:
+                if len(readme.read_text(encoding="utf-8")) > 200:
+                    score += 3
+                else:
+                    gaps.append("README is a stub")
+            except Exception:
+                gaps.append("README unreadable")
+        else:
+            gaps.append("No README.md at project root")
+
+        # .gitignore: present. 2 points. Lots of scaffolds ship without
+        # one and operators commit node_modules / .env by accident.
+        gitignore = artifact_dir / ".gitignore"
+        if gitignore.is_file():
+            score += 2
+        else:
+            gaps.append("No .gitignore at project root")
+
+        # Family-specific artifacts: 5 points total.
+        if family == "web":
+            settings = scaffold_dir / "src" / "Settings.jsx"
+            use_config = scaffold_dir / "src" / "hooks" / "useConfig.js"
+            if settings.is_file():
+                score += 3
+            else:
+                gaps.append("No in-app Settings.jsx (users will be stuck on a .env wall)")
+            if use_config.is_file():
+                score += 2
+            else:
+                gaps.append("No useConfig hook (Settings.jsx has nothing to persist into)")
+        elif family == "server":
+            dockerfile = artifact_dir / "Dockerfile"
+            compose = (artifact_dir / "docker-compose.yml")
+            if not compose.is_file():
+                compose = artifact_dir / "compose.yaml"
+            env_example = artifact_dir / ".env.example"
+            if dockerfile.is_file():
+                score += 2
+            else:
+                gaps.append("No Dockerfile (users have to write their own)")
+            if compose.is_file():
+                score += 2
+            else:
+                gaps.append("No docker-compose.yml (no one-command quick start)")
+            if env_example.is_file():
+                score += 1
+            else:
+                gaps.append("No .env.example (operator has to discover env vars from source)")
+        elif family == "fullstack":
+            # 2 web + 2 server + 1 combo wiring
+            web_ok = (scaffold_dir / "src" / "Settings.jsx").is_file()
+            hook_ok = (scaffold_dir / "src" / "hooks" / "useConfig.js").is_file()
+            docker_ok = (artifact_dir / "Dockerfile").is_file()
+            compose_path = artifact_dir / "docker-compose.yml"
+            compose_ok = compose_path.is_file()
+            if web_ok and hook_ok:
+                score += 2
+            else:
+                gaps.append("Frontend missing Settings UI / useConfig (web layer)")
+            if docker_ok and compose_ok:
+                score += 2
+            else:
+                gaps.append("Backend missing Dockerfile / docker-compose (server layer)")
+            # Combo wiring: frontend service in compose + API_BASE_URL
+            # default in useConfig.
+            wired = False
+            if compose_ok:
+                try:
+                    compose_text = compose_path.read_text(encoding="utf-8")
+                    if re.search(r"^\s*frontend\s*:", compose_text, re.MULTILINE):
+                        wired = True
+                except Exception:
+                    pass
+            if wired:
+                score += 1
+            else:
+                gaps.append("Frontend not wired into docker-compose (no one-command start)")
+        else:
+            # Unknown family — can't grade family-specific artifacts, so
+            # award the 5 points by default. The 0/2/3 for README +
+            # gitignore still apply above, and any docs gaps still
+            # surface there.
+            score += 5
+
+        return max(0, min(10, score)), gaps, family
+
     def _verdict(
         self,
         completeness: List[Dict[str, Any]],
@@ -763,19 +903,33 @@ class ReviewerAgent(BaseAgent):
         llm_review_md: Optional[str] = None,
         heuristic_score: Optional[int] = None,
         llm_score: Optional[int] = None,
+        packaging_score: Optional[int] = None,
+        packaging_gaps: Optional[List[str]] = None,
+        packaging_family: Optional[str] = None,
     ) -> str:
         out: List[str] = []
         out.append(f"# Review - {artifact_dir.name}")
         out.append("")
         out.append(f"**Verdict:** `{verdict}`  **Score:** {score}/100")
-        if heuristic_score is not None or llm_score is not None:
+        if heuristic_score is not None or llm_score is not None or packaging_score is not None:
             parts = []
             if heuristic_score is not None:
                 parts.append(f"heuristic={heuristic_score}")
             if llm_score is not None:
                 parts.append(f"llm={llm_score}")
+            if packaging_score is not None:
+                parts.append(f"packaging={packaging_score}/10")
             if parts:
                 out.append(f"_Score breakdown: {', '.join(parts)}_")
+        if packaging_score is not None and (packaging_gaps or packaging_family):
+            out.append("")
+            family_label = packaging_family or "unknown"
+            out.append(f"### Packaging ({family_label} tier): {packaging_score}/10")
+            if packaging_gaps:
+                for gap in packaging_gaps:
+                    out.append(f"- ⚠️ {gap}")
+            else:
+                out.append("- ✓ All packaging artifacts present.")
         out.append("")
         if llm_review_md:
             out.append("## LLM review")
