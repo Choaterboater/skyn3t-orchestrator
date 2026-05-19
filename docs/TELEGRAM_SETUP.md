@@ -47,8 +47,18 @@ SKYN3T_TELEGRAM_USER_ID=123456789
 ### 4. Restart the SkyN3t server
 
 ```bash
-uvicorn skyn3t.web.app:app --host 0.0.0.0 --port 6660
+uvicorn skyn3t.web.app:app --host 0.0.0.0 --port 6660 --no-access-log
 ```
+
+`--no-access-log` is recommended — the dashboard polls `/api/status`,
+`/api/proposals`, `/api/swarm/snapshot` etc. several times per second,
+which floods the terminal with `127.0.0.1:NNNNN - "GET /api/... 200 OK"`
+lines and buries the orchestrator's own warning/info messages
+(fast-path activations, critique timeouts, etc.). The orchestrator's
+own logger output keeps flowing.
+
+If you specifically want to see HTTP errors (4xx/5xx) without the
+routine traffic, use `--log-level warning` instead.
 
 Watch the logs for `Telegram bot starting in background`. Within a few seconds the bot is connected.
 

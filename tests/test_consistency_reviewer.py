@@ -324,3 +324,88 @@ def test_tech_stack_declares_frontend_only_passes(tmp_path: Path):
     agent = _make_agent()
     findings = agent._heuristic_check(scaffold, brief="Frontend-only.")
     assert not [f for f in findings if "tech_stack.json" in f.message]
+
+
+# ─── _parse_llm_json_array: salvage prose-wrapped JSON ─────────────────
+
+
+class TestParseLLMJSONArray:
+    """The LLM consistency reviewer asks for a JSON array, but CLI
+    backends (Claude CLI in particular) sometimes narrate their tool
+    calls in front of the JSON. The parser has to salvage the real
+    array out of that prose without false-positives on prose [ chars."""
+
+    def test_clean_json(self):
+        from skyn3t.agents.consistency_reviewer import _parse_llm_json_array
+        r = _parse_llm_json_array('[{"severity": "blocker", "message": "x"}]')
+        assert r == [{"severity": "blocker", "message": "x"}]
+
+    def test_empty_array(self):
+        from skyn3t.agents.consistency_reviewer import _parse_llm_json_array
+        assert _parse_llm_json_array("[]") == []
+
+    def test_markdown_fenced(self):
+        from skyn3t.agents.consistency_reviewer import _parse_llm_json_array
+        assert _parse_llm_json_array("```json\n[]\n```") == []
+
+    def test_prose_narration_then_json(self):
+        """The exact failure pattern from production logs:
+        Claude CLI narrates 'Reviewing the scaffold...' + tool-call
+        traces ('● Read Dockerfile  └ 28 lines read'), THEN the JSON."""
+        from skyn3t.agents.consistency_reviewer import _parse_llm_json_array
+        prose = (
+            "Reviewing the scaffold for cross-file mismatches; I'm checking the "
+            "runtime/docs wiring.\n\n"
+            "● Read Dockerfile\n  └ 28 lines read\n"
+            "● Read docker-compose.yml\n  └ 23 lines read\n\n"
+            '[\n  {"severity": "blocker", "category": "hallucination", '
+            '"file": "tech_stack.json", "message": "x", "suggestion": "y"}\n]\n'
+        )
+        r = _parse_llm_json_array(prose)
+        assert r is not None
+        assert len(r) == 1
+        assert r[0]["severity"] == "blocker"
+
+    def test_pure_prose_returns_none(self):
+        from skyn3t.agents.consistency_reviewer import _parse_llm_json_array
+        assert _parse_llm_json_array("I refuse to output JSON") is None
+
+    def test_malformed_json_returns_none(self):
+        from skyn3t.agents.consistency_reviewer import _parse_llm_json_array
+        assert _parse_llm_json_array("[{this is not json}]") is None
+
+    def test_nested_arrays_preserved(self):
+        from skyn3t.agents.consistency_reviewer import _parse_llm_json_array
+        r = _parse_llm_json_array(
+            '[{"severity": "warning", "items": [1, 2, 3]}]'
+        )
+        assert r is not None
+        assert r[0]["items"] == [1, 2, 3]
+
+    def test_strings_with_brackets_dont_confuse_parser(self):
+        """A string value containing ']' must not be treated as the end
+        of the JSON array. Bracket-counter must respect string state."""
+        from skyn3t.agents.consistency_reviewer import _parse_llm_json_array
+        r = _parse_llm_json_array(
+            '[{"message": "use array[0] syntax", "severity": "warning"}]'
+        )
+        assert r is not None
+        assert r[0]["message"] == "use array[0] syntax"
+
+    def test_prose_with_decoy_bracket_then_real_json(self):
+        """When prose contains a stray '[' that doesn't open valid JSON,
+        the salvage pass should move on to the next '[' and try again."""
+        from skyn3t.agents.consistency_reviewer import _parse_llm_json_array
+        tricky = (
+            "I see [ a list... that is not real, but actually:\n"
+            '[{"severity":"blocker","message":"x"}]\n'
+            "and thats it"
+        )
+        r = _parse_llm_json_array(tricky)
+        assert r is not None
+        assert len(r) == 1
+
+    def test_empty_string(self):
+        from skyn3t.agents.consistency_reviewer import _parse_llm_json_array
+        assert _parse_llm_json_array("") is None
+        assert _parse_llm_json_array(None) is None

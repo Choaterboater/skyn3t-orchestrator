@@ -27,6 +27,84 @@ from skyn3t.core.events import EventBus
 logger = logging.getLogger("skyn3t.agents.consistency_reviewer")
 
 
+def _parse_llm_json_array(raw: str) -> Optional[List[Any]]:
+    """Extract a JSON array from an LLM response.
+
+    Two-pass:
+      1. Strict — strip ``` fences then json.loads.
+      2. Salvage — find the first balanced [...] region anywhere in
+         the response and parse that. Handles CLI backends that
+         narrate tool calls ("Reviewing the scaffold...", "● Read
+         README.md  └ 33 lines read") before / around the JSON.
+
+    Returns the parsed list on success, or None if both passes fail.
+    """
+    if not raw:
+        return None
+
+    # Pass 1: strict (preserves existing behavior).
+    cleaned = raw.strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    if cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    cleaned = cleaned.strip()
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, list):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Pass 2: salvage. Walk the raw string, find the first `[` that
+    # opens a balanced bracket region, attempt json.loads on it.
+    # Bracket-counting (not regex) so nested arrays inside the
+    # findings parse correctly.
+    text = raw
+    n = len(text)
+    for start in range(n):
+        if text[start] != "[":
+            continue
+        depth = 0
+        in_string = False
+        escape = False
+        for end in range(start, n):
+            ch = text[end]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : end + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break  # try next `[`
+                    if isinstance(parsed, list):
+                        logger.info(
+                            "LLM consistency review JSON salvaged from prose "
+                            "(prefix=%r, len=%d)",
+                            text[: min(80, start)],
+                            len(candidate),
+                        )
+                        return parsed
+                    break  # not a list, try next `[`
+    return None
+
+
 @dataclass
 class ConsistencyFinding:
     severity: str  # "blocker" | "warning"
@@ -466,8 +544,16 @@ class ConsistencyReviewerAgent(BaseAgent):
             f"{manifest_preview}\n\n"
             "KEY FILES (first 200 lines each):\n"
             f"{key_files_content[:8000]}\n\n"
-            "INSTRUCTIONS:\n"
-            "Return ONLY a JSON array. Each item must have:\n"
+            "OUTPUT FORMAT (CRITICAL):\n"
+            "Your ENTIRE response must be a single JSON array — nothing else.\n"
+            "  - Do NOT narrate, explain, or describe what you are doing.\n"
+            "  - Do NOT include tool-call traces, file-read confirmations, or progress lines.\n"
+            "  - Do NOT wrap in markdown code fences.\n"
+            "  - The first character of your response must be `[`.\n"
+            "  - The last character must be `]`.\n"
+            "  - If there are no issues, respond with EXACTLY: []\n"
+            "\n"
+            "Each item in the array must have:\n"
             '  "severity": "blocker" | "warning",\n'
             '  "category": "missing_feature" | "hallucination" | "readme_drift" | "contradiction",\n'
             '  "file": "relative/path/or (scaffold root)",\n'
@@ -482,7 +568,6 @@ class ConsistencyReviewerAgent(BaseAgent):
             "- hallucination: a service/technology is mentioned in one file but not requested.\n"
             "- readme_drift: README documents something that doesn't match the code.\n"
             "- contradiction: architecture.md says TypeScript but files are .js, etc.\n"
-            "- If everything is consistent, return an empty array [].\n"
             "- Do NOT hallucinate issues. Only report real problems you can see in the files.\n"
         )
 
@@ -498,24 +583,16 @@ class ConsistencyReviewerAgent(BaseAgent):
             logger.warning("LLM consistency review failed: %s", exc)
             return findings
 
-        # Parse JSON — be tolerant of markdown fences
-        cleaned = raw.strip()
-        if cleaned.startswith("```json"):
-            cleaned = cleaned[7:]
-        if cleaned.startswith("```"):
-            cleaned = cleaned[3:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3]
-        cleaned = cleaned.strip()
-
-        try:
-            items = json.loads(cleaned)
-        except json.JSONDecodeError:
+        # Parse JSON. Two passes:
+        #   1. Strict (current behavior): strip code fences, parse.
+        #   2. Salvage: extract the first [...] balanced-bracket region
+        #      from anywhere in the response. CLI backends sometimes
+        #      narrate their tool calls before the actual JSON
+        #      ("Reviewing the scaffold..." + tool-call traces + JSON).
+        #      The salvage pass picks the JSON out of that prose.
+        items = _parse_llm_json_array(raw)
+        if items is None:
             logger.warning("LLM consistency review returned non-JSON: %s", raw[:500])
-            return findings
-
-        if not isinstance(items, list):
-            logger.warning("LLM consistency review returned non-array: %s", type(items))
             return findings
 
         for item in items:
