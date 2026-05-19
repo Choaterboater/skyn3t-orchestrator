@@ -39,6 +39,15 @@ _LLM_REVIEW_TIMEOUT_SECONDS = 180.0
 _LLM_CRITIQUE_TIMEOUT_SECONDS = 90.0
 
 
+def _llm_bucket_ceiling(score: int) -> int:
+    """Keep blended scores inside the verdict bucket implied by the LLM."""
+    if score < 50:
+        return 49
+    if score < 75:
+        return 74
+    return 100
+
+
 class ReviewerAgent(BaseAgent):
     """Hybrid (heuristic + LLM) QA reviewer. Reads artifacts, writes review.md."""
 
@@ -124,6 +133,11 @@ class ReviewerAgent(BaseAgent):
                 + heuristic_score * 0.36
                 + packaging_pct * 0.10
             ))
+            # Don't let a perfect heuristic checklist promote a middling
+            # LLM review into a higher verdict bucket. The blend may still
+            # improve the score within the same bucket, but a 69-quality
+            # artifact should not become a `go`.
+            blended = min(blended, _llm_bucket_ceiling(llm_score))
         else:
             blended = int(round(heuristic_score * 0.90 + packaging_pct * 0.10))
         blended = max(0, min(100, blended))

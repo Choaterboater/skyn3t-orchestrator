@@ -10,7 +10,11 @@ from skyn3t.adapters.llm_client import LLMRequest
 
 logger = logging.getLogger("skyn3t.adapters.openrouter")
 
-DEFAULT_MODEL = "anthropic/claude-3.5-sonnet"
+# Current-day cheap reliable code model. ~$0.25/M in, $0.38/M out.
+# Was claude-3.5-sonnet but that's ~$3/M — way more than we need for
+# generic generation. Use SKYN3T_OPENROUTER_MODEL env var to override
+# globally, or pass model= per call for fine-grained routing.
+DEFAULT_MODEL = "deepseek/deepseek-v3.2"
 BASE_URL = "https://openrouter.ai/api/v1"
 
 

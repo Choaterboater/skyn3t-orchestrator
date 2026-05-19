@@ -46,6 +46,7 @@ __all__ = [
     "GitHubIngestorAgent",
     "KimiCLIAgent",
     "MarketerAgent",
+    "PackagingAgent",
     "ProjectMemoryAgent",
     "ResearchAgent",
     "ReviewerAgent",

@@ -21,8 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from skyn3t.adapters.claude_cli import ClaudeCLIAgent
 from skyn3t.adapters.copilot_cli import CopilotCLIAgent
 from skyn3t.adapters.kimi_cli import KimiCLIAgent
-
-from skyn3t.core.agent import TaskRequest, TaskResult
+from skyn3t.core.agent import TaskResult
 from skyn3t.core.events import EventBus
 from skyn3t.core.orchestrator import Orchestrator
 

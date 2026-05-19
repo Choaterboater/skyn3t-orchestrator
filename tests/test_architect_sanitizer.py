@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from skyn3t.agents.architect import ArchitectAgent
 
-
 NODE_STACK = {
     "frontend": "react-vite-tailwind",
     "backend": "express",
