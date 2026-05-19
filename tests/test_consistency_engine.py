@@ -389,3 +389,96 @@ def test_re_export_named_block_validated(tmp_path: Path) -> None:
     ]
     assert not ok_issues
     assert broken_issues
+
+
+# ─── @skyn3t-backfill-stub marker detection ───────────────────────────
+
+
+def test_consistency_flags_backfill_stub_marker(tmp_path: Path) -> None:
+    """e79bc0 shipped HabitDashboard.jsx with `// @skyn3t-backfill-stub`
+    returning null — undetected by the old stub scanner (which only
+    knew about the TODO[skyn3t]: code generation failed marker)."""
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "src" / "components" / "HabitDashboard.jsx",
+        """
+// @skyn3t-backfill-stub: for missing import.
+export default function HabitDashboard() {
+  return null;
+}
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    stubs = [i for i in report.issues if i.category == "todo_stub"]
+    assert stubs, [i.message for i in report.issues]
+    assert any("backfill" in i.message.lower() for i in stubs)
+    assert stubs[0].severity == "error"
+    backfill_issues = [
+        i for i in stubs if "backfill stub" in i.message.lower()
+    ]
+    assert backfill_issues
+
+
+def test_consistency_does_not_double_flag_backfill_stub_as_organic(tmp_path: Path) -> None:
+    """A backfill stub commonly contains the literal word "TODO" in
+    surrounding comments. The organic-stub scanner must NOT
+    additionally flag a file that's already flagged via the explicit
+    marker."""
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "src" / "Backfilled.jsx",
+        """
+// @skyn3t-backfill-stub: for missing import.
+// TODO: this is a backfill stub
+export default function Backfilled() {
+  return null;
+}
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    stubs = [i for i in report.issues if i.category == "todo_stub"]
+    assert len(stubs) == 1
+    assert "backfill" in stubs[0].message.lower()
+
+
+def test_consistency_clean_file_no_stub_issue(tmp_path: Path) -> None:
+    """Files without either marker stay clean."""
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "src" / "App.jsx",
+        """
+export default function App() {
+  return <div>Hello</div>;
+}
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    stubs = [i for i in report.issues if i.category == "todo_stub"]
+    assert not stubs
+
+
+def test_consistency_still_catches_code_generation_failed_marker(tmp_path: Path) -> None:
+    """Regression guard for the existing marker — the new
+    `_STUB_MARKERS` tuple must still pick up the legacy one."""
+    scaffold = tmp_path / "scaffold"
+    _write(
+        scaffold / "src" / "Failed.jsx",
+        """
+// TODO[skyn3t]: code generation failed
+export default function Failed() {
+  return null;
+}
+""".strip(),
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    stubs = [i for i in report.issues if i.category == "todo_stub"]
+    assert stubs
+    assert any("code generation failed" in i.message.lower() for i in stubs)
