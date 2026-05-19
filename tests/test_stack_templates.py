@@ -13,6 +13,9 @@ import pytest
 
 from skyn3t.agents.stack_templates import (
     STACK_TEMPLATES,
+    _clean_title,
+    _manifest_index_html,
+    _title_from_brief,
     detect_stack,
     detect_stack_from_handoff,
     plan_for_stack,
@@ -612,3 +615,94 @@ def test_decisions_node_language_with_port_alone_triggers_backend():
     plan = plan_for_stack("react_vite", brief, decisions=decisions)
     paths = {rel for rel, _ in (plan or [])}
     assert "server/index.js" in paths
+
+
+# ─── index.html title derivation (fixes hardcoded "Homelab Dashboard") ──
+
+
+class TestTitleFromBrief:
+    def test_habit_tracker(self):
+        assert _title_from_brief("Build a habit tracker with streaks") == "Habit Tracker"
+
+    def test_strips_articles(self):
+        assert _title_from_brief("Build an expense splitter") == "Expense Splitter"
+        assert _title_from_brief("Create the inventory tracker") == "Inventory Tracker"
+
+    def test_explicit_called_pattern(self):
+        # Pulled directly from real briefs ("...call it Tactrax",
+        # "habit tracker named CrackTrack").
+        assert _title_from_brief("Build a habit tracker called Tactrax") == "Tactrax"
+        assert _title_from_brief("Build a habit tracker named CrackTrack") == "CrackTrack"
+
+    def test_quoted_name(self):
+        assert _title_from_brief("Build 'Habit Stack' — a habit tracker") == "Habit Stack"
+
+    def test_handles_multiple_imperatives(self):
+        # The leading verb should be stripped only once.
+        assert _title_from_brief("Build a build system") == "Build System"
+
+    def test_caps_at_five_words(self):
+        # "Build a long product name with many descriptive words"
+        # → drop verb+article, take 5 noun-phrase words.
+        out = _title_from_brief(
+            "Build a really detailed sophisticated comprehensive habit tracker"
+        )
+        # Should be 5 words max, title-cased.
+        assert len(out.split()) <= 5
+
+    def test_empty_brief_falls_back_to_app(self):
+        assert _title_from_brief("") == "App"
+        assert _title_from_brief("   ") == "App"
+
+    def test_no_verb_match_still_works(self):
+        # Briefs that don't start with an imperative still produce a
+        # reasonable title — just the first phrase, cleaned up.
+        out = _title_from_brief("A markdown editor that supports vim mode")
+        assert "Markdown Editor" in out
+
+    def test_stops_at_connector_words(self):
+        assert _title_from_brief("Build a habit tracker with streaks") == "Habit Tracker"
+        assert _title_from_brief("Build a service board for homelab") == "Service Board"
+        assert _title_from_brief("Build a todo app that syncs offline") == "Todo App"
+
+    def test_stops_at_punctuation(self):
+        assert _title_from_brief("Build a habit tracker. Add streaks.") == "Habit Tracker"
+        assert _title_from_brief("Build a habit tracker, please") == "Habit Tracker"
+
+
+class TestCleanTitle:
+    def test_collapses_whitespace(self):
+        assert _clean_title("habit   tracker") == "Habit Tracker"
+
+    def test_preserves_short_acronyms(self):
+        assert _clean_title("HTTP cache") == "HTTP Cache"
+        assert _clean_title("API gateway") == "API Gateway"
+
+    def test_caps_at_50_chars(self):
+        long = "a" * 80
+        assert len(_clean_title(long)) <= 50
+
+    def test_empty_returns_empty(self):
+        assert _clean_title("") == ""
+        assert _clean_title("   ") == ""
+
+
+class TestManifestIndexHTMLUsesTitle:
+    """End-to-end: the deterministic Vite index.html template uses the
+    derived title, not the old hardcoded 'Homelab Dashboard'."""
+
+    def test_no_more_homelab_dashboard_leftover(self):
+        # Habit-tracker brief produced "<title>Homelab Dashboard</title>"
+        # before this fix; review.md Check 6 flagged it on every build.
+        html = _manifest_index_html("Build a habit tracker with streaks")
+        assert "<title>Habit Tracker</title>" in html
+        assert "Homelab Dashboard" not in html
+
+    def test_named_brief_uses_explicit_name(self):
+        html = _manifest_index_html("Build a habit tracker called Tactrax")
+        assert "<title>Tactrax</title>" in html
+
+    def test_empty_brief_uses_fallback(self):
+        html = _manifest_index_html("")
+        assert "<title>App</title>" in html
+        assert "Homelab Dashboard" not in html
