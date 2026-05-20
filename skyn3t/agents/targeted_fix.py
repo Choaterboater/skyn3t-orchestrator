@@ -731,6 +731,7 @@ async def apply_targeted_fix(
                 files_written=written_abs,
                 stack=stack,
                 brief=brief or "",
+                llm_client=llm_client,
             )
         except Exception:
             logger.debug("post-fix backfill failed (non-fatal)", exc_info=True)

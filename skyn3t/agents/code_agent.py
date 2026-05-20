@@ -2721,6 +2721,7 @@ class CodeAgent(BaseAgent):
                 stack=template_key,
                 brief=brief,
                 palette_hexes=_palette_hexes,
+                llm_client=self._llm,
             )
         except Exception:
             logger.exception("backfill unresolved imports failed (non-fatal)")
@@ -2827,6 +2828,7 @@ class CodeAgent(BaseAgent):
         stack: Optional[str],
         brief: str,
         palette_hexes: Optional[List[str]] = None,
+        llm_client=None,
     ) -> list[str]:
         """Scan generated files for relative imports that don't resolve, and
         backfill from deterministic generators when possible.
@@ -2910,10 +2912,54 @@ class CodeAgent(BaseAgent):
                 # First try a deterministic generator. Pass stack as-is;
                 # manifest_for() returns None for unknown (stack, path).
                 body: Optional[str] = None
-                if stack:
+                # Self-healing: check learned generators first (beats Hermes —
+                # permanently learned from past failures).
+                try:
+                    from skyn3t.self_healing.learned_generators import LearnedGeneratorManager
+                    _lgr = LearnedGeneratorManager()
+                    gen = _lgr.get_generator(rel_path)
+                    if gen:
+                        body = gen(brief or "")
+                        if body:
+                            logger.info("Using learned generator for %s", rel_path)
+                except Exception:
+                    pass
+                if body is None and stack:
                     body = manifest_for(
                         stack, rel_path, brief or "", palette_hexes=palette_hexes
                     )
+                if body is None and llm_client:
+                    # No deterministic generator — ask the LLM to produce a
+                    # real implementation so we don't ship a stub that the
+                    # reviewer will flag and the retry loop will never fix.
+                    try:
+                        prompt = (
+                            f"Write the COMPLETE source for the file '{rel_path}'.\n"
+                            f"Brief: {brief}\n"
+                            f"Stack: {stack or 'unknown'}\n"
+                            "Return ONLY the raw code — no markdown fences, "
+                            "no explanations."
+                        )
+                        # llm_client.complete() is async — run it from
+                        # this sync context via asyncio.run().
+                        coro = llm_client.complete(
+                            prompt=prompt,
+                            system="You are a senior developer. Write clean, "
+                                   "working code for the requested file.",
+                            max_tokens=2048,
+                            temperature=0.2,
+                            timeout=120,
+                        )
+                        try:
+                            body = asyncio.run(coro)
+                        except RuntimeError:
+                            # Already inside a running loop — fall back to
+                            # run_until_complete on the current loop.
+                            body = asyncio.get_event_loop().run_until_complete(coro)
+                        if not body or "TODO" in body or "skyn3t-backfill" in body:
+                            body = None
+                    except Exception:
+                        body = None
                 if body is None:
                     # Last-resort placeholder so the build doesn't break.
                     # Cheaper than letting Vite fail, and the reviewer can

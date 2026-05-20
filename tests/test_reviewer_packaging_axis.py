@@ -397,3 +397,33 @@ class TestSubScoreParser:
         subs, total = self._parse(text)
         assert subs == {"completeness": 20, "consistency": 18}
         assert total == 70
+
+
+class TestEdgeCases:
+    def test_nonexistent_path_returns_zero(self) -> None:
+        score, gaps, family = _make_reviewer()._packaging_score(Path("/does/not/exist"))
+        assert score == 0
+        assert gaps
+        assert family == "unknown"
+
+    def test_fullstack_zero_config_not_docked(self, tmp_path: Path) -> None:
+        """Fullstack with no env vars should auto-score the web layer."""
+        artifact = tmp_path / "fs-zero"
+        scaffold = artifact / "scaffold"
+        _write(scaffold, "package.json", json.dumps({
+            "name": "demo", "dependencies": {"react": "^18"},
+            "devDependencies": {"vite": "^5"},
+        }))
+        _write(scaffold, "src/App.jsx", "export default function App(){return null;}")
+        # No Settings.jsx or useConfig.js — but also no env vars.
+        _write(artifact, "Dockerfile", "FROM python:3.12-slim\n")
+        _write(artifact, "docker-compose.yml", "services:\n  app:\n    build: .\n")
+        _write(artifact, "main.py", "from fastapi import FastAPI\napp = FastAPI()\n")
+        _write(artifact, "README.md", "# FS\n" + ("docs " * 25))
+        _write(artifact, ".gitignore", "node_modules/\n.env\n")
+        # No .env.example — simulating zero-config.
+        score, gaps, family = _make_reviewer()._packaging_score(artifact)
+        assert family == "fullstack"
+        # Web layer auto-scores (2) + server (4) + combo (1) = 7, plus readme (3) + gitignore (2) = 12 -> capped at 10
+        assert score == 10
+        assert gaps == []

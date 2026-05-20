@@ -2467,8 +2467,23 @@ class StudioRunner:
                     "with the chosen stack. Review manifest['stack_shape_mismatches']."
                 )
             elif is_stub_bail:
-                manifest["next_action"] = "Retrying with the unresolved stub failure as a hint."
-                manifest["_retry_hint"] = str(exc)
+                # Cap the retry depth — prevent infinite stub loops.
+                retry_depth = str(slug).split("-retry") - 1
+                if retry_depth >= 3:
+                    manifest["next_action"] = (
+                        "Project failed: unresolved stub error persisted "
+                        f"after {retry_depth} retry attempts. Giving up."
+                    )
+                    manifest["error"] = f"UnresolvedScaffoldStubError: {exc}"
+                    logger.error(
+                        "Giving up on slug=%s after %d stub retries",
+                        slug, retry_depth,
+                    )
+                else:
+                    manifest["next_action"] = (
+                        "Retrying with the unresolved stub failure as a hint."
+                    )
+                    manifest["_retry_hint"] = str(exc)
             elif is_missing_files_bail:
                 manifest["next_action"] = "Retrying with the missing file witness as a hint."
                 manifest["_retry_hint"] = str(exc)

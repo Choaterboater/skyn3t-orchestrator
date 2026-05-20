@@ -7,7 +7,6 @@ user-id gating, and the reject-feedback follow-up flow.
 
 from __future__ import annotations
 
-import asyncio
 from typing import List
 
 import pytest
@@ -372,3 +371,52 @@ async def test_dispatch_throttles_duplicates(monkeypatch):
     second = await tgd.dispatch_approval("canary-throttle", "ArchitectAgent", "")
     assert first["ok"] is True
     assert second.get("throttled") is True
+
+
+# ---------------------------------------------------------------------------
+# Reject slash-command + follow-up message (key consistency fix)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reject_slash_command_with_feedback_flow(captured_send):
+    """/_reject followed by a text message should use consistent sender key."""
+    runner = FakeRunner()
+    runner.projects.append({"slug": "reject-me", "status": "awaiting_approval"})
+
+    bot = _bot(runner)
+    # 1. User sends /reject without feedback text
+    await bot._handle_message({
+        "from": {"id": "42"}, "chat": {"id": 42},
+        "text": "/reject reject-me",
+    })
+    # Should prompt for feedback and store pending reject keyed by sender id
+    assert "42" in bot._pending_reject_slugs
+    assert bot._pending_reject_slugs["42"] == "reject-me"
+    assert runner.resumed == []
+
+    # 2. User sends feedback as next message
+    await bot._handle_message({
+        "from": {"id": "42"}, "chat": {"id": 42},
+        "text": "fix the color scheme",
+    })
+    assert runner.resumed == [
+        {"slug": "reject-me", "decision": "reject", "feedback": "fix the color scheme"},
+    ]
+    assert "42" not in bot._pending_reject_slugs
+
+
+@pytest.mark.asyncio
+async def test_reject_slash_no_args_uses_most_recent(captured_send):
+    """/_reject with no slug should use the most recent awaiting project."""
+    runner = FakeRunner()
+    runner.projects.append(
+        {"slug": "awaiting-1", "status": "awaiting_approval", "created_at": 100.0},
+    )
+    bot = _bot(runner)
+    await bot._handle_message({
+        "from": {"id": "42"}, "chat": {"id": 42},
+        "text": "/reject",
+    })
+    assert "42" in bot._pending_reject_slugs
+    assert bot._pending_reject_slugs["42"] == "awaiting-1"
