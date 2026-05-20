@@ -19,7 +19,7 @@ def isolate_runtime_state(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("DATA_DIR", str(data_dir))
     monkeypatch.setenv("LOGS_DIR", str(logs_dir))
     monkeypatch.setenv("VECTOR_DB_PATH", str(vector_dir))
-    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{(data_dir / 'skyn3t.db').as_posix()}")
+    monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
     monkeypatch.setenv("SECRET_STORAGE_PATH", str(secrets_path))
     monkeypatch.setenv("AUDIT_LOG_DIR", str(audit_dir))
 
@@ -29,9 +29,9 @@ def isolate_runtime_state(tmp_path_factory, monkeypatch):
     from skyn3t.memory.database import close_engine
 
     get_settings.cache_clear()
-    asyncio.run(close_engine())
+    close_engine()
     memory_database._async_session_maker = None
-    asyncio.run(init_db())
+    asyncio.get_event_loop().run_until_complete(init_db())
     try:
         import skyn3t.cortex.proposals as proposals_module
 
@@ -41,7 +41,7 @@ def isolate_runtime_state(tmp_path_factory, monkeypatch):
 
     yield Path(runtime_root)
 
-    asyncio.run(close_engine())
+    asyncio.get_event_loop().run_until_complete(close_engine())
     memory_database._async_session_maker = None
     get_settings.cache_clear()
     try:

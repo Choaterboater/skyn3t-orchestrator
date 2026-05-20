@@ -381,6 +381,12 @@ async def lifespan(app: FastAPI):
     # Shutdown
     if orchestrator:
         await orchestrator.stop()
+    # Cleanup loky/joblib semaphores to suppress leak warnings
+    try:
+        from loky import get_reusable_executor
+        get_reusable_executor().shutdown()
+    except Exception:
+        pass
     print("👋 SkyN3t Orchestrator stopped")
 
 
