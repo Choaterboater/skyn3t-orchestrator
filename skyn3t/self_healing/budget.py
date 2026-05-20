@@ -9,7 +9,6 @@ from __future__ import annotations
 import threading
 from typing import Dict, Optional
 
-
 DEFAULT_TOTAL_BUDGET = 20
 DEFAULT_STUB_RETRY_MAX = 5
 DEFAULT_FIX_RETRY_MAX = 2  # build_fix, boot_fix, integration_fix

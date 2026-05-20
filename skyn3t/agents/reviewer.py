@@ -909,6 +909,9 @@ class ReviewerAgent(BaseAgent):
         except Exception:
             return 0, ["stack_detector unavailable — packaging not scored"], None
 
+        if not artifact_dir.is_dir():
+            return 0, ["Artifact directory does not exist"], "unknown"
+
         detection = detect_stack(artifact_dir)
         family = detection.family
 

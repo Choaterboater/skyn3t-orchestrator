@@ -2715,7 +2715,7 @@ class CodeAgent(BaseAgent):
         # path, fall back to it; otherwise a placeholder stub avoids the
         # build break.
         try:
-            files_written = self._backfill_unresolved_local_imports(
+            files_written = await self._backfill_unresolved_local_imports(
                 out_dir=out_dir,
                 files_written=files_written,
                 stack=template_key,
@@ -2820,7 +2820,7 @@ class CodeAgent(BaseAgent):
         ".jsx", ".tsx", ".ts", ".js", ".mjs", ".cjs", ".css", ".scss",
     )
 
-    def _backfill_unresolved_local_imports(
+    async def _backfill_unresolved_local_imports(
         self,
         *,
         out_dir,
@@ -2940,8 +2940,8 @@ class CodeAgent(BaseAgent):
                             "Return ONLY the raw code — no markdown fences, "
                             "no explanations."
                         )
-                        # llm_client.complete() is async — run it from
-                        # this sync context via asyncio.run().
+                        # llm_client.complete() is async — await it
+                        # directly since this method is now async.
                         coro = llm_client.complete(
                             prompt=prompt,
                             system="You are a senior developer. Write clean, "
@@ -2950,12 +2950,7 @@ class CodeAgent(BaseAgent):
                             temperature=0.2,
                             timeout=120,
                         )
-                        try:
-                            body = asyncio.run(coro)
-                        except RuntimeError:
-                            # Already inside a running loop — fall back to
-                            # run_until_complete on the current loop.
-                            body = asyncio.get_event_loop().run_until_complete(coro)
+                        body = await coro
                         if not body or "TODO" in body or "skyn3t-backfill" in body:
                             body = None
                     except Exception:

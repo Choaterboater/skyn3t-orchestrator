@@ -13,12 +13,10 @@ improves its own code generation capabilities permanently.
 
 from __future__ import annotations
 
-import json
 import logging
-import os
-import threading
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+import threading
+from typing import Callable, Dict, Optional
 
 logger = logging.getLogger("skyn3t.self_healing.learned_generators")
 
@@ -45,6 +43,8 @@ class LearnedGeneratorManager:
             spec = importlib.util.spec_from_file_location(
                 "learned_generators", str(_LEARNED_GEN_PATH)
             )
+            if spec is None or spec.loader is None:
+                return
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             # Pull all callable entries that look like generators
@@ -182,14 +182,11 @@ def _path_to_name(file_path: str) -> str:
 
 def _name_to_path(func_name: str) -> Optional[str]:
     """Convert a generator function name back to a file path."""
-    import re
     if not func_name.startswith("gen_"):
         return None
     path_part = func_name[4:]  # Remove "gen_"
     # Convert underscores back to slashes and dots
     # This is a best-effort reverse mapping
-    parts = path_part.split("_")
-    # Try to reconstruct: the last part might be an extension
     return path_part.replace("_", "/").replace("//", "_")
 
 

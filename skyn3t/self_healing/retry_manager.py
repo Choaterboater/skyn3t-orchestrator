@@ -8,10 +8,10 @@ Beats Hermes' generic retry by being context-aware and learning-driven.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from skyn3t.self_healing.budget import ProjectIterationBudget
-from skyn3t.self_healing.error_taxonomy import ErrorClass, RecoveryHint, ErrorTaxonomy
+from skyn3t.self_healing.error_taxonomy import ErrorTaxonomy, RecoveryHint
 from skyn3t.self_healing.learned_generators import LearnedGeneratorManager
 
 logger = logging.getLogger("skyn3t.self_healing.retry_manager")
@@ -37,7 +37,7 @@ class AdaptiveRetryManager:
         retry_type: str,
         exception: Optional[Exception] = None,
         error_text: str = "",
-        file_path: str = None,
+        file_path: Optional[str] = None,
     ) -> Tuple[bool, RecoveryHint]:
         """Return (should_retry, recovery_hint) based on all context.
 

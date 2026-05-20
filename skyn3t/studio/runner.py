@@ -1039,7 +1039,7 @@ class StudioRunner:
                             agent.execute(task), timeout=_stage_to
                         )
                 except _asyncio.TimeoutError:
-                    timeout_secs = int(_stage_to) if _stage_to is not None else 0
+                    timeout_secs = 0 if _stage_to is None else int(_stage_to)
                     stage_error = f"stage timeout (>{timeout_secs}s)"
                     self._publish(
                         "PROJECT_STAGE_FAILED",
@@ -2468,7 +2468,7 @@ class StudioRunner:
                 )
             elif is_stub_bail:
                 # Cap the retry depth — prevent infinite stub loops.
-                retry_depth = str(slug).split("-retry") - 1
+                retry_depth = str(slug).count("-retry")
                 if retry_depth >= 3:
                     manifest["next_action"] = (
                         "Project failed: unresolved stub error persisted "

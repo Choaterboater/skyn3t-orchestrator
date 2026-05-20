@@ -417,13 +417,14 @@ class TestEdgeCases:
         _write(scaffold, "src/App.jsx", "export default function App(){return null;}")
         # No Settings.jsx or useConfig.js — but also no env vars.
         _write(artifact, "Dockerfile", "FROM python:3.12-slim\n")
-        _write(artifact, "docker-compose.yml", "services:\n  app:\n    build: .\n")
+        _write(artifact, "docker-compose.yml", "services:\n  app:\n    build: .\n  frontend:\n    build: ./scaffold\n")
+        _write(artifact, "requirements.txt", "fastapi\nuvicorn\n")
         _write(artifact, "main.py", "from fastapi import FastAPI\napp = FastAPI()\n")
-        _write(artifact, "README.md", "# FS\n" + ("docs " * 25))
+        _write(artifact, "README.md", "# FS\n" + ("Documentation for the fullstack demo application. " * 10))
         _write(artifact, ".gitignore", "node_modules/\n.env\n")
         # No .env.example — simulating zero-config.
         score, gaps, family = _make_reviewer()._packaging_score(artifact)
         assert family == "fullstack"
-        # Web layer auto-scores (2) + server (4) + combo (1) = 7, plus readme (3) + gitignore (2) = 12 -> capped at 10
+        # readme (3) + gitignore (2) + web zero-config (2) + server (2) + combo (1) = 10
         assert score == 10
         assert gaps == []

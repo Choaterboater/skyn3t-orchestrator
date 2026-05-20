@@ -726,7 +726,7 @@ async def apply_targeted_fix(
                 str((scaffold_dir / p).resolve())
                 for p in (changed + created)
             ]
-            agent._backfill_unresolved_local_imports(
+            await agent._backfill_unresolved_local_imports(
                 out_dir=scaffold_dir,
                 files_written=written_abs,
                 stack=stack,
