@@ -989,6 +989,123 @@ class TestStudioRunner:
         assert manifest["completed_at"] is not None
         assert manifest["history"][-1]["event"] == "PROJECT_FAILED"
 
+    async def test_start_failure_posts_thread_update_when_telegram_context_exists(
+        self, event_bus, tmp_path, monkeypatch
+    ):
+        from skyn3t.studio.runner import StudioRunner
+
+        monkeypatch.setattr(
+            "skyn3t.studio.runner.get_template",
+            lambda _key: SimpleNamespace(
+                title="Auto template",
+                description="Auto plan the run.",
+                stages=[],
+            ),
+        )
+
+        async def fail_plan_pipeline(*args, **kwargs):
+            raise RuntimeError("planner offline")
+
+        monkeypatch.setattr(
+            "skyn3t.studio.planner.plan_pipeline",
+            fail_plan_pipeline,
+        )
+
+        runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
+        runner.reserve_project("auto", "Plan a rollout", slug="demo-telegram-fail")
+        updates = []
+
+        async def fake_thread_update(manifest, content):
+            updates.append(
+                {
+                    "starter_message_id": (manifest.get("telegram") or {}).get("starter_message_id"),
+                    "content": content,
+                }
+            )
+
+        monkeypatch.setattr(runner, "_post_discord_thread_update", fake_thread_update)
+
+        with pytest.raises(RuntimeError, match="planner offline"):
+            await runner.start(
+                "auto",
+                "Plan a rollout",
+                slug="demo-telegram-fail",
+                extra={
+                    "source": "telegram:42",
+                    "telegram": {"chat_id": "42", "starter_message_id": 321},
+                },
+            )
+
+        manifest = runner.get_project("demo-telegram-fail")
+        assert manifest is not None
+        assert manifest["telegram"]["starter_message_id"] == 321
+        assert updates == [
+            {
+                "starter_message_id": 321,
+                "content": "❌ **FAILED** — RuntimeError: planner offline\n"
+                "Project stopped before the swarm could finish starting.",
+            }
+        ]
+
+    async def test_start_failure_after_reserve_persists_telegram_context(
+        self, event_bus, tmp_path, monkeypatch
+    ):
+        from skyn3t.studio.runner import StudioRunner
+
+        monkeypatch.setattr(
+            "skyn3t.studio.runner.get_template",
+            lambda _key: SimpleNamespace(
+                title="Demo template",
+                description="Crash after reserve.",
+                stages=[SimpleNamespace(name="writer", agent="WriterAgent", capability="copywriting")],
+            ),
+        )
+
+        runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
+        updates = []
+
+        async def fake_thread_update(manifest, content):
+            updates.append(
+                {
+                    "starter_message_id": (manifest.get("telegram") or {}).get("starter_message_id"),
+                    "content": content,
+                }
+            )
+
+        workflow_calls = 0
+
+        def fail_workflow(*args, **kwargs):
+            nonlocal workflow_calls
+            workflow_calls += 1
+            if workflow_calls == 1:
+                return {"stages": ["writer"]}
+            raise RuntimeError("workflow summary crashed")
+
+        monkeypatch.setattr(runner, "_post_discord_thread_update", fake_thread_update)
+        monkeypatch.setattr(runner, "_workflow_from_template", fail_workflow)
+
+        with pytest.raises(RuntimeError, match="workflow summary crashed"):
+            await runner.start(
+                "demo",
+                "Ship the draft",
+                slug="demo-telegram-post-reserve-fail",
+                extra={
+                    "source": "telegram:42",
+                    "telegram": {"chat_id": "42", "starter_message_id": 654},
+                },
+            )
+
+        manifest = runner.get_project("demo-telegram-post-reserve-fail")
+        assert manifest is not None
+        assert manifest["telegram"]["starter_message_id"] == 654
+        assert updates == [
+            {
+                "starter_message_id": 654,
+                "content": "❌ **FAILED** — RuntimeError: workflow summary crashed\n"
+                "Project stopped before the swarm could finish starting.",
+            }
+        ]
+
     async def test_resume_marks_manifest_failed_when_replanning_crashes(
         self, event_bus, tmp_path, monkeypatch
     ):

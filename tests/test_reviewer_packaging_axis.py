@@ -39,6 +39,7 @@ def _make_web_artifact(tmp_path: Path, *, with_settings: bool, with_useconfig: b
         "devDependencies": {"vite": "^5"},
     }))
     _write(scaffold, "src/App.jsx", "export default function App(){return null;}")
+    _write(scaffold, "src/api.js", "const url = import.meta.env.VITE_API_URL;\n")
     if with_settings:
         _write(scaffold, "src/Settings.jsx", "export default function Settings(){return null;}")
     if with_useconfig:
@@ -100,6 +101,21 @@ def _make_fullstack_artifact(tmp_path: Path, *, frontend_in_compose: bool) -> Pa
     return artifact
 
 
+def _make_zero_config_web_artifact(tmp_path: Path) -> Path:
+    """A react_vite scaffold with no env vars, so Settings UI is not expected."""
+    artifact = tmp_path / "zero-config-web"
+    scaffold = artifact / "scaffold"
+    _write(scaffold, "package.json", json.dumps({
+        "name": "demo",
+        "dependencies": {"react": "^18"},
+        "devDependencies": {"vite": "^5"},
+    }))
+    _write(scaffold, "src/App.jsx", "export default function App(){return <main>Offline app</main>;}")
+    _write(artifact, "README.md", "# Zero config app\n\n" + ("Runs without any setup. " * 15))
+    _write(artifact, ".gitignore", "node_modules/\ndist/\n")
+    return artifact
+
+
 # ---------------------------------------------------------------------------
 # Web tier scoring
 # ---------------------------------------------------------------------------
@@ -140,6 +156,13 @@ class TestWebScoring:
         score, gaps, _ = _make_reviewer()._packaging_score(artifact)
         assert score == 8
         assert any("gitignore" in g.lower() for g in gaps)
+
+    def test_zero_config_web_not_docked_for_missing_settings_ui(self, tmp_path: Path) -> None:
+        artifact = _make_zero_config_web_artifact(tmp_path)
+        score, gaps, family = _make_reviewer()._packaging_score(artifact)
+        assert family == "web"
+        assert score == 10
+        assert gaps == []
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +206,15 @@ class TestServerScoring:
         assert score == 9
         assert any(".env.example" in g for g in gaps)
 
+    def test_compose_yaml_counts_as_compose_manifest(self, tmp_path: Path) -> None:
+        artifact = _make_server_artifact(
+            tmp_path, with_dockerfile=True, with_compose=False, with_env_example=True,
+        )
+        _write(artifact, "compose.yaml", "services:\n  app:\n    build: .\n")
+        score, gaps, _ = _make_reviewer()._packaging_score(artifact)
+        assert score == 10
+        assert not any("docker-compose" in g for g in gaps)
+
 
 # ---------------------------------------------------------------------------
 # Fullstack tier scoring
@@ -202,6 +234,17 @@ class TestFullstackScoring:
         # 3 + 2 + 2 (web) + 2 (server) + 0 (no combo) = 9
         assert score == 9
         assert any("Frontend not wired" in g for g in gaps)
+
+    def test_compose_yaml_counts_for_fullstack_wiring(self, tmp_path: Path) -> None:
+        artifact = _make_fullstack_artifact(tmp_path, frontend_in_compose=True)
+        compose = artifact / "docker-compose.yml"
+        compose_yaml = artifact / "compose.yaml"
+        compose_yaml.write_text(compose.read_text(encoding="utf-8"), encoding="utf-8")
+        compose.unlink()
+        score, gaps, family = _make_reviewer()._packaging_score(artifact)
+        assert family == "fullstack"
+        assert score == 10
+        assert gaps == []
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +270,7 @@ class TestUnknownFamily:
 # ---------------------------------------------------------------------------
 
 class TestBlending:
-    def test_packaging_axis_affects_final_score(self, tmp_path: Path, monkeypatch) -> None:
+    def test_packaging_axis_affects_final_score(self, tmp_path: Path) -> None:
         """End-to-end: a project with full packaging scores higher than one without."""
         # We can't easily run the full reviewer (needs LLM), but we can
         # confirm that _packaging_score returns different values for
@@ -238,9 +281,7 @@ class TestBlending:
         bad_dir = tmp_path / "bad"
         bad = _make_web_artifact(bad_dir, with_settings=False, with_useconfig=False,
                                   with_readme=False, with_gitignore=False)
-        # Clean up the bad artifact's auto-added README/gitignore from the helper
-        # (we passed False but the helper ignores those flags — let's check)
-        # Actually the helper does honor those flags, so bad has neither.
+        # Helper honors all flags; bad has no README, gitignore, Settings, or useConfig.
 
         good_score, _, _ = rev._packaging_score(good)
         bad_score, _, _ = rev._packaging_score(bad)

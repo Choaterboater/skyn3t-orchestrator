@@ -14,6 +14,7 @@ import pytest
 
 from skyn3t.integrations import telegram_bot as tg
 from skyn3t.integrations import telegram_dispatch as tgd
+from skyn3t.config.settings import get_settings
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -55,10 +56,11 @@ class FakeRunner:
 
 
 class _SendCapture:
-    """Captures dispatch.send_message calls so we can assert without
-    needing real HTTP. Returns a fake message object with message_id=1."""
+    """Captures dispatch.send_message and answer_callback calls so we can
+    assert without needing real HTTP."""
     def __init__(self):
         self.calls: List[dict] = []
+        self.ack_calls: List[dict] = []
 
     async def __call__(self, token, chat_id, text, reply_to_message_id=None, reply_markup=None, parse_mode="Markdown"):
         self.calls.append({
@@ -78,7 +80,7 @@ def captured_send(monkeypatch):
     monkeypatch.setattr(tg.dispatch, "send_message", cap)
 
     async def fake_ack(token, cb_id, text=""):
-        return None
+        cap.ack_calls.append({"token": token, "cb_id": cb_id, "text": text})
     monkeypatch.setattr(tg.dispatch, "answer_callback", fake_ack)
     return cap
 
@@ -134,11 +136,19 @@ async def test_build_intent_kicks_off_project(captured_send):
     runner = FakeRunner()
     bot = _bot(runner)
     await bot._handle_message({
-        "from": {"id": "42"}, "chat": {"id": 42}, "text": "build a homelab dashboard",
+        "from": {"id": "42"},
+        "chat": {"id": 42},
+        "message_id": 123,
+        "text": "build a homelab dashboard",
     })
     await asyncio.sleep(0)  # let the create_task fire
     assert len(runner.reserved) == 1
-    assert any("Started" in c["text"] for c in captured_send.calls)
+    assert runner.started[0]["extra"]["telegram"] == {
+        "chat_id": "42",
+        "starter_message_id": 123,
+    }
+    assert captured_send.calls[-1]["reply_to_message_id"] == 123
+    assert "stage updates" in captured_send.calls[-1]["text"]
 
 
 @pytest.mark.asyncio
@@ -221,10 +231,14 @@ async def test_slash_build_with_brief(captured_send):
     runner = FakeRunner()
     bot = _bot(runner)
     await bot._handle_message({
-        "from": {"id": "42"}, "chat": {"id": 42}, "text": "/build a finance tracker",
+        "from": {"id": "42"},
+        "chat": {"id": 42},
+        "message_id": 456,
+        "text": "/build a finance tracker",
     })
     await asyncio.sleep(0)
     assert runner.reserved and "finance" in runner.reserved[0]["brief"]
+    assert runner.started[0]["extra"]["telegram"]["starter_message_id"] == 456
 
 
 @pytest.mark.asyncio
@@ -309,6 +323,7 @@ async def test_malformed_button_data(captured_send):
     })
     # Nothing should have been replied; just an answer_callback for the spinner
     assert captured_send.calls == []
+    assert len(captured_send.ack_calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +334,6 @@ async def test_malformed_button_data(captured_send):
 @pytest.mark.asyncio
 async def test_dispatch_skips_when_unconfigured(monkeypatch):
     # Make settings return no token
-    from skyn3t.config.settings import get_settings
     s = get_settings()
     monkeypatch.setattr(s, "telegram_token", None)
     monkeypatch.setattr(s, "telegram_user_id", None)
@@ -329,7 +343,6 @@ async def test_dispatch_skips_when_unconfigured(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_dispatch_posts_when_configured(monkeypatch):
-    from skyn3t.config.settings import get_settings
     s = get_settings()
     monkeypatch.setattr(s, "telegram_token", "test-token")
     monkeypatch.setattr(s, "telegram_user_id", "42")
@@ -346,7 +359,6 @@ async def test_dispatch_posts_when_configured(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_dispatch_throttles_duplicates(monkeypatch):
-    from skyn3t.config.settings import get_settings
     s = get_settings()
     monkeypatch.setattr(s, "telegram_token", "test-token")
     monkeypatch.setattr(s, "telegram_user_id", "42")

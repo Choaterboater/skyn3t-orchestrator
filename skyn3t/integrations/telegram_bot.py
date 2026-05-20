@@ -320,7 +320,13 @@ class TelegramBot:
         photo_payload = message.get("photo")
         if photo_payload and isinstance(photo_payload, list):
             caption = str(message.get("caption") or "").strip()
-            await self._handle_photo(chat_id, sender, photo_payload, caption)
+            await self._handle_photo(
+                chat_id,
+                sender,
+                photo_payload,
+                caption,
+                source_message_id=int(message.get("message_id") or 0) or None,
+            )
             return
 
         # Document upload (PDFs, brand guidelines, design docs).
@@ -332,7 +338,13 @@ class TelegramBot:
             mime = str(document.get("mime_type") or "").lower()
             if mime.startswith("image/") or mime == "application/pdf":
                 caption = str(message.get("caption") or "").strip()
-                await self._handle_document(chat_id, sender, document, caption)
+                await self._handle_document(
+                    chat_id,
+                    sender,
+                    document,
+                    caption,
+                    source_message_id=int(message.get("message_id") or 0) or None,
+                )
                 return
             else:
                 await self._reply(
@@ -356,7 +368,12 @@ class TelegramBot:
 
         # Slash commands take precedence over the intent parser.
         if text.startswith("/"):
-            await self._handle_slash(chat_id, text)
+            await self._handle_slash(
+                chat_id,
+                text,
+                sender,
+                source_message_id=int(message.get("message_id") or 0) or None,
+            )
             return
 
         intent = parse_intent(text)
@@ -371,7 +388,12 @@ class TelegramBot:
             if not brief:
                 await self._reply(chat_id, "Tell me what to build — e.g. `build a homelab dashboard`.")
                 return
-            await self._do_start(chat_id, brief, intent.slug)
+            await self._do_start(
+                chat_id,
+                brief,
+                intent.slug,
+                source_message_id=int(message.get("message_id") or 0) or None,
+            )
             return
         if intent.action == "status":
             status_slug: Optional[str] = intent.slug or _most_recent_slug(self.studio_runner)
@@ -400,7 +422,9 @@ class TelegramBot:
         # Unknown — show help.
         await self._reply(chat_id, _help_text())
 
-    async def _handle_slash(self, chat_id: int, text: str) -> None:
+    async def _handle_slash(
+        self, chat_id: int, text: str, sender: dict, source_message_id: Optional[int] = None,
+    ) -> None:
         parts = text.split(maxsplit=1)
         cmd = parts[0].lower().lstrip("/").split("@", 1)[0]  # strip @botname suffix
         rest = parts[1].strip() if len(parts) > 1 else ""
@@ -412,7 +436,7 @@ class TelegramBot:
             if not rest:
                 await self._reply(chat_id, "Usage: `/build a homelab dashboard`")
                 return
-            await self._do_start(chat_id, rest, None)
+            await self._do_start(chat_id, rest, None, source_message_id=source_message_id)
             return
         if cmd == "list":
             await self._do_list(chat_id)
@@ -446,7 +470,8 @@ class TelegramBot:
                 return
             if not feedback:
                 await self._reply(chat_id, f"Reply with feedback for `{slug}` and I'll send it back to the architect.")
-                self._pending_reject_slugs[self.allowed_user_id] = slug
+                user_key = str(sender.get("id") or "")
+                self._pending_reject_slugs[user_key] = slug
                 return
             await self._do_reject(chat_id, slug, feedback)
             return
@@ -499,7 +524,13 @@ class TelegramBot:
     # Studio actions
     # ------------------------------------------------------------------
 
-    async def _do_start(self, chat_id: int, brief: str, slug: Optional[str]) -> None:
+    async def _do_start(
+        self,
+        chat_id: int,
+        brief: str,
+        slug: Optional[str],
+        source_message_id: Optional[int] = None,
+    ) -> None:
         if self.studio_runner is None:
             await self._reply(chat_id, "Studio runner not wired.")
             return
@@ -511,7 +542,13 @@ class TelegramBot:
             await self._reply(chat_id, f"Couldn't reserve project: {exc}")
             return
         new_slug = str(manifest.get("slug") or "")
-        extra = {"source": f"telegram:{self.allowed_user_id}"}
+        extra = {
+            "source": f"telegram:{self.allowed_user_id}",
+            "telegram": {
+                "chat_id": str(chat_id),
+                "starter_message_id": source_message_id,
+            },
+        }
 
         # Photo attachment: any photo uploaded by this user in the last
         # 5 minutes auto-attaches. If none, fall back to library search
@@ -526,7 +563,10 @@ class TelegramBot:
         )
         await self._reply(
             chat_id,
-            f"🚀 Started *{new_slug}*. I'll ping you here when the architect needs review.{attach_note}",
+            "🚀 Started "
+            f"*{new_slug}*. I'll keep you posted here with stage updates, failures, "
+            f"and any approval requests if the run pauses.{attach_note}",
+            reply_to_message_id=source_message_id,
         )
 
     def _attach_references_for_new_project(self, brief: str, slug: str) -> list[str]:
@@ -637,7 +677,12 @@ class TelegramBot:
     # ------------------------------------------------------------------
 
     async def _handle_photo(
-        self, chat_id: int, sender: dict, photo_payload: list, caption: str,
+        self,
+        chat_id: int,
+        sender: dict,
+        photo_payload: list,
+        caption: str,
+        source_message_id: Optional[int] = None,
     ) -> None:
         """Ingest a user-uploaded photo as a design reference, then
         kick off vision extraction in the background so the bot can
@@ -707,10 +752,20 @@ class TelegramBot:
         # so it'll attach to this new project automatically.
         if is_build_caption and caption_intent is not None:
             brief = caption_intent.brief or ""
-            await self._do_start(chat_id, brief, caption_intent.slug)
+            await self._do_start(
+                chat_id,
+                brief,
+                caption_intent.slug,
+                source_message_id=source_message_id,
+            )
 
     async def _handle_document(
-        self, chat_id: int, sender: dict, document: dict, caption: str,
+        self,
+        chat_id: int,
+        sender: dict,
+        document: dict,
+        caption: str,
+        source_message_id: Optional[int] = None,
     ) -> None:
         """Ingest a document (PDF or image) as a design reference.
 
@@ -766,7 +821,12 @@ class TelegramBot:
             )
         if is_build_caption and caption_intent is not None:
             brief = caption_intent.brief or ""
-            await self._do_start(chat_id, brief, caption_intent.slug)
+            await self._do_start(
+                chat_id,
+                brief,
+                caption_intent.slug,
+                source_message_id=source_message_id,
+            )
 
     async def _do_references(self, chat_id: int) -> None:
         entries = photos.list_references(self.allowed_user_id)

@@ -208,7 +208,12 @@ class StudioRunner:
         slug = slug or self._slugify(brief or template_key)
         artifact_dir = self.projects_root / slug
         artifact_dir.mkdir(parents=True, exist_ok=True)
+        extra = dict(extra or {})
         manifest = self.get_project(slug)
+        if manifest is not None:
+            manifest = self._normalize_manifest(manifest)
+            if self._merge_telegram_thread_context(manifest, extra):
+                self._save_manifest(artifact_dir, manifest)
         try:
             setup = normalize_mission_setup(mission_setup)
             repo = self._resolved_repo_target(repo_target)
@@ -314,7 +319,6 @@ class StudioRunner:
                             if name not in expected_files:
                                 expected_files.append(name)
                 expected_files = [n for n in expected_files if n != "review.md"]
-                extra = dict(extra or {})
                 extra.setdefault("expected_artifacts", expected_files)
             if manifest is None:
                 manifest = self.reserve_project(
@@ -325,6 +329,8 @@ class StudioRunner:
                     repo_target=repo,
                 )
             manifest = self._normalize_manifest(manifest)
+            if self._merge_telegram_thread_context(manifest, extra):
+                self._save_manifest(artifact_dir, manifest)
             setup = normalize_mission_setup(
                 mission_setup if mission_setup is not None else manifest.get("mission_setup")
             )
@@ -400,11 +406,20 @@ class StudioRunner:
                     return existing
             logger.exception("studio start failed for slug=%s", slug)
             error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-2000:]}"
-            self.mark_project_failed(
+            failed_manifest = self.mark_project_failed(
                 slug,
                 error,
                 next_action="Project stopped before the swarm could finish starting.",
             )
+            if failed_manifest is not None:
+                try:
+                    await self._post_failure_thread_update(
+                        failed_manifest,
+                        f"{type(exc).__name__}: {exc}",
+                        next_action="Project stopped before the swarm could finish starting.",
+                    )
+                except Exception:
+                    logger.exception("failure thread update failed during start")
             raise
 
     async def resume(self, slug: str, answers: List[str]) -> dict:
@@ -514,11 +529,20 @@ class StudioRunner:
         except Exception as exc:
             logger.exception("studio resume failed for slug=%s", slug)
             error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-2000:]}"
-            self.mark_project_failed(
+            failed_manifest = self.mark_project_failed(
                 slug,
                 error,
                 next_action="Project stopped while applying clarification answers.",
             )
+            if failed_manifest is not None:
+                try:
+                    await self._post_failure_thread_update(
+                        failed_manifest,
+                        f"{type(exc).__name__}: {exc}",
+                        next_action="Project stopped while applying clarification answers.",
+                    )
+                except Exception:
+                    logger.exception("failure thread update failed during resume")
             raise
 
     async def resume_after_approval(
@@ -666,6 +690,54 @@ class StudioRunner:
                 await post_thread_reply(int(starter_id), content)
             except Exception:
                 logger.exception("telegram thread update failed")
+
+    @staticmethod
+    def _merge_telegram_thread_context(manifest: dict, extra: Optional[dict]) -> bool:
+        """Persist Telegram reply context from the launch request."""
+        if not isinstance(extra, dict):
+            return False
+        telegram_extra = extra.get("telegram")
+        chat_id = ""
+        starter_message_id: Optional[int] = None
+        if isinstance(telegram_extra, dict):
+            chat_id = str(telegram_extra.get("chat_id") or "").strip()
+            raw_starter = telegram_extra.get("starter_message_id")
+            if raw_starter not in (None, ""):
+                try:
+                    starter_message_id = int(raw_starter)
+                except (TypeError, ValueError):
+                    starter_message_id = None
+        source = str(extra.get("source") or "").strip()
+        if not chat_id and source.startswith("telegram:"):
+            chat_id = source.split(":", 1)[1].strip()
+        if not chat_id and starter_message_id is None:
+            return False
+        telegram_meta = manifest.setdefault("telegram", {})
+        changed = False
+        if chat_id and str(telegram_meta.get("chat_id") or "") != chat_id:
+            telegram_meta["chat_id"] = chat_id
+            changed = True
+        if (
+            starter_message_id is not None
+            and telegram_meta.get("starter_message_id") != starter_message_id
+        ):
+            telegram_meta["starter_message_id"] = starter_message_id
+            changed = True
+        return changed
+
+    async def _post_failure_thread_update(
+        self,
+        manifest: dict,
+        failure_summary: str,
+        *,
+        next_action: Optional[str] = None,
+    ) -> None:
+        headline = str(failure_summary or "Project failed.").splitlines()[0][:600]
+        detail = str(next_action or "").strip()
+        content = f"❌ **FAILED** — {headline}"
+        if detail and detail != headline:
+            content += f"\n{detail[:600]}"
+        await self._post_discord_thread_update(manifest, content)
 
     async def _resume_pipeline_from(self, slug: str, start_index: int) -> dict:
         """Re-enter ``_run_pipeline`` skipping the first ``start_index``
@@ -2422,6 +2494,14 @@ class StudioRunner:
                     slug, exc_info=True,
                 )
             self._publish("PROJECT_FAILED", {"slug": slug, "error": str(exc)})
+            try:
+                await self._post_failure_thread_update(
+                    manifest,
+                    f"{type(exc).__name__}: {exc}",
+                    next_action=manifest.get("next_action"),
+                )
+            except Exception:
+                logger.exception("failure thread update failed")
             raise
 
     def list_projects(self) -> List[dict]:
@@ -4777,14 +4857,19 @@ class StudioRunner:
     ) -> int:
         normalized = (stage_name or "").strip().lower()
         if normalized != "code":
-            return 2 if (execution_profile or "").strip().lower() == "fast" else 3
+            profile = (execution_profile or "").strip().lower()
+            if profile == "fast":
+                return 2
+            elif profile == "deep":
+                return 4
+            return 3
         text = (brief or "").lower()
         visual_signals = (
             "dashboard", "frontend", "front end", "landing page", "website",
             "web app", "ui", "ux", "design", "visual", "theme", "tailwind",
         )
         has_visual_signal = any(
-            re.search(rf"(?<!\w){re.escape(signal)}(?!\w)", text, re.IGNORECASE)
+            re.search(rf"(?<!\w){re.escape(signal)}(?!\w)", text)
             for signal in visual_signals
         )
         profile = (execution_profile or "").strip().lower()

@@ -181,7 +181,7 @@ def _entrypoint_import_instructions(
             continue
         if "components/" not in path.lower():
             continue
-        if not path.endswith((".jsx", ".tsx")):
+        if not path.lower().endswith((".jsx", ".tsx")):
             continue
         component_paths.append(path)
     if not component_paths:
@@ -2978,6 +2978,14 @@ class CodeAgent(BaseAgent):
                 f"}}\n"
             )
         if ext in ("ts", "tsx"):
+            if name.startswith("use"):
+                return (
+                    "// @skyn3t-backfill-stub: for missing import.\n"
+                    f"export function {name}() {{\n"
+                    "  return {};\n"
+                    "}\n"
+                    f"export default {name};\n"
+                )
             return (
                 "// @skyn3t-backfill-stub: for missing import.\n"
                 "export default {};\n"
@@ -2985,6 +2993,14 @@ class CodeAgent(BaseAgent):
         if ext in ("css", "scss"):
             return f"/* @skyn3t-backfill-stub: for missing import ({rel_path}) */\n"
         # js / mjs / cjs / fallback
+        if name.startswith("use"):
+            return (
+                "// @skyn3t-backfill-stub: for missing import.\n"
+                f"export function {name}() {{\n"
+                "  return {};\n"
+                "}\n"
+                f"export default {name};\n"
+            )
         return (
             "// @skyn3t-backfill-stub: for missing import.\n"
             "export default {};\n"

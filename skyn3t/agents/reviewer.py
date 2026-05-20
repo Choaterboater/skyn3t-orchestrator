@@ -59,6 +59,35 @@ _LLM_REVIEW_TIMEOUT_SECONDS = 180.0
 _LLM_CRITIQUE_TIMEOUT_SECONDS = 90.0
 
 
+def _find_compose_file(project_dir: Path) -> Optional[Path]:
+    """Return the first supported Compose manifest in ``project_dir``."""
+    for candidate in (
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yml",
+        "compose.yaml",
+    ):
+        path = project_dir / candidate
+        if path.is_file():
+            return path
+    return None
+
+
+def _has_packaging_env_vars(artifact_dir: Path, scaffold_dir: Path) -> bool:
+    """Mirror PackagingAgent's env-var scan when deciding if web config UI is needed."""
+    try:
+        from skyn3t.agents.env_scanner import scan as scan_env
+    except Exception:
+        # Fall back to the stricter behavior if the scanner can't load.
+        return True
+
+    if scan_env(artifact_dir).vars:
+        return True
+    if scaffold_dir != artifact_dir and scaffold_dir.is_dir() and scan_env(scaffold_dir).vars:
+        return True
+    return False
+
+
 def _llm_bucket_ceiling(score: int) -> int:
     """Deprecated — bucket ceilings (49 / 74 / 100) used to clamp the
     verdict-gate score so a strong heuristic couldn't paper over a weak
@@ -911,27 +940,31 @@ class ReviewerAgent(BaseAgent):
 
         # Family-specific artifacts: 5 points total.
         if family == "web":
-            settings = scaffold_dir / "src" / "Settings.jsx"
-            use_config = scaffold_dir / "src" / "hooks" / "useConfig.js"
-            if settings.is_file():
-                score += 3
+            # PackagingAgent intentionally skips Settings.jsx/useConfig for
+            # zero-config apps; don't dock those runs for omitting a UI that
+            # would be pure scaffolding cruft.
+            if not _has_packaging_env_vars(artifact_dir, scaffold_dir):
+                score += 5
             else:
-                gaps.append("No in-app Settings.jsx (users will be stuck on a .env wall)")
-            if use_config.is_file():
-                score += 2
-            else:
-                gaps.append("No useConfig hook (Settings.jsx has nothing to persist into)")
+                settings = scaffold_dir / "src" / "Settings.jsx"
+                use_config = scaffold_dir / "src" / "hooks" / "useConfig.js"
+                if settings.is_file():
+                    score += 3
+                else:
+                    gaps.append("No in-app Settings.jsx (users will be stuck on a .env wall)")
+                if use_config.is_file():
+                    score += 2
+                else:
+                    gaps.append("No useConfig hook (Settings.jsx has nothing to persist into)")
         elif family == "server":
             dockerfile = artifact_dir / "Dockerfile"
-            compose = (artifact_dir / "docker-compose.yml")
-            if not compose.is_file():
-                compose = artifact_dir / "compose.yaml"
+            compose = _find_compose_file(artifact_dir)
             env_example = artifact_dir / ".env.example"
             if dockerfile.is_file():
                 score += 2
             else:
                 gaps.append("No Dockerfile (users have to write their own)")
-            if compose.is_file():
+            if compose is not None:
                 score += 2
             else:
                 gaps.append("No docker-compose.yml (no one-command quick start)")
@@ -941,15 +974,19 @@ class ReviewerAgent(BaseAgent):
                 gaps.append("No .env.example (operator has to discover env vars from source)")
         elif family == "fullstack":
             # 2 web + 2 server + 1 combo wiring
-            web_ok = (scaffold_dir / "src" / "Settings.jsx").is_file()
-            hook_ok = (scaffold_dir / "src" / "hooks" / "useConfig.js").is_file()
             docker_ok = (artifact_dir / "Dockerfile").is_file()
-            compose_path = artifact_dir / "docker-compose.yml"
-            compose_ok = compose_path.is_file()
-            if web_ok and hook_ok:
-                score += 2
+            compose_path = _find_compose_file(artifact_dir)
+            compose_ok = compose_path is not None
+            # Zero-config apps skip Settings UI (same logic as web family).
+            if not _has_packaging_env_vars(artifact_dir, scaffold_dir):
+                score += 2  # web layer auto-scores for zero-config
             else:
-                gaps.append("Frontend missing Settings UI / useConfig (web layer)")
+                web_ok = (scaffold_dir / "src" / "Settings.jsx").is_file()
+                hook_ok = (scaffold_dir / "src" / "hooks" / "useConfig.js").is_file()
+                if web_ok and hook_ok:
+                    score += 2
+                else:
+                    gaps.append("Frontend missing Settings UI / useConfig (web layer)")
             if docker_ok and compose_ok:
                 score += 2
             else:
@@ -957,7 +994,7 @@ class ReviewerAgent(BaseAgent):
             # Combo wiring: frontend service in compose + API_BASE_URL
             # default in useConfig.
             wired = False
-            if compose_ok:
+            if compose_path is not None:
                 try:
                     compose_text = compose_path.read_text(encoding="utf-8")
                     if re.search(r"^\s*frontend\s*:", compose_text, re.MULTILINE):

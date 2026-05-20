@@ -442,11 +442,13 @@ def _placeholder_for(rel_path: str) -> str:
     if ext in (".js", ".ts", ".mjs", ".cjs"):
         # Use hook pattern for typical hook imports (useX.ts/useX.js)
         if rel_path.lower().startswith("use") or "/use" in rel_path.lower():
+            hook_name = Path(rel_path).stem or "usePlaceholder"
             return (
                 "// Auto-generated placeholder hook — replace with real implementation.\n"
-                "export default function usePlaceholder() {\n"
+                f"export function {hook_name}() {{\n"
                 "  return {};\n"
                 "}\n"
+                f"export default {hook_name};\n"
             )
         # Use router pattern for typical router imports (router.ts, routes.js, etc.)
         if "router" in rel_path.lower() or "route" in rel_path.lower():

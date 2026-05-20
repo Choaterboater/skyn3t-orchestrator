@@ -60,6 +60,29 @@ class FixRunSummary:
     skipped_reason: str = ""
 
 
+def _backfill_missing_local_imports(scaffold_dir: Path, file_path: str) -> None:
+    """Backfill missing relative imports for a rewritten file when possible."""
+    try:
+        from skyn3t.agents.code_agent import CodeAgent
+        from skyn3t.agents.stack_detector import detect as detect_stack
+    except Exception:
+        return
+
+    artifact_dir = scaffold_dir.parent if scaffold_dir.name == "scaffold" else scaffold_dir
+    stack = detect_stack(artifact_dir).stack
+    if not stack:
+        return
+
+    agent = CodeAgent.__new__(CodeAgent)  # bypass __init__
+    agent._backfill_unresolved_local_imports(
+        out_dir=scaffold_dir,
+        files_written=[str((scaffold_dir / file_path).resolve())],
+        stack=stack,
+        brief="",
+        palette_hexes=None,
+    )
+
+
 # Match any filename-ish token that ends in a known code/asset extension.
 # Permissive — picks up `App.jsx`, src/App.jsx, "tokens.css", brand.md, etc.
 _FILE_TOKEN_RE = re.compile(
@@ -320,10 +343,22 @@ async def _try_fix_one(
         # Write the fix.
         try:
             target.write_text(body, encoding="utf-8")
+            _backfill_missing_local_imports(scaffold_dir, candidate.file_path)
         except OSError as e:
             return FixResult(
                 candidate=candidate, model_used=model,
                 body_len=len(body), error=f"write failed: {e}",
+            )
+        except Exception as e:  # noqa: BLE001
+            try:
+                target.write_text(original, encoding="utf-8")
+            except OSError:
+                pass
+            return FixResult(
+                candidate=candidate,
+                model_used=model,
+                body_len=len(body),
+                error=f"post-write backfill failed: {e}",
             )
         return FixResult(
             candidate=candidate, ok=True, model_used=model, body_len=len(body),
