@@ -4,9 +4,12 @@
 
 A multi-agent orchestrator with a **persistent collective brain**: self-healing, Retrieval-Augmented Generation (RAG), autonomous task execution, and a shared consciousness that lets agents think, learn, and remember together.
 
-## Moving to another computer?
+## Documentation
 
-See [PORTABILITY.md](PORTABILITY.md) for one-command setup on a fresh machine.
+- [SkyN3t summary](docs/skyn3t-summary.md) — what SkyN3t does, how it works, how it differs from Hermes-style systems, and its multi-model LLM approach
+- [Technical flow diagrams](docs/technical_flow_diagram.md) — deeper architecture and execution diagrams
+- [Mission](docs/MISSION.md) — product direction and differentiation
+- [Wishlist](docs/WISHLIST.md) — planned and parked work
 
 ## First Run
 
