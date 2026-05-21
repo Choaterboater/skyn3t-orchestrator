@@ -14,8 +14,8 @@ improves its own code generation capabilities permanently.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 import threading
+from pathlib import Path
 from typing import Callable, Dict, Optional
 
 logger = logging.getLogger("skyn3t.self_healing.learned_generators")
@@ -131,7 +131,7 @@ class LearnedGeneratorManager:
                 return None
 
             # Create a callable that returns this body
-            def make_generator(code: str):
+            def make_generator(code: str) -> Callable[..., str]:
                 def generator(brief: str = "") -> str:  # noqa: ARG001
                     return code
                 return generator

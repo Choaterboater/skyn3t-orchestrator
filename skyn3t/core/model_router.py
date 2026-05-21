@@ -62,6 +62,14 @@ logger = logging.getLogger("skyn3t.core.model_router")
 # Codex is a UI specialist; opus is a reasoning specialist. Use
 # opus for reviewer (judging) and codex for code (generating).
 _TIERS: Dict[str, Tuple[str, Optional[str]]] = {
+    # OpenRouter-first tiers (HTTP-based; no 240s CLI idle-timeout cliff).
+    # Capability-routed per file type — see _resolve_static below.
+    "or_cheap":   ("openrouter", "openrouter/owl-alpha"),
+    "or_ui":      ("openrouter", "xiaomi/mimo-v2-flash"),
+    "or_backend": ("openrouter", "qwen/qwen3-coder"),
+    "or_strong":  ("openrouter", "xiaomi/mimo-v2.5-pro"),
+    "or_docs":    ("openrouter", "openai/gpt-oss-120b:free"),
+    # Local-CLI tiers — kept as safety net via _BACKEND_ALTERNATIVES.
     "cheap":    ("kimi_cli",    None),
     "balanced": ("copilot_cli", None),
     "strong":   ("claude_cli",  "opus"),
@@ -85,10 +93,15 @@ _DEFAULT_STAGE_POLICY: Dict[str, str] = {
     # Code stage uses per-file routing inside CodeAgent (see
     # resolve_model_for_file). The agent-level tier here is just
     # the fallback for non-file-specific LLM calls (planning).
-    "code":               "balanced",
-    "code_agent":         "balanced",
-    "code_improver":      "balanced",
-    "reviewer":           "strong",
+    # Flipped from "balanced" (copilot_cli) to "or_cheap"
+    # (openrouter/owl-alpha free) — copilot_cli was timing out on
+    # most calls, causing ~50min wall-time on builds. OpenRouter is
+    # HTTP-based with a 120s timeout instead of the 240s CLI idle.
+    "code":               "or_cheap",
+    "code_agent":         "or_cheap",
+    "code_improver":      "or_cheap",
+    "reviewer":           "or_strong",
+    "docs":               "or_docs",
 
     # verifiers don't call LLMs — listed for completeness
     "build_verifier":     "cheap",
@@ -219,6 +232,9 @@ _BACKEND_PATH_HINTS: Tuple[str, ...] = (
 # tiers: visual specialist demotes to code specialist (and vice versa);
 # strong reasoner demotes back to code specialist.
 _BACKEND_ALTERNATIVES: Dict[str, Tuple[str, Optional[str]]] = {
+    # OpenRouter demotes to local CLIs only when the scoreboard shows
+    # OR losing on a given stack — keeps the safety net intact.
+    "openrouter":  ("copilot_cli", None),
     "kimi_cli":    ("copilot_cli", None),
     "copilot_cli": ("claude_cli",  "opus"),
     "claude_cli":  ("copilot_cli", None),
@@ -231,6 +247,7 @@ _BACKEND_ALTERNATIVES: Dict[str, Tuple[str, Optional[str]]] = {
 # spend over the project history; tune via ``SKYN3T_ROUTER_BACKEND_COSTS``
 # env var (JSON dict ``{"backend": cost}``) if these drift.
 _BACKEND_COST: Dict[str, float] = {
+    "openrouter":  0.5,     # default model is openrouter/owl-alpha (free)
     "kimi_cli":    1.0,     # subscription-backed CLI, effectively free per call
     "copilot_cli": 1.0,     # GitHub Copilot CLI, included in subscription
     "claude_cli":  3.0,     # Anthropic API per-token, strong model
@@ -551,27 +568,27 @@ def _resolve_static(
         return resolve_model(stage_name)
     rl = rel_path.lower().replace("\\", "/")
 
-    # Critical entrypoint files: route to copilot/codex for reliability.
-    # Empirical from v34/v35: Kimi consistently hangs on App.jsx (the
-    # largest single frontend file — root component with state, drawer,
-    # settings, search, filters). Codex shipped it perfectly in v15.
-    # main.jsx is the Vite/React mount point; same concern.
+    # Critical entrypoint files → OpenRouter UI specialist
+    # (xiaomi/mimo-v2-flash). Same files that empirically broke
+    # local CLIs (Kimi hangs on App.jsx, Copilot times out on
+    # server/index.js) — now routed to an HTTP backend with a
+    # 120s timeout instead of the 240s CLI idle.
     if rl.endswith(("app.jsx", "app.tsx", "main.jsx", "main.tsx")):
-        return _TIERS["ui"]          # copilot_cli + gpt-5.3-codex
+        return _TIERS["or_ui"]       # openrouter + xiaomi/mimo-v2-flash
 
-    # Frontend by path hint OR extension.
+    # Frontend by path hint OR extension → OpenRouter UI specialist.
     if any(h in rl for h in _FRONTEND_PATH_HINTS):
-        return _TIERS["cheap"]  # kimi_cli — visual specialist
+        return _TIERS["or_ui"]
     if rl.endswith(_FRONTEND_EXTS):
-        return _TIERS["cheap"]
+        return _TIERS["or_ui"]
     if rl.endswith(".css") and "/server/" not in rl:
-        return _TIERS["cheap"]
+        return _TIERS["or_ui"]
     if rl.endswith(".html"):
-        return _TIERS["cheap"]
+        return _TIERS["or_ui"]
 
-    # Backend by path hint.
+    # Backend by path hint → OpenRouter code specialist (qwen3-coder).
     if any(h in rl for h in _BACKEND_PATH_HINTS):
-        return _TIERS["balanced"]  # copilot_cli — backend code
+        return _TIERS["or_backend"]  # openrouter + qwen/qwen3-coder
 
     # Default to the stage-level tier.
     return resolve_model(stage_name)

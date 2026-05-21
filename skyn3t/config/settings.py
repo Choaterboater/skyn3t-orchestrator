@@ -88,6 +88,17 @@ class Settings(BaseSettings):
     openrouter_api_key: Optional[str] = Field(default=None, alias="OPENROUTER_API_KEY")
     max_build_cost_usd: float = Field(default=1.0, alias="SKYN3T_MAX_BUILD_COST_USD")
 
+    # When True, Cortex proposals with origin='system' are auto-applied
+    # instead of sitting in the pending queue waiting for user approval.
+    # User-originated proposals still require explicit approval.
+    cortex_auto_approve_system: bool = Field(
+        default=True, alias="SKYN3T_CORTEX_AUTO_APPROVE_SYSTEM"
+    )
+
+    # Execution backend for code agent: inline (fast, no isolation),
+    # docker (real sandbox), or auto (probe docker, fall back to inline).
+    execution_backend: str = Field(default="auto", alias="SKYN3T_EXECUTION_BACKEND")
+
     # Public URL — used in notification embeds (Discord etc.) so users can
     # click through to the dashboard. Leave unset to fall back to
     # http://<web_host>:<web_port>, which is fine for local-only use but

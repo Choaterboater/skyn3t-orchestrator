@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, WebSocketException
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,6 +40,7 @@ from skyn3t.registry.catalog import get_agent_catalog_metadata
 # Global orchestrator instance
 orchestrator: Optional[Orchestrator] = None
 event_bus: Optional[EventBus] = None
+trajectory_logger: Optional[Any] = None
 logger = logging.getLogger("skyn3t.web.app")
 
 
@@ -330,7 +332,7 @@ async def _reset_runtime_services() -> Dict[str, Any]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
-    global orchestrator, event_bus
+    global orchestrator, event_bus, trajectory_logger
 
     settings = get_settings()
 
@@ -347,6 +349,16 @@ async def lifespan(app: FastAPI):
         get_default_tracker().subscribe(event_bus)
     except Exception:
         logger.exception("token tracker subscribe failed")
+
+    # Trajectory logger: captures task-level execution traces for dataset export.
+    try:
+        from skyn3t.observability.trajectory_logger import TrajectoryLogger
+
+        trajectory_logger = TrajectoryLogger()
+        trajectory_logger.subscribe(event_bus)
+    except Exception:
+        logger.exception("trajectory logger subscribe failed")
+        trajectory_logger = None
 
     orchestrator = Orchestrator(event_bus)
     orchestrator.enable_memory()
@@ -756,6 +768,78 @@ async def get_status():
     if not orchestrator:
         return {"status": "not_initialized"}
     return orchestrator.get_system_status()
+
+
+@app.post("/api/search")
+async def search(data: Dict[str, Any]):
+    """Full-text search over messages, tasks, and logs via FTS5.
+
+    Body: {"query": "dashboard", "limit": 20, "table": "messages|tasks|logs|all"}
+    """
+    if not orchestrator or not orchestrator.memory_store:
+        return JSONResponse({"error": "memory not initialized"}, status_code=503)
+    query = str(data.get("query", "")).strip()
+    if not query:
+        return JSONResponse({"error": "query is required"}, status_code=400)
+    limit = max(1, min(100, int(data.get("limit", 20))))
+    table = data.get("table", "all")
+    store = orchestrator.memory_store
+    if table == "messages":
+        results = await store.search_messages(query, limit)
+    elif table == "tasks":
+        results = await store.search_tasks(query, limit)
+    elif table == "logs":
+        results = await store.search_logs(query, limit)
+    else:
+        results = await store.search_all(query, limit)
+    return {"query": query, "table": table, "count": len(results), "results": results}
+
+
+@app.get("/api/insights")
+async def get_system_insights(days: int = 7):
+    """Aggregate telemetry: token usage, stage latency, task stats."""
+    if not orchestrator:
+        return JSONResponse({"error": "orchestrator not initialized"}, status_code=503)
+
+    from skyn3t.intelligence.stage_latency import snapshot as stage_latency_snapshot
+    from skyn3t.observability.token_tracker import get_default_tracker
+
+    token_tracker = get_default_tracker()
+    token_data = token_tracker.per_agent()
+    totals = token_tracker.totals()
+    stages = stage_latency_snapshot()
+
+    # Task stats from memory store
+    task_stats = {}
+    if orchestrator.memory_store:
+        task_stats = await orchestrator.memory_store.get_stats()
+
+    # Agent health
+    agent_health = []
+    for name, agent in orchestrator.agents.items():
+        agent_health.append({
+            "name": name,
+            "type": agent.agent_type,
+            "status": agent.status.value if hasattr(agent.status, "value") else str(agent.status),
+            "queue_size": getattr(agent, "queue_size", 0),
+            "recent_errors": getattr(agent, "recent_errors", [])[-3:],
+        })
+
+    return {
+        "period_days": days,
+        "tokens": {
+            "per_agent": token_data,
+            "totals": totals,
+        },
+        "stages": stages,
+        "tasks": {
+            "success_rate": task_stats.get("success_rate", 0),
+            "total_completed": task_stats.get("total_completed", 0),
+            "total_failed": task_stats.get("total_failed", 0),
+            "total_tasks": task_stats.get("tasks", 0),
+        },
+        "agents": agent_health,
+    }
 
 
 @app.get("/metrics", response_class=PlainTextResponse)
@@ -1677,6 +1761,157 @@ async def get_lesson_scores(limit: int = 10):
     }
 
 
+# ---------------------------------------------------------------------------
+# Skills
+# ---------------------------------------------------------------------------
+
+@app.get("/api/skills")
+async def list_skills(tag: Optional[str] = None, limit: int = 50):
+    """List installed skills, optionally filtered by tag."""
+    from skyn3t.intelligence.skill_library import get_default_library
+
+    lib = get_default_library()
+    limit = _clamp_limit(limit, default=50, hi=200)
+    if tag:
+        skills = lib.find(tag=tag, limit=limit)
+    else:
+        skills = lib.all()[:limit]
+    return {
+        "skills": [
+            {
+                "name": s.name,
+                "slug": s.slug,
+                "description": s.description,
+                "tags": s.tags,
+                "score": s.score,
+                "success_count": s.success_count,
+                "failure_count": s.failure_count,
+                "source": s.source,
+                "last_used_at": s.last_used_at,
+                "created_at": s.created_at,
+            }
+            for s in skills
+        ],
+        "summary": lib.summary(),
+    }
+
+
+@app.post("/api/skills/install")
+async def install_skill(request: Request):
+    """Install a skill from a local path or git URL."""
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    from skyn3t.intelligence.skill_library import get_default_library
+
+    body = await request.json()
+    source = (body.get("source") or "").strip()
+    if not source:
+        return JSONResponse({"error": "source is required"}, status_code=400)
+
+    lib = get_default_library()
+    source_path = Path(source)
+
+    if source_path.exists() and source_path.is_dir():
+        path, findings = lib.import_agent_skill(source_path)
+        if path:
+            return {"installed": path.stem, "warnings": findings}
+        return JSONResponse({"error": "install failed", "flagged": findings}, status_code=400)
+
+    if source.startswith(("http://", "https://", "git@")):
+        with tempfile.TemporaryDirectory() as tmp:
+            if not shutil.which("git"):
+                return JSONResponse({"error": "git is not installed"}, status_code=500)
+            proc = await asyncio.create_subprocess_exec(
+                "git", "clone", "--depth", "1", source, tmp,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                return JSONResponse(
+                    {"error": "git clone failed", "detail": stderr.decode()},
+                    status_code=400,
+                )
+            skill_md = Path(tmp) / "SKILL.md"
+            if not skill_md.exists():
+                subdirs = [d for d in Path(tmp).iterdir() if d.is_dir()]
+                if subdirs:
+                    skill_md = subdirs[0] / "SKILL.md"
+            if not skill_md.exists():
+                return JSONResponse({"error": "No SKILL.md found"}, status_code=400)
+            path, findings = lib.import_agent_skill(skill_md.parent)
+            if path:
+                return {"installed": path.stem, "warnings": findings}
+            return JSONResponse({"error": "install failed", "flagged": findings}, status_code=400)
+
+    return JSONResponse({"error": f"source not found: {source}"}, status_code=400)
+
+
+@app.delete("/api/skills/{name}")
+async def delete_skill(name: str):
+    """Remove a skill by name."""
+    from skyn3t.intelligence.skill_library import get_default_library
+
+    lib = get_default_library()
+    if lib.delete(name):
+        return {"deleted": name}
+    return JSONResponse({"error": f"skill '{name}' not found"}, status_code=404)
+
+
+@app.post("/api/exec")
+async def exec_code(request: Request):
+    """Run code through the configured execution backend (inline or Docker).
+
+    Body:
+      {
+        "code": "print('hello')",
+        "language": "python",     # optional, default python
+        "timeout": 30,            # optional, seconds
+        "memory_mb": 256          # optional, MB
+      }
+    """
+    from skyn3t.config.settings import get_settings
+    from skyn3t.security.sandbox import get_backend
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    code = str(body.get("code") or "").strip()
+    if not code:
+        return JSONResponse({"error": "code is required"}, status_code=400)
+
+    language = str(body.get("language") or "python").lower().strip()
+    timeout = max(1, min(int(body.get("timeout") or 30), 300))
+    memory_mb = max(16, min(int(body.get("memory_mb") or 256), 4096))
+
+    try:
+        settings = get_settings()
+        backend = await get_backend(settings.execution_backend)
+        result = await backend.execute(
+            code,
+            language=language,
+            timeout=timeout,
+            memory_mb=memory_mb,
+        )
+        return {
+            "success": result.success,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "error": result.error,
+            "truncated": result.truncated,
+            "backend": backend.__class__.__name__,
+        }
+    except Exception as e:
+        return JSONResponse(
+            {"error": f"Execution failed: {e}"},
+            status_code=500,
+        )
+
+
 @app.get("/api/usage/totals")
 async def usage_totals():
     """Aggregate token usage across all agents + all projects."""
@@ -1720,6 +1955,113 @@ async def stage_latency_snapshot():
     """
     from skyn3t.intelligence.stage_latency import snapshot
     return {"stages": snapshot()}
+
+
+@app.get("/api/trajectories")
+async def list_trajectories():
+    """List available trajectory JSONL files with record counts."""
+    if not trajectory_logger:
+        return {"files": []}
+    return {"files": trajectory_logger.list_files()}
+
+
+@app.get("/api/trajectories/export")
+async def export_trajectories(
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    agent: Optional[str] = None,
+    outcome: Optional[str] = None,
+):
+    """Export trajectories matching filters as a downloadable JSONL file."""
+    if not trajectory_logger:
+        return JSONResponse({"error": "trajectory logger not initialized"}, status_code=503)
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False, encoding="utf-8") as fh:
+        tmp_path = Path(fh.name)
+    count = trajectory_logger.export_jsonl(
+        tmp_path, from_date=from_date, to_date=to_date, agent=agent, outcome=outcome
+    )
+    if count == 0:
+        tmp_path.unlink(missing_ok=True)
+        return JSONResponse({"error": "no trajectories match filters"}, status_code=404)
+
+    from fastapi.responses import FileResponse
+
+    return FileResponse(
+        path=str(tmp_path),
+        media_type="application/jsonl",
+        filename=f"trajectories_{from_date or 'all'}_{to_date or 'all'}.jsonl",
+    )
+
+
+@app.get("/api/users/{platform}/{platform_id}")
+async def get_user(platform: str, platform_id: str):
+    """Get user profile by platform and platform_id."""
+    if not orchestrator or not orchestrator.memory_store:
+        return JSONResponse({"error": "memory not initialized"}, status_code=503)
+    user = await orchestrator.memory_store.get_user_profile(platform_id, platform)
+    if not user:
+        return JSONResponse({"error": "user not found"}, status_code=404)
+    return user
+
+
+@app.patch("/api/users/{platform}/{platform_id}")
+async def patch_user(platform: str, platform_id: str, data: Dict[str, Any]):
+    """Update user profile."""
+    if not orchestrator or not orchestrator.memory_store:
+        return JSONResponse({"error": "memory not initialized"}, status_code=503)
+    profile = data.get("profile")
+    if not isinstance(profile, dict):
+        return JSONResponse({"error": "profile must be an object"}, status_code=400)
+    ok = await orchestrator.memory_store.update_user_profile(platform_id, platform, profile)
+    if not ok:
+        return JSONResponse({"error": "user not found"}, status_code=404)
+    return {"ok": True}
+
+
+@app.get("/api/schedule/jobs")
+async def list_schedule_jobs():
+    """List all scheduled jobs."""
+    if not orchestrator or not orchestrator.memory_store:
+        return JSONResponse({"error": "memory not initialized"}, status_code=503)
+    jobs = await orchestrator.memory_store.list_scheduled_jobs()
+    return {"jobs": jobs, "count": len(jobs)}
+
+
+@app.post("/api/schedule/jobs")
+async def create_schedule_job(data: Dict[str, Any]):
+    """Create a new scheduled job."""
+    if not orchestrator or not orchestrator.memory_store:
+        return JSONResponse({"error": "memory not initialized"}, status_code=503)
+    name = str(data.get("name", "")).strip()
+    schedule_expr = str(data.get("schedule_expr", "")).strip()
+    if not name or not schedule_expr:
+        return JSONResponse({"error": "name and schedule_expr are required"}, status_code=400)
+    job_id = str(uuid4())
+    await orchestrator.memory_store.save_scheduled_job(
+        job_id=job_id,
+        name=name,
+        schedule_expr=schedule_expr,
+        agent_name=data.get("agent_name"),
+        prompt=data.get("prompt"),
+        enabled=data.get("enabled", True),
+        next_run=None,
+        run_count=0,
+    )
+    return {"job_id": job_id, "name": name, "created": True}
+
+
+@app.delete("/api/schedule/jobs/{job_id}")
+async def delete_schedule_job(job_id: str):
+    """Delete a scheduled job."""
+    if not orchestrator or not orchestrator.memory_store:
+        return JSONResponse({"error": "memory not initialized"}, status_code=503)
+    ok = await orchestrator.memory_store.delete_scheduled_job(job_id)
+    if not ok:
+        return JSONResponse({"error": "job not found"}, status_code=404)
+    return {"deleted": True}
 
 
 @app.get("/api/memory/skills")

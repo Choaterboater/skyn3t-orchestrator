@@ -1,6 +1,8 @@
 """Persistent memory store for SkyN3t — the swarm's long-term memory."""
 
 import asyncio
+import json
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -22,6 +24,9 @@ from skyn3t.core.models import (
 )
 from skyn3t.core.models import (
     Task as TaskModel,
+)
+from skyn3t.core.models import (
+    User as UserModel,
 )
 from skyn3t.memory.database import get_session_maker
 
@@ -779,3 +784,334 @@ class MemoryStore:
                 "total_completed": completed,
                 "total_failed": failed,
             }
+
+    # ------------------------------------------------------------------
+    # FTS5 search
+    # ------------------------------------------------------------------
+
+    async def search_messages(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Full-text search over messages.content via FTS5."""
+        return await self._fts_search(query, "messages", limit)
+
+    async def search_tasks(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Full-text search over tasks.title + tasks.description via FTS5."""
+        return await self._fts_search(query, "tasks", limit)
+
+    async def search_logs(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Full-text search over system_logs.message via FTS5."""
+        return await self._fts_search(query, "logs", limit)
+
+    async def search_all(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Full-text search across messages, tasks, and logs via FTS5."""
+        return await self._fts_search(query, None, limit)
+
+    async def _fts_search(self, query: str, table_name: Optional[str], limit: int) -> List[Dict[str, Any]]:
+        """Core FTS5 search implementation."""
+        async with await self._session() as session:
+            from sqlalchemy import text
+            sql = """
+                SELECT table_name, record_id
+                FROM fts_search
+                WHERE content MATCH :query
+            """
+            params: Dict[str, Any] = {"query": query, "limit": limit}
+            if table_name:
+                sql += " AND table_name = :table_name"
+                params["table_name"] = table_name
+            sql += " LIMIT :limit"
+            result = await session.execute(text(sql), params)
+            rows = result.fetchall()
+
+            # Resolve actual records
+            out: List[Dict[str, Any]] = []
+            for row in rows:
+                tname, rid = row.table_name, row.record_id
+                if tname == "messages":
+                    msg_result = await session.execute(
+                        select(MessageModel).where(MessageModel.id == rid)
+                    )
+                    msg = msg_result.scalar_one_or_none()
+                    if msg:
+                        out.append({
+                            "table": "messages",
+                            "id": msg.id,
+                            "source_agent": msg.source_agent,
+                            "target_agent": msg.target_agent,
+                            "content": msg.content,
+                            "created_at": msg.created_at.isoformat() if msg.created_at else None,
+                        })
+                elif tname == "tasks":
+                    task_result = await session.execute(
+                        select(TaskModel).where(TaskModel.id == rid)
+                    )
+                    task = task_result.scalar_one_or_none()
+                    if task:
+                        out.append({
+                            "table": "tasks",
+                            "id": task.id,
+                            "title": task.title,
+                            "description": task.description,
+                            "status": task.status.value if task.status else None,
+                            "created_at": task.created_at.isoformat() if task.created_at else None,
+                        })
+                elif tname == "logs":
+                    log_result = await session.execute(
+                        select(SystemLog).where(SystemLog.id == rid)
+                    )
+                    log = log_result.scalar_one_or_none()
+                    if log:
+                        out.append({
+                            "table": "logs",
+                            "id": log.id,
+                            "level": log.level,
+                            "source": log.source,
+                            "message": log.message,
+                            "created_at": log.created_at.isoformat() if log.created_at else None,
+                        })
+            return out
+
+    async def rebuild_fts_index(self) -> Dict[str, Any]:
+        """Drop and rebuild the FTS5 index from existing data."""
+        async with self._lock:
+            async with await self._session() as session:
+                async with session.begin():
+                    from sqlalchemy import text
+                    await session.execute(text("DELETE FROM fts_search"))
+                    # Re-index messages
+                    msg_result = await session.execute(select(MessageModel))
+                    for msg in msg_result.scalars().all():
+                        await session.execute(text(
+                            "INSERT INTO fts_search(content, table_name, record_id) VALUES (:c, 'messages', :id)"
+                        ), {"c": msg.content, "id": msg.id})
+                    # Re-index tasks
+                    task_result = await session.execute(select(TaskModel))
+                    for task in task_result.scalars().all():
+                        content = f"{task.title or ''} {task.description or ''}"
+                        await session.execute(text(
+                            "INSERT INTO fts_search(content, table_name, record_id) VALUES (:c, 'tasks', :id)"
+                        ), {"c": content, "id": task.id})
+                    # Re-index logs
+                    log_result = await session.execute(select(SystemLog))
+                    for log in log_result.scalars().all():
+                        await session.execute(text(
+                            "INSERT INTO fts_search(content, table_name, record_id) VALUES (:c, 'logs', :id)"
+                        ), {"c": log.message, "id": log.id})
+        return {"rebuilt": True}
+
+    # ------------------------------------------------------------------
+    # Users
+    # ------------------------------------------------------------------
+
+    async def get_or_create_user(self, platform_id: str, platform: str,
+                                 display_name: Optional[str] = None) -> Dict[str, Any]:
+        """Get existing user or create a new one."""
+        async with self._lock:
+            async with await self._session() as session:
+                async with session.begin():
+                    result = await session.execute(
+                        select(UserModel).where(
+                            UserModel.platform_id == platform_id,
+                            UserModel.platform == platform,
+                        )
+                    )
+                    user = result.scalar_one_or_none()
+                    if user:
+                        if display_name and user.display_name != display_name:
+                            user.display_name = display_name
+                        return {
+                            "id": user.id,
+                            "platform_id": user.platform_id,
+                            "platform": user.platform,
+                            "display_name": user.display_name,
+                            "profile": json.loads(user.profile_json) if user.profile_json else {},
+                            "message_count": user.message_count,
+                            "session_count": user.session_count,
+                            "created_at": user.created_at.isoformat() if user.created_at else None,
+                            "updated_at": user.updated_at.isoformat() if user.updated_at else None,
+                        }
+                    user = UserModel(
+                        id=str(uuid.uuid4()),
+                        platform_id=platform_id,
+                        platform=platform,
+                        display_name=display_name,
+                        profile_json="{}",
+                    )
+                    session.add(user)
+                    return {
+                        "id": user.id,
+                        "platform_id": user.platform_id,
+                        "platform": user.platform,
+                        "display_name": user.display_name,
+                        "profile": {},
+                        "message_count": 0,
+                        "session_count": 0,
+                        "created_at": user.created_at.isoformat() if user.created_at else None,
+                        "updated_at": user.updated_at.isoformat() if user.updated_at else None,
+                    }
+
+    async def get_user_profile(self, platform_id: str, platform: str) -> Optional[Dict[str, Any]]:
+        """Get user profile by platform id."""
+        async with await self._session() as session:
+            result = await session.execute(
+                select(UserModel).where(
+                    UserModel.platform_id == platform_id,
+                    UserModel.platform == platform,
+                )
+            )
+            user = result.scalar_one_or_none()
+            if not user:
+                return None
+            return {
+                "id": user.id,
+                "platform_id": user.platform_id,
+                "platform": user.platform,
+                "display_name": user.display_name,
+                "profile": json.loads(user.profile_json) if user.profile_json else {},
+                "message_count": user.message_count,
+                "session_count": user.session_count,
+                "created_at": user.created_at.isoformat() if user.created_at else None,
+                "updated_at": user.updated_at.isoformat() if user.updated_at else None,
+            }
+
+    async def update_user_profile(self, platform_id: str, platform: str,
+                                  profile: Dict[str, Any]) -> bool:
+        """Merge profile updates into an existing user."""
+        async with self._lock:
+            async with await self._session() as session:
+                async with session.begin():
+                    result = await session.execute(
+                        select(UserModel).where(
+                            UserModel.platform_id == platform_id,
+                            UserModel.platform == platform,
+                        )
+                    )
+                    user = result.scalar_one_or_none()
+                    if not user:
+                        return False
+                    existing = json.loads(user.profile_json) if user.profile_json else {}
+                    existing.update(profile)
+                    user.profile_json = json.dumps(existing)
+                    return True
+
+    async def increment_user_stats(self, platform_id: str, platform: str,
+                                   messages: int = 0, sessions: int = 0) -> bool:
+        """Bump message/session counters for a user."""
+        async with self._lock:
+            async with await self._session() as session:
+                async with session.begin():
+                    result = await session.execute(
+                        select(UserModel).where(
+                            UserModel.platform_id == platform_id,
+                            UserModel.platform == platform,
+                        )
+                    )
+                    user = result.scalar_one_or_none()
+                    if not user:
+                        return False
+                    user.message_count += messages
+                    user.session_count += sessions
+                    return True
+
+    # ------------------------------------------------------------------
+    # Scheduled jobs
+    # ------------------------------------------------------------------
+
+    async def save_scheduled_job(self, job_id: str, name: str, schedule_expr: str,
+                                 agent_name: Optional[str] = None,
+                                 prompt: Optional[str] = None,
+                                 enabled: bool = True,
+                                 last_run: Optional[datetime] = None,
+                                 next_run: Optional[datetime] = None,
+                                 run_count: int = 0) -> None:
+        """Upsert a scheduled job."""
+        from skyn3t.core.models import ScheduledJob as ScheduledJobModel
+        async with self._lock:
+            async with await self._session() as session:
+                async with session.begin():
+                    result = await session.execute(
+                        select(ScheduledJobModel).where(ScheduledJobModel.id == job_id)
+                    )
+                    existing = result.scalar_one_or_none()
+                    if existing:
+                        existing.name = name
+                        existing.schedule_expr = schedule_expr
+                        existing.agent_name = agent_name
+                        existing.prompt = prompt
+                        existing.enabled = enabled
+                        existing.last_run = last_run
+                        existing.next_run = next_run
+                        existing.run_count = run_count
+                    else:
+                        session.add(ScheduledJobModel(
+                            id=job_id,
+                            name=name,
+                            schedule_expr=schedule_expr,
+                            agent_name=agent_name,
+                            prompt=prompt,
+                            enabled=enabled,
+                            last_run=last_run,
+                            next_run=next_run,
+                            run_count=run_count,
+                        ))
+
+    async def get_scheduled_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Get a scheduled job by ID."""
+        from skyn3t.core.models import ScheduledJob as ScheduledJobModel
+        async with await self._session() as session:
+            result = await session.execute(
+                select(ScheduledJobModel).where(ScheduledJobModel.id == job_id)
+            )
+            job = result.scalar_one_or_none()
+            if not job:
+                return None
+            return {
+                "id": job.id,
+                "name": job.name,
+                "schedule_expr": job.schedule_expr,
+                "agent_name": job.agent_name,
+                "prompt": job.prompt,
+                "enabled": job.enabled,
+                "last_run": job.last_run.isoformat() if job.last_run else None,
+                "next_run": job.next_run.isoformat() if job.next_run else None,
+                "run_count": job.run_count,
+                "created_at": job.created_at.isoformat() if job.created_at else None,
+            }
+
+    async def list_scheduled_jobs(self, enabled_only: bool = False) -> List[Dict[str, Any]]:
+        """List all scheduled jobs."""
+        from skyn3t.core.models import ScheduledJob as ScheduledJobModel
+        async with await self._session() as session:
+            query = select(ScheduledJobModel).order_by(ScheduledJobModel.created_at)
+            if enabled_only:
+                query = query.where(ScheduledJobModel.enabled)
+            result = await session.execute(query)
+            return [
+                {
+                    "id": job.id,
+                    "name": job.name,
+                    "schedule_expr": job.schedule_expr,
+                    "agent_name": job.agent_name,
+                    "prompt": job.prompt,
+                    "enabled": job.enabled,
+                    "last_run": job.last_run.isoformat() if job.last_run else None,
+                    "next_run": job.next_run.isoformat() if job.next_run else None,
+                    "run_count": job.run_count,
+                    "created_at": job.created_at.isoformat() if job.created_at else None,
+                }
+                for job in result.scalars().all()
+            ]
+
+    async def delete_scheduled_job(self, job_id: str) -> bool:
+        """Delete a scheduled job."""
+        from skyn3t.core.models import ScheduledJob as ScheduledJobModel
+        async with self._lock:
+            async with await self._session() as session:
+                async with session.begin():
+                    result = await session.execute(
+                        select(ScheduledJobModel).where(ScheduledJobModel.id == job_id)
+                    )
+                    job = result.scalar_one_or_none()
+                    if not job:
+                        return False
+                    await session.delete(job)
+                    return True

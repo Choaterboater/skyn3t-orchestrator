@@ -184,6 +184,41 @@ class SystemLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
 
 
+class User(Base):
+    """User profile for cross-session personalization."""
+
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    platform_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    platform: Mapped[str] = mapped_column(String(50), nullable=False)
+    display_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    profile_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    message_count: Mapped[int] = mapped_column(Integer, default=0)
+    session_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=func.now(), onupdate=func.now()
+    )
+
+
+class ScheduledJob(Base):
+    """Persisted scheduled job for the scheduler agent."""
+
+    __tablename__ = "scheduled_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    schedule_expr: Mapped[str] = mapped_column(Text, nullable=False)
+    agent_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_run: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    next_run: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    run_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+
+
 async def init_db() -> None:
     """Initialize the database."""
     from skyn3t.memory.database import get_engine
@@ -191,6 +226,68 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_ensure_added_columns)
+        await conn.run_sync(_init_fts5)
+
+
+def _init_fts5(sync_conn) -> None:
+    """Create FTS5 virtual table and sync triggers for full-text search.
+
+    Uses a contentless FTS5 table so no schema changes are needed on
+    existing tables.  Inserts are synced via triggers; deletes are not
+    (data is append-only in practice).  A rebuild method is available
+    in MemoryStore for the rare case old rows need purging.
+    """
+    from sqlalchemy import text
+
+    sync_conn.execute(text(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS fts_search USING fts5(
+            content,
+            table_name UNINDEXED,
+            record_id UNINDEXED
+        )
+        """
+    ))
+
+    # Messages
+    sync_conn.execute(text(
+        """
+        CREATE TRIGGER IF NOT EXISTS fts_messages_insert
+        AFTER INSERT ON messages
+        BEGIN
+            INSERT INTO fts_search(content, table_name, record_id)
+            VALUES (NEW.content, 'messages', NEW.id);
+        END
+        """
+    ))
+
+    # Tasks (title + description)
+    sync_conn.execute(text(
+        """
+        CREATE TRIGGER IF NOT EXISTS fts_tasks_insert
+        AFTER INSERT ON tasks
+        BEGIN
+            INSERT INTO fts_search(content, table_name, record_id)
+            VALUES (
+                COALESCE(NEW.title, '') || ' ' || COALESCE(NEW.description, ''),
+                'tasks',
+                NEW.id
+            );
+        END
+        """
+    ))
+
+    # System logs
+    sync_conn.execute(text(
+        """
+        CREATE TRIGGER IF NOT EXISTS fts_logs_insert
+        AFTER INSERT ON system_logs
+        BEGIN
+            INSERT INTO fts_search(content, table_name, record_id)
+            VALUES (NEW.message, 'logs', NEW.id);
+        END
+        """
+    ))
 
 
 def _ensure_added_columns(sync_conn) -> None:

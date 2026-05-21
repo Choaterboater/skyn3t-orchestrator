@@ -8,6 +8,19 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def disable_cli_backends(monkeypatch):
+    """Prevent LLMClient from spawning real CLI subprocesses in tests."""
+
+    async def _fake_probe_version(binary: str) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        "skyn3t.adapters.llm_client._probe_version", _fake_probe_version
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
 def isolate_runtime_state(tmp_path_factory, monkeypatch):
     runtime_root = tmp_path_factory.mktemp("runtime-state")
     data_dir = runtime_root / "data"
@@ -22,6 +35,10 @@ def isolate_runtime_state(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
     monkeypatch.setenv("SECRET_STORAGE_PATH", str(secrets_path))
     monkeypatch.setenv("AUDIT_LOG_DIR", str(audit_dir))
+    # Prevent real OpenRouter calls in tests (scaffold entrypoint fast-path).
+    monkeypatch.setenv("OPENROUTER_API_KEY", "")
+    # Force inline execution backend so tests don't pull Docker images.
+    monkeypatch.setenv("SKYN3T_EXECUTION_BACKEND", "inline")
 
     import skyn3t.memory.database as memory_database
     from skyn3t.config.settings import get_settings
@@ -29,9 +46,12 @@ def isolate_runtime_state(tmp_path_factory, monkeypatch):
     from skyn3t.memory.database import close_engine
 
     get_settings.cache_clear()
-    close_engine()
+    try:
+        asyncio.run(close_engine())
+    except Exception:
+        pass
     memory_database._async_session_maker = None
-    asyncio.get_event_loop().run_until_complete(init_db())
+    asyncio.run(init_db())
     try:
         import skyn3t.cortex.proposals as proposals_module
 
@@ -41,7 +61,10 @@ def isolate_runtime_state(tmp_path_factory, monkeypatch):
 
     yield Path(runtime_root)
 
-    asyncio.get_event_loop().run_until_complete(close_engine())
+    try:
+        asyncio.run(close_engine())
+    except Exception:
+        pass
     memory_database._async_session_maker = None
     get_settings.cache_clear()
     try:

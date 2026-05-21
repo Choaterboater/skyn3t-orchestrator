@@ -127,18 +127,18 @@ def test_cost_demote_prefers_cheaper_when_both_winning(scoreboard):
     gpt-5.3-codex). Seed both copilot_cli (cost 1.0) and claude_cli
     (cost 3.0) with high win rates → cost demote should NOT fire
     (the alt is more expensive, not less)."""
-    # Static for src/App.jsx returns ("copilot_cli", "gpt-5.3-codex").
+    # Static for src/App.jsx returns ("openrouter", "gpt-5.3-codex").
     backend_static, _ = _resolve_static("src/App.jsx")
-    assert backend_static == "copilot_cli"
+    assert backend_static == "openrouter"
 
-    _seed_wins(scoreboard, "react_vite", "copilot_cli", wins=8, losses=2)  # 0.8
-    _seed_wins(scoreboard, "react_vite", "claude_cli", wins=8, losses=2)   # 0.8
+    _seed_wins(scoreboard, "react_vite", "openrouter", wins=8, losses=2)  # 0.8
+    _seed_wins(scoreboard, "react_vite", "copilot_cli", wins=8, losses=2)   # 0.8
     out = resolve_model_for_file(
         "src/App.jsx", stack="react_vite", scoreboard=scoreboard,
     )
     # Alternative for copilot_cli is claude_cli, which costs MORE.
     # Cost demote must NOT fire.
-    assert out[0] == "copilot_cli"
+    assert out[0] == "openrouter"
 
 
 def test_cost_demote_fires_when_alt_meaningfully_cheaper(monkeypatch, scoreboard):
@@ -148,16 +148,16 @@ def test_cost_demote_fires_when_alt_meaningfully_cheaper(monkeypatch, scoreboard
     # Make copilot_cli artificially expensive vs claude_cli.
     monkeypatch.setenv(
         "SKYN3T_ROUTER_BACKEND_COSTS",
-        json.dumps({"copilot_cli": 10.0, "claude_cli": 1.0}),
+        json.dumps({"openrouter": 10.0, "copilot_cli": 1.0}),
     )
-    _seed_wins(scoreboard, "react_vite", "copilot_cli", wins=8, losses=2)  # 0.8
-    _seed_wins(scoreboard, "react_vite", "claude_cli", wins=8, losses=2)   # 0.8
+    _seed_wins(scoreboard, "react_vite", "openrouter", wins=8, losses=2)  # 0.8
+    _seed_wins(scoreboard, "react_vite", "copilot_cli", wins=8, losses=2)   # 0.8
     out = resolve_model_for_file(
         "src/App.jsx", stack="react_vite", scoreboard=scoreboard,
     )
     # copilot_cli's cost/success = 10/0.8 = 12.5
     # claude_cli's cost/success = 1/0.8 = 1.25 → 90% savings, fires
-    assert out[0] == "claude_cli"
+    assert out[0] == "copilot_cli"
 
 
 def test_cost_demote_does_not_fire_below_savings_threshold(monkeypatch, scoreboard):
@@ -167,14 +167,14 @@ def test_cost_demote_does_not_fire_below_savings_threshold(monkeypatch, scoreboa
     # savings = (1.0/0.8 - 0.76/0.8) / (1.0/0.8) = 0.24
     monkeypatch.setenv(
         "SKYN3T_ROUTER_BACKEND_COSTS",
-        json.dumps({"copilot_cli": 1.0, "claude_cli": 0.76}),
+        json.dumps({"openrouter": 1.0, "copilot_cli": 0.76}),
     )
+    _seed_wins(scoreboard, "react_vite", "openrouter", wins=8, losses=2)
     _seed_wins(scoreboard, "react_vite", "copilot_cli", wins=8, losses=2)
-    _seed_wins(scoreboard, "react_vite", "claude_cli", wins=8, losses=2)
     out = resolve_model_for_file(
         "src/App.jsx", stack="react_vite", scoreboard=scoreboard,
     )
-    assert out[0] == "copilot_cli"
+    assert out[0] == "openrouter"
 
 
 def test_cost_demote_savings_threshold_env_overridable(monkeypatch, scoreboard):
@@ -182,15 +182,15 @@ def test_cost_demote_savings_threshold_env_overridable(monkeypatch, scoreboard):
     import json
     monkeypatch.setenv(
         "SKYN3T_ROUTER_BACKEND_COSTS",
-        json.dumps({"copilot_cli": 1.0, "claude_cli": 0.76}),
+        json.dumps({"openrouter": 1.0, "copilot_cli": 0.76}),
     )
     monkeypatch.setenv("SKYN3T_ROUTER_COST_SAVINGS", "0.1")
+    _seed_wins(scoreboard, "react_vite", "openrouter", wins=8, losses=2)
     _seed_wins(scoreboard, "react_vite", "copilot_cli", wins=8, losses=2)
-    _seed_wins(scoreboard, "react_vite", "claude_cli", wins=8, losses=2)
     out = resolve_model_for_file(
         "src/App.jsx", stack="react_vite", scoreboard=scoreboard,
     )
-    assert out[0] == "claude_cli"
+    assert out[0] == "copilot_cli"
 
 
 def test_cost_demote_disabled_by_env(monkeypatch, scoreboard):
@@ -199,15 +199,15 @@ def test_cost_demote_disabled_by_env(monkeypatch, scoreboard):
     monkeypatch.setenv("SKYN3T_ROUTER_COST_WEIGHTED", "0")
     monkeypatch.setenv(
         "SKYN3T_ROUTER_BACKEND_COSTS",
-        json.dumps({"copilot_cli": 100.0, "claude_cli": 1.0}),
+        json.dumps({"openrouter": 100.0, "copilot_cli": 1.0}),
     )
+    _seed_wins(scoreboard, "react_vite", "openrouter", wins=8, losses=2)
     _seed_wins(scoreboard, "react_vite", "copilot_cli", wins=8, losses=2)
-    _seed_wins(scoreboard, "react_vite", "claude_cli", wins=8, losses=2)
     out = resolve_model_for_file(
         "src/App.jsx", stack="react_vite", scoreboard=scoreboard,
     )
     # Even with extreme cost difference, kill switch forces static.
-    assert out[0] == "copilot_cli"
+    assert out[0] == "openrouter"
 
 
 def test_cost_demote_skips_when_alt_below_threshold(monkeypatch, scoreboard):
@@ -216,14 +216,14 @@ def test_cost_demote_skips_when_alt_below_threshold(monkeypatch, scoreboard):
     import json
     monkeypatch.setenv(
         "SKYN3T_ROUTER_BACKEND_COSTS",
-        json.dumps({"copilot_cli": 10.0, "claude_cli": 1.0}),
+        json.dumps({"openrouter": 10.0, "copilot_cli": 1.0}),
     )
-    _seed_wins(scoreboard, "react_vite", "copilot_cli", wins=8, losses=2)  # 0.8
-    _seed_wins(scoreboard, "react_vite", "claude_cli", wins=1, losses=9)   # 0.1
+    _seed_wins(scoreboard, "react_vite", "openrouter", wins=8, losses=2)  # 0.8
+    _seed_wins(scoreboard, "react_vite", "copilot_cli", wins=1, losses=9)   # 0.1
     out = resolve_model_for_file(
         "src/App.jsx", stack="react_vite", scoreboard=scoreboard,
     )
-    assert out[0] == "copilot_cli"
+    assert out[0] == "openrouter"
 
 
 def test_failure_demote_takes_precedence_over_cost_demote(monkeypatch, scoreboard):
@@ -234,17 +234,17 @@ def test_failure_demote_takes_precedence_over_cost_demote(monkeypatch, scoreboar
     # theoretically fire, but only failure demote should.
     monkeypatch.setenv(
         "SKYN3T_ROUTER_BACKEND_COSTS",
-        json.dumps({"copilot_cli": 5.0, "claude_cli": 1.0}),
+        json.dumps({"openrouter": 5.0, "copilot_cli": 1.0}),
     )
     # copilot_cli is losing badly → failure demote fires to claude_cli.
-    _seed_wins(scoreboard, "react_vite", "copilot_cli", wins=1, losses=9)  # 0.1
-    _seed_wins(scoreboard, "react_vite", "claude_cli", wins=8, losses=2)   # 0.8
+    _seed_wins(scoreboard, "react_vite", "openrouter", wins=1, losses=9)  # 0.1
+    _seed_wins(scoreboard, "react_vite", "copilot_cli", wins=8, losses=2)   # 0.8
 
     bus = _BusRecorder()
     out = resolve_model_for_file(
         "src/App.jsx", stack="react_vite", scoreboard=scoreboard, event_bus=bus,
     )
-    assert out[0] == "claude_cli"
+    assert out[0] == "copilot_cli"
     decisions = [
         e for e in bus.events
         if e.event_type == EventType.CORTEX_DECISION
@@ -260,10 +260,10 @@ def test_cost_demote_publishes_decision(monkeypatch, scoreboard):
     import json
     monkeypatch.setenv(
         "SKYN3T_ROUTER_BACKEND_COSTS",
-        json.dumps({"copilot_cli": 10.0, "claude_cli": 1.0}),
+        json.dumps({"openrouter": 10.0, "copilot_cli": 1.0}),
     )
+    _seed_wins(scoreboard, "react_vite", "openrouter", wins=8, losses=2)
     _seed_wins(scoreboard, "react_vite", "copilot_cli", wins=8, losses=2)
-    _seed_wins(scoreboard, "react_vite", "claude_cli", wins=8, losses=2)
 
     bus = _BusRecorder()
     resolve_model_for_file(
@@ -276,8 +276,8 @@ def test_cost_demote_publishes_decision(monkeypatch, scoreboard):
     assert len(decisions) == 1
     payload = decisions[0].payload
     assert payload["action"] == "cost_demote_backend"
-    assert payload["input"]["from_backend"] == "copilot_cli"
-    assert payload["input"]["to_backend"] == "claude_cli"
+    assert payload["input"]["from_backend"] == "openrouter"
+    assert payload["input"]["to_backend"] == "copilot_cli"
     assert payload["input"]["relative_savings"] > 0.25
 
 

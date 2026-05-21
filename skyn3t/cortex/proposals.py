@@ -111,6 +111,16 @@ class ProposalStore:
     def create(self, *, kind: str, title: str, summary: str, detail: str,
                 payload: Dict[str, Any] | None = None, source: str = "",
                requires_approval: bool = True, origin: str = "system") -> Proposal:
+        # Auto-approve system-origin proposals when the setting is on.
+        # Curiosity/build-pattern/ingest proposals are low-stakes
+        # self-tuning and shouldn't pile up in the user's queue.
+        if requires_approval and origin == "system":
+            try:
+                from skyn3t.config.settings import get_settings
+                if getattr(get_settings(), "cortex_auto_approve_system", False):
+                    requires_approval = False
+            except Exception:
+                pass
         p = Proposal(kind=kind, title=title, summary=summary, detail=detail,
                      payload=payload or {}, source=source,
                      requires_approval=requires_approval, origin=origin)

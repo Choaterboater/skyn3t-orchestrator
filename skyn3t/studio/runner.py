@@ -702,7 +702,7 @@ class StudioRunner:
         if isinstance(telegram_extra, dict):
             chat_id = str(telegram_extra.get("chat_id") or "").strip()
             raw_starter = telegram_extra.get("starter_message_id")
-            if raw_starter not in (None, ""):
+            if raw_starter not in (None, "") and isinstance(raw_starter, (int, str)):
                 try:
                     starter_message_id = int(raw_starter)
                 except (TypeError, ValueError):

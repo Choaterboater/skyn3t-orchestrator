@@ -129,6 +129,11 @@ class Orchestrator:
         """Enable persistent memory storage."""
         self._memory = memory_store or MemoryStore()
 
+    @property
+    def memory_store(self) -> Optional[MemoryStore]:
+        """Access the persistent memory store."""
+        return getattr(self, "_memory", None)
+
     def enable_consciousness(self, consciousness: Optional[CollectiveConsciousness] = None) -> None:
         """Enable the collective consciousness shared working memory."""
         self._consciousness = consciousness or CollectiveConsciousness(memory_store=self._memory)

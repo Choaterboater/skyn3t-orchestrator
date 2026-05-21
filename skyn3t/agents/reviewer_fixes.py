@@ -60,7 +60,7 @@ class FixRunSummary:
     skipped_reason: str = ""
 
 
-def _backfill_missing_local_imports(scaffold_dir: Path, file_path: str) -> None:
+async def _backfill_missing_local_imports(scaffold_dir: Path, file_path: str) -> None:
     """Backfill missing relative imports for a rewritten file when possible."""
     try:
         from skyn3t.agents.code_agent import CodeAgent
@@ -74,7 +74,7 @@ def _backfill_missing_local_imports(scaffold_dir: Path, file_path: str) -> None:
         return
 
     agent = CodeAgent.__new__(CodeAgent)  # bypass __init__
-    agent._backfill_unresolved_local_imports(
+    await agent._backfill_unresolved_local_imports(
         out_dir=scaffold_dir,
         files_written=[str((scaffold_dir / file_path).resolve())],
         stack=stack,
@@ -343,7 +343,7 @@ async def _try_fix_one(
         # Write the fix.
         try:
             target.write_text(body, encoding="utf-8")
-            _backfill_missing_local_imports(scaffold_dir, candidate.file_path)
+            await _backfill_missing_local_imports(scaffold_dir, candidate.file_path)
         except OSError as e:
             return FixResult(
                 candidate=candidate, model_used=model,

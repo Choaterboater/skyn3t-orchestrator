@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from skyn3t.agents.code_agent import CodeAgent
 
 
@@ -29,7 +31,8 @@ def _new_agent() -> CodeAgent:
     return CodeAgent()
 
 
-def test_backfill_writes_command_palette_when_app_imports_it(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_backfill_writes_command_palette_when_app_imports_it(tmp_path: Path) -> None:
     out_dir = tmp_path / "scaffold"
     _write(
         out_dir / "src" / "App.jsx",
@@ -38,7 +41,7 @@ def test_backfill_writes_command_palette_when_app_imports_it(tmp_path: Path) -> 
     )
     agent = _new_agent()
     written = [str(out_dir / "src" / "App.jsx")]
-    out = agent._backfill_unresolved_local_imports(
+    out = await agent._backfill_unresolved_local_imports(
         out_dir=out_dir,
         files_written=written,
         stack="react_vite",
@@ -52,14 +55,15 @@ def test_backfill_writes_command_palette_when_app_imports_it(tmp_path: Path) -> 
     assert str(target) in out
 
 
-def test_backfill_falls_back_to_stub_when_no_generator(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_backfill_falls_back_to_stub_when_no_generator(tmp_path: Path) -> None:
     out_dir = tmp_path / "scaffold"
     _write(
         out_dir / "src" / "App.jsx",
         "import Mystery from './components/Mystery.jsx';\nexport default Mystery;\n",
     )
     agent = _new_agent()
-    agent._backfill_unresolved_local_imports(
+    await agent._backfill_unresolved_local_imports(
         out_dir=out_dir,
         files_written=[str(out_dir / "src" / "App.jsx")],
         stack="react_vite",
@@ -72,7 +76,8 @@ def test_backfill_falls_back_to_stub_when_no_generator(tmp_path: Path) -> None:
     assert "export default function Mystery" in body
 
 
-def test_backfill_skips_imports_that_already_resolve(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_backfill_skips_imports_that_already_resolve(tmp_path: Path) -> None:
     out_dir = tmp_path / "scaffold"
     # Real file already exists at the import target.
     _write(
@@ -86,7 +91,7 @@ def test_backfill_skips_imports_that_already_resolve(tmp_path: Path) -> None:
     agent = _new_agent()
     before = out_dir / "src" / "components" / "ServiceEditor.jsx"
     mtime_before = before.stat().st_mtime
-    out = agent._backfill_unresolved_local_imports(
+    out = await agent._backfill_unresolved_local_imports(
         out_dir=out_dir,
         files_written=[
             str(out_dir / "src" / "App.jsx"),
@@ -100,13 +105,14 @@ def test_backfill_skips_imports_that_already_resolve(tmp_path: Path) -> None:
     assert len(out) == 2
 
 
-def test_backfill_resolves_extension_variants(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_backfill_resolves_extension_variants(tmp_path: Path) -> None:
     """import './Foo' (no extension) should resolve when Foo.jsx exists."""
     out_dir = tmp_path / "scaffold"
     _write(out_dir / "src" / "Foo.jsx", "export default 1;\n")
     _write(out_dir / "src" / "App.jsx", "import F from './Foo';\nexport default F;\n")
     agent = _new_agent()
-    out = agent._backfill_unresolved_local_imports(
+    out = await agent._backfill_unresolved_local_imports(
         out_dir=out_dir,
         files_written=[str(out_dir / "src" / "App.jsx"), str(out_dir / "src" / "Foo.jsx")],
         stack="react_vite",
@@ -117,7 +123,8 @@ def test_backfill_resolves_extension_variants(tmp_path: Path) -> None:
     assert len(out) == 2
 
 
-def test_backfill_ignores_bare_package_specifiers(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_backfill_ignores_bare_package_specifiers(tmp_path: Path) -> None:
     """`import React from 'react'` is a package, not a scaffold file."""
     out_dir = tmp_path / "scaffold"
     _write(
@@ -125,7 +132,7 @@ def test_backfill_ignores_bare_package_specifiers(tmp_path: Path) -> None:
         "import React from 'react';\nimport { useState } from 'react';\nexport default React;\n",
     )
     agent = _new_agent()
-    agent._backfill_unresolved_local_imports(
+    await agent._backfill_unresolved_local_imports(
         out_dir=out_dir,
         files_written=[str(out_dir / "src" / "App.jsx")],
         stack="react_vite",
@@ -136,7 +143,8 @@ def test_backfill_ignores_bare_package_specifiers(tmp_path: Path) -> None:
     assert not list(out_dir.rglob("react*.jsx"))
 
 
-def test_backfill_refuses_paths_outside_scaffold(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_backfill_refuses_paths_outside_scaffold(tmp_path: Path) -> None:
     """`import '../../etc/passwd'` must not write outside the scaffold."""
     out_dir = tmp_path / "scaffold"
     _write(
@@ -144,7 +152,7 @@ def test_backfill_refuses_paths_outside_scaffold(tmp_path: Path) -> None:
         "import bad from '../../../../tmp/evil.js';\nexport default bad;\n",
     )
     agent = _new_agent()
-    out = agent._backfill_unresolved_local_imports(
+    out = await agent._backfill_unresolved_local_imports(
         out_dir=out_dir,
         files_written=[str(out_dir / "src" / "App.jsx")],
         stack="react_vite",
@@ -156,7 +164,8 @@ def test_backfill_refuses_paths_outside_scaffold(tmp_path: Path) -> None:
     assert len(out) == 1
 
 
-def test_backfill_writes_activity_feed_and_service_detail(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_backfill_writes_activity_feed_and_service_detail(tmp_path: Path) -> None:
     """The canary-119 trifecta: App.jsx imports 3 missing components,
     all should be backfilled via the deterministic homelab generators.
     """
@@ -169,7 +178,7 @@ def test_backfill_writes_activity_feed_and_service_detail(tmp_path: Path) -> Non
         "export default function App(){return <CommandPalette/>;}\n",
     )
     agent = _new_agent()
-    agent._backfill_unresolved_local_imports(
+    await agent._backfill_unresolved_local_imports(
         out_dir=out_dir,
         files_written=[str(out_dir / "src" / "App.jsx")],
         stack="react_vite",

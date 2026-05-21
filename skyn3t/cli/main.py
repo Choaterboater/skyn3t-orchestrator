@@ -173,6 +173,10 @@ pipeline_app = typer.Typer(help="Pipeline management commands", no_args_is_help=
 rag_app = typer.Typer(help="RAG knowledge base commands", no_args_is_help=True)
 github_app = typer.Typer(help="GitHub exploration commands", no_args_is_help=True)
 proposal_app = typer.Typer(help="Self-update proposal review", no_args_is_help=True)
+export_app = typer.Typer(help="Export data for analysis or training", no_args_is_help=True)
+user_app = typer.Typer(help="User profile management", no_args_is_help=True)
+schedule_app = typer.Typer(help="Schedule recurring tasks", no_args_is_help=True)
+skills_app = typer.Typer(help="Skill registry commands", no_args_is_help=True)
 
 app.add_typer(agent_app, name="agent")
 app.add_typer(task_app, name="task")
@@ -180,6 +184,10 @@ app.add_typer(pipeline_app, name="pipeline")
 app.add_typer(rag_app, name="rag")
 app.add_typer(github_app, name="github")
 app.add_typer(proposal_app, name="proposal")
+app.add_typer(export_app, name="export")
+app.add_typer(user_app, name="user")
+app.add_typer(schedule_app, name="schedule")
+app.add_typer(skills_app, name="skills")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1541,6 +1549,449 @@ def conversation(
     console.print(
         f"\n[green]✅ Conversation completed with {len(conversation_data)} messages.[/green]"
     )
+
+
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+
+@schedule_app.command("list")
+def schedule_list() -> None:
+    """📅 List all scheduled jobs."""
+    try:
+        with _client() as client:
+            resp = client.get("/api/schedule/jobs")
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    jobs = data.get("jobs", [])
+    if not jobs:
+        console.print("[dim]No scheduled jobs[/dim]")
+        return
+
+    tbl = Table(title="Scheduled Jobs", box=box.SIMPLE)
+    tbl.add_column("Name", style="cyan")
+    tbl.add_column("Schedule", style="dim")
+    tbl.add_column("Agent", style="dim")
+    tbl.add_column("Next Run", style="dim")
+    tbl.add_column("Runs", justify="right")
+    for job in jobs:
+        status_icon = "🟢" if job.get("enabled") else "🔴"
+        tbl.add_row(
+            f"{status_icon} {job.get('name', '?')}",
+            job.get("schedule_expr", "?"),
+            job.get("agent_name") or "—",
+            job.get("next_run") or "—",
+            str(job.get("run_count", 0)),
+        )
+    console.print(tbl)
+
+
+@schedule_app.command("add")
+def schedule_add(
+    name: str = typer.Argument(..., help="Unique job name"),
+    schedule_expr: str = typer.Option(..., "--every", help="Schedule expression, e.g. 'daily at 09:00' or 'every 5 minutes'"),
+    agent_name: str = typer.Option("", "--agent", help="Agent to trigger"),
+    prompt: str = typer.Option("", "--prompt", help="Prompt or topic to send"),
+) -> None:
+    """➕ Add a new scheduled job."""
+    try:
+        with _client() as client:
+            resp = client.post("/api/schedule/jobs", json={
+                "name": name,
+                "schedule_expr": schedule_expr,
+                "agent_name": agent_name or None,
+                "prompt": prompt or None,
+            })
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+    _success(f"Scheduled job '{name}' created with ID {data.get('job_id', '?')}")
+
+
+@schedule_app.command("remove")
+def schedule_remove(
+    job_id: str = typer.Argument(..., help="Job ID to delete"),
+) -> None:
+    """❌ Remove a scheduled job."""
+    try:
+        with _client() as client:
+            resp = client.delete(f"/api/schedule/jobs/{job_id}")
+            resp.raise_for_status()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+    _success(f"Job {job_id} deleted")
+
+
+@user_app.command("profile")
+def user_profile(
+    platform: str = typer.Option("cli", "--platform", help="Platform: cli, telegram, discord"),
+    platform_id: str = typer.Option("default", "--id", help="User ID on the platform"),
+    profile_json: Optional[str] = typer.Option(None, "--set", help="JSON string to merge into profile"),
+) -> None:
+    """👤 View or update a user profile."""
+    try:
+        with _client() as client:
+            if profile_json:
+                resp = client.patch(
+                    f"/api/users/{platform}/{platform_id}",
+                    json={"profile": json.loads(profile_json)},
+                )
+                resp.raise_for_status()
+                console.print("[green]✅ Profile updated[/green]")
+                return
+            resp = client.get(f"/api/users/{platform}/{platform_id}")
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            console.print(f"[dim]No profile found for {platform}/{platform_id}[/dim]")
+            raise typer.Exit(1)
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    console.print(
+        Panel(
+            f"Platform: [bold]{data.get('platform')}[/bold]\n"
+            f"ID: [bold]{data.get('platform_id')}[/bold]\n"
+            f"Name: {data.get('display_name') or '—'}\n"
+            f"Messages: {data.get('message_count', 0)}  Sessions: {data.get('session_count', 0)}\n"
+            f"Profile: {json.dumps(data.get('profile', {}), indent=2)}",
+            title="[bold cyan]User Profile[/bold cyan]",
+            border_style="cyan",
+        )
+    )
+
+
+@export_app.command("trajectories")
+def export_trajectories(
+    from_date: str = typer.Option("", "--from", help="Start date (YYYY-MM-DD)"),
+    to_date: str = typer.Option("", "--to", help="End date (YYYY-MM-DD)"),
+    agent: str = typer.Option("", "--agent", help="Filter by agent name"),
+    outcome: str = typer.Option("", "--outcome", help="Filter by outcome: success, failure"),
+    output: str = typer.Option("trajectories.jsonl", "--output", "-o", help="Output file path"),
+) -> None:
+    """📤 Export agent trajectories to JSONL for analysis or training."""
+    try:
+        with _client() as client:
+            params: Dict[str, Any] = {}
+            if from_date:
+                params["from_date"] = from_date
+            if to_date:
+                params["to_date"] = to_date
+            if agent:
+                params["agent"] = agent
+            if outcome:
+                params["outcome"] = outcome
+            resp = client.get("/api/trajectories/export", params=params)
+            resp.raise_for_status()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    with open(output, "wb") as fh:
+        fh.write(resp.content)
+    console.print(f"[green]✅ Exported trajectories to {output}[/green]")
+
+
+# ---------------------------------------------------------------------------
+# Search & Insights
+# ---------------------------------------------------------------------------
+
+@app.command()
+def search(
+    query: str = typer.Argument(..., help="Search query"),
+    table: str = typer.Option("all", "--table", "-t", help="Table to search: messages, tasks, logs, all"),
+    limit: int = typer.Option(20, "--limit", "-l", help="Max results"),
+) -> None:
+    """🔎 Full-text search over messages, tasks, and logs."""
+    try:
+        with _client() as client:
+            resp = client.post("/api/search", json={"query": query, "table": table, "limit": limit})
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    results = data.get("results", [])
+    if not results:
+        console.print(f"[dim]No results for '{query}'[/dim]")
+        return
+
+    tbl = Table(title=f"Search: '{query}' ({data.get('count', 0)} results)", box=box.SIMPLE)
+    tbl.add_column("Table", style="cyan", no_wrap=True)
+    tbl.add_column("ID", style="dim", no_wrap=True)
+    tbl.add_column("Summary", style="white")
+    tbl.add_column("When", style="dim")
+
+    for r in results:
+        tname = r.get("table", "?")
+        rid = r.get("id", "?")[:8]
+        when = r.get("created_at", "—")
+        if tname == "messages":
+            summary = f"{r.get('source_agent', '?')} → {r.get('target_agent', '?')}: {r.get('content', '')[:80]}"
+        elif tname == "tasks":
+            summary = f"[{r.get('status', '?')}] {r.get('title', '')[:80]}"
+        elif tname == "logs":
+            summary = f"[{r.get('level', '?')}] {r.get('message', '')[:80]}"
+        else:
+            summary = str(r)[:80]
+        tbl.add_row(tname, rid, summary, when)
+
+    console.print(tbl)
+
+
+@app.command()
+def insights(
+    days: int = typer.Option(7, "--days", "-d", help="Lookback period in days"),
+) -> None:
+    """📊 System insights: token usage, stage latency, task stats, agent health."""
+    try:
+        with _client() as client:
+            resp = client.get("/api/insights", params={"days": days})
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    # Token usage
+    tokens = data.get("tokens", {})
+    totals = tokens.get("totals", {})
+    console.print(
+        Panel(
+            f"Total tokens: [bold]{totals.get('total_tokens', 0):,}[/bold]  "
+            f"Calls: [bold]{totals.get('total_calls', 0):,}[/bold]  "
+            f"Agents tracked: {totals.get('agents_tracked', 0)}  "
+            f"Projects: {totals.get('projects_tracked', 0)}",
+            title="[bold cyan]Token Usage[/bold cyan]",
+            border_style="cyan",
+        )
+    )
+
+    per_agent = tokens.get("per_agent", [])
+    if per_agent:
+        tbl = Table(title="Per-Agent Tokens", box=box.SIMPLE)
+        tbl.add_column("Agent", style="cyan")
+        tbl.add_column("Tokens", justify="right")
+        tbl.add_column("Calls", justify="right")
+        tbl.add_column("Backend", style="dim")
+        for a in per_agent[:10]:
+            tbl.add_row(
+                a.get("agent", "?"),
+                f"{a.get('total_tokens', 0):,}",
+                f"{a.get('calls', 0):,}",
+                a.get("backend", "?"),
+            )
+        console.print(tbl)
+
+    # Stage latency
+    stages = data.get("stages", {})
+    if stages:
+        tbl = Table(title="Stage Latency", box=box.SIMPLE)
+        tbl.add_column("Stage", style="cyan")
+        tbl.add_column("Avg", justify="right")
+        tbl.add_column("Min", justify="right")
+        tbl.add_column("Max", justify="right")
+        tbl.add_column("Runs", justify="right")
+        for stage, stats in stages.items():
+            tbl.add_row(
+                stage,
+                f"{stats.get('avg', 0):.1f}s",
+                f"{stats.get('min', 0):.1f}s",
+                f"{stats.get('max', 0):.1f}s",
+                f"{stats.get('count', 0):,}",
+            )
+        console.print(tbl)
+
+    # Tasks
+    tasks = data.get("tasks", {})
+    console.print(
+        Panel(
+            f"Success rate: [bold]{'%.1f' % (tasks.get('success_rate', 0) * 100)}%[/bold]  "
+            f"Completed: [bold]{tasks.get('total_completed', 0)}[/bold]  "
+            f"Failed: [bold]{tasks.get('total_failed', 0)}[/bold]  "
+            f"Total: {tasks.get('total_tasks', 0)}",
+            title="[bold cyan]Tasks[/bold cyan]",
+            border_style="cyan",
+        )
+    )
+
+    # Agent health
+    agents = data.get("agents", [])
+    if agents:
+        tbl = Table(title="Agent Health", box=box.SIMPLE)
+        tbl.add_column("Agent", style="cyan")
+        tbl.add_column("Type", style="dim")
+        tbl.add_column("Status")
+        tbl.add_column("Queue", justify="right")
+        for a in agents:
+            status = a.get("status", "?")
+            status_style = "green" if status == "idle" else "yellow" if status == "busy" else "red"
+            tbl.add_row(
+                a.get("name", "?"),
+                a.get("type", "?"),
+                f"[{status_style}]{status}[/{status_style}]",
+                str(a.get("queue_size", 0)),
+            )
+        console.print(tbl)
+
+
+# ---------------------------------------------------------------------------
+# Skills
+# ---------------------------------------------------------------------------
+
+@skills_app.command("list")
+def skills_list() -> None:
+    """List installed skills."""
+    from skyn3t.intelligence.skill_library import get_default_library
+
+    lib = get_default_library()
+    skills = lib.all()
+    if not skills:
+        console.print("[dim]No skills installed.[/dim]")
+        return
+    tbl = Table(title="Skills", box=box.SIMPLE)
+    tbl.add_column("Name", style="cyan")
+    tbl.add_column("Score", justify="right")
+    tbl.add_column("Tags", style="dim")
+    tbl.add_column("Source")
+    for s in skills:
+        score_str = f"{s.score:+.2f}"
+        score_style = "green" if s.score > 0 else "red" if s.score < 0 else "yellow"
+        tbl.add_row(
+            s.name,
+            f"[{score_style}]{score_str}[/{score_style}]",
+            ", ".join(s.tags[:3]),
+            s.source,
+        )
+    console.print(tbl)
+    console.print(f"\nTotal: {len(skills)} skill(s)")
+
+
+@skills_app.command("search")
+def skills_search(query: str) -> None:
+    """Search skills by relevance."""
+    from skyn3t.intelligence.skill_library import get_default_library
+
+    lib = get_default_library()
+    results = lib.find_relevant(query, limit=10)
+    if not results:
+        console.print(f"[dim]No skills match '{query}'.[/dim]")
+        return
+    tbl = Table(title=f"Search: {query}", box=box.SIMPLE)
+    tbl.add_column("Name", style="cyan")
+    tbl.add_column("Relevance", justify="right")
+    tbl.add_column("Tags", style="dim")
+    for s in results:
+        rel = s.relevance(query)
+        tbl.add_row(s.name, f"{rel:.1f}", ", ".join(s.tags[:3]))
+    console.print(tbl)
+
+
+@skills_app.command("install")
+def skills_install(source: str) -> None:
+    """Install a skill from a local path or URL.
+
+    SOURCE can be a local directory containing SKILL.md or a git URL.
+    """
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    from skyn3t.intelligence.skill_library import get_default_library
+
+    lib = get_default_library()
+    source_path = Path(source)
+
+    if source_path.exists() and source_path.is_dir():
+        path, findings = lib.import_agent_skill(source_path)
+        if path:
+            _success(f"Installed skill from {source}")
+            if findings:
+                console.print(f"[yellow]Warnings: {', '.join(findings)}[/yellow]")
+        else:
+            _error(f"Could not install skill from {source}")
+            if findings:
+                console.print(f"[red]Flagged: {', '.join(findings)}[/red]")
+        return
+
+    # Try git clone
+    if source.startswith(("http://", "https://", "git@")):
+        with tempfile.TemporaryDirectory() as tmp:
+            console.print(f"Cloning {source} ...")
+            result = shutil.which("git")
+            if not result:
+                _error("git is not installed")
+                raise typer.Exit(1)
+            import subprocess
+            proc = subprocess.run(
+                ["git", "clone", "--depth", "1", source, tmp],
+                capture_output=True,
+                text=True,
+            )
+            if proc.returncode != 0:
+                _error(f"git clone failed: {proc.stderr}")
+                raise typer.Exit(1)
+            # Look for SKILL.md in the clone root or first subdir
+            skill_md = Path(tmp) / "SKILL.md"
+            if not skill_md.exists():
+                subdirs = [d for d in Path(tmp).iterdir() if d.is_dir()]
+                if subdirs:
+                    skill_md = subdirs[0] / "SKILL.md"
+            if not skill_md.exists():
+                _error("No SKILL.md found in cloned repository")
+                raise typer.Exit(1)
+            path, findings = lib.import_agent_skill(skill_md.parent)
+            if path:
+                _success(f"Installed skill from {source}")
+                if findings:
+                    console.print(f"[yellow]Warnings: {', '.join(findings)}[/yellow]")
+            else:
+                _error("Could not install skill")
+        return
+
+    _error(f"Source not found: {source}")
+
+
+@skills_app.command("remove")
+def skills_remove(name: str) -> None:
+    """Remove a skill by name."""
+    from skyn3t.intelligence.skill_library import get_default_library
+
+    lib = get_default_library()
+    if lib.delete(name):
+        _success(f"Removed skill '{name}'")
+    else:
+        _error(f"Skill '{name}' not found")
 
 
 def main() -> None:

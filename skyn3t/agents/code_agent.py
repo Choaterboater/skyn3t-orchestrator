@@ -1752,15 +1752,15 @@ class CodeAgent(BaseAgent):
                             _or_key = getattr(_gs(), "openrouter_api_key", None)
                         except Exception:
                             _or_key = None
-                    if _is_problem_file and _or_key and _fast_path_enabled:
+                    if _or_key and _fast_path_enabled:
                         # Mirror into os.environ so OpenRouterBackend can
                         # see it without us threading the key everywhere.
                         _os_route.environ.setdefault("OPENROUTER_API_KEY", _or_key)
                         try:
                             logger.warning(
-                                "ENTRYPOINT FAST-PATH: %s routed to OpenRouter ladder "
-                                "(skipping CLI to avoid known timeout)",
-                                rel,
+                                "OPENROUTER FAST-PATH: %s routed to OpenRouter ladder "
+                                "(entrypoint=%s)",
+                                rel, _is_problem_file,
                             )
                             from skyn3t.adapters import LLMClient as _LLMCEntry
                             # Task-aware ladder. ladder_for_file_and_brief
@@ -1823,7 +1823,7 @@ class CodeAgent(BaseAgent):
                                     )
                                 except Exception as _fp_exc:
                                     logger.warning(
-                                        "ENTRYPOINT FAST-PATH %s failed for %s: %s",
+                                        "OPENROUTER FAST-PATH %s failed for %s: %s",
                                         _fp_model, rel, _fp_exc,
                                     )
                                     continue
@@ -1856,12 +1856,12 @@ class CodeAgent(BaseAgent):
                                     _accepted_model = _fp_model
                                     break
                                 logger.warning(
-                                    "ENTRYPOINT FAST-PATH %s returned unusable body for %s (len=%d)",
+                                    "OPENROUTER FAST-PATH %s returned unusable body for %s (len=%d)",
                                     _fp_model, rel, len(_try_body or ""),
                                 )
                             if body_local:
                                 logger.warning(
-                                    "ENTRYPOINT FAST-PATH ACCEPTED for %s via %s",
+                                    "OPENROUTER FAST-PATH ACCEPTED for %s via %s",
                                     rel, _accepted_model,
                                 )
                                 await self.think(
@@ -1870,7 +1870,7 @@ class CodeAgent(BaseAgent):
                                 return rel, body_local, target
                             else:
                                 logger.warning(
-                                    "ENTRYPOINT FAST-PATH ladder exhausted for %s — falling back to CLI chain",
+                                    "OPENROUTER FAST-PATH ladder exhausted for %s — falling back to CLI chain",
                                     rel,
                                 )
                         except Exception:
@@ -3818,12 +3818,10 @@ if __name__ == '__main__':
         return written
 
     async def _execute_code(self, task_or_code) -> Dict[str, Any]:
-        """Execute Python code with a restricted-builtins shim.
+        """Execute Python code via the configured sandbox backend.
 
-        WARNING: This is not a real sandbox. The restricted-builtins dict can be
-        escaped (e.g. ``().__class__.__bases__[0].__subclasses__()``). It only
-        limits accidental use of dangerous names; it does not contain hostile code.
-        For untrusted code, route through ``skyn3t.security.sandbox`` instead.
+        Defaults to InlineBackend for speed; set ``SKYN3T_EXECUTION_BACKEND=docker``
+        for real container isolation.
         """
         if isinstance(task_or_code, TaskRequest):
             code = task_or_code.input_data.get("code", "")
@@ -3833,88 +3831,27 @@ if __name__ == '__main__':
         if not code:
             return {"success": False, "error": "No code provided"}
 
-        # Restricted builtins shim (not a real sandbox; see method docstring).
-        safe_builtins = {
-            "abs": abs,
-            "all": all,
-            "any": any,
-            "ascii": ascii,
-            "bin": bin,
-            "bool": bool,
-            "bytearray": bytearray,
-            "bytes": bytes,
-            "chr": chr,
-            "complex": complex,
-            "dict": dict,
-            "dir": dir,
-            "divmod": divmod,
-            "enumerate": enumerate,
-            "filter": filter,
-            "float": float,
-            "format": format,
-            "frozenset": frozenset,
-            "hasattr": hasattr,
-            "hash": hash,
-            "hex": hex,
-            "id": id,
-            "int": int,
-            "isinstance": isinstance,
-            "issubclass": issubclass,
-            "iter": iter,
-            "len": len,
-            "list": list,
-            "map": map,
-            "max": max,
-            "min": min,
-            "next": next,
-            "oct": oct,
-            "ord": ord,
-            "pow": pow,
-            "print": print,
-            "range": range,
-            "repr": repr,
-            "reversed": reversed,
-            "round": round,
-            "set": set,
-            "slice": slice,
-            "sorted": sorted,
-            "str": str,
-            "sum": sum,
-            "tuple": tuple,
-            "type": type,
-            "zip": zip,
-        }
-
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        stdout_buffer = io.StringIO()
-        stderr_buffer = io.StringIO()
-
         try:
-            sys.stdout = stdout_buffer
-            sys.stderr = stderr_buffer
+            from skyn3t.config.settings import get_settings
+            from skyn3t.security.sandbox import get_backend
 
-            compiled_code = compile(code, "<sandbox>", "exec")
-            exec_globals = {"__builtins__": safe_builtins}
-            exec(compiled_code, exec_globals)
-
-            output = stdout_buffer.getvalue()
-            errors = stderr_buffer.getvalue()
-
-            if len(output) > self._max_output_size:
-                output = output[: self._max_output_size] + "\n...[truncated]"
-
+            settings = get_settings()
+            backend = await get_backend(settings.execution_backend)
+            result = await backend.execute(
+                code,
+                language="python",
+                timeout=30,
+                memory_mb=256,
+            )
             return {
-                "success": True,
-                "output": output,
-                "errors": errors,
-                "truncated": len(stdout_buffer.getvalue()) > self._max_output_size,
+                "success": result.success,
+                "output": result.stdout,
+                "errors": result.stderr,
+                "error": result.error,
+                "truncated": result.truncated,
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
-        finally:
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
 
     async def _analyze_code(self, task: TaskRequest) -> Dict[str, Any]:
         """Analyze code quality and structure."""

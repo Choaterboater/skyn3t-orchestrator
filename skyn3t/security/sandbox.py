@@ -487,3 +487,527 @@ class CLISandboxRunner:
                 f"SANDBOX_ERROR: {result.kill_reason}\n{result.stderr}",
             )
         return result.returncode, result.stdout, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Pluggable execution backends (Phase-3 sandbox)
+# ---------------------------------------------------------------------------
+
+import asyncio
+import shutil
+import tempfile
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ExecutionResult:
+    """Outcome of a sandboxed code run."""
+
+    success: bool
+    stdout: str = ""
+    stderr: str = ""
+    error: str = ""
+    truncated: bool = False
+
+
+class ExecutionBackend(ABC):
+    """Abstract backend for running untrusted code."""
+
+    @abstractmethod
+    async def execute(
+        self,
+        code: str,
+        language: str = "python",
+        *,
+        timeout: int = 30,
+        memory_mb: int = 256,
+    ) -> ExecutionResult:
+        """Run ``code`` and return captured output."""
+        ...
+
+
+class InlineBackend(ExecutionBackend):
+    """Run code in-process with restricted builtins.
+
+    Fast but NOT a real sandbox — trivial to escape. Suitable only for
+    trusted or heavily-reviewed code snippets.
+    """
+
+    _SAFE_BUILTINS: Dict[str, object] = {
+        "abs": abs,
+        "all": all,
+        "any": any,
+        "ascii": ascii,
+        "bin": bin,
+        "bool": bool,
+        "bytearray": bytearray,
+        "bytes": bytes,
+        "chr": chr,
+        "complex": complex,
+        "dict": dict,
+        "dir": dir,
+        "divmod": divmod,
+        "enumerate": enumerate,
+        "filter": filter,
+        "float": float,
+        "format": format,
+        "frozenset": frozenset,
+        "hasattr": hasattr,
+        "hash": hash,
+        "hex": hex,
+        "id": id,
+        "int": int,
+        "isinstance": isinstance,
+        "issubclass": issubclass,
+        "iter": iter,
+        "len": len,
+        "list": list,
+        "map": map,
+        "max": max,
+        "min": min,
+        "next": next,
+        "oct": oct,
+        "ord": ord,
+        "pow": pow,
+        "print": print,
+        "range": range,
+        "repr": repr,
+        "reversed": reversed,
+        "round": round,
+        "set": set,
+        "slice": slice,
+        "sorted": sorted,
+        "str": str,
+        "sum": sum,
+        "tuple": tuple,
+        "type": type,
+        "zip": zip,
+    }
+
+    async def execute(
+        self,
+        code: str,
+        language: str = "python",
+        *,
+        timeout: int = 30,
+        memory_mb: int = 256,
+    ) -> ExecutionResult:
+        import io
+        import sys
+
+        if language != "python":
+            return ExecutionResult(
+                success=False,
+                error=f"InlineBackend only supports python, not {language}",
+            )
+
+        if not code.strip():
+            return ExecutionResult(success=False, error="No code provided")
+
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        stdout_buffer = io.StringIO()
+        stderr_buffer = io.StringIO()
+
+        try:
+            sys.stdout = stdout_buffer
+            sys.stderr = stderr_buffer
+
+            compiled_code = compile(code, "<sandbox>", "exec")
+            exec_globals = {"__builtins__": self._SAFE_BUILTINS.copy()}
+            exec(compiled_code, exec_globals)
+
+            out = stdout_buffer.getvalue()
+            err = stderr_buffer.getvalue()
+            truncated = len(out) > 1_000_000
+            if truncated:
+                out = out[:1_000_000] + "\n...[truncated]"
+
+            return ExecutionResult(success=True, stdout=out, stderr=err, truncated=truncated)
+        except Exception as e:
+            return ExecutionResult(success=False, error=str(e))
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+
+
+class DockerBackend(ExecutionBackend):
+    """Run code inside a short-lived Docker container.
+
+    Features:
+      - Network isolation (--network none)
+      - Memory limit (--memory)
+      - Read-only rootfs + writable /tmp
+      - stdout/stderr capture
+      - Automatic container cleanup
+    """
+
+    _IMAGES: Dict[str, str] = {
+        "python": "python:3.11-alpine",
+        "javascript": "node:18-alpine",
+        "typescript": "node:18-alpine",
+        "bash": "alpine:3.19",
+        "go": "golang:1.22-alpine",
+        "rust": "rust:1.78-alpine",
+        "php": "php:8.3-alpine",
+        "ruby": "ruby:3.3-alpine",
+    }
+
+    _ENTRYPOINTS: Dict[str, List[str]] = {
+        "python": ["python"],
+        "javascript": ["node"],
+        "typescript": ["npx", "ts-node"],
+        "bash": ["sh"],
+        "go": ["go", "run"],
+        "rust": ["rustc", "-o", "/tmp/out", "&&", "/tmp/out"],
+        "php": ["php"],
+        "ruby": ["ruby"],
+    }
+
+    def __init__(self, docker_path: str = "docker"):
+        self.docker_path = docker_path
+        self._available: Optional[bool] = None
+
+    async def available(self) -> bool:
+        """Return True if the Docker CLI is responsive."""
+        if self._available is not None:
+            return self._available
+        if not shutil.which(self.docker_path):
+            self._available = False
+            return False
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.docker_path, "version", "--format", "{{.Server.Version}}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            self._available = proc.returncode == 0 and bool(stdout.strip())
+        except Exception:
+            self._available = False
+        return self._available
+
+    async def execute(
+        self,
+        code: str,
+        language: str = "python",
+        *,
+        timeout: int = 30,
+        memory_mb: int = 256,
+    ) -> ExecutionResult:
+        if not await self.available():
+            return ExecutionResult(
+                success=False,
+                error="Docker is not available; install Docker or switch to InlineBackend",
+            )
+
+        image = self._IMAGES.get(language)
+        entrypoint = self._ENTRYPOINTS.get(language)
+        if not image or not entrypoint:
+            return ExecutionResult(
+                success=False,
+                error=f"DockerBackend does not support language: {language}",
+            )
+
+        suffix = ".py" if language == "python" else ".js" if language == "javascript" else ".sh"
+        with tempfile.NamedTemporaryFile(mode="w", suffix=suffix, delete=False) as fh:
+            fh.write(code)
+            code_path = fh.name
+
+        cmd = [
+            self.docker_path,
+            "run",
+            "--rm",
+            "--network", "none",
+            "--memory", f"{memory_mb}m",
+            "--memory-swap", f"{memory_mb}m",
+            "--read-only",
+            "--tmpfs", "/tmp:noexec,nosuid,size=50m",
+            "-v", f"{code_path}:/sandbox/code{suffix}:ro",
+            "-w", "/tmp",
+            image,
+        ]
+        if language in ("bash", "python", "javascript", "typescript", "go", "php", "ruby"):
+            cmd.extend(entrypoint)
+            cmd.append(f"/sandbox/code{suffix}")
+        elif language == "rust":
+            # Rust needs compile then run
+            cmd.extend(["sh", "-c", f"rustc -o /tmp/out /sandbox/code{suffix} && /tmp/out"])
+        else:
+            cmd.extend(entrypoint)
+            cmd.append(f"/sandbox/code{suffix}")
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return ExecutionResult(
+                success=proc.returncode == 0,
+                stdout=stdout.decode("utf-8", errors="replace"),
+                stderr=stderr.decode("utf-8", errors="replace"),
+            )
+        except asyncio.TimeoutError:
+            return ExecutionResult(
+                success=False,
+                error=f"Execution timed out after {timeout}s",
+            )
+        except Exception as e:
+            return ExecutionResult(success=False, error=str(e))
+        finally:
+            try:
+                os.unlink(code_path)
+            except Exception:
+                pass
+
+
+class DockerPoolBackend(ExecutionBackend):
+    """Pooled Docker containers for low-latency sandboxed execution.
+
+    Pre-starts a small fleet of ``sleep infinity`` containers per language.
+    Actual runs use ``docker exec`` (~100-200ms) instead of cold-starting
+    a new container (~1-2s).
+
+    Security flags (network, memory, read-only) are set at container creation
+    time and enforced for every exec.
+    """
+
+    _IMAGES = DockerBackend._IMAGES
+
+    def __init__(self, pool_size: int = 2, docker_path: str = "docker"):
+        self.pool_size = pool_size
+        self.docker_path = docker_path
+        self._containers: Dict[str, List[str]] = {}
+        self._locks: Dict[str, asyncio.Lock] = {}
+        self._initialized: Dict[str, bool] = {}
+        self._shutdown = False
+
+    async def available(self) -> bool:
+        backend = DockerBackend(self.docker_path)
+        return await backend.available()
+
+    async def _ensure_pool(self, language: str) -> None:
+        if self._initialized.get(language):
+            return
+        image = self._IMAGES.get(language)
+        if not image:
+            return
+        containers: List[str] = []
+        for i in range(self.pool_size):
+            name = f"skyn3t-pool-{language}-{i}-{os.getpid()}"
+            proc = await asyncio.create_subprocess_exec(
+                self.docker_path,
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                name,
+                "--network",
+                "none",
+                "--memory",
+                "512m",
+                "--read-only",
+                "--tmpfs",
+                "/tmp:noexec,nosuid,size=50m",
+                image,
+                "sleep",
+                "infinity",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.wait()
+            containers.append(name)
+            self._locks[name] = asyncio.Lock()
+        self._containers[language] = containers
+        self._initialized[language] = True
+        logger.info(
+            "DockerPoolBackend: started %d %s container(s)", self.pool_size, language
+        )
+
+    async def execute(
+        self,
+        code: str,
+        language: str = "python",
+        *,
+        timeout: int = 30,
+        memory_mb: int = 256,
+    ) -> ExecutionResult:
+        if self._shutdown:
+            return ExecutionResult(success=False, error="Backend is shutting down")
+
+        if not await self.available():
+            return ExecutionResult(
+                success=False,
+                error="Docker is not available",
+            )
+
+        image = self._IMAGES.get(language)
+        if not image:
+            return ExecutionResult(
+                success=False,
+                error=f"DockerPoolBackend does not support language: {language}",
+            )
+
+        await self._ensure_pool(language)
+
+        # Pick an idle container
+        for name in self._containers.get(language, []):
+            if self._locks[name].locked():
+                continue
+            async with self._locks[name]:
+                return await self._exec_in_container(name, code, language, timeout)
+
+        # All containers busy — fall back to cold-start DockerBackend
+        logger.warning("DockerPoolBackend pool exhausted for %s; cold-starting", language)
+        fallback = DockerBackend(self.docker_path)
+        return await fallback.execute(code, language, timeout=timeout, memory_mb=memory_mb)
+
+    async def _exec_in_container(
+        self, name: str, code: str, language: str, timeout: int
+    ) -> ExecutionResult:
+        import uuid
+
+        suffix = {
+            "python": ".py",
+            "javascript": ".js",
+            "typescript": ".ts",
+            "bash": ".sh",
+            "go": ".go",
+            "rust": ".rs",
+            "php": ".php",
+            "ruby": ".rb",
+        }.get(language, ".txt")
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=suffix, delete=False) as fh:
+            fh.write(code)
+            local_path = fh.name
+
+        remote_path = f"/tmp/code-{uuid.uuid4().hex}{suffix}"
+
+        run_cmds: Dict[str, List[str]] = {
+            "python": ["python", remote_path],
+            "javascript": ["node", remote_path],
+            "typescript": ["npx", "ts-node", remote_path],
+            "bash": ["sh", remote_path],
+            "go": ["go", "run", remote_path],
+            "php": ["php", remote_path],
+            "ruby": ["ruby", remote_path],
+        }
+
+        try:
+            # Stream code into container via docker exec + cat (avoids
+            # docker cp failing on read-only rootfs containers).
+            with open(local_path, "rb") as fh:
+                code_bytes = fh.read()
+            cp_proc = await asyncio.create_subprocess_exec(
+                self.docker_path, "exec", "-i", name, "sh", "-c",
+                f"cat > {remote_path}",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await cp_proc.communicate(code_bytes)
+            if cp_proc.returncode != 0:
+                stderr = (await cp_proc.stderr.read()).decode("utf-8", errors="replace")
+                return ExecutionResult(success=False, error=f"docker stream-in failed: {stderr}")
+
+            # Execute
+            if language == "rust":
+                exec_cmd = ["sh", "-c", f"rustc -o /tmp/out {remote_path} && /tmp/out"]
+            else:
+                exec_cmd = run_cmds.get(language, ["sh", remote_path])
+
+            proc = await asyncio.create_subprocess_exec(
+                self.docker_path, "exec", name, *exec_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+
+            # Clean up remote file
+            asyncio.create_task(self._rm_in_container(name, remote_path))
+
+            return ExecutionResult(
+                success=proc.returncode == 0,
+                stdout=stdout.decode("utf-8", errors="replace"),
+                stderr=stderr.decode("utf-8", errors="replace"),
+            )
+        except asyncio.TimeoutError:
+            return ExecutionResult(
+                success=False,
+                error=f"Execution timed out after {timeout}s",
+            )
+        except Exception as e:
+            return ExecutionResult(success=False, error=str(e))
+        finally:
+            try:
+                os.unlink(local_path)
+            except Exception:
+                pass
+
+    async def _rm_in_container(self, name: str, remote_path: str) -> None:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.docker_path, "exec", name, "rm", "-f", remote_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.wait()
+        except Exception:
+            pass
+
+    async def shutdown(self) -> None:
+        """Stop and remove all pooled containers."""
+        self._shutdown = True
+        for language, names in self._containers.items():
+            for name in names:
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        self.docker_path, "stop", "-t", "2", name,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await proc.wait()
+                except Exception:
+                    pass
+        self._containers.clear()
+        self._initialized.clear()
+
+
+async def get_backend(name: str = "auto") -> ExecutionBackend:
+    """Return an execution backend by name.
+
+    Names:
+      - ``inline``      → InlineBackend
+      - ``docker``      → DockerBackend (raises if unavailable)
+      - ``docker-pool`` → DockerPoolBackend (raises if unavailable)
+      - ``auto``        → DockerPoolBackend if Docker is up, else InlineBackend
+    """
+    name = name.lower().strip()
+    if name == "inline":
+        return InlineBackend()
+    if name == "docker":
+        backend = DockerBackend()
+        if not await backend.available():
+            raise RuntimeError("Docker backend requested but Docker is not available")
+        return backend
+    if name == "docker-pool":
+        backend = DockerPoolBackend()
+        if not await backend.available():
+            raise RuntimeError("Docker pool backend requested but Docker is not available")
+        return backend
+    if name == "auto":
+        docker = DockerPoolBackend()
+        if await docker.available():
+            logger.info("DockerPoolBackend selected (Docker is available)")
+            return docker
+        logger.warning("Docker unavailable; falling back to InlineBackend")
+        return InlineBackend()
+    raise ValueError(f"Unknown execution backend: {name}")

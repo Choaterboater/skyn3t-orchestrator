@@ -74,11 +74,16 @@ class TestCodeAgent:
         assert "4" in str(result.output)
 
     @pytest.mark.asyncio
-    async def test_scaffold_task_type_uses_scaffold_flow(self, tmp_path):
+    async def test_scaffold_task_type_uses_scaffold_flow(self, tmp_path, monkeypatch):
         from skyn3t.agents.code_agent import CodeAgent
+
+        class StubLLM:
+            async def complete(self, *args, **kwargs):
+                return "[deterministic-stub]"
 
         agent = CodeAgent("code", EventBus())
         await agent.initialize()
+        monkeypatch.setattr(agent, "get_llm", lambda: StubLLM())
 
         task = TaskRequest(
             title="Scaffold app",

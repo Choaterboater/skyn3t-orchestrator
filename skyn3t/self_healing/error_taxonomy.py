@@ -81,7 +81,7 @@ class ErrorTaxonomy:
     @classmethod
     def classify(cls, exception: Optional[Exception] = None,
                  error_text: str = "",
-                 file_path: str = None) -> tuple[ErrorClass, RecoveryHint]:
+                 file_path: Optional[str] = None) -> tuple[ErrorClass, RecoveryHint]:
         """Classify an error into (ErrorClass, RecoveryHint)."""
         text = error_text
         if exception:
@@ -141,7 +141,7 @@ class ErrorTaxonomy:
         return ErrorClass.UNKNOWN, RecoveryHint(action="retry", retryable=True)
 
     @classmethod
-    def _classify_stub_error(cls, file_path: str = None) -> tuple[ErrorClass, RecoveryHint]:
+    def _classify_stub_error(cls, file_path: Optional[str] = None) -> tuple[ErrorClass, RecoveryHint]:
         """Stub errors should trigger deterministic generator creation."""
         return ErrorClass.STUB_ERROR, RecoveryHint(
             action="use_deterministic_generator",

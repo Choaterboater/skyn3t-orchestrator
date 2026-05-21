@@ -113,7 +113,7 @@ async def test_try_fix_one_llm_returns_empty(monkeypatch, tmp_path: Path) -> Non
     )
 
     assert result.ok is False
-    assert "empty" in result.note.lower() or "llm" in result.note.lower()
+    assert "empty" in result.error.lower() or "llm" in result.error.lower()
 
 
 @pytest.mark.asyncio
@@ -142,7 +142,7 @@ async def test_try_fix_one_no_issue_in_candidate(monkeypatch, tmp_path: Path) ->
             pass
 
         async def complete(self, prompt, system, max_tokens, temperature, timeout):
-            return "export default function App(){return <div/>;}"
+            return "export default function App(){return <div className='app'><h1>Hello</h1><p>This is a longer response so it passes the length check.</p></div>;}"
 
         async def aclose(self) -> None:
             return None

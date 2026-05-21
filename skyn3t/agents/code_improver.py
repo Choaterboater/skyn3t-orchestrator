@@ -19,6 +19,59 @@ logger = logging.getLogger("skyn3t.agents.code_improver")
 REPO_ROOT = Path(__file__).resolve().parents[2]   # /.../jarvis
 
 
+
+
+def _prevalidate_diff(diff: str) -> Optional[str]:
+    """Catch common LLM diff errors before hitting git apply.
+
+    Returns an actionable error string (for LLM feedback), or None if OK.
+    """
+    lines = diff.splitlines(keepends=True)
+    in_hunk = False
+    hunk_start = 0
+    for i, line in enumerate(lines, 1):
+        stripped = line.rstrip("\n")
+        if stripped.startswith("@@"):
+            in_hunk = True
+            hunk_start = i
+            m = re.match(r"^@@\s*-(\d+)(?:(,\d+))?\s*\+(\d+)(?:(,\d+))?\s*@@", stripped)
+            if not m:
+                return (
+                    f"Line {i}: malformed hunk header (need "
+                    f"'@@ -start,count +start,count @@'): {stripped[:80]}"
+                )
+            expected_old = int(m.group(2) or "1")
+            expected_new = int(m.group(4) or "1")
+            actual_old = 0
+            actual_new = 0
+            for j in range(i, len(lines)):
+                l = lines[j].rstrip("\n")
+                if l.startswith("@@"):
+                    break
+                if l.startswith("-"):
+                    actual_old += 1
+                elif l.startswith("+"):
+                    actual_new += 1
+                else:
+                    actual_old += 1
+                    actual_new += 1
+            if actual_old != expected_old or actual_new != expected_new:
+                return (
+                    f"Line {i}: hunk header claims {expected_old} old/{expected_new} "
+                    f"new lines but actually has {actual_old} old/{actual_new} new "
+                    f"lines. Fix the counts in: {stripped[:80]}"
+                )
+        elif stripped.startswith("--- ") or stripped.startswith("+++ "):
+            in_hunk = False
+        elif in_hunk and stripped and not stripped[0] in (" ", "-", "+"):
+            return (
+                f"Line {i}: unexpected character '{stripped[0]}' inside hunk "
+                f"(started at line {hunk_start}). Hunk lines must start with "
+                f"' ', '-', or '+'."
+            )
+    return None
+
+
 class CodePatchApplyError(RuntimeError):
     """Raised by ``_apply_patch`` when the diff cannot be applied.
 
@@ -1140,58 +1193,6 @@ class CodeImproverAgent(BaseAgent):
             return (False, str(e)[:200])
 
 
-    def _prevalidate_diff(diff: str) -> Optional[str]:
-        """Catch common LLM diff errors before hitting git apply.
-
-        Returns an actionable error string (for LLM feedback), or None if OK.
-        """
-        lines = diff.splitlines(keepends=True)
-        in_hunk = False
-        hunk_start = 0
-        for i, line in enumerate(lines, 1):
-            stripped = line.rstrip("\n")
-            if stripped.startswith("@@"):
-                in_hunk = True
-                hunk_start = i
-                # Validate hunk header format: @@ -start,count +start,count @@
-                m = re.match(r"^@@\s*-(\d+)(?:,(\d+))?\s*\+(\d+)(?:,(\d+))?\s*@@", stripped)
-                if not m:
-                    return (
-                        f"Line {i}: malformed hunk header (need "
-                        f"'@@ -start,count +start,count @@'): {stripped[:80]}"
-                    )
-                expected_old = int(m.group(2) or "1")
-                expected_new = int(m.group(4) or "1")
-                # Count actual lines in this hunk (until next @@ or end)
-                actual_old = 0
-                actual_new = 0
-                for j in range(i, len(lines)):
-                    l = lines[j].rstrip("\n")
-                    if l.startswith("@@"):
-                        break
-                    if l.startswith("-"):
-                        actual_old += 1
-                    elif l.startswith("+"):
-                        actual_new += 1
-                    else:
-                        actual_old += 1
-                        actual_new += 1
-                if actual_old != expected_old or actual_new != expected_new:
-                    return (
-                        f"Line {i}: hunk header claims {expected_old} old/{expected_new} "
-                        f"new lines but actually has {actual_old} old/{actual_new} new "
-                        f"lines. Fix the counts in: {stripped[:80]}"
-                    )
-            elif stripped.startswith("--- ") or stripped.startswith("+++ "):
-                in_hunk = False  # headers reset hunk state
-            elif in_hunk and stripped and not stripped[0] in (" ", "-", "+"):
-                return (
-                    f"Line {i}: unexpected character '{stripped[0]}' inside hunk "
-                    f"(started at line {hunk_start}). Hunk lines must start with "
-                    f"' ', '-', or '+'."
-                )
-        return None
-
     def _extract_diff(self, raw: str, rel_path: str) -> Optional[str]:
         """Pull a unified diff out of an LLM response. Returns ``None`` if no
         usable diff is present (e.g. deterministic stub, missing hunks, etc).
@@ -1246,14 +1247,14 @@ class CodeImproverAgent(BaseAgent):
         # Step 4: Validate and fix hunk headers
         # Each hunk should look like: @@ -start,count +start,count @@
         def _fix_hunk_header(m: re.Match) -> str:
-            header = m.group(0)
+            header = str(m.group(0))
             # Ensure there's a trailing @@
             if not header.endswith("@@"):
                 # Try to find where the @@ should end
                 rest = m.string[m.end():]
                 end_m = re.match(r"(.*?)@@", rest, re.S)
                 if end_m:
-                    return header + " " + end_m.group(1).strip() + " @@"
+                    return header + " " + str(end_m.group(1)).strip() + " @@"
             return header
 
         body = re.sub(r"@@\s*-?\d+,?\d*\s*\+?\d+,?\d*\s*@@?", _fix_hunk_header, body)

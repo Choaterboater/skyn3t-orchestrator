@@ -156,9 +156,11 @@ def test_router_publishes_decision_on_demote(monkeypatch, tmp_path):
     monkeypatch.setenv("SKYN3T_ROUTER_EXPLORATION_EPS", "0")
 
     sb = BuildPatternScoreboard(store_path=tmp_path / "patterns.json")
+    # Static now picks openrouter for frontend files; record losses on it
+    # so the demote can fire.
     for _ in range(10):
         sb.record_backend(
-            "react_vite", ["src/App.jsx"], "kimi_cli", "no",
+            "react_vite", ["src/App.jsx"], "openrouter", "no",
         )
 
     bus = _BusRecorder()
@@ -173,12 +175,12 @@ def test_router_publishes_decision_on_demote(monkeypatch, tmp_path):
         e for e in bus.events
         if e.event_type == EventType.CORTEX_DECISION
     ]
-    assert backend != "kimi_cli", "static would have picked kimi_cli; demote should have fired"
+    assert backend != "openrouter", "static would have picked openrouter; demote should have fired"
     assert len(decisions) == 1
     payload = decisions[0].payload
     assert payload["system"] == "router"
     assert payload["action"] == "demote_backend"
-    assert payload["input"]["from_backend"] == "kimi_cli"
+    assert payload["input"]["from_backend"] == "openrouter"
     assert payload["input"]["to_backend"] == backend
 
 

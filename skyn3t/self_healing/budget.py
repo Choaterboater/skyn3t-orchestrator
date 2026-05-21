@@ -75,7 +75,7 @@ class ProjectIterationBudget:
             self._grace_used[retry_type] = True
             return True
 
-    def is_exhausted(self, retry_type: str = None) -> bool:
+    def is_exhausted(self, retry_type: Optional[str] = None) -> bool:
         """Check if budget is exhausted (globally or per-type)."""
         with self._lock:
             if self._total_used >= self.max_total:

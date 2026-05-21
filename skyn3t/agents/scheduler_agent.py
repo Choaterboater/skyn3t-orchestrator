@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import Event, EventBus, EventType
+from skyn3t.memory.store import MemoryStore
 
 
 @dataclass
@@ -87,6 +88,7 @@ class SchedulerAgent(BaseAgent):
         self._scheduler_task: Optional[asyncio.Task] = None
         self._scheduler_loop_running: bool = False
         self._tick_interval = self.config.get("tick_interval", 60)
+        self._store: Optional[MemoryStore] = None
 
     async def initialize(self) -> None:
         """Initialize the scheduler agent and start the background tick loop.
@@ -104,6 +106,29 @@ class SchedulerAgent(BaseAgent):
         # Idempotency: don't spawn a second loop if one is alive.
         if self._scheduler_task is not None and not self._scheduler_task.done():
             return
+        # Load persisted jobs from the database.
+        try:
+            self._store = MemoryStore()
+            rows = await self._store.list_scheduled_jobs()
+            for row in rows:
+                job = ScheduledJob(
+                    job_id=row["id"],
+                    name=row["name"],
+                    schedule=row["schedule_expr"],
+                    task_type="scheduled_task",
+                    payload={"agent_name": row["agent_name"], "prompt": row["prompt"]},
+                    next_run=self._parse_datetime(row["next_run"]) if row.get("next_run") else None,
+                    last_run=self._parse_datetime(row["last_run"]) if row.get("last_run") else None,
+                    run_count=row.get("run_count", 0),
+                    enabled=row.get("enabled", True),
+                )
+                # Re-compute next_run if it's in the past
+                if job.next_run is None or job.next_run < datetime.now(timezone.utc):
+                    job.next_run = self._parse_schedule(job.schedule)
+                self._jobs[job.job_id] = job
+            self.metadata["jobs_count"] = len(self._jobs)
+        except Exception:
+            pass  # DB may not be available during tests
         # Use our own running flag so the loop survives whether or not
         # BaseAgent.start() has been called (the registry path calls
         # initialize() directly without ever flipping BaseAgent._running).
@@ -202,6 +227,22 @@ class SchedulerAgent(BaseAgent):
         self._jobs[job.job_id] = job
         self.metadata["jobs_count"] = len(self._jobs)
 
+        # Persist to database
+        if self._store:
+            try:
+                await self._store.save_scheduled_job(
+                    job_id=job.job_id,
+                    name=job.name,
+                    schedule_expr=job.schedule,
+                    agent_name=payload.get("agent_name"),
+                    prompt=payload.get("prompt"),
+                    enabled=True,
+                    next_run=job.next_run,
+                    run_count=0,
+                )
+            except Exception:
+                pass
+
         return {
             "success": True,
             "job_id": job.job_id,
@@ -233,12 +274,32 @@ class SchedulerAgent(BaseAgent):
             if job_id not in self._jobs:
                 return {"success": False, "error": f"Job not found: {job_id}"}
             self._jobs[job_id].enabled = True
+            if self._store:
+                try:
+                    j = self._jobs[job_id]
+                    await self._store.save_scheduled_job(
+                        job_id=j.job_id, name=j.name, schedule_expr=j.schedule,
+                        enabled=j.enabled, next_run=j.next_run,
+                        last_run=j.last_run, run_count=j.run_count,
+                    )
+                except Exception:
+                    pass
             return {"success": True, "job_id": job_id, "enabled": True}
 
         elif action == "disable":
             if job_id not in self._jobs:
                 return {"success": False, "error": f"Job not found: {job_id}"}
             self._jobs[job_id].enabled = False
+            if self._store:
+                try:
+                    j = self._jobs[job_id]
+                    await self._store.save_scheduled_job(
+                        job_id=j.job_id, name=j.name, schedule_expr=j.schedule,
+                        enabled=j.enabled, next_run=j.next_run,
+                        last_run=j.last_run, run_count=j.run_count,
+                    )
+                except Exception:
+                    pass
             return {"success": True, "job_id": job_id, "enabled": False}
 
         elif action == "delete":
@@ -246,6 +307,11 @@ class SchedulerAgent(BaseAgent):
                 return {"success": False, "error": f"Job not found: {job_id}"}
             del self._jobs[job_id]
             self.metadata["jobs_count"] = len(self._jobs)
+            if self._store:
+                try:
+                    await self._store.delete_scheduled_job(job_id)
+                except Exception:
+                    pass
             return {"success": True, "job_id": job_id, "deleted": True}
 
         elif action == "validate":
@@ -330,6 +396,11 @@ class SchedulerAgent(BaseAgent):
             return {"success": False, "error": f"Job not found: {job_id}"}
         del self._jobs[job_id]
         self.metadata["jobs_count"] = len(self._jobs)
+        if self._store:
+            try:
+                await self._store.delete_scheduled_job(job_id)
+            except Exception:
+                pass
         return {"success": True, "job_id": job_id, "cancelled": True}
 
     async def _scheduler_loop(self) -> None:
@@ -383,7 +454,7 @@ class SchedulerAgent(BaseAgent):
                 await asyncio.sleep(self._tick_interval)
 
     async def _trigger_job(self, job: ScheduledJob) -> None:
-        """Trigger a scheduled job via event bus."""
+        """Trigger a scheduled job via event bus and persist state."""
         self.event_bus.publish(
             Event(
                 event_type=EventType.SYSTEM_ALERT,
@@ -397,6 +468,20 @@ class SchedulerAgent(BaseAgent):
                 },
             )
         )
+        # Persist updated run state
+        if self._store:
+            try:
+                await self._store.save_scheduled_job(
+                    job_id=job.job_id,
+                    name=job.name,
+                    schedule_expr=job.schedule,
+                    enabled=job.enabled,
+                    next_run=job.next_run,
+                    last_run=job.last_run,
+                    run_count=job.run_count,
+                )
+            except Exception:
+                pass
 
     async def _trigger_reminder(self, reminder: Dict[str, Any]) -> None:
         """Trigger a reminder via event bus."""

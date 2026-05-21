@@ -187,3 +187,145 @@ class TestMetaAgent:
         # Should detect low success rate
         types = [h["type"] for h in hypotheses]
         assert "suggest_fallback_review" in types
+
+
+class TestFTSSearch:
+    def test_search_messages(self):
+        store = MemoryStore()
+        run_async(store.save_message(
+            source_agent="designer", target_agent="architect",
+            content="Build a dark-mode dashboard with React",
+            message_type="chat",
+        ))
+        run_async(store.save_message(
+            source_agent="architect", target_agent="code_agent",
+            content="Use FastAPI for the backend API",
+            message_type="chat",
+        ))
+        results = run_async(store.search_messages("dashboard", limit=10))
+        assert len(results) == 1
+        assert results[0]["source_agent"] == "designer"
+
+    def test_search_tasks(self):
+        store = MemoryStore()
+        run_async(store.save_task(
+            task_id="t-dashboard", title="Build homelab dashboard",
+            description="A React frontend with Tailwind",
+            status="completed", priority=1, agent_id=None,
+            agent_name="code_agent", parent_task_id=None,
+            input_data={}, output_data={}, error_message=None,
+            retry_count=0, max_retries=3,
+            started_at=None, completed_at=None, session_id=None,
+        ))
+        results = run_async(store.search_tasks("homelab", limit=10))
+        assert len(results) == 1
+        assert results[0]["title"] == "Build homelab dashboard"
+
+    def test_search_all(self):
+        store = MemoryStore()
+        run_async(store.save_message(
+            source_agent="reviewer", target_agent=None,
+            content="The dashboard layout is approved",
+            message_type="chat",
+        ))
+        run_async(store.save_task(
+            task_id="t-layout", title="Design dashboard layout",
+            description="Grid layout with cards",
+            status="completed", priority=1, agent_id=None,
+            agent_name="designer", parent_task_id=None,
+            input_data={}, output_data={}, error_message=None,
+            retry_count=0, max_retries=3,
+            started_at=None, completed_at=None, session_id=None,
+        ))
+        results = run_async(store.search_all("dashboard", limit=10))
+        assert len(results) == 2
+        tables = {r["table"] for r in results}
+        assert "messages" in tables
+        assert "tasks" in tables
+
+    def test_search_logs(self):
+        store = MemoryStore()
+        run_async(store.save_log(
+            level="ERROR", source="code_agent",
+            message="Dashboard build failed: missing dependency",
+        ))
+        results = run_async(store.search_logs("dependency", limit=10))
+        assert len(results) == 1
+        assert results[0]["level"] == "ERROR"
+
+    def test_rebuild_fts_index(self):
+        store = MemoryStore()
+        run_async(store.save_message(
+            source_agent="tester", target_agent=None,
+            content="Rebuild test content",
+            message_type="chat",
+        ))
+        result = run_async(store.rebuild_fts_index())
+        assert result["rebuilt"] is True
+        # After rebuild, search should still work
+        results = run_async(store.search_messages("Rebuild", limit=10))
+        assert len(results) == 1
+
+
+class TestUserModel:
+    def test_get_or_create_user(self):
+        store = MemoryStore()
+        user = run_async(store.get_or_create_user("123", "telegram", display_name="Alice"))
+        assert user["platform_id"] == "123"
+        assert user["platform"] == "telegram"
+        assert user["display_name"] == "Alice"
+        assert user["profile"] == {}
+
+        # Second call should return the same user
+        user2 = run_async(store.get_or_create_user("123", "telegram", display_name="Alice B"))
+        assert user2["id"] == user["id"]
+        assert user2["display_name"] == "Alice B"
+
+    def test_update_user_profile(self):
+        store = MemoryStore()
+        run_async(store.get_or_create_user("456", "discord"))
+        ok = run_async(store.update_user_profile("456", "discord", {"tone": "concise"}))
+        assert ok is True
+        profile = run_async(store.get_user_profile("456", "discord"))
+        assert profile is not None
+        assert profile["profile"]["tone"] == "concise"
+
+    def test_increment_user_stats(self):
+        store = MemoryStore()
+        run_async(store.get_or_create_user("789", "cli"))
+        ok = run_async(store.increment_user_stats("789", "cli", messages=5, sessions=1))
+        assert ok is True
+        profile = run_async(store.get_user_profile("789", "cli"))
+        assert profile["message_count"] == 5
+        assert profile["session_count"] == 1
+
+
+class TestScheduledJobs:
+    def test_save_and_get_job(self):
+        store = MemoryStore()
+        run_async(store.save_scheduled_job(
+            job_id="j-1", name="daily-report",
+            schedule_expr="daily at 09:00",
+            agent_name="reviewer", prompt="Review builds",
+            enabled=True, next_run=None, run_count=0,
+        ))
+        job = run_async(store.get_scheduled_job("j-1"))
+        assert job is not None
+        assert job["name"] == "daily-report"
+        assert job["schedule_expr"] == "daily at 09:00"
+        assert job["agent_name"] == "reviewer"
+
+    def test_list_and_delete_jobs(self):
+        store = MemoryStore()
+        run_async(store.save_scheduled_job(
+            job_id="j-2", name="cleanup",
+            schedule_expr="every 1 hour",
+            enabled=True, next_run=None, run_count=0,
+        ))
+        jobs = run_async(store.list_scheduled_jobs())
+        assert len(jobs) >= 1
+        ok = run_async(store.delete_scheduled_job("j-2"))
+        assert ok is True
+        jobs_after = run_async(store.list_scheduled_jobs())
+        ids = {j["id"] for j in jobs_after}
+        assert "j-2" not in ids
