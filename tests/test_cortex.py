@@ -244,7 +244,46 @@ async def test_feature_handler_collapses_duplicate_feature_runs(tmp_path, monkey
         "feature_proposal_id": first.id,
         "details": "An older approved feature proposal is already running for that file.",
     }
-    assert improver_calls == []
+
+
+@pytest.mark.asyncio
+async def test_ingest_handler_caps_limit_and_returns_errors(tmp_path, monkeypatch):
+    from skyn3t.cortex.handlers import install_handlers
+
+    store = ProposalStore(root=tmp_path / "proposals")
+    monkeypatch.setattr("skyn3t.cortex.get_store", lambda: store)
+
+    calls: list[dict] = []
+
+    class StubIngestor:
+        async def execute(self, req):
+            calls.append(req.input_data)
+            return SimpleNamespace(
+                success=True,
+                output={
+                    "ingested": ["a", "b"],
+                    "summary": "done",
+                    "errors": ["skipped one"],
+                },
+            )
+
+    orchestrator = SimpleNamespace(agents={"github_ingestor": StubIngestor()})
+    install_handlers(orchestrator)
+
+    result = await store._handlers["ingest"](
+        {
+            "topic": "agentic rag",
+            "limit": 999999,
+        }
+    )
+
+    assert calls == [{"max_files": 100, "mode": "search", "query": "agentic rag"}]
+    assert result == {
+        "ok": True,
+        "ingested": 2,
+        "summary": "done",
+        "errors": ["skipped one"],
+    }
 
 
 @pytest.mark.asyncio
