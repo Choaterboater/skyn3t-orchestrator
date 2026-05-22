@@ -12,6 +12,7 @@ from skyn3t.intelligence.skill_library import (
     Skill,
     SkillLibrary,
     _slugify,
+    skill_from_memory_doc,
 )
 
 # ─── Slugify ───────────────────────────────────────────────────────────
@@ -181,13 +182,14 @@ def test_find_returns_empty_on_unknown_tag(tmp_path):
 
 def test_record_use_ticks_counts(tmp_path):
     lib = SkillLibrary(root=tmp_path / "skills")
-    lib.upsert(Skill(name="practice", tags=["x"]))
+    lib.upsert(Skill(name="practice", tags=["x"], memory_doc_id="mem-1"))
     lib.record_use("practice", success=True)
     lib.record_use("practice", success=True)
     lib.record_use("practice", success=False)
     [reloaded] = lib.all()
     assert reloaded.success_count == 2
     assert reloaded.failure_count == 1
+    assert reloaded.memory_doc_id == "mem-1"
 
 
 def test_record_use_on_missing_skill_returns_none(tmp_path):
@@ -213,6 +215,143 @@ def test_summary_aggregates_counts(tmp_path):
     assert s["net_helpful"] == 1
     assert s["demoted"] == 1
     assert sorted(s["tags"]) == ["fastapi", "flask", "next"]
+
+
+def test_upsert_draft_and_approve_promotes_to_live_library(tmp_path):
+    lib = SkillLibrary(root=tmp_path / "skills")
+    draft = Skill(
+        name="memory draft one",
+        tags=["memory-promoted"],
+        body="# Guidance",
+        memory_doc_id="mem-123",
+    )
+    lib.upsert_draft(draft)
+
+    drafts = lib.all_drafts()
+    assert [item.slug for item in drafts] == [draft.slug]
+    assert lib.find(tag="memory-promoted") == []
+
+    path = lib.approve_draft(draft.slug)
+
+    assert path is not None
+    assert path.exists()
+    assert lib.all_drafts() == []
+    live = lib.find(tag="memory-promoted", min_score=-1.0)
+    assert len(live) == 1
+    assert live[0].memory_doc_id == "mem-123"
+
+
+def test_reject_draft_removes_pending_file(tmp_path):
+    lib = SkillLibrary(root=tmp_path / "skills")
+    draft = Skill(name="reject me", tags=["draft"], body="body")
+    lib.upsert_draft(draft)
+
+    assert lib.reject_draft(draft.slug) is True
+    assert lib.all_drafts() == []
+    assert lib.reject_draft(draft.slug) is False
+
+
+def test_skill_from_memory_doc_derives_unique_named_skill():
+    skill = skill_from_memory_doc(
+        {
+            "id": "abcd-1234",
+            "title": "Insight from architect",
+            "content": "Agent: architect\nInsight: Prefer a single orchestration boundary.\n",
+            "source": "reflection",
+            "doc_type": "insight",
+            "meta": {
+                "review_status": "approved",
+                "memory_layer": "operator",
+                "confidence": 0.9,
+                "agent_name": "architect",
+                "capability": "system_design",
+                "reusable": True,
+            },
+        }
+    )
+
+    assert skill.memory_doc_id == "abcd-1234"
+    assert skill.slug.endswith("abcd1234")
+    assert "memory-promoted" in skill.tags
+    assert "system_design" in skill.triggers
+    assert "Memory document" in skill.body
+
+
+def test_skill_from_memory_doc_external_learning_builds_adaptation_skill():
+    skill = skill_from_memory_doc(
+        {
+            "id": "ext-1234",
+            "title": "External learning: GitLab repo cortex-lab",
+            "content": "Source platform: gitlab\nRepository: org/cortex-lab\nDescription: proposal review loop\n",
+            "source": "repo_scout:gitlab",
+            "doc_type": "external_learning",
+            "meta": {
+                "review_status": "approved",
+                "memory_layer": "project",
+                "confidence": 0.82,
+                "reusable": True,
+                "source_platform": "gitlab",
+                "repo": "org/cortex-lab",
+                "repo_url": "https://gitlab.com/org/cortex-lab",
+                "lane": "fit",
+                "query": "cortex autonomy self-healing proposal review agent learning",
+                "language": "Python",
+                "license": "MIT",
+                "reuse_risk": "low",
+                "topics": ["cortex", "autonomy"],
+                "selection_reason": "fit lane via cortex query",
+                "external_doc_paths_ingested": ["README.md", "docs/README.md"],
+                "external_doc_ingest_status": "docs_ingested",
+            },
+        }
+    )
+
+    assert skill.memory_doc_id == "ext-1234"
+    assert "external-learning" in skill.tags
+    assert "adaptation-skill" in skill.tags
+    assert "cortex" in skill.tags
+    assert "org/cortex-lab" in skill.triggers
+    assert "cortex autonomy self-healing proposal review agent learning" in skill.triggers
+    assert "Adaptation rules" in skill.body
+    assert "Borrow the pattern, not the code." in skill.body
+    assert "`README.md`" in skill.body
+
+
+def test_skill_from_memory_doc_external_pattern_keeps_eval_guidance():
+    skill = skill_from_memory_doc(
+        {
+            "id": "pattern-1234",
+            "title": "External pattern: fit / python / cortex",
+            "content": (
+                "Pattern Name: external fit python pattern\n"
+                "Description: Multiple approved repos converge on cortex autonomy review loops.\n"
+                "Suggested Fix: Adapt the repeated pattern into SkyN3t's architecture.\n"
+                "Evaluation Ideas:\n"
+                "- Verify cortex proposal review appears in the flow.\n"
+                "- Compare at least two approved repos before promotion.\n"
+            ),
+            "source": "external_pattern_synthesizer",
+            "doc_type": "pattern",
+            "meta": {
+                "review_status": "approved",
+                "memory_layer": "project",
+                "confidence": 0.74,
+                "reusable": True,
+                "external_pattern": True,
+                "source_platform": "external",
+                "patterns": ["cortex", "autonomy"],
+                "source_repos": ["org/cortex-a", "org/cortex-b"],
+                "lane": "fit",
+                "language": "Python",
+            },
+        }
+    )
+
+    assert "external-pattern" in skill.tags
+    assert "adaptation-skill" in skill.tags
+    assert "org/cortex-a" in skill.triggers
+    assert "Evaluation ideas:" in skill.body
+    assert "Verify cortex proposal review appears in the flow." in skill.body
 
 
 def test_external_edits_are_picked_up_on_next_scan(tmp_path):

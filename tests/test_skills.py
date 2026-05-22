@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
-import pytest
+from fastapi.testclient import TestClient
 
+import skyn3t.web.app as web_app
 from skyn3t.intelligence.skill_library import Skill, SkillLibrary
-
 
 # ---------------------------------------------------------------------------
 # SkillLibrary unit tests
@@ -156,14 +155,6 @@ class TestSkillsCLI:
         assert result.exit_code == 0
         assert "Removed" in result.output
         assert not lib.find(tag="gone")
-
-
-# ---------------------------------------------------------------------------
-# API tests
-# ---------------------------------------------------------------------------
-
-import skyn3t.web.app as web_app
-from fastapi.testclient import TestClient
 
 
 class TestSkillsAPI:

@@ -3931,6 +3931,9 @@
                 provider: a.provider || '',
                 backend: (a.config && a.config.backend) || '',
                 model: (a.config && a.config.model) || '',
+                effective_backend: a.effective_backend || a.backend || '',
+                effective_model: a.effective_model || a.model || '',
+                effective_source: a.effective_source || '',
                 recommended_backend: a.recommended_backend || '',
                 recommended_model: a.recommended_model || '',
                 queue_depth: (a.queue_depth != null) ? a.queue_depth : (a.queue_size != null ? a.queue_size : null),
@@ -3975,6 +3978,10 @@
             const cfg = row.config || {};
             const status = (row.status || 'offline').toLowerCase();
             const caps = row.capabilities || [];
+            const effectiveBackend = row.effective_backend || row.backend || '';
+            const effectiveModel = row.effective_model || row.model || '';
+            const configuredBackend = cfg.backend || '';
+            const configuredModel = cfg.model || '';
             const capsHtml = caps.length
                 ? `<ul class="sv-caps">${caps.map(c => `<li>${escapeHTML(c)}</li>`).join('')}</ul>`
                 : `<div class="sv-caps-empty">${dash}</div>`;
@@ -3997,9 +4004,9 @@
 
                     <h4 class="sv-section">Routing</h4>
                     <dl class="kv kv-wide">
-                        <dt>Backend</dt><dd>${escapeHTML(cfg.backend || '(default)')}</dd>
-                        <dt>Model</dt><dd>${escapeHTML(cfg.model || '(default)')}</dd>
-                        <dt>Recommended</dt><dd>${escapeHTML(row.recommended_backend || '(default)')} / ${escapeHTML(row.recommended_model || '(default)')}</dd>
+                        <dt>Backend</dt><dd>${escapeHTML(effectiveBackend || dash)}</dd>
+                        <dt>Model</dt><dd>${escapeHTML(effectiveModel || (effectiveBackend ? '(backend default)' : dash))}</dd>
+                        <dt>Configured override</dt><dd>${escapeHTML(configuredBackend || '(none)')} / ${escapeHTML(configuredModel || '(none)')}</dd>
                     </dl>
 
                     <h4 class="sv-section">Capabilities</h4>
@@ -5892,8 +5899,10 @@
             try {
                 const c = await fetchJSON('/api/agents/' + encodeURIComponent(name) + '/config');
                 if (typeEl)    typeEl.textContent    = c.agent_type || '—';
-                if (backendEl) backendEl.textContent = (c.config && c.config.backend) || '(default)';
-                if (modelEl)   modelEl.textContent   = (c.config && c.config.model) || '(default)';
+                const effectiveBackend = c.effective_backend || (c.config && c.config.backend) || '';
+                const effectiveModel = c.effective_model || (c.config && c.config.model) || '';
+                if (backendEl) backendEl.textContent = effectiveBackend || '—';
+                if (modelEl)   modelEl.textContent   = effectiveModel || (effectiveBackend ? '(backend default)' : '—');
                 const status = c.enabled === false ? 'disabled' : (_agentRecord(name).status || 'idle');
                 const pill = document.getElementById('aiStatus');
                 if (pill) { pill.textContent = status; pill.className = 'pill ' + status; }
@@ -8863,9 +8872,72 @@
 
         // ─── Per-agent Config Drawer ───
         let _acfgName = null;
+        let _acfgRoutingStage = null;
+        let _acfgRoutingSource = null;
+        async function _hydrateAgentRouting(configView) {
+            const section = document.getElementById('acfgRoutingSection');
+            const effectiveEl = document.getElementById('acfgEffectiveRoute');
+            const overrideEl = document.getElementById('acfgOverrideMeta');
+            const stageEl = document.getElementById('acfgStage');
+            const sourceEl = document.getElementById('acfgPolicySource');
+            const tierSel = document.getElementById('acfgTier');
+            const saveBtn = document.getElementById('acfgSaveTierBtn');
+            const resetTierBtn = document.getElementById('acfgResetTierBtn');
+            const resetAgentBtn = document.getElementById('acfgResetRouteBtn');
+            if (!section || !effectiveEl || !overrideEl || !stageEl || !sourceEl || !tierSel) return;
+
+            const effectiveBackend = configView.effective_backend || (configView.config && configView.config.backend) || '';
+            const effectiveModel = configView.effective_model || (configView.config && configView.config.model) || '';
+            effectiveEl.textContent = effectiveBackend
+                ? `${effectiveBackend} · ${effectiveModel || '(backend default)'}`
+                : '—';
+            overrideEl.textContent = configView.effective_source === 'config'
+                ? 'Explicit backend/model override is active for this agent.'
+                : 'This agent is using router-driven defaults.';
+
+            let stage = '';
+            if (typeof configView.effective_stage === 'string' && configView.effective_stage) {
+                stage = configView.effective_stage;
+            } else if (typeof configView.agent_type === 'string' && configView.agent_type) {
+                stage = configView.agent_type;
+            } else if (typeof configView.name === 'string' && configView.name) {
+                stage = configView.name;
+            }
+            _acfgRoutingStage = stage || null;
+
+            let policy = { tiers: [], routes: [] };
+            try {
+                policy = await fetchJSON('/api/routing/policy');
+            } catch (e) {
+                notifyDashboardError('agent-routing-policy', 'Could not load routing policy', e.message || 'unknown error');
+            }
+            const tiers = Array.isArray(policy.tiers) ? policy.tiers : [];
+            const routes = Array.isArray(policy.routes) ? policy.routes : [];
+            const route = stage ? routes.find(r => r && r.stage === stage) : null;
+            _acfgRoutingSource = route && route.source ? route.source : (configView.effective_policy_source || 'fallback');
+
+            tierSel.innerHTML = tiers.map(t => `<option value="${escapeHTML(t.name)}">${escapeHTML(t.name)}</option>`).join('');
+            if (route && route.tier) {
+                tierSel.value = route.tier;
+            } else if (configView.effective_tier) {
+                tierSel.value = configView.effective_tier;
+            } else if (tiers.length) {
+                tierSel.value = tiers[0].name;
+            }
+            tierSel.disabled = !stage || tiers.length === 0;
+            stageEl.textContent = stage || '—';
+            sourceEl.textContent = _acfgRoutingSource || '—';
+            if (saveBtn) saveBtn.disabled = !stage || tiers.length === 0;
+            if (resetTierBtn) resetTierBtn.disabled = !stage || _acfgRoutingSource !== 'persisted';
+            if (resetAgentBtn) resetAgentBtn.disabled = !_acfgName;
+            section.classList.remove('hidden');
+        }
         async function openAgentConfig(name) {
             _acfgName = name;
+            _acfgRoutingStage = null;
+            _acfgRoutingSource = null;
             document.getElementById('acfgTitle').textContent = `Configure ${name}`;
+            document.getElementById('acfgRoutingSection').classList.add('hidden');
             // load backends
             try {
                 const data = await fetchJSON('/api/llm/backends');
@@ -8885,6 +8957,7 @@
                 document.getElementById('acfgMaxTok').value = (c.config && c.config.max_tokens != null) ? c.config.max_tokens : 1500;
                 document.getElementById('acfgCaps').value = (c.capabilities || []).join(', ');
                 document.getElementById('acfgEnabled').checked = !!c.enabled;
+                await _hydrateAgentRouting(c);
             } catch (e) {
                 notifyDashboardError('agent-config-' + name, `Could not load ${name} config`, e.message || 'unknown error');
             }
@@ -8920,6 +8993,51 @@
             closeAgentConfig();
             if (typeof refreshAgents === 'function') refreshAgents();
         }
+        async function resetAgentRouting() {
+            if (!_acfgName) return;
+            try {
+                await fetchJSON('/api/agents/' + encodeURIComponent(_acfgName) + '/config/reset', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ keys: ['backend', 'model'] }),
+                });
+            } catch (e) {
+                notifyDashboardError('reset-agent-routing-' + _acfgName, `Could not reset ${_acfgName} routing`, e.message || 'unknown error');
+                return;
+            }
+            await openAgentConfig(_acfgName);
+            if (typeof refreshAgents === 'function') refreshAgents();
+        }
+        async function saveStageRouting() {
+            if (!_acfgRoutingStage) return;
+            const tier = (document.getElementById('acfgTier').value || '').trim();
+            if (!tier) return;
+            try {
+                await fetchJSON('/api/routing/policy', {
+                    method: 'PATCH',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ policies: { [_acfgRoutingStage]: tier } }),
+                });
+            } catch (e) {
+                notifyDashboardError('save-stage-routing-' + _acfgRoutingStage, `Could not save ${_acfgRoutingStage} routing`, e.message || 'unknown error');
+                return;
+            }
+            if (_acfgName) await openAgentConfig(_acfgName);
+            if (typeof refreshAgents === 'function') refreshAgents();
+        }
+        async function resetStageRouting() {
+            if (!_acfgRoutingStage) return;
+            try {
+                await fetchJSON('/api/routing/policy/' + encodeURIComponent(_acfgRoutingStage), {
+                    method: 'DELETE',
+                });
+            } catch (e) {
+                notifyDashboardError('reset-stage-routing-' + _acfgRoutingStage, `Could not reset ${_acfgRoutingStage} routing`, e.message || 'unknown error');
+                return;
+            }
+            if (_acfgName) await openAgentConfig(_acfgName);
+            if (typeof refreshAgents === 'function') refreshAgents();
+        }
 
         // ─── Create / Delete / Dispatch for Agent Drawer ───
         let _acfgMode = "edit"; // "edit" or "create"
@@ -8953,6 +9071,7 @@
             document.getElementById('acfgMaxTok').value = 1500;
             document.getElementById('acfgCaps').value = '';
             document.getElementById('acfgEnabled').checked = true;
+            document.getElementById('acfgRoutingSection').classList.add('hidden');
             document.getElementById('agentConfigDrawer').classList.remove('hidden');
         }
 
@@ -9563,6 +9682,31 @@
                     <label>Base type
                         <select id="acfgBaseType"></select>
                     </label>
+                </div>
+                <div id="acfgRoutingSection" class="hidden" style="display:flex; flex-direction:column; gap:.65rem; padding:.8rem; margin-bottom:.85rem; border:1px solid var(--border); border-radius:.8rem; background:var(--bg-2);">
+                    <div class="muted" style="text-transform:uppercase; letter-spacing:.08em; font-size:.72rem;">Effective routing</div>
+                    <div id="acfgEffectiveRoute" style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace;">—</div>
+                    <div id="acfgOverrideMeta" class="muted" style="font-size:.76rem;">—</div>
+                    <div class="drawer-row">
+                        <div>
+                            <div class="muted" style="font-size:.72rem; margin-bottom:.3rem;">Stage</div>
+                            <div id="acfgStage" style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace;">—</div>
+                        </div>
+                        <div>
+                            <div class="muted" style="font-size:.72rem; margin-bottom:.3rem;">Policy source</div>
+                            <div id="acfgPolicySource" style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace;">—</div>
+                        </div>
+                    </div>
+                    <label>Stage tier
+                        <select id="acfgTier"></select>
+                    </label>
+                    <div class="drawer-row">
+                        <button id="acfgResetRouteBtn" class="btn btn-ghost" type="button" onclick="resetAgentRouting()">Reset agent routing</button>
+                        <div style="display:flex; gap:.5rem; justify-content:flex-end;">
+                            <button id="acfgResetTierBtn" class="btn btn-ghost" type="button" onclick="resetStageRouting()">Reset stage tier</button>
+                            <button id="acfgSaveTierBtn" class="btn btn-primary" type="button" onclick="saveStageRouting()">Save stage tier</button>
+                        </div>
+                    </div>
                 </div>
                 <label>Backend
                     <select id="acfgBackend"></select>

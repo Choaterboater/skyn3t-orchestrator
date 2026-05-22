@@ -62,11 +62,243 @@ def test_proposal_store_filters_by_origin(tmp_path):
         origin="user",
     )
 
-    system_only = store.list(status="pending", origin="system")
+    system_only = store.list(origin="system")
     user_only = store.list(status="pending", origin="user")
 
     assert [proposal.title for proposal in system_only] == ["Tune planner"]
     assert [proposal.title for proposal in user_only] == ["User idea"]
+
+
+def test_proposal_store_feature_proposals_stay_pending_under_selective_triage(tmp_path):
+    store = ProposalStore(root=tmp_path / "proposals")
+
+    proposal = store.create(
+        kind="feature",
+        title="Keep review gate",
+        summary="System suggestion",
+        detail="detail",
+        source="feature_suggester:failure_pattern",
+    )
+
+    current = store.get(proposal.id)
+    assert current is not None
+    assert current.status == "pending"
+    assert current.requires_approval is True
+    assert current.decided_at is None
+
+
+@pytest.mark.asyncio
+async def test_proposal_store_create_auto_applies_with_running_loop(tmp_path):
+    store = ProposalStore(root=tmp_path / "proposals")
+    applied = asyncio.Event()
+
+    async def handler(payload):
+        applied.set()
+        return {"ok": True}
+
+    store.register_handler("ingest", handler)
+    proposal = store.create(
+        kind="ingest",
+        title="Auto apply now",
+        summary="System suggestion",
+        detail="detail",
+        payload={"topic": "agentic rag"},
+        source="feature_suggester:meta",
+        requires_approval=False,
+    )
+
+    await asyncio.wait_for(applied.wait(), timeout=1)
+    for _ in range(20):
+        current = store.get(proposal.id)
+        if current is not None and current.status == "applied":
+            break
+        await asyncio.sleep(0)
+
+    current = store.get(proposal.id)
+    assert current is not None
+    assert current.status == "applied"
+    assert current.requires_approval is False
+
+
+@pytest.mark.asyncio
+async def test_proposal_store_sync_auto_approved_system_items_resume_without_user_review(
+    tmp_path, monkeypatch
+):
+    store = ProposalStore(root=tmp_path / "proposals")
+    applied = asyncio.Event()
+
+    async def handler(payload):
+        applied.set()
+        return {"ok": True}
+
+    store.register_handler("ingest", handler)
+    monkeypatch.setattr(store, "_has_running_loop", lambda: False)
+    proposal = store.create(
+        kind="ingest",
+        title="Replay later",
+        summary="System suggestion",
+        detail="detail",
+        payload={"topic": "agentic rag", "limit": 3, "mode": "search"},
+        source="explorer",
+        auto_triage_eligible=True,
+    )
+
+    current = store.get(proposal.id)
+    assert current is not None
+    assert current.status == "approved"
+    assert current.requires_approval is False
+
+    monkeypatch.setattr(store, "_has_running_loop", lambda: True)
+    result = await store.resume_inflight()
+
+    assert result == {"requeued": 1, "failed_no_handler": 0}
+    await asyncio.wait_for(applied.wait(), timeout=1)
+    for _ in range(20):
+        current = store.get(proposal.id)
+        if current is not None and current.status == "applied":
+            break
+        await asyncio.sleep(0)
+
+    current = store.get(proposal.id)
+    assert current is not None
+    assert current.status == "applied"
+
+
+@pytest.mark.asyncio
+async def test_retriage_pending_auto_approves_existing_explorer_ingest(tmp_path, monkeypatch):
+    disabled = SimpleNamespace(cortex_auto_approve_system=False)
+    enabled = SimpleNamespace(
+        cortex_auto_approve_system=True,
+        cortex_auto_reject_duplicates=True,
+        cortex_auto_reject_low_signal_ingest=True,
+        cortex_auto_approve_safe_ingest=True,
+        cortex_auto_triage_duplicate_window_seconds=86_400,
+        cortex_auto_triage_min_ingest_topic_length=6,
+        cortex_auto_triage_max_safe_ingest_limit=3,
+    )
+    monkeypatch.setattr("skyn3t.config.settings.get_settings", lambda: disabled)
+    store = ProposalStore(root=tmp_path / "proposals")
+    applied = asyncio.Event()
+
+    async def handler(payload):
+        applied.set()
+        return {"ok": True}
+
+    store.register_handler("ingest", handler)
+    proposal = store.create(
+        kind="ingest",
+        title="Replay later",
+        summary="System suggestion",
+        detail="detail",
+        payload={"topic": "agentic rag", "limit": 3, "mode": "search"},
+        source="explorer",
+    )
+    current = store.get(proposal.id)
+    assert current is not None
+    assert current.status == "pending"
+
+    monkeypatch.setattr("skyn3t.config.settings.get_settings", lambda: enabled)
+    result = await store.retriage_pending()
+
+    assert result == {"auto_approved": 1, "auto_rejected": 0}
+    await asyncio.wait_for(applied.wait(), timeout=1)
+    for _ in range(20):
+        current = store.get(proposal.id)
+        if current is not None and current.status == "applied":
+            break
+        await asyncio.sleep(0)
+
+    current = store.get(proposal.id)
+    assert current is not None
+    assert current.status == "applied"
+    assert current.triage_decision == "auto_approved"
+
+
+@pytest.mark.asyncio
+async def test_retriage_pending_auto_rejects_invalid_studio_debug(tmp_path, monkeypatch):
+    disabled = SimpleNamespace(cortex_auto_approve_system=False)
+    enabled = SimpleNamespace(
+        cortex_auto_approve_system=True,
+        cortex_auto_reject_duplicates=True,
+        cortex_auto_reject_low_signal_ingest=True,
+        cortex_auto_approve_safe_ingest=True,
+        cortex_auto_triage_duplicate_window_seconds=86_400,
+        cortex_auto_triage_min_ingest_topic_length=6,
+        cortex_auto_triage_max_safe_ingest_limit=3,
+    )
+    monkeypatch.setattr("skyn3t.config.settings.get_settings", lambda: disabled)
+    store = ProposalStore(root=tmp_path / "proposals")
+
+    proposal = store.create(
+        kind="studio_debug",
+        title="All LLM attempts failed for None",
+        summary="Could not produce a valid unified diff for `None` after 4 attempts.",
+        detail="detail",
+        payload={"target_file": None, "attempts": [{"attempt": 1, "error": "boom"}]},
+        source="code_improver",
+    )
+    current = store.get(proposal.id)
+    assert current is not None
+    assert current.status == "pending"
+
+    monkeypatch.setattr("skyn3t.config.settings.get_settings", lambda: enabled)
+    result = await store.retriage_pending()
+
+    assert result == {"auto_approved": 0, "auto_rejected": 1}
+    current = store.get(proposal.id)
+    assert current is not None
+    assert current.status == "rejected"
+    assert current.error == "auto-rejected invalid studio_debug: missing target_file"
+    assert current.triage_decision == "auto_rejected"
+
+
+def test_proposal_store_auto_rejects_duplicate_system_feature_proposals(tmp_path):
+    store = ProposalStore(root=tmp_path / "proposals")
+    first = store.create(
+        kind="feature",
+        title="Prefer the winning FastAPI scaffold",
+        summary="Use the higher-success pattern for FastAPI builds",
+        detail="detail",
+        payload={"kind": "build_pattern_bias", "stack": "fastapi"},
+        source="meta_agent:thresholds",
+    )
+    second = store.create(
+        kind="feature",
+        title="Prefer the winning FastAPI scaffold",
+        summary="Use the higher-success pattern for FastAPI builds",
+        detail="detail",
+        payload={"kind": "build_pattern_bias", "stack": "fastapi"},
+        source="meta_agent:thresholds",
+    )
+
+    first_current = store.get(first.id)
+    second_current = store.get(second.id)
+    assert first_current is not None
+    assert second_current is not None
+    assert first_current.status == "pending"
+    assert second_current.status == "rejected"
+    assert second_current.error == f"auto-rejected duplicate of {first.id}"
+    assert second_current.triage_decision == "auto_rejected"
+
+
+def test_proposal_store_auto_rejects_low_signal_ingest(tmp_path):
+    store = ProposalStore(root=tmp_path / "proposals")
+
+    proposal = store.create(
+        kind="ingest",
+        title="Ingest topic: ai",
+        summary="Explorer suggests ingesting open-source content for: ai",
+        detail="detail",
+        payload={"topic": "ai", "limit": 3, "mode": "search"},
+        source="explorer",
+        auto_triage_eligible=True,
+    )
+
+    current = store.get(proposal.id)
+    assert current is not None
+    assert current.status == "rejected"
+    assert current.error == "auto-rejected low-signal ingest: topic too short"
+    assert current.triage_decision == "auto_rejected"
 
 
 def test_feature_suggester_user_idea_includes_execution_brief(tmp_path, monkeypatch):
@@ -284,6 +516,103 @@ async def test_ingest_handler_caps_limit_and_returns_errors(tmp_path, monkeypatc
         "summary": "done",
         "errors": ["skipped one"],
     }
+
+
+def test_proposal_store_create_can_force_review_gate(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "skyn3t.config.settings.get_settings",
+        lambda: SimpleNamespace(cortex_auto_approve_system=True),
+    )
+    store = ProposalStore(root=tmp_path / "proposals")
+
+    proposal = store.create(
+        kind="ingest",
+        title="Scout repo",
+        summary="review gated",
+        detail="detail",
+        payload={"repo": "octo/agent-flow"},
+        source="repo_scout:github",
+        force_requires_approval=True,
+    )
+
+    current = store.get(proposal.id)
+    assert current is not None
+    assert current.status == "pending"
+    assert current.requires_approval is True
+
+
+@pytest.mark.asyncio
+async def test_external_learning_handler_persists_governed_memory(tmp_path, monkeypatch):
+    from skyn3t.cortex.handlers import install_handlers
+
+    store = ProposalStore(root=tmp_path / "proposals")
+    monkeypatch.setattr("skyn3t.cortex.get_store", lambda: store)
+
+    calls = {}
+
+    class FakeIngestor:
+        def __init__(self, *, memory_store, rag_engine=None):
+            calls["memory_store"] = memory_store
+            calls["rag_engine"] = rag_engine
+
+        async def ingest_repo_approval(self, **kwargs):
+            calls["kwargs"] = kwargs
+            return {
+                "doc_id": "doc-1",
+                "summary_embedding_id": "embed-1",
+                "ingested_count": 2,
+                "ingested_paths": ["README.md", "docs/README.md"],
+                "warnings": ["docs/index.md: not_found"],
+            }
+
+    class FakeSynthesizer:
+        def __init__(self, memory_store):
+            calls["synth_memory_store"] = memory_store
+
+        async def synthesize_for_doc(self, doc_id):
+            calls["synth_doc_id"] = doc_id
+            return {"status": "created", "doc_id": "pattern-1", "consensus_count": 2}
+
+    monkeypatch.setattr("skyn3t.cortex.handlers.ExternalRepoDocIngestor", FakeIngestor)
+    monkeypatch.setattr("skyn3t.cortex.handlers.ExternalPatternSynthesizer", FakeSynthesizer)
+
+    orchestrator = SimpleNamespace(agents={}, memory_store=object(), _ingestor=SimpleNamespace(rag="rag-engine"))
+    install_handlers(orchestrator)
+
+    result = await store._handlers["external_learning"](
+        {
+            "source_platform": "gitlab",
+            "repo": "gitlab-org/agent-lab",
+            "repo_url": "https://gitlab.com/gitlab-org/agent-lab",
+            "lane": "fit",
+            "query": "agent cli memory",
+            "description": "GitLab agent workflow repo",
+            "language": "Python",
+            "license": "MIT",
+            "reuse_risk": "low",
+            "topics": ["agents"],
+            "selection_reason": "fit lane via 'agent cli memory'",
+            "stars": 220,
+        }
+    )
+
+    assert result == {
+        "ok": True,
+        "doc_id": "doc-1",
+        "stored_as": "external_learning",
+        "summary_embedding_id": "embed-1",
+        "ingested": 2,
+        "paths": ["README.md", "docs/README.md"],
+        "warnings": ["docs/index.md: not_found"],
+        "pattern": {"status": "created", "doc_id": "pattern-1", "consensus_count": 2},
+    }
+    assert calls["memory_store"] is orchestrator.memory_store
+    assert calls["rag_engine"] == "rag-engine"
+    assert calls["kwargs"]["platform"] == "gitlab"
+    assert calls["kwargs"]["repo"] == "gitlab-org/agent-lab"
+    assert calls["kwargs"]["reuse_risk"] == "low"
+    assert calls["synth_memory_store"] is orchestrator.memory_store
+    assert calls["synth_doc_id"] == "doc-1"
 
 
 @pytest.mark.asyncio

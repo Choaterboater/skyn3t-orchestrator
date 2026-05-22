@@ -312,6 +312,12 @@ async def _resume_cortex_proposals() -> Dict[str, int]:
     return await get_store().resume_inflight()
 
 
+async def _retriage_cortex_proposals() -> Dict[str, int]:
+    from skyn3t.cortex import get_store
+
+    return await get_store().retriage_pending()
+
+
 async def _reset_runtime_services() -> Dict[str, Any]:
     from skyn3t.cortex import get_store
 
@@ -372,6 +378,11 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("proposal recovery boot failed")
         app.state.proposal_recovery = {"requeued": 0, "failed_no_handler": 0}
+    try:
+        app.state.proposal_triage = await _retriage_cortex_proposals()
+    except Exception:
+        logger.exception("proposal triage boot failed")
+        app.state.proposal_triage = {"auto_approved": 0, "auto_rejected": 0}
 
     # Initialize integration agents if configured
     await _init_integrations(orchestrator, event_bus, settings)
@@ -956,6 +967,76 @@ def _clamp_limit(value: int, *, default: int, hi: int = 200) -> int:
     return max(1, min(n, hi))
 
 
+_EVALUATION_STATUSES = {"draft", "approved", "rejected"}
+
+
+def _evaluation_record_from_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
+    meta = dict(doc.get("meta") or {})
+    return {
+        "id": str(doc.get("id") or ""),
+        "title": str(doc.get("title") or ""),
+        "doc_type": str(doc.get("doc_type") or ""),
+        "review_status": str(meta.get("review_status") or ""),
+        "lane": str(meta.get("lane") or ""),
+        "language": str(meta.get("language") or ""),
+        "signals": [str(item) for item in list(meta.get("patterns") or []) if str(item).strip()],
+        "checks": [str(item) for item in list(meta.get("checks") or []) if str(item).strip()],
+        "source_doc_ids": [str(item) for item in list(meta.get("source_doc_ids") or []) if str(item).strip()],
+        "source_repos": [str(item) for item in list(meta.get("source_repos") or []) if str(item).strip()],
+        "source_platform": str(meta.get("source_platform") or ""),
+        "synthesis_key": str(meta.get("synthesis_key") or ""),
+        "consensus_count": int(meta.get("consensus_count") or 0),
+        "memory_layer": str(meta.get("memory_layer") or ""),
+        "confidence": meta.get("confidence"),
+        "content": str(doc.get("content") or ""),
+    }
+
+
+async def _append_evaluation_bundle(
+    output_path: Path,
+    *,
+    trajectory_count: int,
+    review_status: str = "approved",
+    limit: int = 500,
+    filters: Optional[Dict[str, Any]] = None,
+) -> int:
+    store = getattr(orchestrator, "memory_store", None) or getattr(orchestrator, "_memory", None)
+    if not store:
+        raise RuntimeError("memory not initialized")
+    docs = await store.list_knowledge_drafts(
+        review_status=review_status,
+        doc_type="evaluation",
+        limit=limit,
+        preview_only=False,
+    )
+    with output_path.open("a", encoding="utf-8") as fh:
+        for doc in docs:
+            fh.write(
+                json.dumps(
+                    {
+                        "kind": "evaluation_asset",
+                        "evaluation": _evaluation_record_from_doc(doc),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+        fh.write(
+            json.dumps(
+                {
+                    "kind": "bundle_manifest",
+                    "trajectory_count": trajectory_count,
+                    "evaluation_count": len(docs),
+                    "evaluation_review_status": review_status,
+                    "filters": filters or {},
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+    return len(docs)
+
+
 @app.get("/traces")
 async def get_traces(limit: int = 50):
     """Return recent finished traces."""
@@ -1015,6 +1096,11 @@ def _agent_list_item(agent: BaseAgent) -> Dict[str, Any]:
         **stats,
         "agent_type": stats.get("type"),
         "class_name": type(agent).__name__,
+        "backend": config_view.get("effective_backend"),
+        "model": config_view.get("effective_model"),
+        "effective_backend": config_view.get("effective_backend"),
+        "effective_model": config_view.get("effective_model"),
+        "effective_source": config_view.get("effective_source"),
         "enabled": config_view.get("enabled", getattr(agent, "enabled", True)),
         "config": config_view.get("config", {}),
         **catalog,
@@ -1135,6 +1221,36 @@ async def agent_config_patch(name: str, payload: Dict[str, Any]):
     return out
 
 
+@app.post("/api/agents/{name}/config/reset")
+async def agent_config_reset(name: str, payload: Optional[Dict[str, Any]] = None):
+    if not orchestrator:
+        return JSONResponse({"error": "Orchestrator not initialized"}, status_code=503)
+    a = orchestrator.agents.get(name)
+    if not a:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    requested = (payload or {}).get("keys")
+    keys = [str(k) for k in requested] if isinstance(requested, list) and requested else ["backend", "model"]
+    res = a.clear_override(keys)
+    persisted = True
+    persist_error: Optional[str] = None
+    try:
+        from skyn3t.config.agent_overrides import get_override_store
+
+        get_override_store().unset(name, keys)
+    except Exception as exc:
+        persisted = False
+        persist_error = f"{type(exc).__name__}: {exc}"
+        logger.warning(
+            "agent override reset persistence failed for %s (keys=%s): %s",
+            name, keys, exc, exc_info=True,
+        )
+    out = dict(res) if isinstance(res, dict) else {"applied": res}
+    out["persisted"] = persisted
+    if persist_error:
+        out["persist_error"] = persist_error
+    return out
+
+
 def _persist_override_or_log(name: str, patch: dict) -> tuple[bool, Optional[str]]:
     """Shared helper for the enable/disable endpoints. Returns
     (persisted, error_msg). On failure, logs at WARNING with the
@@ -1149,6 +1265,109 @@ def _persist_override_or_log(name: str, patch: dict) -> tuple[bool, Optional[str
             name, patch, exc, exc_info=True,
         )
         return False, f"{type(exc).__name__}: {exc}"
+
+
+def _invalidate_policy_llm_cache(stage_names: List[str]) -> None:
+    if not orchestrator:
+        return
+    wanted = {str(stage).strip().lower() for stage in stage_names if str(stage).strip()}
+    if not wanted:
+        return
+    for agent in orchestrator.agents.values():
+        if {
+            str(getattr(agent, "name", "")).strip().lower(),
+            str(getattr(agent, "agent_type", "")).strip().lower(),
+        } & wanted:
+            try:
+                if hasattr(agent, "_llm"):
+                    agent._llm = None
+            except Exception:
+                logger.debug("failed to invalidate llm cache for %s", getattr(agent, "name", "?"))
+
+
+@app.get("/api/routing/policy")
+async def routing_policy_get():
+    from skyn3t.core.model_router import available_tiers, list_stage_routes
+
+    return {
+        "tiers": available_tiers(),
+        "routes": list_stage_routes(),
+    }
+
+
+@app.get("/api/routing/recommendations")
+async def routing_recommendations_get():
+    from skyn3t.intelligence.routing_recommendations import list_stage_recommendations
+
+    return {
+        "recommendations": list_stage_recommendations(),
+    }
+
+
+@app.patch("/api/routing/policy")
+async def routing_policy_patch(payload: Dict[str, Any]):
+    from skyn3t.config.model_routing import get_model_routing_store
+    from skyn3t.core.model_router import available_tiers, list_stage_routes
+
+    raw_candidate = payload.get("policies") if isinstance(payload.get("policies"), dict) else (payload or {})
+    raw_updates: Dict[str, Any] = raw_candidate if isinstance(raw_candidate, dict) else {}
+    valid_tiers = {item["name"] for item in available_tiers()}
+    updates: Dict[str, Dict[str, Any]] = {}
+    for stage, tier in raw_updates.items():
+        stage_name = str(stage or "").strip().lower()
+        tier_name = ""
+        applied_via: Optional[str] = None
+        if isinstance(tier, dict):
+            tier_name = str(tier.get("tier") or "").strip()
+            raw_applied_via = str(tier.get("applied_via") or "").strip().lower()
+            if raw_applied_via:
+                if raw_applied_via not in {"manual", "recommendation"}:
+                    return JSONResponse(
+                        {
+                            "error": f"unknown applied_via '{raw_applied_via}'",
+                            "valid_applied_via": ["manual", "recommendation"],
+                        },
+                        status_code=400,
+                    )
+                applied_via = raw_applied_via
+        else:
+            tier_name = str(tier or "").strip()
+        if not stage_name:
+            return JSONResponse({"error": "stage name required"}, status_code=400)
+        if tier_name not in valid_tiers:
+            return JSONResponse(
+                {"error": f"unknown tier '{tier_name}'", "valid_tiers": sorted(valid_tiers)},
+                status_code=400,
+            )
+        updates[stage_name] = {"tier": tier_name}
+        if applied_via is not None:
+            updates[stage_name]["applied_via"] = applied_via
+    if not updates:
+        return JSONResponse({"error": "no routing policies supplied"}, status_code=400)
+    get_model_routing_store().set_entries(updates)
+    _invalidate_policy_llm_cache(list(updates))
+    return {
+        "ok": True,
+        "updated": sorted(updates),
+        "tiers": available_tiers(),
+        "routes": list_stage_routes(),
+    }
+
+
+@app.delete("/api/routing/policy/{stage_name}")
+async def routing_policy_delete(stage_name: str):
+    from skyn3t.config.model_routing import get_model_routing_store
+    from skyn3t.core.model_router import available_tiers, list_stage_routes
+
+    deleted = get_model_routing_store().delete(stage_name)
+    _invalidate_policy_llm_cache([stage_name])
+    return {
+        "ok": True,
+        "deleted": deleted,
+        "stage": stage_name.strip().lower(),
+        "tiers": available_tiers(),
+        "routes": list_stage_routes(),
+    }
 
 
 @app.post("/api/agents/{name}/enable")
@@ -1372,6 +1591,34 @@ async def llm_models(backend: str = "auto"):
     return {"backend": backend, "models": await list_models(backend)}
 
 
+@app.post("/api/orchestrator/submit")
+async def orchestrator_submit(data: Dict[str, Any]):
+    """Submit a free-form prompt through the orchestrator."""
+    from skyn3t.core.agent import TaskRequest
+
+    if not orchestrator:
+        return {"error": "Orchestrator not initialized"}
+
+    prompt = str(data.get("prompt") or data.get("message") or "").strip()
+    if not prompt:
+        return JSONResponse({"error": "prompt required"}, status_code=400)
+
+    agent_name = data.get("agent_name")
+    if agent_name is not None and not isinstance(agent_name, str):
+        return JSONResponse({"error": "agent_name must be a string"}, status_code=400)
+
+    title = str(data.get("title") or prompt[:80]).strip() or "Prompt"
+    task = TaskRequest(
+        title=title,
+        description=str(data.get("description") or prompt),
+        input_data={"message": prompt},
+        priority=int(data.get("priority") or 0),
+        session_id=str(data.get("session_id")) if data.get("session_id") else None,
+    )
+    task_id = await orchestrator.submit_task(task, agent_name=agent_name or None)
+    return {"task_id": task_id, "status": "submitted"}
+
+
 @app.post("/api/agents/{agent_name}/task")
 async def submit_task(agent_name: str, task_data: Dict[str, Any]):
     """Submit a task to an agent."""
@@ -1469,6 +1716,17 @@ async def get_task_result(task_id: str):
             "execution_time_ms": result.execution_time_ms,
         }
     return {"task_id": task_id, "status": "pending"}
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str):
+    """Cancel a running task."""
+    if not orchestrator:
+        return {"error": "Orchestrator not initialized"}
+
+    if not orchestrator.cancel_task(task_id):
+        return JSONResponse({"error": f"Task '{task_id}' not found"}, status_code=404)
+    return {"task_id": task_id, "status": "cancelled"}
 
 
 @app.post("/api/pipeline")
@@ -1676,6 +1934,243 @@ async def rag_add(request: Request, data: Dict[str, Any]):
 # ------------------------------------------------------------------
 # Brain / Memory API
 # ------------------------------------------------------------------
+
+@app.get("/api/memory/layers")
+async def memory_layers(limit: int = 5):
+    """Return a layer-oriented memory summary for CLI and REPL surfaces."""
+    limit = _clamp_limit(limit, default=5, hi=50)
+    if not orchestrator:
+        return {
+            "enabled": False,
+            "layers": {
+                "session": {"active_sessions": 0, "sessions": []},
+                "operator": {"insight_count": 0, "recent_insights": [], "skill_summary": {}, "top_skills": []},
+                "project": {
+                    "tasks": 0,
+                    "messages": 0,
+                    "knowledge_documents": 0,
+                    "success_rate": 0.0,
+                    "recent_documents": [],
+                },
+            },
+        }
+
+    store = getattr(orchestrator, "memory_store", None) or getattr(orchestrator, "_memory", None)
+    consciousness = getattr(orchestrator, "_consciousness", None)
+
+    stats: Dict[str, Any] = {}
+    recent_documents: List[Dict[str, Any]] = []
+    if store:
+        stats = await store.get_stats()
+        recent_documents = await store.get_lessons(limit=limit)
+
+    sessions: List[str] = []
+    insights: List[Dict[str, Any]] = []
+    if consciousness:
+        sessions = await consciousness.list_sessions()
+        insights = await consciousness.get_insights(limit=limit)
+
+    from skyn3t.intelligence.skill_library import get_default_library
+
+    lib = get_default_library()
+    skill_summary = lib.summary()
+    top_skills = lib.find(min_score=0.1, limit=limit)
+
+    return {
+        "enabled": bool(store or consciousness),
+        "layers": {
+            "session": {
+                "active_sessions": len(sessions),
+                "sessions": sessions[:limit],
+            },
+            "operator": {
+                "insight_count": len(insights),
+                "recent_insights": [
+                    {
+                        "agent": item.get("agent"),
+                        "capability": item.get("capability"),
+                        "insight": item.get("insight"),
+                        "timestamp": item.get("timestamp"),
+                    }
+                    for item in insights[:limit]
+                ],
+                "skill_summary": skill_summary,
+                "top_skills": [
+                    {
+                        "name": skill.name,
+                        "score": skill.score,
+                        "tags": skill.tags,
+                        "source": skill.source,
+                    }
+                    for skill in top_skills
+                ],
+            },
+            "project": {
+                "tasks": stats.get("tasks", 0),
+                "messages": stats.get("messages", 0),
+                "knowledge_documents": stats.get("knowledge_documents", 0),
+                "success_rate": stats.get("success_rate", 0.0),
+                "recent_documents": [
+                    {
+                        "title": doc.get("title"),
+                        "source": doc.get("source"),
+                        "doc_type": doc.get("doc_type"),
+                        "created_at": doc.get("created_at"),
+                    }
+                    for doc in recent_documents[:limit]
+                ],
+            },
+        },
+    }
+
+
+@app.get("/api/memory/drafts")
+async def memory_drafts(limit: int = 20, doc_type: Optional[str] = None):
+    """List pending memory drafts awaiting review."""
+    store = getattr(orchestrator, "memory_store", None) or getattr(orchestrator, "_memory", None)
+    if not store:
+        return {"drafts": []}
+    limit = _clamp_limit(limit, default=20, hi=200)
+    drafts = await store.list_knowledge_drafts(
+        review_status="draft",
+        doc_type=doc_type,
+        limit=limit,
+    )
+    return {"drafts": drafts}
+
+
+@app.get("/api/memory/evaluations")
+async def memory_evaluations(status: str = "draft", limit: int = 20):
+    """List governed evaluation assets by review status."""
+    store = getattr(orchestrator, "memory_store", None) or getattr(orchestrator, "_memory", None)
+    if not store:
+        return {"evaluations": []}
+    normalized_status = str(status or "draft").strip().lower() or "draft"
+    if normalized_status not in _EVALUATION_STATUSES:
+        return JSONResponse(
+            {"error": "status must be one of: draft, approved, rejected"},
+            status_code=422,
+        )
+    limit = _clamp_limit(limit, default=20, hi=100)
+    docs = await store.list_knowledge_drafts(
+        review_status=normalized_status,
+        doc_type="evaluation",
+        limit=limit,
+    )
+    return {
+        "evaluations": [_evaluation_record_from_doc(doc) for doc in docs],
+        "status": normalized_status,
+    }
+
+
+@app.get("/api/memory/evaluations/{doc_id}")
+async def memory_evaluation_detail(doc_id: str):
+    """Get one governed evaluation asset."""
+    store = getattr(orchestrator, "memory_store", None) or getattr(orchestrator, "_memory", None)
+    if not store:
+        return JSONResponse({"error": "memory not initialized"}, status_code=503)
+    doc = await store.get_knowledge_doc(doc_id)
+    if doc is None or str(doc.get("doc_type") or "") != "evaluation":
+        return JSONResponse({"error": "evaluation asset not found"}, status_code=404)
+    return {"evaluation": _evaluation_record_from_doc(doc), "doc": doc}
+
+
+@app.get("/api/memory/evaluations/{doc_id}/export")
+async def memory_evaluation_export(doc_id: str, format: str = "json"):
+    """Export an approved evaluation asset for downstream use."""
+    store = getattr(orchestrator, "memory_store", None) or getattr(orchestrator, "_memory", None)
+    if not store:
+        return JSONResponse({"error": "memory not initialized"}, status_code=503)
+    doc = await store.get_knowledge_doc(doc_id)
+    if doc is None or str(doc.get("doc_type") or "") != "evaluation":
+        return JSONResponse({"error": "evaluation asset not found"}, status_code=404)
+    record = _evaluation_record_from_doc(doc)
+    if record["review_status"] != "approved":
+        return JSONResponse(
+            {"error": "evaluation asset must be approved before export"},
+            status_code=400,
+        )
+    normalized_format = str(format or "json").strip().lower() or "json"
+    if normalized_format not in {"json", "jsonl"}:
+        return JSONResponse({"error": "format must be one of: json, jsonl"}, status_code=422)
+    payload = {
+        "kind": "evaluation_asset",
+        "evaluation": {
+            key: value for key, value in record.items() if key != "content"
+        },
+    }
+    if normalized_format == "jsonl":
+        return PlainTextResponse(
+            json.dumps(payload, separators=(",", ":")) + "\n",
+            media_type="application/x-ndjson",
+        )
+    return payload
+
+
+@app.post("/api/memory/drafts/{doc_id}/approve")
+async def memory_draft_approve(doc_id: str, request: Request):
+    """Promote a memory draft into trusted RAG-backed knowledge."""
+    store = getattr(orchestrator, "memory_store", None) or getattr(orchestrator, "_memory", None)
+    if not store:
+        return JSONResponse({"error": "memory not initialized"}, status_code=503)
+    draft = await store.get_knowledge_doc(doc_id)
+    if draft is None:
+        return JSONResponse({"error": "draft not found"}, status_code=404)
+    meta = dict(draft.get("meta") or {})
+    if meta.get("review_status") != "draft":
+        return JSONResponse({"error": "draft is not pending review"}, status_code=400)
+
+    engine = await _get_rag_engine(request)
+    approved_meta = {
+        **meta,
+        "review_status": "approved",
+        "provenance_status": "approved",
+    }
+    embedding_id = draft.get("embedding_id")
+    if not embedding_id:
+        embedding_id = await engine.add_knowledge_one(
+            content=str(draft.get("content") or ""),
+            title=str(draft.get("title") or ""),
+            source=str(draft.get("source") or ""),
+            doc_type=str(draft.get("doc_type") or "lesson"),
+            metadata=approved_meta,
+        )
+    if not embedding_id:
+        return JSONResponse({"error": "failed to promote draft"}, status_code=500)
+    updated = await store.update_knowledge_doc_review(
+        doc_id,
+        review_status="approved",
+        embedding_id=embedding_id,
+        extra_meta={"provenance_status": "approved"},
+    )
+    if updated is None:
+        return JSONResponse({"error": "draft not found"}, status_code=404)
+    return {"ok": True, "draft": updated}
+
+
+@app.post("/api/memory/drafts/{doc_id}/reject")
+async def memory_draft_reject(doc_id: str, payload: dict | None = None):
+    """Reject a memory draft so it stays out of trusted retrieval."""
+    store = getattr(orchestrator, "memory_store", None) or getattr(orchestrator, "_memory", None)
+    if not store:
+        return JSONResponse({"error": "memory not initialized"}, status_code=503)
+    draft = await store.get_knowledge_doc(doc_id)
+    if draft is None:
+        return JSONResponse({"error": "draft not found"}, status_code=404)
+    meta = dict(draft.get("meta") or {})
+    if meta.get("review_status") != "draft":
+        return JSONResponse({"error": "draft is not pending review"}, status_code=400)
+    reason = str((payload or {}).get("reason") or "")
+    updated = await store.update_knowledge_doc_review(
+        doc_id,
+        review_status="rejected",
+        reason=reason,
+        extra_meta={"provenance_status": "rejected"},
+    )
+    if updated is None:
+        return JSONResponse({"error": "draft not found"}, status_code=404)
+    return {"ok": True, "draft": updated}
+
 
 @app.get("/api/memory/stats")
 async def memory_stats():
@@ -1971,6 +2466,7 @@ async def export_trajectories(
     to_date: Optional[str] = None,
     agent: Optional[str] = None,
     outcome: Optional[str] = None,
+    include_evaluations: bool = False,
 ):
     """Export trajectories matching filters as a downloadable JSONL file."""
     if not trajectory_logger:
@@ -1980,10 +2476,33 @@ async def export_trajectories(
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False, encoding="utf-8") as fh:
         tmp_path = Path(fh.name)
-    count = trajectory_logger.export_jsonl(
+    trajectory_count = trajectory_logger.export_jsonl(
         tmp_path, from_date=from_date, to_date=to_date, agent=agent, outcome=outcome
     )
-    if count == 0:
+    evaluation_count = 0
+    if include_evaluations:
+        try:
+            evaluation_count = await _append_evaluation_bundle(
+                tmp_path,
+                trajectory_count=trajectory_count,
+                review_status="approved",
+                limit=500,
+                filters={
+                    key: value
+                    for key, value in {
+                        "from_date": from_date,
+                        "to_date": to_date,
+                        "agent": agent,
+                        "outcome": outcome,
+                    }.items()
+                    if value
+                },
+            )
+        except RuntimeError:
+            tmp_path.unlink(missing_ok=True)
+            return JSONResponse({"error": "memory not initialized"}, status_code=503)
+    total_count = trajectory_count + evaluation_count
+    if total_count == 0:
         tmp_path.unlink(missing_ok=True)
         return JSONResponse({"error": "no trajectories match filters"}, status_code=404)
 
@@ -1992,7 +2511,11 @@ async def export_trajectories(
     return FileResponse(
         path=str(tmp_path),
         media_type="application/jsonl",
-        filename=f"trajectories_{from_date or 'all'}_{to_date or 'all'}.jsonl",
+        filename=(
+            f"trajectories_bundle_{from_date or 'all'}_{to_date or 'all'}.jsonl"
+            if include_evaluations
+            else f"trajectories_{from_date or 'all'}_{to_date or 'all'}.jsonl"
+        ),
     )
 
 
@@ -2064,6 +2587,116 @@ async def delete_schedule_job(job_id: str):
     return {"deleted": True}
 
 
+async def _ensure_repo_scout():
+    if not orchestrator:
+        return None
+    scout = getattr(orchestrator, "_repo_scout", None)
+    if scout is not None:
+        return scout
+    try:
+        from skyn3t.cortex.repo_scout import GitHubRepoScout
+
+        scout = GitHubRepoScout(orchestrator=orchestrator, event_bus=orchestrator.event_bus)
+        scout.start()
+        setattr(orchestrator, "_repo_scout", scout)
+        return scout
+    except Exception:
+        logger.exception("could not initialize repo scout")
+        return None
+
+
+def _normalize_repo_scout_config(
+    data: Dict[str, Any] | None,
+    *,
+    default_platforms: List[str],
+) -> Dict[str, Any]:
+    payload = dict(data or {})
+    if "platforms" not in payload or payload.get("platforms") is None:
+        payload["platforms"] = list(default_platforms)
+    return payload
+
+
+async def _run_repo_scout(data: Dict[str, Any] | None = None, *, default_platforms: List[str]):
+    if not orchestrator:
+        return JSONResponse({"error": "orchestrator not initialized"}, status_code=503)
+    scout = await _ensure_repo_scout()
+    if scout is None:
+        return JSONResponse({"error": "repo scout not available"}, status_code=503)
+    result = await scout.run_once(_normalize_repo_scout_config(data, default_platforms=default_platforms))
+    status_code = 200 if result.get("ok") else 400
+    if status_code != 200:
+        return JSONResponse(result, status_code=status_code)
+    return result
+
+
+async def _schedule_repo_scout(
+    data: Dict[str, Any],
+    *,
+    default_platforms: List[str],
+    default_name_prefix: str,
+):
+    if not orchestrator or not orchestrator.memory_store:
+        return JSONResponse({"error": "memory not initialized"}, status_code=503)
+    schedule_expr = str(data.get("schedule_expr", "")).strip()
+    if not schedule_expr:
+        return JSONResponse({"error": "schedule_expr is required"}, status_code=400)
+    cadence = str(data.get("cadence") or "daily").strip() or "daily"
+    name = str(data.get("name") or "").strip() or f"{default_name_prefix}-{cadence}-{uuid4().hex[:6]}"
+    config = _normalize_repo_scout_config(
+        {
+            "cadence": cadence,
+            "limit": data.get("limit", 4),
+            "queries": data.get("queries") or [],
+            **({"platforms": data.get("platforms")} if "platforms" in data else {}),
+        },
+        default_platforms=default_platforms,
+    )
+    job_id = str(uuid4())
+    await orchestrator.memory_store.save_scheduled_job(
+        job_id=job_id,
+        name=name,
+        schedule_expr=schedule_expr,
+        agent_name="github_repo_scout",
+        prompt=json.dumps(config, sort_keys=True),
+        enabled=bool(data.get("enabled", True)),
+        next_run=None,
+        run_count=0,
+    )
+    return {"job_id": job_id, "name": name, "created": True, "config": config}
+
+
+@app.post("/api/repo-scout/run")
+async def run_repo_scout(data: Dict[str, Any] | None = None):
+    """Run the multi-source repo scout immediately."""
+    return await _run_repo_scout(data, default_platforms=["github", "gitlab", "bitbucket"])
+
+
+@app.post("/api/repo-scout/schedule")
+async def schedule_repo_scout(data: Dict[str, Any]):
+    """Create a recurring multi-source repo scout job."""
+    return await _schedule_repo_scout(
+        data,
+        default_platforms=["github", "gitlab", "bitbucket"],
+        default_name_prefix="repo-scout",
+    )
+
+
+@app.post("/api/github/scout/run")
+async def run_github_scout(data: Dict[str, Any] | None = None):
+    """Run the GitHub scout immediately."""
+    return await _run_repo_scout(data, default_platforms=["github"])
+
+
+@app.post("/api/github/scout/schedule")
+async def schedule_github_scout(data: Dict[str, Any]):
+    """Create a recurring GitHub scout job."""
+    return await _schedule_repo_scout(
+        data,
+        default_platforms=["github"],
+        default_name_prefix="github-scout",
+    )
+
+
 @app.get("/api/memory/skills")
 async def get_skills(tag: Optional[str] = None, limit: int = 20):
     """First-class skill library — durable learned-skill files in data/skills/.
@@ -2084,6 +2717,175 @@ async def get_skills(tag: Optional[str] = None, limit: int = 20):
     return {
         "summary": summary,
         "top": [s.__dict__ | {"score": s.score} for s in top],
+    }
+
+
+@app.get("/api/skills/candidates")
+async def get_skill_candidates(limit: int = 20, min_confidence: float = 0.7):
+    """List approved governed-memory docs eligible for skill drafting."""
+    store = getattr(orchestrator, "memory_store", None) or getattr(orchestrator, "_memory", None)
+    if not store:
+        return JSONResponse({"error": "memory not initialized"}, status_code=503)
+    limit = _clamp_limit(limit, default=20, hi=100)
+    candidates = await store.list_skill_candidate_docs(
+        min_confidence=min_confidence,
+        limit=limit,
+    )
+    return {"candidates": candidates}
+
+
+@app.get("/api/skills/drafts")
+async def list_skill_drafts():
+    """List pending skill drafts derived from governed memory."""
+    from skyn3t.intelligence.skill_library import get_default_library
+
+    lib = get_default_library()
+    return {
+        "drafts": [
+            {
+                "name": skill.name,
+                "slug": skill.slug,
+                "description": skill.description,
+                "tags": skill.tags,
+                "triggers": skill.triggers,
+                "source": skill.source,
+                "created_at": skill.created_at,
+                "memory_doc_id": skill.memory_doc_id,
+            }
+            for skill in lib.all_drafts()
+        ]
+    }
+
+
+@app.post("/api/skills/drafts/from-memory/{doc_id}")
+async def create_skill_draft_from_memory(doc_id: str):
+    """Create a pending skill draft from an approved memory document."""
+    from skyn3t.intelligence.skill_library import get_default_library, skill_from_memory_doc
+
+    store = getattr(orchestrator, "memory_store", None) or getattr(orchestrator, "_memory", None)
+    if not store:
+        return JSONResponse({"error": "memory not initialized"}, status_code=503)
+    doc = await store.get_knowledge_doc(doc_id)
+    if doc is None:
+        return JSONResponse({"error": "memory document not found"}, status_code=404)
+    meta = dict(doc.get("meta") or {})
+    if meta.get("review_status") != "approved":
+        return JSONResponse({"error": "memory document must be approved first"}, status_code=400)
+    if str(doc.get("doc_type") or "") == "evaluation":
+        return JSONResponse(
+            {"error": "evaluation assets cannot be promoted into skills"},
+            status_code=400,
+        )
+    if not meta.get("reusable"):
+        return JSONResponse({"error": "memory document is not reusable"}, status_code=400)
+    if doc.get("doc_type") == "external_learning":
+        if meta.get("external_doc_ingest_status") != "docs_ingested":
+            return JSONResponse(
+                {"error": "external learning document must ingest approved docs first"},
+                status_code=400,
+            )
+        if not list(meta.get("external_doc_paths_ingested") or []):
+            return JSONResponse(
+                {"error": "external learning document has no ingested docs to promote"},
+                status_code=400,
+            )
+    if meta.get("skill_promotion_status"):
+        return JSONResponse(
+            {
+                "error": "memory document already has a skill promotion status",
+                "status": meta.get("skill_promotion_status"),
+            },
+            status_code=400,
+        )
+
+    lib = get_default_library()
+    skill = skill_from_memory_doc(doc)
+    lib.upsert_draft(skill)
+    updated = await store.merge_knowledge_doc_meta(
+        doc_id,
+        {
+            "skill_promotion_status": "draft",
+            "skill_draft_slug": skill.slug,
+        },
+    )
+    return {
+        "created": True,
+        "draft": {
+            "name": skill.name,
+            "slug": skill.slug,
+            "memory_doc_id": skill.memory_doc_id,
+            "tags": skill.tags,
+        },
+        "memory_doc": updated,
+    }
+
+
+@app.post("/api/skills/drafts/{slug}/approve")
+async def approve_skill_draft(slug: str):
+    """Promote a pending skill draft into the live skill library."""
+    from skyn3t.intelligence.skill_library import get_default_library
+
+    lib = get_default_library()
+    draft = lib.get_draft(slug)
+    if draft is None:
+        return JSONResponse({"error": "skill draft not found"}, status_code=404)
+    path = lib.approve_draft(slug)
+    if path is None:
+        return JSONResponse({"error": "skill draft not found"}, status_code=404)
+
+    store = getattr(orchestrator, "memory_store", None) or getattr(orchestrator, "_memory", None)
+    memory_doc = None
+    if draft.memory_doc_id and store:
+        memory_doc = await store.merge_knowledge_doc_meta(
+            draft.memory_doc_id,
+            {
+                "skill_promotion_status": "installed",
+                "skill_slug": draft.slug,
+                "skill_draft_slug": draft.slug,
+            },
+        )
+    return {
+        "installed": path.stem,
+        "skill": {
+            "name": draft.name,
+            "slug": draft.slug,
+            "memory_doc_id": draft.memory_doc_id,
+        },
+        "memory_doc": memory_doc,
+    }
+
+
+@app.post("/api/skills/drafts/{slug}/reject")
+async def reject_skill_draft(slug: str, payload: dict | None = None):
+    """Reject and delete a pending skill draft."""
+    from skyn3t.intelligence.skill_library import get_default_library
+
+    lib = get_default_library()
+    draft = lib.get_draft(slug)
+    if draft is None:
+        return JSONResponse({"error": "skill draft not found"}, status_code=404)
+    if not lib.reject_draft(slug):
+        return JSONResponse({"error": "skill draft not found"}, status_code=404)
+    reason = str((payload or {}).get("reason") or "")
+
+    store = getattr(orchestrator, "memory_store", None) or getattr(orchestrator, "_memory", None)
+    memory_doc = None
+    if draft.memory_doc_id and store:
+        extra_meta: Dict[str, Any] = {
+            "skill_promotion_status": "rejected",
+            "skill_draft_slug": draft.slug,
+        }
+        if reason:
+            extra_meta["skill_promotion_reason"] = reason
+        memory_doc = await store.merge_knowledge_doc_meta(draft.memory_doc_id, extra_meta)
+    return {
+        "rejected": True,
+        "draft": {
+            "name": draft.name,
+            "slug": draft.slug,
+            "memory_doc_id": draft.memory_doc_id,
+        },
+        "memory_doc": memory_doc,
     }
 
 

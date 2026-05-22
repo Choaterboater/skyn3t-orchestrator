@@ -452,10 +452,8 @@ class BaseAgent(ABC):
             "name": self.name,
             "type": self.agent_type,
             "provider": self.provider,
-            # Expose backend + model so the Agents UI can show which
-            # LLM each agent is actually wired to. Without these the
-            # dashboard looked like everything was running on the
-            # default backend even when overrides were applied.
+            # Raw override values only. UIs that need the routed values
+            # should use get_config_view()["effective_*"].
             "backend": self.config.get("backend"),
             "model": self.config.get("model"),
             "status": self.status,
@@ -693,8 +691,49 @@ class BaseAgent(ABC):
     # Per-agent live config / override surface (used by the dashboard)
     # ─────────────────────────────────────────────────────────────────
 
+    def _effective_llm_view(self) -> Dict[str, Any]:
+        """Best-effort view of the backend/model this agent is routed to."""
+        raw_backend = self.config.get("backend")
+        raw_model = self.config.get("model")
+        if raw_backend:
+            return {
+                "effective_backend": raw_backend,
+                "effective_model": raw_model,
+                "effective_source": "config",
+                "effective_stage": None,
+                "effective_tier": None,
+                "effective_policy_source": None,
+            }
+        try:
+            from skyn3t.core.model_router import describe_stage_route, has_stage_policy
+
+            for stage_name in (self.name, self.agent_type):
+                if not stage_name:
+                    continue
+                if has_stage_policy(stage_name):
+                    route = describe_stage_route(stage_name)
+                    return {
+                        "effective_backend": route.get("backend"),
+                        "effective_model": raw_model if raw_model is not None else route.get("model"),
+                        "effective_source": "policy",
+                        "effective_stage": route.get("stage"),
+                        "effective_tier": route.get("tier"),
+                        "effective_policy_source": route.get("source"),
+                    }
+        except Exception:
+            logger.debug("effective llm view failed for %s", self.name, exc_info=True)
+        return {
+            "effective_backend": raw_backend,
+            "effective_model": raw_model,
+            "effective_source": "config" if (raw_backend or raw_model) else None,
+            "effective_stage": None,
+            "effective_tier": None,
+            "effective_policy_source": None,
+        }
+
     def get_config_view(self) -> Dict[str, Any]:
         """Snapshot of the live, editable config exposed to UIs."""
+        effective = self._effective_llm_view()
         return {
             "name": self.name,
             "agent_type": self.agent_type,
@@ -704,6 +743,7 @@ class BaseAgent(ABC):
             "reports_to": self.reports_to,
             "lifecycle": self.lifecycle,
             "capabilities": [c.name for c in self.capabilities],
+            **effective,
             "config": {
                 "backend": self.config.get("backend"),
                 "model": self.config.get("model"),
@@ -968,6 +1008,29 @@ class BaseAgent(ABC):
             view = {"name": getattr(self, "name", ""), "enabled": getattr(self, "_enabled", True)}
         return {"changed": changed, "config_view": view}
 
+    def clear_override(self, keys: List[str]) -> Dict[str, Any]:
+        """Clear supported config override keys live."""
+        changed: List[str] = []
+        try:
+            clearable = {"backend", "model", "system_prompt", "temperature", "max_tokens"}
+            for key in keys:
+                if key not in clearable:
+                    logger.debug("clear_override: ignoring unsupported key %s", key)
+                    continue
+                if key in self.config:
+                    self.config.pop(key, None)
+                    changed.append(key)
+            if any(k in changed for k in ("backend", "model")) and hasattr(self, "_llm"):
+                self._llm = None
+        except Exception:
+            logger.exception("clear_override: unexpected failure on agent %s", getattr(self, "name", "?"))
+        try:
+            view = self.get_config_view()
+        except Exception:
+            logger.exception("clear_override: get_config_view failed for %s", getattr(self, "name", "?"))
+            view = {"name": getattr(self, "name", ""), "enabled": getattr(self, "_enabled", True)}
+        return {"changed": changed, "config_view": view}
+
     @property
     def enabled(self) -> bool:
         return getattr(self, "_enabled", True)
@@ -997,12 +1060,16 @@ class BaseAgent(ABC):
             # designer / code_agent / reviewer in the runner.
             if not backend:
                 try:
-                    from skyn3t.core.model_router import resolve_model
-                    policy_backend, policy_model = resolve_model(self.name)
-                    backend = policy_backend
-                    backend_is_policy = bool(policy_backend)
-                    if model is None:
-                        model = policy_model
+                    from skyn3t.core.model_router import describe_stage_route, has_stage_policy
+                    for stage_name in (self.name, self.agent_type):
+                        if not stage_name or not has_stage_policy(stage_name):
+                            continue
+                        route = describe_stage_route(stage_name)
+                        backend = route.get("backend")
+                        backend_is_policy = bool(backend)
+                        if model is None:
+                            model = route.get("model")
+                        break
                 except Exception:
                     logger.debug(
                         "model router lookup failed for %s",

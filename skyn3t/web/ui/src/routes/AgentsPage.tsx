@@ -1,6 +1,13 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, AgentConfigView, AgentRow } from "../api/client";
+import {
+  api,
+  AgentConfigView,
+  AgentRow,
+  RoutingRecommendation,
+  RoutingRoute,
+  RoutingTier,
+} from "../api/client";
 
 // Agent registry. Click a row to open the edit drawer — change backend,
 // model, system prompt, temperature, max_tokens. Enable/disable inline.
@@ -33,8 +40,23 @@ export default function AgentsPage() {
   const usageByName = new Map(
     (usage.data ?? []).map((u) => [u.agent, u]),
   );
+  const routing = useQuery({
+    queryKey: ["routing_policy"],
+    queryFn: api.routingPolicy,
+    refetchInterval: 15_000,
+  });
+  const routingRecommendations = useQuery({
+    queryKey: ["routing_recommendations"],
+    queryFn: api.routingRecommendations,
+    refetchInterval: 15_000,
+    retry: false,
+  });
 
-  const invalidate = () => qc.invalidateQueries({ queryKey: ["agents"] });
+  const invalidate = () => {
+    qc.invalidateQueries({ queryKey: ["agents"] });
+    qc.invalidateQueries({ queryKey: ["routing_policy"] });
+    qc.invalidateQueries({ queryKey: ["routing_recommendations"] });
+  };
 
   return (
     <div className="space-y-6">
@@ -72,6 +94,15 @@ export default function AgentsPage() {
       )}
       {data && data.length === 0 && (
         <p className="text-text-secondary">No agents registered yet.</p>
+      )}
+
+      {routing.data && (
+        <RoutingPolicyCard
+          routes={routing.data.routes ?? []}
+          tiers={routing.data.tiers ?? []}
+          recommendations={routingRecommendations.data ?? []}
+          onChanged={invalidate}
+        />
       )}
 
       <div
@@ -124,6 +155,228 @@ export default function AgentsPage() {
   );
 }
 
+function RoutingPolicyCard({
+  routes,
+  tiers,
+  recommendations,
+  onChanged,
+}: {
+  routes: RoutingRoute[];
+  tiers: RoutingTier[];
+  recommendations: RoutingRecommendation[];
+  onChanged: () => void;
+}) {
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const recByStage = new Map(recommendations.map((rec) => [rec.stage, rec]));
+  const save = useMutation({
+    mutationFn: ({ stage, tier }: { stage: string; tier: string }) =>
+      api.patchRoutingPolicy({ [stage]: { tier, applied_via: "manual" } }),
+    onSuccess: () => onChanged(),
+  });
+  const reset = useMutation({
+    mutationFn: (stage: string) => api.resetRoutingPolicy(stage),
+    onSuccess: () => onChanged(),
+  });
+
+  return (
+    <section className="rounded-lg border border-border bg-bg-2 overflow-hidden">
+      <header className="px-4 py-3 border-b border-border">
+        <h2 className="font-mono text-accent">Routing policy</h2>
+        <p className="text-text-secondary text-sm mt-1">
+          Stage defaults now come from saved policy first, then env bootstrap, then built-in defaults.
+        </p>
+        <p className="text-text-dim text-xs mt-1">
+          Recommendations are advisory. Saving marks an override manual; apply rec marks it recommendation until you reset it.
+        </p>
+      </header>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="bg-bg-3 text-text-secondary text-xs uppercase tracking-wider">
+            <tr>
+              <Th>Stage</Th>
+              <Th>Tier</Th>
+              <Th>Backend</Th>
+              <Th>Model</Th>
+              <Th>Source</Th>
+              <Th>Recommendation</Th>
+              <Th align="right">Actions</Th>
+            </tr>
+          </thead>
+          <tbody>
+            {routes.map((route) => {
+              const currentTier = drafts[route.stage] ?? route.tier;
+              const rec = recByStage.get(route.stage);
+              const canApplyRec = !!rec && rec.applyable && rec.recommended_tier !== currentTier;
+              const canSave =
+                currentTier !== route.tier ||
+                (route.source === "persisted" && route.persisted_via === "recommendation");
+              return (
+                <tr key={route.stage} className="border-t border-border">
+                  <Td mono>{route.stage}</Td>
+                  <Td>
+                    <select
+                      value={currentTier}
+                      onChange={(e) =>
+                        setDrafts((d) => ({ ...d, [route.stage]: e.target.value }))
+                      }
+                      className="w-full bg-bg-3 border border-border rounded px-2 py-1.5 text-sm font-mono outline-none focus:border-accent"
+                    >
+                      {tiers.map((tier) => (
+                        <option key={tier.name} value={tier.name}>
+                          {tier.name}
+                        </option>
+                      ))}
+                    </select>
+                  </Td>
+                  <Td mono>{route.backend ?? "—"}</Td>
+                  <Td mono>{route.model ?? "(backend default)"}</Td>
+                  <Td>{routingSourceLabel(route)}</Td>
+                  <Td>
+                    {rec ? (
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono text-xs">
+                            {rec.recommended_tier}
+                          </span>
+                          <span
+                            className={[
+                              "text-[0.65rem] px-1.5 py-0.5 rounded border uppercase tracking-wider",
+                              rec.applyable
+                                ? "border-accent-line bg-accent-soft text-accent"
+                                : "border-border text-text-secondary",
+                            ].join(" ")}
+                          >
+                            {rec.recommendation_kind} · {rec.confidence}
+                          </span>
+                        </div>
+                        <div className="text-[0.65rem] text-text-dim">
+                          {(rec.reasons ?? []).slice(0, 2).join(" ")}
+                        </div>
+                        {routingEvidenceChips(rec).length > 0 && (
+                          <div className="flex flex-wrap gap-1">
+                            {routingEvidenceChips(rec).map((chip) => (
+                              <span
+                                key={chip}
+                                className="text-[0.65rem] px-1.5 py-0.5 rounded border border-border bg-bg-3 text-text-secondary font-mono"
+                              >
+                                {chip}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                        {routingEvidenceNote(rec) && (
+                          <div className="text-[0.65rem] text-text-secondary">
+                            {routingEvidenceNote(rec)}
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <span className="text-text-dim">—</span>
+                    )}
+                  </Td>
+                  <Td align="right">
+                    <div className="inline-flex gap-2">
+                      <button
+                        type="button"
+                        disabled={save.isPending || !canSave}
+                        onClick={() => save.mutate({ stage: route.stage, tier: currentTier })}
+                        className="text-[0.65rem] px-2 py-0.5 rounded border border-accent-line text-accent hover:bg-accent-soft disabled:opacity-50"
+                      >
+                        save
+                      </button>
+                      <button
+                        type="button"
+                        disabled={save.isPending || !canApplyRec || !rec}
+                        onClick={() =>
+                          rec &&
+                          api
+                            .patchRoutingPolicy({
+                              [route.stage]: {
+                                tier: rec.recommended_tier,
+                                applied_via: "recommendation",
+                              },
+                            })
+                            .then(() => onChanged())
+                        }
+                        className="text-[0.65rem] px-2 py-0.5 rounded border border-accent-line text-accent hover:bg-accent-soft disabled:opacity-50"
+                      >
+                        apply rec
+                      </button>
+                      <button
+                        type="button"
+                        disabled={reset.isPending || route.source !== "persisted"}
+                        onClick={() => reset.mutate(route.stage)}
+                        className="text-[0.65rem] px-2 py-0.5 rounded border border-border text-text-secondary hover:border-border-strong disabled:opacity-50"
+                      >
+                        reset
+                      </button>
+                    </div>
+                  </Td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function routingSourceLabel(route: RoutingRoute): string {
+  if (route.source !== "persisted") {
+    return route.source;
+  }
+  const appliedVia = route.persisted_via === "recommendation" ? "recommendation" : "manual";
+  return `persisted · ${appliedVia}`;
+}
+
+function routingEvidenceChips(rec: RoutingRecommendation): string[] {
+  const signals = rec.signals ?? {};
+  const chips: string[] = [];
+  const samples = signals.trajectory_samples ?? 0;
+  if (samples > 0) {
+    chips.push(`${samples} traj`);
+  }
+  const latency = signals.avg_latency_seconds ?? 0;
+  if (latency > 0) {
+    chips.push(`${Math.round(latency)}s avg`);
+  }
+  const tokenWeight = Math.max(
+    signals.trajectory_stage_tokens ?? 0,
+    signals.live_stage_tokens ?? 0,
+  );
+  if (tokenWeight > 0) {
+    chips.push(`${fmtTokens(tokenWeight)} tok`);
+  }
+  const mixed = signals.mixed_route_samples ?? 0;
+  if (mixed > 0) {
+    chips.push(`${mixed} mixed`);
+  }
+  return chips;
+}
+
+function routingEvidenceNote(rec: RoutingRecommendation): string | null {
+  const samples = rec.signals?.trajectory_samples ?? 0;
+  if (samples <= 0 && rec.confidence === "low") {
+    return "No trajectory evidence yet — this is still a default/heuristic recommendation.";
+  }
+  const mixed = rec.signals?.mixed_route_samples ?? 0;
+  if (mixed > 0) {
+    return "Mixed-route stage runs are excluded from per-route scoring, so confidence stays conservative.";
+  }
+  return null;
+}
+
+function displayBackend(a: Pick<AgentRow, "effective_backend" | "backend">): string {
+  return a.effective_backend ?? a.backend ?? "—";
+}
+
+function displayModel(
+  a: Pick<AgentRow, "effective_backend" | "backend" | "effective_model" | "model">,
+): string {
+  return a.effective_model ?? a.model ?? (displayBackend(a) === "—" ? "—" : "(backend default)");
+}
+
 function AgentTableRow({
   a,
   selected,
@@ -169,8 +422,8 @@ function AgentTableRow({
     >
       <Td truncate>{a.name}</Td>
       <Td>{a.agent_type ?? "—"}</Td>
-      <Td mono>{a.backend ?? "default"}</Td>
-      <Td mono>{a.model ?? "default"}</Td>
+      <Td mono>{displayBackend(a)}</Td>
+      <Td mono>{displayModel(a)}</Td>
       <Td align="right" mono>
         {usage ? fmtTokens(usage.total_tokens) : "—"}
       </Td>
@@ -263,6 +516,19 @@ function AgentEditDrawer({
       refetch();
     },
   });
+  const resetLLM = useMutation({
+    mutationFn: () => api.resetAgentConfig(name, ["backend", "model"]),
+    onSuccess: (res) => {
+      if (res && res.persisted === false) {
+        console.warn(
+          `Agent ${name}: live routing reset but persistence failed: ` +
+            (res.persist_error ?? "(no detail)"),
+        );
+      }
+      onChanged();
+      refetch();
+    },
+  });
 
   const del = useMutation({
     mutationFn: () => api.deleteAgent(name),
@@ -321,6 +587,22 @@ function AgentEditDrawer({
         <form onSubmit={onSubmit} className="space-y-3">
           <div className="text-[0.65rem] text-text-dim font-mono">
             {data.agent_type ?? "—"} · {data.provider ?? "—"}
+          </div>
+          <div className="rounded border border-border bg-bg-3 px-3 py-2 text-xs space-y-1">
+            <div className="font-mono text-text-secondary uppercase tracking-wider">
+              Effective routing
+            </div>
+            <div className="font-mono">
+              {data.effective_backend ?? "—"} ·{" "}
+              {data.effective_model ?? (data.effective_backend ? "(backend default)" : "—")}
+            </div>
+            <div className="text-text-dim">
+              {data.effective_source === "config"
+                ? "explicit agent override"
+                : data.effective_source === "policy"
+                  ? `stage ${data.effective_stage ?? "—"} · ${data.effective_tier ?? "—"} · ${data.effective_policy_source ?? "policy"}`
+                  : "no routed model"}
+            </div>
           </div>
 
           <label className="flex items-center gap-2 text-sm">
@@ -409,6 +691,14 @@ function AgentEditDrawer({
               className="rounded bg-accent text-bg-0 text-sm font-medium px-3 py-1.5 disabled:opacity-60"
             >
               {save.isPending ? "Saving…" : "Save"}
+            </button>
+            <button
+              type="button"
+              onClick={() => resetLLM.mutate()}
+              disabled={resetLLM.isPending}
+              className="rounded border border-border text-text-secondary text-xs px-2 py-1 hover:border-border-strong"
+            >
+              Reset routing
             </button>
             <button
               type="button"

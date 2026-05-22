@@ -12,6 +12,7 @@ import resource
 import shutil
 import tempfile
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -493,16 +494,6 @@ class CLISandboxRunner:
 # Pluggable execution backends (Phase-3 sandbox)
 # ---------------------------------------------------------------------------
 
-import asyncio
-import shutil
-import tempfile
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Optional
-
-logger = logging.getLogger(__name__)
-
 
 @dataclass
 class ExecutionResult:
@@ -513,6 +504,14 @@ class ExecutionResult:
     stderr: str = ""
     error: str = ""
     truncated: bool = False
+
+
+def _decode_subprocess_output(data: bytes | str | None) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+    return str(data)
 
 
 class ExecutionBackend(ABC):
@@ -913,10 +912,13 @@ class DockerPoolBackend(ExecutionBackend):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            await cp_proc.communicate(code_bytes)
+            _stdout_data, stderr_data = await cp_proc.communicate(code_bytes)
             if cp_proc.returncode != 0:
-                stderr = (await cp_proc.stderr.read()).decode("utf-8", errors="replace")
-                return ExecutionResult(success=False, error=f"docker stream-in failed: {stderr}")
+                stderr_text = _decode_subprocess_output(stderr_data)
+                return ExecutionResult(
+                    success=False,
+                    error=f"docker stream-in failed: {stderr_text}",
+                )
 
             # Execute
             if language == "rust":
@@ -929,15 +931,16 @@ class DockerPoolBackend(ExecutionBackend):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            communicate_task = asyncio.create_task(proc.communicate())
+            stdout_data, stderr_data = await asyncio.wait_for(communicate_task, timeout=timeout)
 
             # Clean up remote file
             asyncio.create_task(self._rm_in_container(name, remote_path))
 
             return ExecutionResult(
                 success=proc.returncode == 0,
-                stdout=stdout.decode("utf-8", errors="replace"),
-                stderr=stderr.decode("utf-8", errors="replace"),
+                stdout=_decode_subprocess_output(stdout_data),
+                stderr=_decode_subprocess_output(stderr_data),
             )
         except asyncio.TimeoutError:
             return ExecutionResult(
@@ -994,15 +997,15 @@ async def get_backend(name: str = "auto") -> ExecutionBackend:
     if name == "inline":
         return InlineBackend()
     if name == "docker":
-        backend = DockerBackend()
-        if not await backend.available():
+        docker_backend = DockerBackend()
+        if not await docker_backend.available():
             raise RuntimeError("Docker backend requested but Docker is not available")
-        return backend
+        return docker_backend
     if name == "docker-pool":
-        backend = DockerPoolBackend()
-        if not await backend.available():
+        docker_pool_backend = DockerPoolBackend()
+        if not await docker_pool_backend.available():
             raise RuntimeError("Docker pool backend requested but Docker is not available")
-        return backend
+        return docker_pool_backend
     if name == "auto":
         docker = DockerPoolBackend()
         if await docker.available():

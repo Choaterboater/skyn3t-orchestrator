@@ -18,9 +18,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
@@ -83,7 +84,16 @@ def _has_packaging_env_vars(artifact_dir: Path, scaffold_dir: Path) -> bool:
 
     if scan_env(artifact_dir).vars:
         return True
-    if scaffold_dir != artifact_dir and scaffold_dir.is_dir() and scan_env(scaffold_dir).vars:
+    try:
+        scaffold_nested_in_artifact = scaffold_dir.relative_to(artifact_dir) != Path(".")
+    except ValueError:
+        scaffold_nested_in_artifact = False
+    if (
+        scaffold_dir != artifact_dir
+        and scaffold_dir.is_dir()
+        and not scaffold_nested_in_artifact
+        and scan_env(scaffold_dir).vars
+    ):
         return True
     return False
 
@@ -489,13 +499,22 @@ class ReviewerAgent(BaseAgent):
             return True
         return False
 
+    @classmethod
+    def _walk_artifact_files(cls, artifact_dir: Path) -> Iterator[Path]:
+        if not artifact_dir.exists():
+            return
+        for dirpath, dirnames, filenames in os.walk(artifact_dir):
+            dirnames[:] = sorted(d for d in dirnames if d not in cls._SKIP_DIR_PARTS)
+            base = Path(dirpath)
+            for filename in sorted(filenames):
+                path = base / filename
+                if path.name in cls._SKIP_FILE_NAMES:
+                    continue
+                yield path
+
     def _artifact_files(self, artifact_dir: Path) -> List[Path]:
         return sorted(
-            (
-                path
-                for path in artifact_dir.rglob("*")
-                if path.is_file() and not self._should_skip_artifact(path, artifact_dir)
-            ),
+            self._walk_artifact_files(artifact_dir),
             key=lambda path: self._artifact_name(artifact_dir, path),
         )
 
@@ -514,11 +533,7 @@ class ReviewerAgent(BaseAgent):
         """
         if not artifact_dir.exists():
             return False
-        for p in artifact_dir.rglob("*"):
-            if not p.is_file():
-                continue
-            if cls._should_skip_artifact(p, artifact_dir):
-                continue
+        for p in cls._walk_artifact_files(artifact_dir):
             if p.suffix in cls._CODE_EXTS:
                 return True
         return False

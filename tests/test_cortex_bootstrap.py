@@ -175,6 +175,7 @@ async def test_start_invokes_each_component_lifecycle(monkeypatch):
     assert status["booted"] is True
     assert {c["name"] for c in status["components"]} == {"sync", "async", "nostop"}
     assert all(c["started"] for c in status["components"])
+    await cb.stop()
 
 
 @pytest.mark.asyncio
@@ -190,6 +191,7 @@ async def test_start_is_idempotent(monkeypatch):
     inst.started = "sentinel"
     await cb.start()
     assert inst.started == "sentinel"
+    await cb.stop()
 
 
 @pytest.mark.asyncio
@@ -209,6 +211,7 @@ async def test_failure_in_one_component_does_not_abort_others(monkeypatch):
     assert statuses["bad"]["started"] is False
     assert "boom" in (statuses["bad"]["error"] or "")
     assert statuses["good"]["started"] is True
+    await cb.stop()
 
 
 @pytest.mark.asyncio
@@ -276,6 +279,7 @@ async def test_register_reuses_existing_orchestrator_attribute(monkeypatch):
     assert orch._feature_suggester.start_calls == 1
     # Should still be the same instance — no parallel construction.
     assert cb._components[0].instance is orch._feature_suggester
+    await cb.stop()
 
 
 @pytest.mark.asyncio
@@ -305,6 +309,7 @@ async def test_register_parks_new_instance_on_orchestrator(monkeypatch):
     cb = CortexBootstrap(orch)
     await cb.start()
     assert orch._gated_tuner is cb._components[0].instance
+    await cb.stop()
 
 
 # ---------------------------------------------------------------------
@@ -339,6 +344,7 @@ async def test_status_surfaces_proposal_store_counts(monkeypatch, tmp_path):
     assert st["proposal_handlers"] == ["tuning", "feature", "studio_debug"]
     assert st["proposal_counts"] == {"pending": 2, "approved": 1, "failed": 1}
     assert st["recent_failures"][0]["kind"] == "tuning"
+    await cb.stop()
 
 
 @pytest.mark.asyncio
@@ -357,6 +363,7 @@ async def test_status_component_details_via_get_status(monkeypatch):
     await cb.start()
     comp = cb.status()["components"][0]
     assert comp["details"]["config_path"] == "data/config/runtime.json"
+    await cb.stop()
 
 
 # ---------------------------------------------------------------------
@@ -379,6 +386,7 @@ async def test_disable_env_var_skips_named_components(monkeypatch):
     assert curiosity is not None
     assert curiosity["started"] is False
     assert "disabled" in (curiosity["skipped_reason"] or "")
+    await cb.stop()
 
 
 @pytest.mark.asyncio
@@ -390,6 +398,7 @@ async def test_disable_env_var_star_skips_everything(monkeypatch):
     for c in cb.status()["components"]:
         assert c["started"] is False
         assert "disabled" in (c["skipped_reason"] or "")
+    await cb.stop()
 
 
 # ---------------------------------------------------------------------
@@ -419,7 +428,7 @@ def test_proposal_store_recent_failures(tmp_path):
     for i in range(3):
         p = store.create(
             kind="nope", title=f"t{i}", summary="", detail="",
-            payload={}, source="t",
+            payload={}, source="t", force_requires_approval=True,
         )
         pids.append(p.id)
 

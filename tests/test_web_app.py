@@ -9,7 +9,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 import skyn3t.web.app as web_app
+from skyn3t.config.agent_overrides import AgentOverrideStore
+from skyn3t.config.model_routing import ModelRoutingStore
 from skyn3t.config.settings import get_settings
+from skyn3t.core.agent import BaseAgent, TaskResult
 from skyn3t.core.events import Event, EventBus, EventType
 
 
@@ -226,6 +229,714 @@ async def test_studio_start_rejects_focus_file_without_repo_path(monkeypatch):
 
     assert result.status_code == 400
     assert json.loads(result.body) == {"error": "focus file requires a repo path"}
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_submit_creates_task_with_session_and_agent(monkeypatch):
+    calls = {}
+
+    class FakeOrchestrator:
+        async def submit_task(self, task, agent_name=None):
+            calls["task"] = task
+            calls["agent_name"] = agent_name
+            return "task-123"
+
+    monkeypatch.setattr(web_app, "orchestrator", FakeOrchestrator())
+
+    result = await web_app.orchestrator_submit(
+        {"prompt": "Investigate latency", "session_id": "sess-1", "agent_name": "writer"}
+    )
+
+    assert result == {"task_id": "task-123", "status": "submitted"}
+    assert calls["agent_name"] == "writer"
+    assert calls["task"].description == "Investigate latency"
+    assert calls["task"].input_data == {"message": "Investigate latency"}
+    assert calls["task"].session_id == "sess-1"
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_returns_cancelled_status(monkeypatch):
+    class FakeOrchestrator:
+        def cancel_task(self, task_id):
+            return task_id == "task-123"
+
+    monkeypatch.setattr(web_app, "orchestrator", FakeOrchestrator())
+
+    result = await web_app.cancel_task("task-123")
+
+    assert result == {"task_id": "task-123", "status": "cancelled"}
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_returns_404_when_task_missing(monkeypatch):
+    class FakeOrchestrator:
+        def cancel_task(self, task_id):
+            return False
+
+    monkeypatch.setattr(web_app, "orchestrator", FakeOrchestrator())
+
+    result = await web_app.cancel_task("missing")
+
+    assert result.status_code == 404
+    assert json.loads(result.body) == {"error": "Task 'missing' not found"}
+
+
+@pytest.mark.asyncio
+async def test_memory_layers_combines_session_operator_and_project(monkeypatch):
+    import skyn3t.intelligence.skill_library as skill_library_mod
+
+    class FakeStore:
+        async def get_stats(self):
+            return {"tasks": 12, "messages": 7, "knowledge_documents": 3, "success_rate": 0.75}
+
+        async def get_lessons(self, limit=5):
+            return [{"title": "Landing page", "source": "repo", "doc_type": "lesson", "created_at": "now"}]
+
+    class FakeConsciousness:
+        async def list_sessions(self):
+            return ["sess-1", "sess-2"]
+
+        async def get_insights(self, limit=5):
+            return [{"agent": "writer", "capability": "ui", "insight": "Use cards", "timestamp": 1.0}]
+
+    class FakeSkill:
+        def __init__(self):
+            self.name = "layout-skill"
+            self.score = 0.9
+            self.tags = ["ui"]
+            self.source = "learned"
+
+    class FakeLibrary:
+        def summary(self):
+            return {"total": 4}
+
+        def find(self, min_score=0.1, limit=5):
+            return [FakeSkill()]
+
+    monkeypatch.setattr(
+        web_app,
+        "orchestrator",
+        SimpleNamespace(memory_store=FakeStore(), _memory=FakeStore(), _consciousness=FakeConsciousness()),
+    )
+    monkeypatch.setattr(skill_library_mod, "get_default_library", lambda: FakeLibrary())
+
+    result = await web_app.memory_layers(limit=5)
+
+    assert result["enabled"] is True
+    assert result["layers"]["session"]["active_sessions"] == 2
+    assert result["layers"]["operator"]["skill_summary"] == {"total": 4}
+    assert result["layers"]["project"]["tasks"] == 12
+    assert result["layers"]["project"]["recent_documents"][0]["title"] == "Landing page"
+
+
+@pytest.mark.asyncio
+async def test_memory_drafts_lists_pending_docs(monkeypatch):
+    class FakeStore:
+        async def list_knowledge_drafts(self, review_status="draft", doc_type=None, limit=20):
+            assert review_status == "draft"
+            assert doc_type is None
+            assert limit == 20
+            return [
+                {
+                    "id": "draft-1",
+                    "title": "Lesson draft",
+                    "doc_type": "lesson",
+                    "source": "reflection",
+                    "meta": {"review_status": "draft", "memory_layer": "operator"},
+                }
+            ]
+
+    monkeypatch.setattr(
+        web_app,
+        "orchestrator",
+        SimpleNamespace(memory_store=FakeStore(), _memory=FakeStore()),
+    )
+
+    result = await web_app.memory_drafts()
+
+    assert result["drafts"][0]["id"] == "draft-1"
+
+
+@pytest.mark.asyncio
+async def test_memory_evaluations_lists_assets_by_status(monkeypatch):
+    class FakeStore:
+        async def list_knowledge_drafts(self, review_status="draft", doc_type=None, limit=20):
+            assert review_status == "approved"
+            assert doc_type == "evaluation"
+            assert limit == 20
+            return [
+                {
+                    "id": "eval-1",
+                    "title": "External eval",
+                    "doc_type": "evaluation",
+                    "content": "Evaluation Asset",
+                    "meta": {
+                        "review_status": "approved",
+                        "lane": "fit",
+                        "language": "python",
+                        "patterns": ["cortex", "autonomy"],
+                        "checks": ["Confirm shared signals."],
+                        "source_repos": ["org/repo-a", "org/repo-b"],
+                    },
+                }
+            ]
+
+    monkeypatch.setattr(
+        web_app,
+        "orchestrator",
+        SimpleNamespace(memory_store=FakeStore(), _memory=FakeStore()),
+    )
+
+    result = await web_app.memory_evaluations(status="approved")
+
+    assert result["status"] == "approved"
+    assert result["evaluations"][0]["id"] == "eval-1"
+    assert result["evaluations"][0]["checks"] == ["Confirm shared signals."]
+
+
+@pytest.mark.asyncio
+async def test_memory_evaluation_export_requires_approval(monkeypatch):
+    class FakeStore:
+        async def get_knowledge_doc(self, doc_id):
+            assert doc_id == "eval-1"
+            return {
+                "id": "eval-1",
+                "title": "External eval",
+                "doc_type": "evaluation",
+                "content": "Evaluation Asset",
+                "meta": {"review_status": "draft", "checks": ["Confirm shared signals."]},
+            }
+
+    monkeypatch.setattr(
+        web_app,
+        "orchestrator",
+        SimpleNamespace(memory_store=FakeStore(), _memory=FakeStore()),
+    )
+
+    result = await web_app.memory_evaluation_export("eval-1")
+
+    assert result.status_code == 400
+    assert json.loads(result.body) == {"error": "evaluation asset must be approved before export"}
+
+
+@pytest.mark.asyncio
+async def test_memory_evaluation_export_jsonl_returns_ndjson(monkeypatch):
+    class FakeStore:
+        async def get_knowledge_doc(self, doc_id):
+            assert doc_id == "eval-1"
+            return {
+                "id": "eval-1",
+                "title": "External eval",
+                "doc_type": "evaluation",
+                "content": "Evaluation Asset",
+                "meta": {
+                    "review_status": "approved",
+                    "lane": "fit",
+                    "language": "python",
+                    "patterns": ["cortex", "autonomy"],
+                    "checks": ["Confirm shared signals."],
+                    "source_doc_ids": ["doc-1"],
+                    "source_repos": ["org/repo-a", "org/repo-b"],
+                    "source_platform": "external",
+                    "synthesis_key": "external-eval:fit:python",
+                    "consensus_count": 2,
+                    "memory_layer": "project",
+                    "confidence": 0.6,
+                },
+            }
+
+    monkeypatch.setattr(
+        web_app,
+        "orchestrator",
+        SimpleNamespace(memory_store=FakeStore(), _memory=FakeStore()),
+    )
+
+    result = await web_app.memory_evaluation_export("eval-1", format="jsonl")
+
+    assert result.media_type == "application/x-ndjson"
+    exported = json.loads(result.body)
+    assert exported["kind"] == "evaluation_asset"
+    assert exported["evaluation"]["checks"] == ["Confirm shared signals."]
+
+
+@pytest.mark.asyncio
+async def test_export_trajectories_can_bundle_approved_evaluations(monkeypatch, tmp_path):
+    class FakeTrajectoryLogger:
+        def export_jsonl(self, output_path, **kwargs):
+            assert kwargs["agent"] == "designer"
+            output_path.write_text(json.dumps({"task_id": "t-1", "agent": "designer"}) + "\n", encoding="utf-8")
+            return 1
+
+    class FakeStore:
+        async def list_knowledge_drafts(
+            self,
+            review_status="draft",
+            doc_type=None,
+            limit=20,
+            preview_only=True,
+        ):
+            assert review_status == "approved"
+            assert doc_type == "evaluation"
+            assert preview_only is False
+            return [
+                {
+                    "id": "eval-1",
+                    "title": "External eval",
+                    "doc_type": "evaluation",
+                    "content": "Evaluation Asset full content",
+                    "meta": {
+                        "review_status": "approved",
+                        "lane": "fit",
+                        "language": "python",
+                        "patterns": ["cortex"],
+                        "checks": ["Confirm shared signals."],
+                        "source_doc_ids": ["doc-1"],
+                        "source_repos": ["org/repo-a"],
+                        "source_platform": "external",
+                        "synthesis_key": "external-eval:fit:python",
+                        "consensus_count": 1,
+                        "memory_layer": "project",
+                        "confidence": 0.6,
+                    },
+                }
+            ]
+
+    monkeypatch.setattr(web_app, "trajectory_logger", FakeTrajectoryLogger())
+    monkeypatch.setattr(
+        web_app,
+        "orchestrator",
+        SimpleNamespace(memory_store=FakeStore(), _memory=FakeStore()),
+    )
+
+    result = await web_app.export_trajectories(agent="designer", include_evaluations=True)
+
+    body_path = Path(result.path)
+    lines = body_path.read_text(encoding="utf-8").strip().splitlines()
+    body_path.unlink(missing_ok=True)
+
+    assert result.filename.startswith("trajectories_bundle_")
+    assert json.loads(lines[0]) == {"task_id": "t-1", "agent": "designer"}
+    assert json.loads(lines[1])["kind"] == "evaluation_asset"
+    assert json.loads(lines[1])["evaluation"]["content"] == "Evaluation Asset full content"
+    assert json.loads(lines[2])["kind"] == "bundle_manifest"
+    assert json.loads(lines[2])["trajectory_count"] == 1
+    assert json.loads(lines[2])["evaluation_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_export_trajectories_can_return_eval_only_bundle(monkeypatch):
+    class FakeTrajectoryLogger:
+        def export_jsonl(self, output_path, **kwargs):
+            output_path.write_text("", encoding="utf-8")
+            return 0
+
+    class FakeStore:
+        async def list_knowledge_drafts(
+            self,
+            review_status="draft",
+            doc_type=None,
+            limit=20,
+            preview_only=True,
+        ):
+            return [
+                {
+                    "id": "eval-1",
+                    "title": "External eval",
+                    "doc_type": "evaluation",
+                    "content": "Evaluation Asset full content",
+                    "meta": {
+                        "review_status": "approved",
+                        "patterns": ["cortex"],
+                        "checks": ["Confirm shared signals."],
+                    },
+                }
+            ]
+
+    monkeypatch.setattr(web_app, "trajectory_logger", FakeTrajectoryLogger())
+    monkeypatch.setattr(
+        web_app,
+        "orchestrator",
+        SimpleNamespace(memory_store=FakeStore(), _memory=FakeStore()),
+    )
+
+    result = await web_app.export_trajectories(include_evaluations=True)
+
+    body_path = Path(result.path)
+    lines = body_path.read_text(encoding="utf-8").strip().splitlines()
+    body_path.unlink(missing_ok=True)
+
+    assert len(lines) == 2
+    assert json.loads(lines[0])["kind"] == "evaluation_asset"
+    assert json.loads(lines[1])["kind"] == "bundle_manifest"
+    assert json.loads(lines[1])["trajectory_count"] == 0
+    assert json.loads(lines[1])["evaluation_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_memory_draft_approve_promotes_into_rag(monkeypatch):
+    calls = {}
+
+    class FakeStore:
+        async def get_knowledge_doc(self, doc_id):
+            assert doc_id == "draft-1"
+            return {
+                "id": "draft-1",
+                "title": "Lesson draft",
+                "content": "Teach the planner to retry less",
+                "source": "reflection",
+                "doc_type": "lesson",
+                "embedding_id": None,
+                "meta": {"review_status": "draft", "memory_layer": "operator"},
+            }
+
+        async def update_knowledge_doc_review(self, doc_id, **kwargs):
+            calls["doc_id"] = doc_id
+            calls["kwargs"] = kwargs
+            return {
+                "id": doc_id,
+                "title": "Lesson draft",
+                "embedding_id": kwargs["embedding_id"],
+                "meta": {"review_status": "approved"},
+            }
+
+    class FakeEngine:
+        async def add_knowledge_one(self, **kwargs):
+            calls["rag"] = kwargs
+            return "emb-1"
+
+    async def fake_get_rag_engine(_request):
+        return FakeEngine()
+
+    monkeypatch.setattr(
+        web_app,
+        "orchestrator",
+        SimpleNamespace(memory_store=FakeStore(), _memory=FakeStore()),
+    )
+    monkeypatch.setattr(web_app, "_get_rag_engine", fake_get_rag_engine)
+
+    result = await web_app.memory_draft_approve("draft-1", SimpleNamespace(app=SimpleNamespace()))
+
+    assert result["ok"] is True
+    assert result["draft"]["embedding_id"] == "emb-1"
+    assert calls["rag"]["doc_type"] == "lesson"
+    assert calls["kwargs"]["review_status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_memory_draft_reject_marks_doc_rejected(monkeypatch):
+    class FakeStore:
+        async def get_knowledge_doc(self, doc_id):
+            assert doc_id == "draft-2"
+            return {
+                "id": "draft-2",
+                "title": "Bad draft",
+                "meta": {"review_status": "draft"},
+            }
+
+        async def update_knowledge_doc_review(self, doc_id, **kwargs):
+            assert doc_id == "draft-2"
+            assert kwargs["review_status"] == "rejected"
+            assert kwargs["reason"] == "too generic"
+            return {"id": doc_id, "title": "Bad draft", "meta": {"review_status": "rejected"}}
+
+    monkeypatch.setattr(
+        web_app,
+        "orchestrator",
+        SimpleNamespace(memory_store=FakeStore(), _memory=FakeStore()),
+    )
+
+    result = await web_app.memory_draft_reject("draft-2", {"reason": "too generic"})
+
+    assert result["ok"] is True
+    assert result["draft"]["meta"]["review_status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_skill_candidates_lists_approved_memory_docs(monkeypatch):
+    class FakeStore:
+        async def list_skill_candidate_docs(self, min_confidence=0.7, limit=20):
+            assert min_confidence == 0.7
+            assert limit == 20
+            return [{"id": "mem-1", "title": "Skillable lesson", "doc_type": "lesson", "meta": {}}]
+
+    monkeypatch.setattr(
+        web_app,
+        "orchestrator",
+        SimpleNamespace(memory_store=FakeStore(), _memory=FakeStore()),
+    )
+
+    result = await web_app.get_skill_candidates()
+
+    assert result["candidates"][0]["id"] == "mem-1"
+
+
+@pytest.mark.asyncio
+async def test_create_skill_draft_from_memory_marks_doc_status(monkeypatch, tmp_path):
+    import skyn3t.intelligence.skill_library as skill_library_mod
+
+    calls = {}
+
+    class FakeStore:
+        async def get_knowledge_doc(self, doc_id):
+            assert doc_id == "mem-1"
+            return {
+                "id": "mem-1",
+                "title": "Insight from architect",
+                "content": "Agent: architect\nInsight: Prefer one boundary.\n",
+                "source": "reflection",
+                "doc_type": "insight",
+                "meta": {"review_status": "approved", "reusable": True, "confidence": 0.8},
+            }
+
+        async def merge_knowledge_doc_meta(self, doc_id, extra_meta):
+            calls["doc_id"] = doc_id
+            calls["extra_meta"] = extra_meta
+            return {"id": doc_id, "meta": extra_meta}
+
+    lib = skill_library_mod.SkillLibrary(root=tmp_path / "skills")
+    monkeypatch.setattr(skill_library_mod, "get_default_library", lambda: lib)
+    monkeypatch.setattr(
+        web_app,
+        "orchestrator",
+        SimpleNamespace(memory_store=FakeStore(), _memory=FakeStore()),
+    )
+
+    result = await web_app.create_skill_draft_from_memory("mem-1")
+
+    assert result["created"] is True
+    assert result["draft"]["memory_doc_id"] == "mem-1"
+    assert calls["extra_meta"]["skill_promotion_status"] == "draft"
+    assert lib.all_drafts()
+
+
+@pytest.mark.asyncio
+async def test_create_skill_draft_from_external_memory_requires_ingested_docs(monkeypatch):
+    class FakeStore:
+        async def get_knowledge_doc(self, doc_id):
+            assert doc_id == "mem-external"
+            return {
+                "id": "mem-external",
+                "title": "External learning summary",
+                "content": "summary",
+                "source": "repo_scout:gitlab",
+                "doc_type": "external_learning",
+                "meta": {
+                    "review_status": "approved",
+                    "reusable": True,
+                    "confidence": 0.8,
+                    "external_doc_ingest_status": "summary_only",
+                    "external_doc_paths_ingested": [],
+                },
+            }
+
+    monkeypatch.setattr(
+        web_app,
+        "orchestrator",
+        SimpleNamespace(memory_store=FakeStore(), _memory=FakeStore()),
+    )
+
+    result = await web_app.create_skill_draft_from_memory("mem-external")
+
+    assert result.status_code == 400
+    assert json.loads(result.body) == {
+        "error": "external learning document must ingest approved docs first"
+    }
+
+
+@pytest.mark.asyncio
+async def test_create_skill_draft_from_evaluation_is_blocked(monkeypatch):
+    class FakeStore:
+        async def get_knowledge_doc(self, doc_id):
+            assert doc_id == "eval-asset"
+            return {
+                "id": "eval-asset",
+                "title": "External eval",
+                "content": "Evaluation Asset",
+                "source": "external_pattern_synthesizer",
+                "doc_type": "evaluation",
+                "meta": {"review_status": "approved", "reusable": True, "confidence": 0.9},
+            }
+
+    monkeypatch.setattr(
+        web_app,
+        "orchestrator",
+        SimpleNamespace(memory_store=FakeStore(), _memory=FakeStore()),
+    )
+
+    result = await web_app.create_skill_draft_from_memory("eval-asset")
+
+    assert result.status_code == 400
+    assert json.loads(result.body) == {"error": "evaluation assets cannot be promoted into skills"}
+
+
+@pytest.mark.asyncio
+async def test_approve_skill_draft_installs_and_updates_memory(monkeypatch, tmp_path):
+    import skyn3t.intelligence.skill_library as skill_library_mod
+
+    calls = {}
+
+    class FakeStore:
+        async def merge_knowledge_doc_meta(self, doc_id, extra_meta):
+            calls["doc_id"] = doc_id
+            calls["extra_meta"] = extra_meta
+            return {"id": doc_id, "meta": extra_meta}
+
+    lib = skill_library_mod.SkillLibrary(root=tmp_path / "skills")
+    lib.upsert_draft(
+        skill_library_mod.Skill(
+            name="draft install",
+            body="# body",
+            tags=["memory-promoted"],
+            memory_doc_id="mem-2",
+        )
+    )
+    monkeypatch.setattr(skill_library_mod, "get_default_library", lambda: lib)
+    monkeypatch.setattr(
+        web_app,
+        "orchestrator",
+        SimpleNamespace(memory_store=FakeStore(), _memory=FakeStore()),
+    )
+
+    result = await web_app.approve_skill_draft("draft-install")
+
+    assert result["installed"] == "draft-install"
+    assert calls["doc_id"] == "mem-2"
+    assert calls["extra_meta"]["skill_promotion_status"] == "installed"
+    assert lib.find(tag="memory-promoted", min_score=-1.0)
+
+
+@pytest.mark.asyncio
+async def test_reject_skill_draft_updates_memory(monkeypatch, tmp_path):
+    import skyn3t.intelligence.skill_library as skill_library_mod
+
+    calls = {}
+
+    class FakeStore:
+        async def merge_knowledge_doc_meta(self, doc_id, extra_meta):
+            calls["doc_id"] = doc_id
+            calls["extra_meta"] = extra_meta
+            return {"id": doc_id, "meta": extra_meta}
+
+    lib = skill_library_mod.SkillLibrary(root=tmp_path / "skills")
+    lib.upsert_draft(
+        skill_library_mod.Skill(
+            name="draft reject",
+            body="# body",
+            tags=["memory-promoted"],
+            memory_doc_id="mem-3",
+        )
+    )
+    monkeypatch.setattr(skill_library_mod, "get_default_library", lambda: lib)
+    monkeypatch.setattr(
+        web_app,
+        "orchestrator",
+        SimpleNamespace(memory_store=FakeStore(), _memory=FakeStore()),
+    )
+
+    result = await web_app.reject_skill_draft("draft-reject", {"reason": "too generic"})
+
+    assert result["rejected"] is True
+    assert calls["doc_id"] == "mem-3"
+    assert calls["extra_meta"]["skill_promotion_status"] == "rejected"
+    assert calls["extra_meta"]["skill_promotion_reason"] == "too generic"
+
+
+@pytest.mark.asyncio
+async def test_run_github_scout_returns_component_result(monkeypatch):
+    class FakeScout:
+        async def run_once(self, config):
+            assert config == {"cadence": "weekly", "limit": 2, "platforms": ["github"]}
+            return {"ok": True, "filed": 1}
+
+    async def fake_ensure():
+        return FakeScout()
+
+    monkeypatch.setattr(web_app, "orchestrator", SimpleNamespace())
+    monkeypatch.setattr(web_app, "_ensure_repo_scout", fake_ensure)
+
+    result = await web_app.run_github_scout({"cadence": "weekly", "limit": 2})
+
+    assert result == {"ok": True, "filed": 1}
+
+
+@pytest.mark.asyncio
+async def test_schedule_github_scout_persists_job(monkeypatch):
+    calls = {}
+
+    class FakeStore:
+        async def save_scheduled_job(self, **kwargs):
+            calls.update(kwargs)
+
+    monkeypatch.setattr(
+        web_app,
+        "orchestrator",
+        SimpleNamespace(memory_store=FakeStore()),
+    )
+
+    result = await web_app.schedule_github_scout(
+        {
+            "schedule_expr": "daily at 09:00",
+            "cadence": "daily",
+            "limit": 3,
+            "queries": ["agent cli memory"],
+        }
+    )
+
+    assert result["created"] is True
+    assert calls["agent_name"] == "github_repo_scout"
+    config = json.loads(calls["prompt"])
+    assert config["cadence"] == "daily"
+    assert config["limit"] == 3
+    assert config["queries"] == ["agent cli memory"]
+    assert config["platforms"] == ["github"]
+
+
+@pytest.mark.asyncio
+async def test_run_repo_scout_defaults_to_multi_platform(monkeypatch):
+    class FakeScout:
+        async def run_once(self, config):
+            assert config["platforms"] == ["github", "gitlab", "bitbucket"]
+            assert config["cadence"] == "weekly"
+            return {"ok": True, "filed": 2}
+
+    async def fake_ensure():
+        return FakeScout()
+
+    monkeypatch.setattr(web_app, "orchestrator", SimpleNamespace())
+    monkeypatch.setattr(web_app, "_ensure_repo_scout", fake_ensure)
+
+    result = await web_app.run_repo_scout({"cadence": "weekly"})
+
+    assert result == {"ok": True, "filed": 2}
+
+
+@pytest.mark.asyncio
+async def test_schedule_repo_scout_persists_platforms(monkeypatch):
+    calls = {}
+
+    class FakeStore:
+        async def save_scheduled_job(self, **kwargs):
+            calls.update(kwargs)
+
+    monkeypatch.setattr(
+        web_app,
+        "orchestrator",
+        SimpleNamespace(memory_store=FakeStore()),
+    )
+
+    result = await web_app.schedule_repo_scout(
+        {
+            "schedule_expr": "weekly",
+            "cadence": "weekly",
+            "limit": 2,
+            "platforms": ["gitlab", "bitbucket"],
+        }
+    )
+
+    assert result["created"] is True
+    config = json.loads(calls["prompt"])
+    assert config["platforms"] == ["gitlab", "bitbucket"]
+    assert config["cadence"] == "weekly"
 
 
 @pytest.mark.asyncio
@@ -526,6 +1237,184 @@ async def test_list_agents_includes_catalog_metadata(monkeypatch):
     assert result["agents"][0]["tier"] == "internal"
     assert result["agents"][0]["recommended_backend"] == "claude_cli"
     assert result["agents"][0]["config"]["backend"] is None
+    assert result["agents"][0]["effective_backend"] == "openrouter"
+    assert result["agents"][0]["effective_model"] == "openrouter/owl-alpha"
+
+
+@pytest.mark.asyncio
+async def test_list_agents_surfaces_effective_policy_route(monkeypatch):
+    class RoutedAgent(BaseAgent):
+        async def initialize(self):
+            return None
+
+        async def execute(self, task, stdin_data=None):
+            return TaskResult(task_id=task.task_id, success=True, output={})
+
+        async def health_check(self):
+            return True
+
+    agent = RoutedAgent(
+        name="reviewer",
+        agent_type="review",
+        provider="local",
+        event_bus=EventBus(),
+    )
+    monkeypatch.setattr(
+        web_app,
+        "orchestrator",
+        SimpleNamespace(agents={agent.name: agent}),
+    )
+
+    result = await web_app.list_agents()
+
+    assert result["agents"][0]["backend"] == "openrouter"
+    assert result["agents"][0]["model"] == "xiaomi/mimo-v2.5-pro"
+    assert result["agents"][0]["effective_backend"] == "openrouter"
+    assert result["agents"][0]["effective_model"] == "xiaomi/mimo-v2.5-pro"
+
+
+@pytest.mark.asyncio
+async def test_routing_policy_get_returns_routes_and_tiers(monkeypatch, tmp_path):
+    import skyn3t.config.model_routing as routing_config
+
+    store = ModelRoutingStore(tmp_path / "routing.json")
+    store.set_entries({"reviewer": {"tier": "or_cheap", "applied_via": "recommendation"}})
+    monkeypatch.setattr(routing_config, "_store", store)
+
+    result = await web_app.routing_policy_get()
+
+    assert any(route["stage"] == "reviewer" for route in result["routes"])
+    assert any(tier["name"] == "or_cheap" for tier in result["tiers"])
+    reviewer = next(route for route in result["routes"] if route["stage"] == "reviewer")
+    assert reviewer["persisted_via"] == "recommendation"
+
+
+@pytest.mark.asyncio
+async def test_routing_recommendations_get_returns_rows(monkeypatch):
+    monkeypatch.setattr(
+        "skyn3t.intelligence.routing_recommendations.list_stage_recommendations",
+        lambda: [
+            {
+                "stage": "brainstorm",
+                "current_tier": "or_strong",
+                "recommended_tier": "or_cheap",
+                "recommendation_kind": "cheaper",
+                "confidence": "medium",
+                "reasons": ["Heavy-stage signal detected."],
+                "signals": {"trajectory_samples": 8},
+                "applyable": True,
+            }
+        ],
+    )
+
+    result = await web_app.routing_recommendations_get()
+
+    assert result["recommendations"][0]["stage"] == "brainstorm"
+    assert result["recommendations"][0]["recommended_tier"] == "or_cheap"
+    assert result["recommendations"][0]["applyable"] is True
+
+
+@pytest.mark.asyncio
+async def test_routing_policy_patch_invalidates_live_agent_llm(monkeypatch, tmp_path):
+    import skyn3t.config.model_routing as routing_config
+
+    class RoutedAgent(BaseAgent):
+        async def initialize(self):
+            return None
+
+        async def execute(self, task, stdin_data=None):
+            return TaskResult(task_id=task.task_id, success=True, output={})
+
+        async def health_check(self):
+            return True
+
+    monkeypatch.setattr(routing_config, "_store", ModelRoutingStore(tmp_path / "routing.json"))
+    agent = RoutedAgent(
+        name="research_agent",
+        agent_type="research",
+        provider="test",
+        event_bus=EventBus(),
+        config={},
+    )
+    before = agent.llm
+    assert before is not None
+    assert before._backend_name == "openrouter"
+
+    monkeypatch.setattr(web_app, "orchestrator", SimpleNamespace(agents={agent.name: agent}))
+
+    result = await web_app.routing_policy_patch({"policies": {"research": "balanced"}})
+
+    assert result["ok"] is True
+    assert agent._llm is None
+    after = agent.llm
+    assert after is not None
+    assert after._backend_name == "copilot_cli"
+
+
+@pytest.mark.asyncio
+async def test_routing_policy_patch_accepts_recommendation_metadata(monkeypatch, tmp_path):
+    import skyn3t.config.model_routing as routing_config
+
+    store = ModelRoutingStore(tmp_path / "routing.json")
+    monkeypatch.setattr(routing_config, "_store", store)
+    monkeypatch.setattr(web_app, "orchestrator", SimpleNamespace(agents={}))
+
+    result = await web_app.routing_policy_patch(
+        {"policies": {"research": {"tier": "or_cheap", "applied_via": "recommendation"}}}
+    )
+
+    assert result["ok"] is True
+    route = next(route for route in result["routes"] if route["stage"] == "research")
+    assert route["tier"] == "or_cheap"
+    assert route["persisted_via"] == "recommendation"
+
+
+@pytest.mark.asyncio
+async def test_agent_config_reset_clears_backend_model_only(monkeypatch, tmp_path):
+    import skyn3t.config.agent_overrides as override_config
+
+    class ResettableAgent(BaseAgent):
+        async def initialize(self):
+            return None
+
+        async def execute(self, task, stdin_data=None):
+            return TaskResult(task_id=task.task_id, success=True, output={})
+
+        async def health_check(self):
+            return True
+
+    store = AgentOverrideStore(tmp_path / "agent_overrides.json")
+    monkeypatch.setattr(override_config, "_store", store)
+    store.set(
+        "reviewer",
+        {
+            "backend": "claude_cli",
+            "model": "opus",
+            "temperature": 0.4,
+        },
+    )
+    agent = ResettableAgent(
+        name="reviewer",
+        agent_type="reviewer",
+        provider="test",
+        event_bus=EventBus(),
+        config={
+            "backend": "claude_cli",
+            "model": "opus",
+            "temperature": 0.4,
+        },
+    )
+    monkeypatch.setattr(web_app, "orchestrator", SimpleNamespace(agents={agent.name: agent}))
+
+    result = await web_app.agent_config_reset("reviewer", {"keys": ["backend", "model"]})
+
+    assert sorted(result["changed"]) == ["backend", "model"]
+    assert "backend" not in agent.config
+    assert "model" not in agent.config
+    assert agent.config["temperature"] == 0.4
+    assert store.get("reviewer") == {"temperature": 0.4}
+    assert result["config_view"]["effective_backend"] == "openrouter"
+    assert result["config_view"]["effective_source"] == "policy"
 
 
 @pytest.mark.asyncio
@@ -704,7 +1593,10 @@ def test_dashboard_html_surfaces_guided_overview():
     assert "function _agentTierBadge" in dashboard_html
     assert "const roster = Array.isArray(data.agents)" in dashboard_html
     assert "r.tier === 'internal'" in dashboard_html
-    assert "Recommended" in dashboard_html
+    assert "Configured override" in dashboard_html
+    assert "Reset agent routing" in dashboard_html
+    assert "async function saveStageRouting" in dashboard_html
+    assert "/api/routing/policy" in dashboard_html
     assert "Reset services" in dashboard_html
     assert "cortexResetServicesBtn" in dashboard_html
     assert "async function resetServices" in dashboard_html

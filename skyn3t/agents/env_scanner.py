@@ -20,6 +20,7 @@ without re-parsing source.
 from __future__ import annotations
 
 import ast
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -171,13 +172,13 @@ _SKIP_DIRS = {
 def _iter_source_files(root: Path) -> List[Path]:
     """Walk root, yield JS/TS/Python files, skip vendored + cache dirs."""
     out: List[Path] = []
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        if any(part in _SKIP_DIRS for part in path.relative_to(root).parts):
-            continue
-        if path.suffix.lower() in _JS_EXTS or path.suffix.lower() in _PY_EXTS:
-            out.append(path)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS)
+        base = Path(dirpath)
+        for filename in sorted(filenames):
+            path = base / filename
+            if path.suffix.lower() in _JS_EXTS or path.suffix.lower() in _PY_EXTS:
+                out.append(path)
     return out
 
 

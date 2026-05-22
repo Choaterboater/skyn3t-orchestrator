@@ -172,10 +172,12 @@ task_app = typer.Typer(help="Task management commands", no_args_is_help=True)
 pipeline_app = typer.Typer(help="Pipeline management commands", no_args_is_help=True)
 rag_app = typer.Typer(help="RAG knowledge base commands", no_args_is_help=True)
 github_app = typer.Typer(help="GitHub exploration commands", no_args_is_help=True)
+scout_app = typer.Typer(help="External repo scout commands", no_args_is_help=True)
 proposal_app = typer.Typer(help="Self-update proposal review", no_args_is_help=True)
 export_app = typer.Typer(help="Export data for analysis or training", no_args_is_help=True)
 user_app = typer.Typer(help="User profile management", no_args_is_help=True)
 schedule_app = typer.Typer(help="Schedule recurring tasks", no_args_is_help=True)
+memory_app = typer.Typer(help="Memory inspection commands", no_args_is_help=True)
 skills_app = typer.Typer(help="Skill registry commands", no_args_is_help=True)
 
 app.add_typer(agent_app, name="agent")
@@ -183,10 +185,12 @@ app.add_typer(task_app, name="task")
 app.add_typer(pipeline_app, name="pipeline")
 app.add_typer(rag_app, name="rag")
 app.add_typer(github_app, name="github")
+app.add_typer(scout_app, name="scout")
 app.add_typer(proposal_app, name="proposal")
 app.add_typer(export_app, name="export")
 app.add_typer(user_app, name="user")
 app.add_typer(schedule_app, name="schedule")
+app.add_typer(memory_app, name="memory")
 app.add_typer(skills_app, name="skills")
 
 # ---------------------------------------------------------------------------
@@ -631,6 +635,377 @@ def status() -> None:
         console.print(table)
     else:
         console.print("[dim]No agents registered.[/dim]")
+
+
+@app.command()
+def doctor() -> None:
+    """🩺 Run local and remote health checks."""
+    from skyn3t.cli.doctor import run_doctor
+
+    report = run_doctor(API_BASE)
+
+    table = Table(title="[bold]🩺 Doctor[/bold]", box=box.SIMPLE, header_style="bold cyan")
+    table.add_column("Check", style="cyan", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Summary", style="white")
+    for check in report.checks:
+        status_style = {"ok": "green", "warn": "yellow", "fail": "red"}.get(check.status, "white")
+        table.add_row(check.name, f"[{status_style}]{check.icon}[/{status_style}]", check.summary)
+    console.print(table)
+    console.print(
+        f"[dim]Failures: {report.failed}  Warnings: {report.warned}  API: {API_BASE}[/dim]"
+    )
+
+    if report.failed:
+        raise typer.Exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Memory commands
+# ---------------------------------------------------------------------------
+
+
+@memory_app.command("summary")
+def memory_summary(
+    limit: int = typer.Option(5, "--limit", "-l", help="Number of items per section"),
+) -> None:
+    """🧠 Show memory grouped as session, operator, and project layers."""
+    try:
+        with _client() as client:
+            resp = client.get("/api/memory/layers", params={"limit": limit})
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    if not data.get("enabled"):
+        console.print("[dim]Memory is not initialized.[/dim]")
+        return
+
+    layers = data.get("layers") or {}
+    session = layers.get("session") or {}
+    operator = layers.get("operator") or {}
+    project = layers.get("project") or {}
+
+    summary = Table(show_header=False, box=box.SIMPLE, pad_edge=False)
+    summary.add_row("Session memory", f"{session.get('active_sessions', 0)} active session(s)")
+    summary.add_row(
+        "Operator memory",
+        f"{operator.get('insight_count', 0)} insight(s), {operator.get('skill_summary', {}).get('total', 0)} skill(s)",
+    )
+    summary.add_row(
+        "Project memory",
+        f"{project.get('tasks', 0)} tasks, {project.get('knowledge_documents', 0)} knowledge docs",
+    )
+    console.print(Panel(summary, title="[bold cyan]🧠 Memory Layers[/bold cyan]", border_style="cyan"))
+
+    sessions = session.get("sessions") or []
+    if sessions:
+        console.print("[bold]Session layer[/bold]")
+        for session_id in sessions:
+            console.print(f"• {session_id}")
+
+    insights = operator.get("recent_insights") or []
+    if insights:
+        table = Table(title="Operator memory", box=box.SIMPLE)
+        table.add_column("Agent", style="cyan")
+        table.add_column("Capability", style="dim")
+        table.add_column("Insight")
+        for item in insights:
+            table.add_row(
+                str(item.get("agent") or "—"),
+                str(item.get("capability") or "—"),
+                str(item.get("insight") or "")[:100],
+            )
+        console.print(table)
+
+    skills = operator.get("top_skills") or []
+    if skills:
+        table = Table(title="Top skills", box=box.SIMPLE)
+        table.add_column("Name", style="cyan")
+        table.add_column("Score", justify="right")
+        table.add_column("Tags", style="dim")
+        for skill in skills:
+            table.add_row(
+                str(skill.get("name") or "—"),
+                f"{float(skill.get('score') or 0):+.2f}",
+                ", ".join(skill.get("tags") or []),
+            )
+        console.print(table)
+
+    recent_docs = project.get("recent_documents") or []
+    if recent_docs:
+        table = Table(title="Project knowledge", box=box.SIMPLE)
+        table.add_column("Title", style="cyan")
+        table.add_column("Type", style="dim")
+        table.add_column("Source", style="dim")
+        for doc in recent_docs:
+            table.add_row(
+                str(doc.get("title") or "—"),
+                str(doc.get("doc_type") or "—"),
+                str(doc.get("source") or "—"),
+            )
+        console.print(table)
+
+
+@memory_app.command("sessions")
+def memory_sessions() -> None:
+    """List active session-memory contexts."""
+    try:
+        with _client() as client:
+            resp = client.get("/api/memory/sessions")
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    sessions = data.get("sessions") or []
+    if not sessions:
+        console.print("[dim]No active memory sessions.[/dim]")
+        return
+    table = Table(title="Memory sessions", box=box.SIMPLE)
+    table.add_column("Session ID", style="cyan")
+    for session_id in sessions:
+        table.add_row(str(session_id))
+    console.print(table)
+
+
+@memory_app.command("session")
+def memory_session(session_id: str) -> None:
+    """Show one session-memory context and recent activity."""
+    try:
+        with _client() as client:
+            resp = client.get(f"/api/memory/sessions/{session_id}")
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    if data.get("error"):
+        _error(str(data["error"]))
+        raise typer.Exit(1)
+
+    context = data.get("context") or {}
+    info = Table(show_header=False, box=box.SIMPLE, pad_edge=False)
+    info.add_row("Session", str(data.get("session_id") or session_id))
+    info.add_row("Participants", ", ".join(context.get("participants") or []) or "—")
+    info.add_row("History entries", str(len(context.get("history") or [])))
+    console.print(Panel(info, title="[bold cyan]Session Memory[/bold cyan]", border_style="cyan"))
+
+    activity = data.get("recent_activity") or []
+    if activity:
+        table = Table(title="Recent activity", box=box.SIMPLE)
+        table.add_column("Type", style="cyan")
+        table.add_column("Summary")
+        for item in activity:
+            summary = item.get("title") or item.get("content") or item.get("description") or "—"
+            table.add_row(str(item.get("type") or "—"), str(summary)[:100])
+        console.print(table)
+
+
+@memory_app.command("drafts")
+def memory_drafts_cmd(
+    limit: int = typer.Option(20, "--limit", "-l", help="Number of drafts to show"),
+    doc_type: Optional[str] = typer.Option(None, "--type", help="Optional document type filter"),
+) -> None:
+    """List pending reviewable memory drafts."""
+    params: dict[str, int | str] = {"limit": limit}
+    if doc_type:
+        params["doc_type"] = doc_type
+    try:
+        with _client() as client:
+            resp = client.get("/api/memory/drafts", params=params)
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    drafts = data.get("drafts") or []
+    if not drafts:
+        console.print("[dim]No pending memory drafts.[/dim]")
+        return
+
+    table = Table(title="Memory drafts", box=box.SIMPLE)
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Type", style="dim")
+    table.add_column("Layer", style="dim")
+    table.add_column("Source", style="dim")
+    table.add_column("Title")
+    for draft in drafts:
+        meta = draft.get("meta") or {}
+        table.add_row(
+            str(draft.get("id") or "—"),
+            str(draft.get("doc_type") or "—"),
+            str(meta.get("memory_layer") or "—"),
+            str(draft.get("source") or "—"),
+            str(draft.get("title") or "—"),
+        )
+    console.print(table)
+
+
+@memory_app.command("approve")
+def memory_approve(doc_id: str) -> None:
+    """Approve a memory draft and promote it into trusted knowledge."""
+    try:
+        with _client() as client:
+            resp = client.post(f"/api/memory/drafts/{doc_id}/approve")
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    draft = data.get("draft") or {}
+    console.print(
+        f"[green]Approved[/green] {draft.get('id', doc_id)} — {draft.get('title', 'memory draft')}"
+    )
+
+
+@memory_app.command("reject")
+def memory_reject(
+    doc_id: str,
+    reason: str = typer.Option("", "--reason", "-r", help="Optional rejection reason"),
+) -> None:
+    """Reject a memory draft."""
+    try:
+        with _client() as client:
+            resp = client.post(f"/api/memory/drafts/{doc_id}/reject", json={"reason": reason})
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    draft = data.get("draft") or {}
+    console.print(
+        f"[yellow]Rejected[/yellow] {draft.get('id', doc_id)} — {draft.get('title', 'memory draft')}"
+    )
+
+
+@memory_app.command("evals")
+def memory_evals_cmd(
+    status: str = typer.Option("draft", "--status", help="draft, approved, or rejected"),
+    limit: int = typer.Option(20, "--limit", "-l", help="Number of evaluation assets to show"),
+) -> None:
+    """List governed evaluation assets."""
+    try:
+        with _client() as client:
+            resp = client.get("/api/memory/evaluations", params={"status": status, "limit": limit})
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    evaluations = data.get("evaluations") or []
+    if not evaluations:
+        console.print("[dim]No evaluation assets found.[/dim]")
+        return
+
+    table = Table(title="Evaluation assets", box=box.SIMPLE)
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Status", style="dim")
+    table.add_column("Lane", style="dim")
+    table.add_column("Lang", style="dim")
+    table.add_column("Signals")
+    table.add_column("Title")
+    for item in evaluations:
+        table.add_row(
+            str(item.get("id") or "—"),
+            str(item.get("review_status") or "—"),
+            str(item.get("lane") or "—"),
+            str(item.get("language") or "—"),
+            ", ".join(item.get("signals") or []) or "—",
+            str(item.get("title") or "—"),
+        )
+    console.print(table)
+
+
+@memory_app.command("eval")
+def memory_eval_cmd(doc_id: str) -> None:
+    """Show one governed evaluation asset."""
+    try:
+        with _client() as client:
+            resp = client.get(f"/api/memory/evaluations/{doc_id}")
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    evaluation = data.get("evaluation") or {}
+    info = Table(show_header=False, box=box.SIMPLE, pad_edge=False)
+    info.add_row("ID", str(evaluation.get("id") or doc_id))
+    info.add_row("Status", str(evaluation.get("review_status") or "—"))
+    info.add_row("Lane", str(evaluation.get("lane") or "—"))
+    info.add_row("Language", str(evaluation.get("language") or "—"))
+    info.add_row("Signals", ", ".join(evaluation.get("signals") or []) or "—")
+    info.add_row("Repos", ", ".join(evaluation.get("source_repos") or []) or "—")
+    console.print(
+        Panel(
+            info,
+            title=f"[bold cyan]{evaluation.get('title') or 'Evaluation asset'}[/bold cyan]",
+            border_style="cyan",
+        )
+    )
+
+    checks = evaluation.get("checks") or []
+    if checks:
+        checks_table = Table(title="Checks", box=box.SIMPLE)
+        checks_table.add_column("Check")
+        for check in checks:
+            checks_table.add_row(str(check))
+        console.print(checks_table)
+
+
+@memory_app.command("export-eval")
+def memory_export_eval_cmd(
+    doc_id: str,
+    format: str = typer.Option("json", "--format", help="json or jsonl"),
+) -> None:
+    """Export an approved evaluation asset."""
+    try:
+        with _client() as client:
+            resp = client.get(f"/api/memory/evaluations/{doc_id}/export", params={"format": format})
+            resp.raise_for_status()
+            if format.strip().lower() == "jsonl":
+                console.print(resp.text.rstrip())
+            else:
+                console.print_json(json.dumps(resp.json()))
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -1416,6 +1791,132 @@ def github_explore(
     )
 
 
+def _run_repo_scout_command(
+    *,
+    cadence: str,
+    limit: int,
+    queries: str,
+    every: Optional[str],
+    platforms: List[str],
+    run_path: str,
+    schedule_path: str,
+    title: str,
+) -> None:
+    payload: Dict[str, Any] = {
+        "cadence": cadence,
+        "limit": limit,
+        "queries": [item.strip() for item in queries.split(",") if item.strip()],
+    }
+    if platforms:
+        payload["platforms"] = platforms
+
+    path = run_path
+    if every:
+        payload["schedule_expr"] = every
+        path = schedule_path
+
+    try:
+        with _client() as client:
+            resp = client.post(path, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    if every:
+        _success(
+            f"Scheduled {title}\n"
+            f"• Job ID: [bold]{data.get('job_id', 'unknown')}[/bold]\n"
+            f"• Name: [cyan]{data.get('name', title.lower())}[/cyan]\n"
+            f"• Schedule: {every}"
+        )
+        return
+
+    proposals = data.get("proposals") or []
+    tbl = Table(title=f"{title} result", box=box.SIMPLE)
+    tbl.add_column("Platform", style="dim")
+    tbl.add_column("Repo", style="cyan")
+    tbl.add_column("Lane", style="dim")
+    tbl.add_column("License", style="dim")
+    tbl.add_column("Proposal", style="dim")
+    for item in proposals:
+        tbl.add_row(
+            str(item.get("platform") or ("github" if title == "GitHub scout" else "—")),
+            str(item.get("repo") or "—"),
+            str(item.get("lane") or "—"),
+            str(item.get("license") or "—"),
+            str(item.get("proposal_id") or "—"),
+        )
+    console.print(tbl)
+    console.print(
+        f"[dim]Filed {data.get('filed', 0)} proposal(s) from {data.get('candidates_seen', 0)} candidate repo(s).[/dim]"
+    )
+
+
+@github_app.command("scout")
+def github_scout(
+    cadence: str = typer.Option("daily", "--cadence", help="Scout cadence label"),
+    limit: int = typer.Option(4, "--limit", "-l", help="Max proposals to file per run"),
+    queries: str = typer.Option("", "--queries", help="Comma-separated fit-lane queries"),
+    platforms: str = typer.Option(
+        "",
+        "--platforms",
+        help="Optional comma-separated source platforms (github, gitlab, bitbucket)",
+    ),
+    every: Optional[str] = typer.Option(
+        None,
+        "--every",
+        help="Schedule expression to make the scout recurring instead of running now",
+    ),
+) -> None:
+    """Run or schedule the GitHub scout."""
+    platform_list = [item.strip() for item in platforms.split(",") if item.strip()]
+    multi_platform = bool(platform_list)
+    _run_repo_scout_command(
+        cadence=cadence,
+        limit=limit,
+        queries=queries,
+        every=every,
+        platforms=platform_list,
+        run_path="/api/repo-scout/run" if multi_platform else "/api/github/scout/run",
+        schedule_path="/api/repo-scout/schedule" if multi_platform else "/api/github/scout/schedule",
+        title="Repo scout" if multi_platform else "GitHub scout",
+    )
+
+
+@scout_app.command("run")
+def scout_run(
+    cadence: str = typer.Option("daily", "--cadence", help="Scout cadence label"),
+    limit: int = typer.Option(4, "--limit", "-l", help="Max proposals to file per run"),
+    queries: str = typer.Option("", "--queries", help="Comma-separated fit-lane queries"),
+    platforms: str = typer.Option(
+        "github,gitlab,bitbucket",
+        "--platforms",
+        help="Comma-separated source platforms (github, gitlab, bitbucket)",
+    ),
+    every: Optional[str] = typer.Option(
+        None,
+        "--every",
+        help="Schedule expression to make the scout recurring instead of running now",
+    ),
+) -> None:
+    """Run or schedule the multi-source repo scout."""
+    _run_repo_scout_command(
+        cadence=cadence,
+        limit=limit,
+        queries=queries,
+        every=every,
+        platforms=[item.strip() for item in platforms.split(",") if item.strip()],
+        run_path="/api/repo-scout/run",
+        schedule_path="/api/repo-scout/schedule",
+        title="Repo scout",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Exec command
 # ---------------------------------------------------------------------------
@@ -1687,6 +2188,11 @@ def export_trajectories(
     to_date: str = typer.Option("", "--to", help="End date (YYYY-MM-DD)"),
     agent: str = typer.Option("", "--agent", help="Filter by agent name"),
     outcome: str = typer.Option("", "--outcome", help="Filter by outcome: success, failure"),
+    include_evaluations: bool = typer.Option(
+        False,
+        "--include-evaluations",
+        help="Append approved evaluation assets to the exported JSONL bundle",
+    ),
     output: str = typer.Option("trajectories.jsonl", "--output", "-o", help="Output file path"),
 ) -> None:
     """📤 Export agent trajectories to JSONL for analysis or training."""
@@ -1701,6 +2207,8 @@ def export_trajectories(
                 params["agent"] = agent
             if outcome:
                 params["outcome"] = outcome
+            if include_evaluations:
+                params["include_evaluations"] = True
             resp = client.get("/api/trajectories/export", params=params)
             resp.raise_for_status()
     except httpx.ConnectError:
@@ -1712,7 +2220,8 @@ def export_trajectories(
 
     with open(output, "wb") as fh:
         fh.write(resp.content)
-    console.print(f"[green]✅ Exported trajectories to {output}[/green]")
+    label = "trajectory bundle" if include_evaluations else "trajectories"
+    console.print(f"[green]✅ Exported {label} to {output}[/green]")
 
 
 # ---------------------------------------------------------------------------
@@ -1915,6 +2424,153 @@ def skills_search(query: str) -> None:
         rel = s.relevance(query)
         tbl.add_row(s.name, f"{rel:.1f}", ", ".join(s.tags[:3]))
     console.print(tbl)
+
+
+@skills_app.command("candidates")
+def skills_candidates(
+    limit: int = typer.Option(20, "--limit", "-l", help="Number of candidates to show"),
+) -> None:
+    """List approved memory docs that can be turned into skill drafts."""
+    try:
+        with _client() as client:
+            resp = client.get("/api/skills/candidates", params={"limit": limit})
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    candidates = data.get("candidates") or []
+    if not candidates:
+        console.print("[dim]No approved memory skill candidates.[/dim]")
+        return
+    tbl = Table(title="Skill candidates", box=box.SIMPLE)
+    tbl.add_column("Doc ID", style="cyan", no_wrap=True)
+    tbl.add_column("Type", style="dim")
+    tbl.add_column("Confidence", justify="right")
+    tbl.add_column("Title")
+    for doc in candidates:
+        meta = doc.get("meta") or {}
+        confidence = meta.get("confidence")
+        try:
+            confidence_value = confidence if confidence is not None else 0.0
+            confidence_str = f"{float(confidence_value):.2f}"
+        except (TypeError, ValueError):
+            confidence_str = "—"
+        tbl.add_row(
+            str(doc.get("id") or "—"),
+            str(doc.get("doc_type") or "—"),
+            confidence_str,
+            str(doc.get("title") or "—"),
+        )
+    console.print(tbl)
+
+
+@skills_app.command("drafts")
+def skills_drafts() -> None:
+    """List pending skill drafts."""
+    try:
+        with _client() as client:
+            resp = client.get("/api/skills/drafts")
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    drafts = data.get("drafts") or []
+    if not drafts:
+        console.print("[dim]No pending skill drafts.[/dim]")
+        return
+    tbl = Table(title="Skill drafts", box=box.SIMPLE)
+    tbl.add_column("Slug", style="cyan")
+    tbl.add_column("Memory doc", style="dim")
+    tbl.add_column("Tags", style="dim")
+    tbl.add_column("Name")
+    for draft in drafts:
+        tbl.add_row(
+            str(draft.get("slug") or "—"),
+            str(draft.get("memory_doc_id") or "—"),
+            ", ".join(draft.get("tags") or []),
+            str(draft.get("name") or "—"),
+        )
+    console.print(tbl)
+
+
+@skills_app.command("draft")
+def skills_draft(doc_id: str) -> None:
+    """Create a pending skill draft from an approved memory document."""
+    try:
+        with _client() as client:
+            resp = client.post(f"/api/skills/drafts/from-memory/{doc_id}")
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    draft = data.get("draft") or {}
+    _success(
+        f"Created skill draft\n"
+        f"• Memory doc: [bold]{doc_id}[/bold]\n"
+        f"• Draft slug: [cyan]{draft.get('slug', 'unknown')}[/cyan]\n"
+        f"• Draft name: {draft.get('name', 'unknown')}"
+    )
+
+
+@skills_app.command("approve-draft")
+def skills_approve_draft(slug: str) -> None:
+    """Promote a pending skill draft into the live library."""
+    try:
+        with _client() as client:
+            resp = client.post(f"/api/skills/drafts/{slug}/approve")
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    _success(
+        f"Installed skill draft\n"
+        f"• Skill: [cyan]{data.get('installed', slug)}[/cyan]"
+    )
+
+
+@skills_app.command("reject-draft")
+def skills_reject_draft(
+    slug: str,
+    reason: str = typer.Option("", "--reason", "-r", help="Optional rejection reason"),
+) -> None:
+    """Reject and delete a pending skill draft."""
+    try:
+        with _client() as client:
+            resp = client.post(f"/api/skills/drafts/{slug}/reject", json={"reason": reason})
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    draft = data.get("draft") or {}
+    _success(
+        f"Rejected skill draft\n"
+        f"• Draft: [cyan]{draft.get('slug', slug)}[/cyan]"
+    )
 
 
 @skills_app.command("install")

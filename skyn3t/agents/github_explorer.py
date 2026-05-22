@@ -1,8 +1,12 @@
 """GitHub Explorer Agent - explores and analyzes GitHub repositories."""
 
 import base64
+import html
 import os
+import re
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
 
 from skyn3t.config.settings import get_settings
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
@@ -11,6 +15,24 @@ from skyn3t.core.events import EventBus
 
 class GitHubExplorerAgent(BaseAgent):
     """Agent for exploring GitHub repositories and projects."""
+
+    _TRENDING_ARTICLE_RE = re.compile(r"<article class=\"Box-row\">(.*?)</article>", re.DOTALL)
+    _TRENDING_NAME_RE = re.compile(
+        r"<h2 class=\"h3[^\"]*\">.*?<a[^>]+href=\"/([^/\"]+)/([^/\"]+)\"",
+        re.DOTALL,
+    )
+    _TRENDING_DESCRIPTION_RE = re.compile(
+        r"<p class=\"col-9 color-fg-muted[^>]*\">(.*?)</p>",
+        re.DOTALL,
+    )
+    _TRENDING_LANGUAGE_RE = re.compile(
+        r"<span itemprop=\"programmingLanguage\">(.*?)</span>",
+        re.DOTALL,
+    )
+    _TRENDING_STARS_RE = re.compile(
+        r"<a href=\"/[^\"#?]+/stargazers\"[^>]*>.*?</svg>\s*([\d,]+)\s*</a>",
+        re.DOTALL,
+    )
 
     def __init__(
         self,
@@ -245,31 +267,106 @@ class GitHubExplorerAgent(BaseAgent):
         """Find trending repositories."""
         language = task.input_data.get("language")
         since = task.input_data.get("since", "daily")
+        repos: List[Dict[str, Any]] = []
+        normalized_since = self._normalize_trending_since(since)
 
-        # GitHub trending is not directly available via API, so we search for recently starred repos
-        query = "stars:>100"
-        if language:
-            query += f" language:{language}"
-        query += " sort:stars"
+        try:
+            html_text = self._fetch_trending_html(language=language, since=normalized_since)
+            repos = self._parse_trending_html(html_text)
+        except Exception:
+            repos = []
 
-        results = self.github_client.search_repositories(query)
+        if not repos:
+            # Fallback when the public Trending page is unavailable.
+            query = "stars:>100"
+            if language:
+                query += f" language:{language}"
+            query += " sort:stars"
 
-        repos = []
-        for repo in results[:15]:
-            repos.append({
-                "name": repo.name,
-                "full_name": repo.full_name,
-                "description": repo.description,
-                "stars": repo.stargazers_count,
-                "language": repo.language,
-                "url": repo.html_url,
-            })
+            results = self.github_client.search_repositories(query)
+            for repo in results[:15]:
+                repos.append({
+                    "name": repo.name,
+                    "full_name": repo.full_name,
+                    "description": repo.description,
+                    "stars": repo.stargazers_count,
+                    "language": repo.language,
+                    "url": repo.html_url,
+                })
 
         return {
             "language": language,
-            "since": since,
+            "since": normalized_since,
             "repositories": repos,
         }
+
+    @classmethod
+    def _normalize_trending_since(cls, since: Any) -> str:
+        value = str(since or "daily").strip().lower()
+        if value in {"daily", "weekly", "monthly"}:
+            return value
+        return "daily"
+
+    @classmethod
+    def _fetch_trending_html(cls, *, language: Any, since: str) -> str:
+        normalized_since = cls._normalize_trending_since(since)
+        path = "/trending"
+        language_part = str(language or "").strip().lower()
+        if language_part:
+            path += f"/{quote(language_part, safe='')}"
+        query = urlencode({"since": normalized_since})
+        url = f"https://github.com{path}?{query}"
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "SkyN3t-GitHubExplorer/1.0",
+                "Accept": "text/html,application/xhtml+xml",
+            },
+        )
+        with urlopen(request, timeout=20) as response:
+            body = response.read()
+        if isinstance(body, bytes):
+            return body.decode("utf-8", "ignore")
+        return str(body)
+
+    @classmethod
+    def _parse_trending_html(cls, html_text: str) -> List[Dict[str, Any]]:
+        repositories: List[Dict[str, Any]] = []
+        for article in cls._TRENDING_ARTICLE_RE.findall(html_text or ""):
+            name_match = cls._TRENDING_NAME_RE.search(article)
+            if not name_match:
+                continue
+            owner = html.unescape(name_match.group(1).strip())
+            repo_name = html.unescape(name_match.group(2).strip())
+            full_name = f"{owner}/{repo_name}"
+            description_match = cls._TRENDING_DESCRIPTION_RE.search(article)
+            language_match = cls._TRENDING_LANGUAGE_RE.search(article)
+            stars_match = cls._TRENDING_STARS_RE.search(article)
+            repositories.append(
+                {
+                    "name": repo_name,
+                    "full_name": full_name,
+                    "description": cls._strip_html(description_match.group(1))
+                    if description_match
+                    else "",
+                    "stars": cls._parse_count(stars_match.group(1)) if stars_match else 0,
+                    "language": cls._strip_html(language_match.group(1)) if language_match else "",
+                    "url": f"https://github.com/{owner}/{repo_name}",
+                }
+            )
+        return repositories
+
+    @staticmethod
+    def _strip_html(fragment: str) -> str:
+        text = re.sub(r"<[^>]+>", " ", fragment or "")
+        return " ".join(html.unescape(text).split())
+
+    @staticmethod
+    def _parse_count(raw: str) -> int:
+        try:
+            return int(str(raw or "").replace(",", "").strip())
+        except ValueError:
+            return 0
 
     async def _generate_readme(self, task: TaskRequest) -> Dict[str, Any]:
         """Generate a README for a project."""

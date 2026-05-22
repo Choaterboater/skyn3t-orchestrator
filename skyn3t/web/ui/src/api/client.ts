@@ -15,6 +15,9 @@ export type AgentRow = {
   provider?: string;
   backend?: string | null;
   model?: string | null;
+  effective_backend?: string | null;
+  effective_model?: string | null;
+  effective_source?: string | null;
   status?: string;
   queue_depth?: number;
   recent_errors?: number;
@@ -26,6 +29,12 @@ export type AgentConfigView = {
   provider?: string;
   enabled?: boolean;
   capabilities?: string[];
+  effective_backend?: string | null;
+  effective_model?: string | null;
+  effective_source?: string | null;
+  effective_stage?: string | null;
+  effective_tier?: string | null;
+  effective_policy_source?: string | null;
   config?: {
     backend?: string;
     model?: string;
@@ -33,6 +42,53 @@ export type AgentConfigView = {
     temperature?: number;
     max_tokens?: number;
   };
+};
+
+export type RoutingTier = {
+  name: string;
+  backend?: string | null;
+  model?: string | null;
+};
+
+export type RoutingRoute = {
+  stage: string;
+  tier: string;
+  backend?: string | null;
+  model?: string | null;
+  source: string;
+  persisted_via?: string | null;
+};
+
+export type RoutingPolicyUpdate =
+  | string
+  | {
+      tier: string;
+      applied_via?: "manual" | "recommendation";
+    };
+
+export type RoutingRecommendation = {
+  stage: string;
+  current_tier: string;
+  current_backend?: string | null;
+  current_model?: string | null;
+  current_source?: string | null;
+  recommended_tier: string;
+  recommended_backend?: string | null;
+  recommended_model?: string | null;
+  default_tier?: string | null;
+  recommendation_kind: string;
+  confidence: "low" | "medium" | "high";
+  reasons: string[];
+  signals: {
+    live_stage_tokens?: number;
+    trajectory_stage_tokens?: number;
+    avg_latency_seconds?: number;
+    trajectory_samples?: number;
+    mixed_route_samples?: number;
+    current_success_rate?: number | null;
+    recommended_success_rate?: number | null;
+  };
+  applyable: boolean;
 };
 
 // Mutation responses from /api/agents/* endpoints. Backend signals
@@ -311,6 +367,11 @@ export const api = {
       `/api/agents/${encodeURIComponent(name)}/config`,
       { method: "PATCH", body: JSON.stringify(patch) },
     ),
+  resetAgentConfig: (name: string, keys?: string[]) =>
+    fetchJson<AgentMutateResponse>(
+      `/api/agents/${encodeURIComponent(name)}/config/reset`,
+      { method: "POST", body: JSON.stringify({ keys: keys ?? ["backend", "model"] }) },
+    ),
   enableAgent: (name: string) =>
     fetchJson<AgentMutateResponse>(
       `/api/agents/${encodeURIComponent(name)}/enable`,
@@ -324,6 +385,21 @@ export const api = {
   deleteAgent: (name: string) =>
     fetchJson<AgentDeleteResponse>(
       `/api/agents/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    ),
+  routingPolicy: () =>
+    fetchJson<{ tiers: RoutingTier[]; routes: RoutingRoute[] }>("/api/routing/policy"),
+  routingRecommendations: () =>
+    fetchJson<{ recommendations: RoutingRecommendation[] }>("/api/routing/recommendations")
+      .then((d) => d.recommendations ?? []),
+  patchRoutingPolicy: (policies: Record<string, RoutingPolicyUpdate>) =>
+    fetchJson<{ ok?: boolean; tiers: RoutingTier[]; routes: RoutingRoute[] }>(
+      "/api/routing/policy",
+      { method: "PATCH", body: JSON.stringify({ policies }) },
+    ),
+  resetRoutingPolicy: (stage: string) =>
+    fetchJson<{ ok?: boolean; tiers: RoutingTier[]; routes: RoutingRoute[] }>(
+      `/api/routing/policy/${encodeURIComponent(stage)}`,
       { method: "DELETE" },
     ),
   projects: () =>

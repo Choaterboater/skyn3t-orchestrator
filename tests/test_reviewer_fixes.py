@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from skyn3t.agents.reviewer_fixes import FixCandidate, _try_fix_one
 import skyn3t.adapters as adapters
+from skyn3t.agents.reviewer_fixes import FixCandidate, _try_fix_one
 
 
 def _write(root: Path, rel: str, content: str) -> Path:

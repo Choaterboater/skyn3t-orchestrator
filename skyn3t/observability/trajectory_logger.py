@@ -63,15 +63,19 @@ class TrajectoryLogger:
         task_id = payload.get("task_id") or payload.get("id")
         if not task_id:
             return
+        session_id = payload.get("session_id")
+        session_key = session_id if isinstance(session_id, str) else None
+        project_slug = payload.get("project_slug")
+        if not project_slug and session_key is not None:
+            project_slug = self._session_meta.get(session_key, {}).get("project_slug")
         with self._lock:
             self._active[task_id] = {
                 "trajectory_id": str(uuid4()),
                 "task_id": task_id,
-                "session_id": payload.get("session_id"),
+                "session_id": session_id,
                 "agent": event.source,
                 "stage": payload.get("stage"),
-                "project_slug": payload.get("project_slug")
-                    or self._session_meta.get(payload.get("session_id"), {}).get("project_slug"),
+                "project_slug": project_slug,
                 "start_time": event.timestamp.isoformat(),
                 "end_time": None,
                 "events": [],
@@ -119,6 +123,7 @@ class TrajectoryLogger:
         traj["events"].append({
             "type": "llm_call",
             "timestamp": event.timestamp.isoformat(),
+            "project_stage": payload.get("project_stage"),
             "backend": payload.get("backend"),
             "model": payload.get("model"),
             "prompt_tokens": payload.get("prompt_tokens"),
@@ -163,6 +168,12 @@ class TrajectoryLogger:
         try:
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(trajectory, ensure_ascii=False) + "\n")
+            try:
+                from skyn3t.intelligence.routing_observations import record_trajectory
+
+                record_trajectory(trajectory)
+            except Exception:
+                logger.exception("Failed to update routing observations")
         except Exception:
             logger.exception("Failed to write trajectory to %s", path)
 

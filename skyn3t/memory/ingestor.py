@@ -1,8 +1,8 @@
-"""Experience Ingestor — feeds task outcomes, lessons, and insights into RAG.
+"""Experience Ingestor — feeds task outcomes and governed learnings into memory.
 
-Every experience the swarm has gets automatically converted into knowledge
-and stored in the vector database. This means agents can semantically recall
-"how did we solve this before?" just by querying RAG.
+Trusted experiences land in RAG immediately. Reflection-generated lessons,
+insights, and patterns are first stored as reviewable drafts so they do not
+silently influence later retrieval before an operator approves them.
 """
 
 import asyncio
@@ -137,6 +137,7 @@ class ExperienceIngestor:
         "CONTRACT_VERIFIER_BLOCKERS",
         "CONSISTENCY_REVIEW_BLOCKERS",
     }
+    _GOVERNED_DOC_TYPES = {"lesson", "insight", "pattern"}
 
     def _on_system_alert(self, event: Event) -> None:
         """Catch studio project events that ride on SYSTEM_ALERT.
@@ -214,6 +215,14 @@ class ExperienceIngestor:
             "fix_worked": fix_worked,
             "brief_shape": list(brief_shape) if brief_shape else None,
         }
+        metadata = self._with_governance_metadata(
+            metadata,
+            memory_layer="project",
+            review_status="approved",
+            reusable=False,
+            confidence=0.9 if success else 0.75,
+            auto_reject_reason="",
+        )
         embedding_id = await self.rag.add_knowledge_one(
             content=content,
             title=title,
@@ -295,17 +304,16 @@ class ExperienceIngestor:
             "task_id": task_id,
             "content_hash": content_hash,
         }
-        embedding_id = await self.rag.add_knowledge_one(
-            content=content,
-            title=title,
-            source="reflection",
-            doc_type="lesson",
-            metadata=metadata,
+        metadata = self._with_governance_metadata(
+            metadata,
+            memory_layer="operator",
+            reusable=True,
+            confidence=0.75 if success else 0.6,
+            auto_reject_reason=self._auto_reject_reason_for_lesson(patterns, suggestions),
         )
-        if embedding_id:
-            self._record_seen(content_hash)
-            await self._persist_doc(title, content, "reflection", "lesson", metadata, embedding_id)
-        return embedding_id
+        await self._persist_doc(title, content, "reflection", "lesson", metadata, None)
+        self._record_seen(content_hash)
+        return None
 
     async def ingest_insight(
         self,
@@ -332,17 +340,16 @@ class ExperienceIngestor:
             "capability": capability,
             "content_hash": content_hash,
         }
-        embedding_id = await self.rag.add_knowledge_one(
-            content=content,
-            title=title,
-            source=agent_name,
-            doc_type="insight",
-            metadata=metadata,
+        metadata = self._with_governance_metadata(
+            metadata,
+            memory_layer="operator",
+            reusable=True,
+            confidence=0.65,
+            auto_reject_reason=self._auto_reject_reason_for_insight(insight),
         )
-        if embedding_id:
-            self._record_seen(content_hash)
-            await self._persist_doc(title, content, agent_name, "insight", metadata, embedding_id)
-        return embedding_id
+        await self._persist_doc(title, content, agent_name, "insight", metadata, None)
+        self._record_seen(content_hash)
+        return None
 
     async def ingest_failure_pattern(
         self,
@@ -368,17 +375,16 @@ class ExperienceIngestor:
             "affected_agents": affected_agents,
             "content_hash": content_hash,
         }
-        embedding_id = await self.rag.add_knowledge_one(
-            content=content,
-            title=title,
-            source="reflection",
-            doc_type="pattern",
-            metadata=metadata,
+        metadata = self._with_governance_metadata(
+            metadata,
+            memory_layer="operator",
+            reusable=True,
+            confidence=0.7,
+            auto_reject_reason=self._auto_reject_reason_for_pattern(description, suggested_fix),
         )
-        if embedding_id:
-            self._record_seen(content_hash)
-            await self._persist_doc(title, content, "reflection", "pattern", metadata, embedding_id)
-        return embedding_id
+        await self._persist_doc(title, content, "reflection", "pattern", metadata, None)
+        self._record_seen(content_hash)
+        return None
 
     async def ingest_project_event(
         self,
@@ -457,6 +463,14 @@ class ExperienceIngestor:
             "fix_applied": fix_applied,
             "fix_worked": fix_worked,
         }
+        metadata = self._with_governance_metadata(
+            metadata,
+            memory_layer="project",
+            review_status="approved",
+            reusable=False,
+            confidence=0.8,
+            auto_reject_reason="",
+        )
         embedding_id = await self.rag.add_knowledge_one(
             content=content,
             title=title,
@@ -530,6 +544,51 @@ class ExperienceIngestor:
         """Create a content hash for deduplication."""
         return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
 
+    def _with_governance_metadata(
+        self,
+        metadata: Dict[str, Any],
+        *,
+        memory_layer: str,
+        review_status: str = "draft",
+        reusable: bool,
+        confidence: float,
+        auto_reject_reason: str = "",
+    ) -> Dict[str, Any]:
+        enriched = dict(metadata)
+        final_review_status = "rejected" if auto_reject_reason else review_status
+        enriched.setdefault("memory_layer", memory_layer)
+        enriched.setdefault("review_status", final_review_status)
+        enriched.setdefault("provenance_status", "captured")
+        enriched.setdefault("source_platform", "internal")
+        enriched.setdefault("reusable", reusable)
+        enriched.setdefault("confidence", confidence)
+        if auto_reject_reason:
+            enriched.setdefault("review_reason", auto_reject_reason)
+            enriched.setdefault("reviewed_by", "system:auto")
+        return enriched
+
+    def _auto_reject_reason_for_lesson(self, patterns: list, suggestions: list) -> str:
+        non_empty_patterns = [str(item).strip() for item in patterns if str(item).strip()]
+        non_empty_suggestions = [str(item).strip() for item in suggestions if str(item).strip()]
+        if not non_empty_patterns and not non_empty_suggestions:
+            return "no actionable lesson content"
+        if non_empty_suggestions and max(len(item) for item in non_empty_suggestions) < 12:
+            return "suggestions too vague for reuse"
+        return ""
+
+    def _auto_reject_reason_for_insight(self, insight: str) -> str:
+        text = (insight or "").strip()
+        if len(text) < 16:
+            return "insight too short for reuse"
+        return ""
+
+    def _auto_reject_reason_for_pattern(self, description: str, suggested_fix: str) -> str:
+        if len((description or "").strip()) < 16:
+            return "pattern description too short"
+        if len((suggested_fix or "").strip()) < 12:
+            return "pattern fix too short"
+        return ""
+
     def _load_seen_hashes(self) -> set[str]:
         """Restore the seen-hashes set from disk, if any."""
         try:
@@ -571,7 +630,7 @@ class ExperienceIngestor:
         source: str,
         doc_type: str,
         metadata: Dict[str, Any],
-        embedding_id: str,
+        embedding_id: Optional[str],
     ) -> None:
         """Persist a knowledge doc to MemoryStore alongside RAG, if available."""
         if self._memory is None:

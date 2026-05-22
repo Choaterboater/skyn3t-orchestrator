@@ -53,6 +53,7 @@ class Orchestrator:
         self._task_done_events: Dict[str, asyncio.Event] = {}
         self._failed_agents_by_task: Dict[str, Set[str]] = {}
         self._handling_task_failures: Set[str] = set()
+        self._cancelled_tasks: Set[str] = set()
         # Guards _handling_task_failures so concurrent TASK_FAILED publishes
         # (e.g. from worker thread + decomposer thread) can't both pass the
         # dedup check before either records the in-flight handler.
@@ -1031,6 +1032,39 @@ class Orchestrator:
         """Get the result of a task."""
         return self.task_results.get(task_id)
 
+    def cancel_task(self, task_id: str, *, reason: str = "cancelled by user") -> bool:
+        """Mark a running task as cancelled and wake result waiters.
+
+        This is a best-effort cancellation signal for API callers. The
+        underlying agent execution may still finish, but later completion
+        events are ignored so callers don't hang on stale work.
+        """
+        task = self.running_tasks.pop(task_id, None)
+        if task is None or task_id in self.task_results:
+            return False
+
+        self._cancelled_tasks.add(task_id)
+        self._failed_agents_by_task.pop(task_id, None)
+        self._handling_task_failures.discard(task_id)
+        self.task_results[task_id] = TaskResult(
+            task_id=task_id,
+            success=False,
+            output={},
+            error=reason,
+            session_id=task.session_id,
+        )
+        self._task_result_completed_at[task_id] = datetime.now(timezone.utc)
+        self._signal_task_done(task_id)
+        self.event_bus.publish(
+            Event(
+                event_type=EventType.TASK_FAILED_FINAL,
+                source="orchestrator",
+                payload={"task_id": task_id, "error": reason, "cancelled": True},
+                correlation_id=task_id,
+            )
+        )
+        return True
+
     async def wait_for_task(self, task_id: str, timeout: float = 300.0) -> Optional[TaskResult]:
         """Wait for a task to complete (event-driven, no polling)."""
         # Fast path: already completed.
@@ -1466,6 +1500,12 @@ class Orchestrator:
         """Handle task completion."""
         task_id = event.payload.get("task_id")
         if not isinstance(task_id, str):
+            return
+        if task_id in self._cancelled_tasks:
+            self._cancelled_tasks.discard(task_id)
+            self.running_tasks.pop(task_id, None)
+            self._failed_agents_by_task.pop(task_id, None)
+            self._handling_task_failures.discard(task_id)
             return
         agent_name = event.source
         existing_result = self.task_results.get(task_id)
@@ -1988,6 +2028,7 @@ class Orchestrator:
             self.task_results.pop(tid, None)
             self._failed_agents_by_task.pop(tid, None)
             self._task_done_events.pop(tid, None)
+            self._cancelled_tasks.discard(tid)
 
     async def _heartbeat_loop(self) -> None:
         """Send periodic heartbeats."""

@@ -59,7 +59,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 logger = logging.getLogger("skyn3t.intelligence.skill_library")
 
@@ -88,6 +88,7 @@ class Skill:
     last_used_at: float = field(default_factory=time.time)
     source: str = ""
     created_at: float = field(default_factory=time.time)
+    memory_doc_id: str = ""
 
     @property
     def slug(self) -> str:
@@ -113,6 +114,8 @@ class Skill:
             front_lines.append(f"author: {self.author}")
         if self.description:
             front_lines.append(f"description: {self.description}")
+        if self.memory_doc_id:
+            front_lines.append(f"memory_doc_id: {self.memory_doc_id}")
         front_lines.append(f"tags: {tags_str}")
         if self.triggers:
             front_lines.append(f"triggers: {triggers_str}")
@@ -146,6 +149,7 @@ class Skill:
             last_used_at=float(front.get("last_used_at") or time.time()),
             source=str(front.get("source") or ""),
             created_at=float(front.get("created_at") or time.time()),
+            memory_doc_id=str(front.get("memory_doc_id") or ""),
             body=body.strip(),
         )
 
@@ -302,9 +306,11 @@ class SkillLibrary:
 
     def __init__(self, root: Optional[Path] = None):
         self.root = Path(root) if root else Path("data/skills")
+        self.drafts_root = self.root / "drafts"
         self._lock = threading.Lock()
         try:
             self.root.mkdir(parents=True, exist_ok=True)
+            self.drafts_root.mkdir(parents=True, exist_ok=True)
         except Exception:
             logger.exception("skill library root creation failed: %s", self.root)
 
@@ -315,11 +321,14 @@ class SkillLibrary:
     def _path_for(self, skill: Skill) -> Path:
         return self.root / f"{skill.slug}.md"
 
-    def _scan(self) -> List[Skill]:
+    def _draft_path_for(self, skill: Skill) -> Path:
+        return self.drafts_root / f"{skill.slug}.md"
+
+    def _scan_dir(self, root: Path) -> List[Skill]:
         """Load every .md file in the root, best-effort."""
         out: List[Skill] = []
         try:
-            entries = sorted(self.root.glob("*.md"))
+            entries = sorted(root.glob("*.md"))
         except Exception:
             return out
         # Documentation files in the skills dir aren't skills; they
@@ -341,6 +350,32 @@ class SkillLibrary:
             out.append(skill)
         return out
 
+    def _scan(self) -> List[Skill]:
+        return self._scan_dir(self.root)
+
+    def _write_skill(self, path: Path, skill: Skill) -> Path:
+        existing: Optional[Skill] = None
+        if path.exists():
+            try:
+                existing = Skill.from_markdown(path.read_text(encoding="utf-8"))
+            except Exception:
+                existing = None
+        if existing is not None:
+            skill.created_at = existing.created_at
+            skill.success_count = max(skill.success_count, existing.success_count)
+            skill.failure_count = max(skill.failure_count, existing.failure_count)
+            skill.tags = sorted(set(skill.tags) | set(existing.tags))
+        try:
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(skill.to_markdown())
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            logger.exception("skill upsert failed: %s", path)
+        return path
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -349,6 +384,26 @@ class SkillLibrary:
         """Snapshot every skill currently on disk."""
         with self._lock:
             return self._scan()
+
+    def all_drafts(self) -> List[Skill]:
+        """Snapshot every pending skill draft."""
+        with self._lock:
+            drafts = self._scan_dir(self.drafts_root)
+        drafts.sort(key=lambda s: s.created_at, reverse=True)
+        return drafts
+
+    def get_draft(self, name: str) -> Optional[Skill]:
+        """Return one skill draft by name or slug."""
+        slug = _slugify(name)
+        path = self.drafts_root / f"{slug}.md"
+        with self._lock:
+            if not path.exists():
+                return None
+            try:
+                return Skill.from_markdown(path.read_text(encoding="utf-8"))
+            except Exception:
+                logger.exception("draft skill parse failed: %s", path)
+                return None
 
     def find(self, *, tag: Optional[str] = None, min_score: float = 0.0,
              limit: int = 5) -> List[Skill]:
@@ -391,29 +446,48 @@ class SkillLibrary:
         """
         path = self._path_for(skill)
         with self._lock:
-            existing: Optional[Skill] = None
-            if path.exists():
-                try:
-                    existing = Skill.from_markdown(path.read_text(encoding="utf-8"))
-                except Exception:
-                    existing = None
-            if existing is not None:
-                # Preserve provenance; accumulate counts.
-                skill.created_at = existing.created_at
-                skill.success_count = max(skill.success_count, existing.success_count)
-                skill.failure_count = max(skill.failure_count, existing.failure_count)
-                # Merge tag sets.
-                skill.tags = sorted(set(skill.tags) | set(existing.tags))
+            return self._write_skill(path, skill)
+
+    def upsert_draft(self, skill: Skill) -> Path:
+        """Write a pending skill draft without making it live."""
+        path = self._draft_path_for(skill)
+        with self._lock:
+            return self._write_skill(path, skill)
+
+    def approve_draft(self, name: str) -> Optional[Path]:
+        """Promote a draft into the live library."""
+        slug = _slugify(name)
+        draft_path = self.drafts_root / f"{slug}.md"
+        with self._lock:
+            if not draft_path.exists():
+                return None
             try:
-                tmp = path.with_suffix(path.suffix + ".tmp")
-                with open(tmp, "w", encoding="utf-8") as fh:
-                    fh.write(skill.to_markdown())
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.replace(tmp, path)
+                skill = Skill.from_markdown(draft_path.read_text(encoding="utf-8"))
             except Exception:
-                logger.exception("skill upsert failed: %s", path)
-        return path
+                logger.exception("draft skill parse failed: %s", draft_path)
+                return None
+            path = self._write_skill(self.root / f"{slug}.md", skill)
+            try:
+                draft_path.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                logger.exception("draft skill cleanup failed: %s", draft_path)
+            return path
+
+    def reject_draft(self, name: str) -> bool:
+        """Delete a pending skill draft."""
+        slug = _slugify(name)
+        path = self.drafts_root / f"{slug}.md"
+        with self._lock:
+            try:
+                path.unlink()
+                return True
+            except FileNotFoundError:
+                return False
+            except Exception:
+                logger.exception("draft skill delete failed: %s", path)
+                return False
 
     def record_use(self, name: str, *, success: bool) -> Optional[Skill]:
         """Tick the success/failure count for a skill on disk."""
@@ -586,3 +660,238 @@ def get_default_library() -> SkillLibrary:
     if _default_library is None:
         _default_library = SkillLibrary()
     return _default_library
+
+
+def _as_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    if not text:
+        return []
+    if "," in text:
+        return [piece.strip() for piece in text.split(",") if piece.strip()]
+    return [text]
+
+
+def _memory_guidance(doc_type: str, content: str) -> str:
+    stripped_lines = [line.strip() for line in (content or "").splitlines() if line.strip()]
+    if not stripped_lines:
+        return "Review the source memory before using this skill."
+    if doc_type == "insight":
+        for line in stripped_lines:
+            if line.startswith("Insight:"):
+                return line.partition(":")[2].strip()
+    if doc_type == "pattern":
+        description = ""
+        fix = ""
+        eval_ideas: List[str] = []
+        collecting_eval = False
+        for line in stripped_lines:
+            if line.startswith("Description:"):
+                description = line.partition(":")[2].strip()
+            elif line.startswith("Suggested Fix:"):
+                fix = line.partition(":")[2].strip()
+            elif line == "Evaluation Ideas:":
+                collecting_eval = True
+                continue
+            elif collecting_eval and line.startswith("-"):
+                eval_ideas.append(line[1:].strip())
+            elif collecting_eval and not line.startswith("-"):
+                collecting_eval = False
+        bits = [bit for bit in [description, fix] if bit]
+        if eval_ideas:
+            bits.append("Evaluation ideas:\n" + "\n".join(f"- {item}" for item in eval_ideas))
+        if bits:
+            return "\n\n".join(bits)
+    if doc_type == "lesson":
+        suggestions: List[str] = []
+        collecting = False
+        for line in stripped_lines:
+            if line == "Suggestions:":
+                collecting = True
+                continue
+            if collecting and line.startswith("-"):
+                suggestions.append(line[1:].strip())
+        if suggestions:
+            return "\n".join(f"- {item}" for item in suggestions)
+    return "\n".join(stripped_lines[:6])
+
+
+def _external_learning_guidance(doc: Dict[str, Any], meta: Dict[str, Any]) -> str:
+    repo = str(meta.get("repo") or doc.get("title") or "the external repo").strip()
+    lane = str(meta.get("lane") or "fit").strip() or "fit"
+    query = str(meta.get("query") or "").strip()
+    language = str(meta.get("language") or "unknown").strip() or "unknown"
+    reuse_risk = str(meta.get("reuse_risk") or "unknown").strip() or "unknown"
+    topics = _as_list(meta.get("topics"))
+    docs = _as_list(meta.get("external_doc_paths_ingested"))
+
+    context_bits = [bit for bit in [query, ", ".join(topics[:4]), language] if bit]
+    focus = " / ".join(context_bits) if context_bits else "its strongest patterns"
+    guidance = (
+        f"Use `{repo}` as inspiration for {lane} work around {focus}. "
+        "Adapt the underlying pattern into SkyN3t's architecture instead of copying implementation details."
+    )
+    if docs:
+        guidance += f" Start with: {', '.join(docs[:3])}."
+    if reuse_risk == "high":
+        guidance += " License risk is high, so treat it as reference-only and avoid close code/text reuse."
+    elif reuse_risk == "medium":
+        guidance += " Check provenance carefully before lifting any structure or wording."
+    return guidance
+
+
+def _external_learning_body(
+    *,
+    doc: Dict[str, Any],
+    meta: Dict[str, Any],
+    doc_id: str,
+    title: str,
+) -> str:
+    repo = str(meta.get("repo") or "unknown").strip() or "unknown"
+    repo_url = str(meta.get("repo_url") or "unknown").strip() or "unknown"
+    lane = str(meta.get("lane") or "fit").strip() or "fit"
+    query = str(meta.get("query") or "none").strip() or "none"
+    language = str(meta.get("language") or "unknown").strip() or "unknown"
+    license_name = str(meta.get("license") or "unknown").strip() or "unknown"
+    reuse_risk = str(meta.get("reuse_risk") or "unknown").strip() or "unknown"
+    selection_reason = str(meta.get("selection_reason") or lane).strip() or lane
+    docs = _as_list(meta.get("external_doc_paths_ingested"))
+    topics = _as_list(meta.get("topics"))
+    confidence = meta.get("confidence")
+    guidance = _external_learning_guidance(doc, meta)
+    review_targets = "\n".join(f"- `{path}`" for path in docs) if docs else "- No approved docs were captured."
+    topics_text = ", ".join(topics) if topics else "none"
+    source_memory = str(doc.get("content") or "").strip()
+    return (
+        f"# {title}\n\n"
+        "## Inspiration guidance\n\n"
+        f"{guidance}\n\n"
+        "## Adaptation rules\n\n"
+        "- Borrow the pattern, not the code.\n"
+        "- Rebuild the idea in SkyN3t's own architecture, naming, and UX.\n"
+        f"- License: `{license_name}`\n"
+        f"- Reuse risk: `{reuse_risk}`\n\n"
+        "## Review targets\n\n"
+        f"{review_targets}\n\n"
+        "## Fit signals\n\n"
+        f"- Repo: `{repo}`\n"
+        f"- URL: {repo_url}\n"
+        f"- Lane: `{lane}`\n"
+        f"- Query: `{query}`\n"
+        f"- Language: `{language}`\n"
+        f"- Topics: {topics_text}\n"
+        f"- Why selected: {selection_reason}\n\n"
+        "## Provenance\n\n"
+        f"- Memory document: `{doc_id or 'unknown'}`\n"
+        f"- Memory type: `external_learning`\n"
+        f"- Source: `{doc.get('source') or 'unknown'}`\n"
+        f"- Review status: `{meta.get('review_status') or 'unknown'}`\n"
+        f"- Confidence: `{confidence if confidence is not None else 'unknown'}`\n\n"
+        "## Source memory\n\n"
+        "```text\n"
+        f"{source_memory}\n"
+        "```\n"
+    )
+
+
+def skill_from_memory_doc(
+    doc: Dict[str, Any],
+    *,
+    source: str = "memory_promotion",
+) -> Skill:
+    """Derive a pending skill draft from an approved memory document."""
+    meta = dict(doc.get("meta") or {})
+    doc_id = str(doc.get("id") or "").strip()
+    doc_type = str(doc.get("doc_type") or "memory").strip() or "memory"
+    title = str(doc.get("title") or f"{doc_type.title()} skill").strip()
+    suffix = (doc_id.replace("-", "")[:8] or str(int(time.time())))
+    name = f"{title} {suffix}"
+    guidance = _memory_guidance(doc_type, str(doc.get("content") or ""))
+
+    tags = {
+        "memory-promoted",
+        "governed-memory",
+        doc_type.lower(),
+    }
+    for raw in (
+        meta.get("memory_layer"),
+        meta.get("capability"),
+        meta.get("source_platform"),
+        meta.get("agent"),
+        meta.get("agent_name"),
+    ):
+        for item in _as_list(raw):
+            tags.add(_slugify(item))
+    for item in _as_list(meta.get("patterns")):
+        tags.add(_slugify(item))
+    if meta.get("external_pattern"):
+        tags.update({"external-pattern", "adaptation-skill"})
+    if doc_type == "external_learning":
+        tags.update({"external-learning", "adaptation-skill"})
+    for raw in (
+        meta.get("language"),
+        meta.get("lane"),
+    ):
+        for item in _as_list(raw):
+            tags.add(_slugify(item))
+    for item in _as_list(meta.get("topics")):
+        tags.add(_slugify(item))
+
+    triggers: List[str] = []
+    for raw in (
+        meta.get("capability"),
+        meta.get("pattern_name"),
+        meta.get("agent"),
+        meta.get("agent_name"),
+        title,
+    ):
+        for item in _as_list(raw):
+            if item and item not in triggers:
+                triggers.append(item)
+    for raw in (
+        meta.get("query"),
+        meta.get("repo"),
+        meta.get("source_repos"),
+        meta.get("lane"),
+        meta.get("language"),
+    ):
+        for item in _as_list(raw):
+            if item and item not in triggers:
+                triggers.append(item)
+    for item in _as_list(meta.get("topics")):
+        if item and item not in triggers:
+            triggers.append(item)
+
+    confidence = meta.get("confidence")
+    if doc_type == "external_learning":
+        body = _external_learning_body(doc=doc, meta=meta, doc_id=doc_id, title=title)
+        description = "Adapt a pattern inspired by approved external repo learning."
+    else:
+        body = (
+            f"# {title}\n\n"
+            "## Guidance\n\n"
+            f"{guidance}\n\n"
+            "## Provenance\n\n"
+            f"- Memory document: `{doc_id or 'unknown'}`\n"
+            f"- Memory type: `{doc_type}`\n"
+            f"- Source: `{doc.get('source') or 'unknown'}`\n"
+            f"- Review status: `{meta.get('review_status') or 'unknown'}`\n"
+            f"- Confidence: `{confidence if confidence is not None else 'unknown'}`\n\n"
+            "## Source memory\n\n"
+            "```text\n"
+            f"{str(doc.get('content') or '').strip()}\n"
+            "```\n"
+        )
+        description = f"Promoted from approved {doc_type} memory."
+    return Skill(
+        name=name,
+        description=description,
+        tags=sorted(tag for tag in tags if tag),
+        triggers=triggers,
+        source=source,
+        body=body,
+        memory_doc_id=doc_id,
+    )

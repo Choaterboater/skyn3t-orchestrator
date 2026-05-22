@@ -30,6 +30,8 @@ from skyn3t.core.models import (
 )
 from skyn3t.memory.database import get_session_maker
 
+_KEEP = object()
+
 
 class MemoryStore:
     """Persistent store for agent states, tasks, messages, lessons, and logs.
@@ -398,6 +400,23 @@ class MemoryStore:
     # Lessons / Knowledge
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _serialize_knowledge_doc(
+        doc: KnowledgeDocument,
+        *,
+        preview_only: bool = True,
+    ) -> Dict[str, Any]:
+        return {
+            "id": doc.id,
+            "title": doc.title,
+            "content": doc.content[:500] if preview_only else doc.content,
+            "source": doc.source,
+            "doc_type": doc.doc_type,
+            "meta": doc.meta,
+            "embedding_id": doc.embedding_id,
+            "created_at": doc.created_at.isoformat(),
+        }
+
     async def save_lesson(self, title: str, content: str, source: str,
                           doc_type: str = "lesson", meta: Optional[Dict[str, Any]] = None,
                           embedding_id: Optional[str] = None) -> str:
@@ -449,19 +468,225 @@ class MemoryStore:
                 query = query.where(KnowledgeDocument.source == source)
             query = query.limit(limit)
             result = await session.execute(query)
+            return [self._serialize_knowledge_doc(d) for d in result.scalars().all()]
+
+    async def get_knowledge_doc(self, doc_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch one knowledge document by id."""
+        async with await self._session() as session:
+            result = await session.execute(
+                select(KnowledgeDocument).where(KnowledgeDocument.id == doc_id)
+            )
+            doc = result.scalar_one_or_none()
+            if doc is None:
+                return None
+            return self._serialize_knowledge_doc(doc, preview_only=False)
+
+    async def list_knowledge_drafts(
+        self,
+        *,
+        review_status: str = "draft",
+        doc_type: Optional[str] = None,
+        limit: int = 50,
+        preview_only: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """List knowledge documents by review status.
+
+        Uses SQLite's JSON extract when available and falls back to Python-side
+        filtering if the backend cannot evaluate the JSON expression.
+        """
+        async with await self._session() as session:
+            query = select(KnowledgeDocument).order_by(desc(KnowledgeDocument.created_at))
+            if doc_type:
+                query = query.where(KnowledgeDocument.doc_type == doc_type)
+            try:
+                query = query.where(
+                    func.json_extract(KnowledgeDocument.meta, "$.review_status") == review_status
+                ).limit(limit)
+                result = await session.execute(query)
+                docs = result.scalars().all()
+            except Exception:
+                result = await session.execute(
+                    select(KnowledgeDocument)
+                    .order_by(desc(KnowledgeDocument.created_at))
+                    .limit(max(limit * 5, 50))
+                )
+                docs = [
+                    doc for doc in result.scalars().all()
+                    if (doc.meta or {}).get("review_status") == review_status
+                    and (doc_type is None or doc.doc_type == doc_type)
+                ][:limit]
             return [
-                {
-                    "id": d.id,
-                    "title": d.title,
-                    "content": d.content[:500],
-                    "source": d.source,
-                    "doc_type": d.doc_type,
-                    "meta": d.meta,
-                    "embedding_id": d.embedding_id,
-                    "created_at": d.created_at.isoformat(),
-                }
-                for d in result.scalars().all()
+                self._serialize_knowledge_doc(doc, preview_only=preview_only)
+                for doc in docs
             ]
+
+    async def update_knowledge_doc_review(
+        self,
+        doc_id: str,
+        *,
+        review_status: str,
+        reviewed_by: str = "operator",
+        reason: str = "",
+        embedding_id: Optional[str] = None,
+        extra_meta: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Update review metadata for a knowledge document."""
+        async with self._lock:
+            async with await self._session() as session:
+                async with session.begin():
+                    result = await session.execute(
+                        select(KnowledgeDocument).where(KnowledgeDocument.id == doc_id)
+                    )
+                    doc = result.scalar_one_or_none()
+                    if doc is None:
+                        return None
+                    now = datetime.now(timezone.utc).isoformat()
+                    meta = dict(doc.meta or {})
+                    meta.update(extra_meta or {})
+                    meta["review_status"] = review_status
+                    meta["reviewed_by"] = reviewed_by
+                    meta["reviewed_at"] = now
+                    if review_status == "approved":
+                        meta["approved_at"] = now
+                        meta.pop("rejected_at", None)
+                        meta.pop("review_reason", None)
+                    elif review_status == "rejected":
+                        meta["rejected_at"] = now
+                        if reason:
+                            meta["review_reason"] = reason
+                    elif reason:
+                        meta["review_reason"] = reason
+                    doc.meta = meta
+                    if embedding_id is not None:
+                        doc.embedding_id = embedding_id
+                await session.refresh(doc)
+                return self._serialize_knowledge_doc(doc)
+
+    async def merge_knowledge_doc_meta(
+        self,
+        doc_id: str,
+        extra_meta: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Merge arbitrary metadata into a knowledge document."""
+        async with self._lock:
+            async with await self._session() as session:
+                async with session.begin():
+                    result = await session.execute(
+                        select(KnowledgeDocument).where(KnowledgeDocument.id == doc_id)
+                    )
+                    doc = result.scalar_one_or_none()
+                    if doc is None:
+                        return None
+                    meta = dict(doc.meta or {})
+                    meta.update(extra_meta)
+                    doc.meta = meta
+                await session.refresh(doc)
+                return self._serialize_knowledge_doc(doc)
+
+    async def update_knowledge_doc(
+        self,
+        doc_id: str,
+        *,
+        title: Optional[str] = None,
+        content: Optional[str] = None,
+        meta: Optional[Dict[str, Any]] = None,
+        embedding_id: Any = _KEEP,
+    ) -> Optional[Dict[str, Any]]:
+        """Update content/title/meta for a knowledge document."""
+        async with self._lock:
+            async with await self._session() as session:
+                async with session.begin():
+                    result = await session.execute(
+                        select(KnowledgeDocument).where(KnowledgeDocument.id == doc_id)
+                    )
+                    doc = result.scalar_one_or_none()
+                    if doc is None:
+                        return None
+                    if title is not None:
+                        doc.title = title
+                    if content is not None:
+                        doc.content = content
+                    if meta is not None:
+                        doc.meta = meta
+                    if embedding_id is not _KEEP:
+                        doc.embedding_id = embedding_id
+                await session.refresh(doc)
+                return self._serialize_knowledge_doc(doc, preview_only=False)
+
+    async def find_knowledge_doc_by_meta(
+        self,
+        *,
+        meta_key: str,
+        meta_value: Any,
+        doc_type: Optional[str] = None,
+        review_status: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Find the most recent knowledge document by a metadata key/value pair."""
+        async with await self._session() as session:
+            query = select(KnowledgeDocument).order_by(desc(KnowledgeDocument.created_at))
+            if doc_type:
+                query = query.where(KnowledgeDocument.doc_type == doc_type)
+            try:
+                query = query.where(
+                    func.json_extract(KnowledgeDocument.meta, f"$.{meta_key}") == meta_value
+                )
+                if review_status:
+                    query = query.where(
+                        func.json_extract(KnowledgeDocument.meta, "$.review_status") == review_status
+                    )
+                result = await session.execute(query.limit(1))
+                doc = result.scalar_one_or_none()
+            except Exception:
+                result = await session.execute(query.limit(500))
+                doc = next(
+                    (
+                        item for item in result.scalars().all()
+                        if (item.meta or {}).get(meta_key) == meta_value
+                        and (review_status is None or (item.meta or {}).get("review_status") == review_status)
+                    ),
+                    None,
+                )
+            if doc is None:
+                return None
+            return self._serialize_knowledge_doc(doc, preview_only=False)
+
+    async def list_skill_candidate_docs(
+        self,
+        *,
+        min_confidence: float = 0.7,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """List approved reusable memory docs that have not yet been skill-promoted."""
+        async with await self._session() as session:
+            result = await session.execute(
+                select(KnowledgeDocument)
+                .order_by(desc(KnowledgeDocument.created_at))
+                .limit(max(limit * 5, 100))
+            )
+            docs = []
+            for doc in result.scalars().all():
+                meta = dict(doc.meta or {})
+                if meta.get("review_status") != "approved":
+                    continue
+                if not meta.get("reusable"):
+                    continue
+                if meta.get("skill_promotion_status"):
+                    continue
+                if doc.doc_type == "external_learning":
+                    if meta.get("external_doc_ingest_status") != "docs_ingested":
+                        continue
+                    if not list(meta.get("external_doc_paths_ingested") or []):
+                        continue
+                try:
+                    confidence = float(meta.get("confidence") or 0.0)
+                except (TypeError, ValueError):
+                    confidence = 0.0
+                if confidence < min_confidence:
+                    continue
+                docs.append(self._serialize_knowledge_doc(doc))
+                if len(docs) >= limit:
+                    break
+            return docs
 
     # ------------------------------------------------------------------
     # Experience index (Phase-2 structured fix recall)

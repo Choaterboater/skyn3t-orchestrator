@@ -45,12 +45,12 @@ def _prevalidate_diff(diff: str) -> Optional[str]:
             actual_old = 0
             actual_new = 0
             for j in range(i, len(lines)):
-                l = lines[j].rstrip("\n")
-                if l.startswith("@@"):
+                line = lines[j].rstrip("\n")
+                if line.startswith("@@"):
                     break
-                if l.startswith("-"):
+                if line.startswith("-"):
                     actual_old += 1
-                elif l.startswith("+"):
+                elif line.startswith("+"):
                     actual_new += 1
                 else:
                     actual_old += 1
@@ -63,7 +63,7 @@ def _prevalidate_diff(diff: str) -> Optional[str]:
                 )
         elif stripped.startswith("--- ") or stripped.startswith("+++ "):
             in_hunk = False
-        elif in_hunk and stripped and not stripped[0] in (" ", "-", "+"):
+        elif in_hunk and stripped and stripped[0] not in (" ", "-", "+"):
             return (
                 f"Line {i}: unexpected character '{stripped[0]}' inside hunk "
                 f"(started at line {hunk_start}). Hunk lines must start with "
@@ -611,7 +611,7 @@ class CodeImproverAgent(BaseAgent):
             # SKIP filing if we're already inside a studio_debug retry — that
             # would create an infinite loop (failed retry → new debug proposal
             # → approve → fail → new debug → ...).
-            if attempts and not from_studio_debug:
+            if attempts and not from_studio_debug and target:
                 try:
                     from skyn3t.cortex import get_store
                     attempts_summary = "\n".join(
@@ -645,6 +645,10 @@ class CodeImproverAgent(BaseAgent):
                     )
                 except Exception:
                     logger.exception("could not file studio_debug proposal")
+            elif attempts and not from_studio_debug:
+                logger.info(
+                    "skipping studio_debug proposal because diff drafting ended without a target"
+                )
 
             self._publish_result(applied=False, branch=None,
                                   error="no actionable diff produced", target=target or "(unknown)",

@@ -45,6 +45,50 @@ class TestGitHubExplorerAgent:
         result = await agent.execute(task)
         assert result.success is False
 
+    def test_parse_trending_html_reads_real_repo_cards(self):
+        from skyn3t.agents.github_explorer import GitHubExplorerAgent
+
+        html = """
+        <article class="Box-row">
+          <h2 class="h3 lh-condensed">
+            <a href="/freeCodeCamp/freeCodeCamp" class="Link">
+              <span class="text-normal">freeCodeCamp /</span>
+              freeCodeCamp
+            </a>
+          </h2>
+          <p class="col-9 color-fg-muted my-1 tmp-pr-4">
+            Learn math, programming, and computer science for free.
+          </p>
+          <span class="d-inline-block ml-0 tmp-ml-0">
+            <span itemprop="programmingLanguage">TypeScript</span>
+          </span>
+          <a href="/freeCodeCamp/freeCodeCamp/stargazers" class="Link Link--muted d-inline-block">
+            <svg aria-label="star"></svg>
+            445,274
+          </a>
+        </article>
+        """
+
+        repositories = GitHubExplorerAgent._parse_trending_html(html)
+
+        assert repositories == [
+            {
+                "name": "freeCodeCamp",
+                "full_name": "freeCodeCamp/freeCodeCamp",
+                "description": "Learn math, programming, and computer science for free.",
+                "stars": 445274,
+                "language": "TypeScript",
+                "url": "https://github.com/freeCodeCamp/freeCodeCamp",
+            }
+        ]
+
+    def test_normalize_trending_since_accepts_weekly_and_monthly(self):
+        from skyn3t.agents.github_explorer import GitHubExplorerAgent
+
+        assert GitHubExplorerAgent._normalize_trending_since("weekly") == "weekly"
+        assert GitHubExplorerAgent._normalize_trending_since("monthly") == "monthly"
+        assert GitHubExplorerAgent._normalize_trending_since("weird") == "daily"
+
 
 class TestCodeAgent:
     @pytest.mark.asyncio
@@ -592,6 +636,47 @@ class TestCodeImproverAgent:
         assert result.output["proposed"] is False
         assert result.output["skipped"] is True
         assert result.output["reason"] == "review flagged no actionable risks"
+
+    @pytest.mark.asyncio
+    async def test_execute_does_not_file_studio_debug_without_target(self, monkeypatch):
+        from skyn3t.agents.code_improver import CodeImproverAgent
+
+        agent = CodeImproverAgent(event_bus=EventBus())
+        monkeypatch.setattr(agent, "_register_handler", lambda: None)
+        agent._last_attempts = [
+            {"backend": "openrouter", "model": "foo", "attempt": 1, "error": "bad diff"}
+        ]
+
+        async def fake_draft_patch(*args, **kwargs):
+            return None, "", "Tighten the implementation."
+
+        monkeypatch.setattr(agent, "_draft_patch", fake_draft_patch)
+
+        created: list[dict[str, object]] = []
+
+        class _FakeStore:
+            def create(self, **kwargs):
+                created.append(kwargs)
+                return None
+
+        monkeypatch.setattr("skyn3t.cortex.get_store", lambda: _FakeStore())
+
+        result = await agent.execute(
+            TaskRequest(
+                title="improve code",
+                input_data={
+                    "target_file": "src/app.py",
+                    "rationale": "Tighten the implementation.",
+                    "intent": "frontend_redesign",
+                    "use_mcp": False,
+                },
+            )
+        )
+
+        assert result.success is False
+        assert result.output["proposed"] is False
+        assert result.output["error"] == "no actionable diff produced"
+        assert created == []
 
     @pytest.mark.asyncio
     async def test_do_apply_uses_target_repo_root(self, tmp_path, monkeypatch):

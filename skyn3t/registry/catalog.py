@@ -22,8 +22,10 @@ _CATALOG = [
         tier="primary",
         label="Brainstorm",
         summary="Frames the mission and expands the initial brief.",
-        recommended_backend="claude_cli",
-        recommended_model="sonnet",
+        # Router-driven. Keep the catalog neutral so stage policy and
+        # operator overrides decide the backend/model at runtime.
+        recommended_backend=None,
+        recommended_model=None,
     ),
     AgentCatalogEntry(
         class_name="ResearchAgent",
@@ -43,8 +45,8 @@ _CATALOG = [
         tier="primary",
         label="Architect",
         summary="Turns the brief into a concrete system plan.",
-        recommended_backend="claude_cli",
-        recommended_model="sonnet",
+        recommended_backend=None,
+        recommended_model=None,
     ),
     AgentCatalogEntry(
         class_name="CodeAgent",
@@ -82,8 +84,8 @@ _CATALOG = [
         tier="primary",
         label="Marketer",
         summary="Builds positioning and go-to-market materials.",
-        recommended_backend="claude_cli",
-        recommended_model="sonnet",
+        recommended_backend=None,
+        recommended_model=None,
     ),
     AgentCatalogEntry(
         class_name="ReviewerAgent",
@@ -102,8 +104,8 @@ _CATALOG = [
         tier="primary",
         label="Business analyst",
         summary="Covers strategy, audience, pricing, and business framing.",
-        recommended_backend="claude_cli",
-        recommended_model="sonnet",
+        recommended_backend=None,
+        recommended_model=None,
     ),
     AgentCatalogEntry(
         class_name="CodeImproverAgent",
@@ -214,13 +216,10 @@ def build_agent_override(
     class_patch: Optional[Mapping[str, Any]] = None,
     name_patch: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    entry = get_agent_catalog_entry(class_name=class_name, runtime_name=runtime_name)
+    # Catalog metadata is descriptive only. Runtime config should come
+    # from explicit operator settings/overrides, not hidden code-level
+    # defaults tied to one vendor or model family.
     merged: Dict[str, Any] = {}
-    if entry is not None:
-        if entry.recommended_backend:
-            merged["backend"] = entry.recommended_backend
-        if entry.recommended_model:
-            merged["model"] = entry.recommended_model
     merged.update(dict(class_patch or {}))
     merged.update(dict(name_patch or {}))
     return merged

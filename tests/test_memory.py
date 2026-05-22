@@ -78,6 +78,143 @@ class TestMemoryStore:
         titles = [lesson["title"] for lesson in lessons]
         assert f"Lesson {unique}" in titles
 
+    def test_knowledge_draft_review_roundtrip(self):
+        import uuid
+
+        store = MemoryStore()
+        unique = str(uuid.uuid4())[:8]
+        doc_id = run_async(store.save_lesson(
+            title=f"Draft {unique}",
+            content=f"Review me {unique}",
+            source="reflection",
+            doc_type="lesson",
+            meta={"review_status": "draft", "memory_layer": "operator"},
+        ))
+
+        drafts = run_async(store.list_knowledge_drafts(limit=20))
+        draft_ids = [draft["id"] for draft in drafts]
+        assert doc_id in draft_ids
+
+        updated = run_async(store.update_knowledge_doc_review(
+            doc_id,
+            review_status="approved",
+            embedding_id=f"emb-{unique}",
+            extra_meta={"provenance_status": "approved"},
+        ))
+        assert updated is not None
+        assert updated["embedding_id"] == f"emb-{unique}"
+        assert updated["meta"]["review_status"] == "approved"
+
+        drafts_after = run_async(store.list_knowledge_drafts(limit=20))
+        assert doc_id not in [draft["id"] for draft in drafts_after]
+
+    def test_skill_candidate_docs_filters_approved_reusable_unpromoted(self):
+        import uuid
+
+        store = MemoryStore()
+        keep = str(uuid.uuid4())[:8]
+        skip_rejected = str(uuid.uuid4())[:8]
+        skip_promoted = str(uuid.uuid4())[:8]
+        run_async(store.save_lesson(
+            title=f"Keep {keep}",
+            content="Useful lesson",
+            source="reflection",
+            doc_type="lesson",
+            meta={
+                "review_status": "approved",
+                "reusable": True,
+                "confidence": 0.9,
+            },
+        ))
+        run_async(store.save_lesson(
+            title=f"Reject {skip_rejected}",
+            content="Rejected lesson",
+            source="reflection",
+            doc_type="lesson",
+            meta={
+                "review_status": "rejected",
+                "reusable": True,
+                "confidence": 0.9,
+            },
+        ))
+        run_async(store.save_lesson(
+            title=f"Promoted {skip_promoted}",
+            content="Already promoted lesson",
+            source="reflection",
+            doc_type="lesson",
+            meta={
+                "review_status": "approved",
+                "reusable": True,
+                "confidence": 0.9,
+                "skill_promotion_status": "installed",
+            },
+        ))
+
+        candidates = run_async(store.list_skill_candidate_docs(limit=20))
+
+        titles = [item["title"] for item in candidates]
+        assert f"Keep {keep}" in titles
+        assert f"Reject {skip_rejected}" not in titles
+        assert f"Promoted {skip_promoted}" not in titles
+
+    def test_skill_candidate_docs_require_ingested_external_docs(self):
+        store = MemoryStore()
+        run_async(store.save_lesson(
+            title="External summary only",
+            content="External repo summary",
+            source="repo_scout:gitlab",
+            doc_type="external_learning",
+            meta={
+                "review_status": "approved",
+                "reusable": True,
+                "confidence": 0.9,
+                "external_doc_ingest_status": "summary_only",
+                "external_doc_paths_ingested": [],
+            },
+        ))
+        run_async(store.save_lesson(
+            title="External docs ready",
+            content="External repo summary with docs",
+            source="repo_scout:gitlab",
+            doc_type="external_learning",
+            meta={
+                "review_status": "approved",
+                "reusable": True,
+                "confidence": 0.9,
+                "external_doc_ingest_status": "docs_ingested",
+                "external_doc_paths_ingested": ["README.md"],
+            },
+        ))
+
+        candidates = run_async(store.list_skill_candidate_docs(limit=20))
+
+        titles = [item["title"] for item in candidates]
+        assert "External summary only" not in titles
+        assert "External docs ready" in titles
+
+    def test_list_knowledge_drafts_can_return_full_content(self):
+        store = MemoryStore()
+        content = "x" * 700
+        run_async(store.save_lesson(
+            title="Approved eval",
+            content=content,
+            source="external_pattern_synthesizer",
+            doc_type="evaluation",
+            meta={"review_status": "approved", "checks": ["check"]},
+        ))
+
+        docs = run_async(
+            store.list_knowledge_drafts(
+                review_status="approved",
+                doc_type="evaluation",
+                limit=20,
+                preview_only=False,
+            )
+        )
+
+        assert docs
+        assert docs[0]["content"] == content
+
     def test_stats(self):
         store = MemoryStore()
         stats = run_async(store.get_stats())

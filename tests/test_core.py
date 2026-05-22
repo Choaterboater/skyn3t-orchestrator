@@ -459,6 +459,56 @@ class TestOrgChart:
         assert agent.role == "director"
         assert agent.reports_to == "founder"
 
+    async def test_get_config_view_exposes_effective_policy_route(self, event_bus):
+        agent = MockTestAgent("reviewer", event_bus)
+
+        view = agent.get_config_view()
+
+        assert view["config"]["backend"] is None
+        assert view["config"]["model"] is None
+        assert view["effective_backend"] == "openrouter"
+        assert view["effective_model"] == "xiaomi/mimo-v2.5-pro"
+        assert view["effective_source"] == "policy"
+
+    async def test_get_config_view_can_resolve_policy_from_agent_type(self, event_bus):
+        agent = MockTestAgent("research_agent", event_bus)
+        agent.agent_type = "research"
+
+        view = agent.get_config_view()
+
+        assert view["effective_backend"] == "openrouter"
+        assert view["effective_model"] == "openrouter/owl-alpha"
+        assert view["effective_source"] == "policy"
+
+    async def test_llm_can_resolve_policy_from_agent_type(self, event_bus):
+        agent = MockTestAgent("research_agent", event_bus)
+        agent.agent_type = "research"
+
+        client = agent.llm
+
+        assert client is not None
+        assert client._backend_name == "openrouter"
+        assert client.default_model == "openrouter/owl-alpha"
+
+    async def test_clear_override_only_removes_requested_keys(self, event_bus):
+        agent = MockTestAgent("reviewer", event_bus)
+        agent.config.update(
+            {
+                "backend": "claude_cli",
+                "model": "opus",
+                "temperature": 0.2,
+            }
+        )
+
+        result = agent.clear_override(["backend", "model"])
+
+        assert sorted(result["changed"]) == ["backend", "model"]
+        assert "backend" not in agent.config
+        assert "model" not in agent.config
+        assert agent.config["temperature"] == 0.2
+        assert result["config_view"]["effective_source"] == "policy"
+        assert result["config_view"]["effective_backend"] == "openrouter"
+
     async def test_orchestrator_registry_includes_hierarchy(self, event_bus):
         orch = Orchestrator(event_bus)
         agent = MockTestAgent("eng", event_bus)
@@ -591,6 +641,7 @@ class TestAutoSpawn:
         assert "mgr-engineer" in sub.name
         assert any(c.name == "code" for c in sub.capabilities)
         assert sub.name in orch.agents
+        await sub.shutdown()
 
     async def test_spawn_subordinate_unknown_type_returns_none(self, event_bus):
         orch = Orchestrator(event_bus)
@@ -611,6 +662,8 @@ class TestAutoSpawn:
         assert sub1 is not None
         assert sub2 is not None
         assert sub1.name != sub2.name
+        await sub1.shutdown()
+        await sub2.shutdown()
 
     async def test_delegate_task_auto_spawns_when_no_subordinate(self, event_bus):
         orch = Orchestrator(event_bus)
@@ -626,6 +679,8 @@ class TestAutoSpawn:
         auto_agents = [a for a in orch.agents.values() if a.lifecycle == "auto"]
         assert len(auto_agents) == 1
         assert auto_agents[0].reports_to == "mgr"
+        for agent in auto_agents:
+            await agent.shutdown()
 
     async def test_delegate_task_auto_spawn_false_returns_none(self, event_bus):
         orch = Orchestrator(event_bus)
@@ -671,6 +726,7 @@ class TestAutoSpawn:
         sub.last_active_at = datetime.now(timezone.utc)
         await orch._terminate_idle_auto_agents()
         assert sub.name in orch.agents
+        await sub.shutdown()
 
 
 @pytest.mark.asyncio
@@ -724,6 +780,8 @@ class TestFanOut:
         # An auto agent should have been created
         auto_agents = [a for a in orch.agents.values() if a.lifecycle == "auto"]
         assert len(auto_agents) == 1
+        for agent in auto_agents:
+            await agent.shutdown()
 
     async def test_fan_out_returns_failure_when_no_match(self, event_bus):
         orch = Orchestrator(event_bus)

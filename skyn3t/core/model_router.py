@@ -45,8 +45,9 @@ import json
 import logging
 import os
 import random
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("skyn3t.core.model_router")
 
@@ -80,16 +81,18 @@ _TIERS: Dict[str, Tuple[str, Optional[str]]] = {
 # Default stage → tier policy. Keys are LOWERCASED stage names matching
 # what the runner publishes in PROJECT_STAGE_STARTED / project.json.
 _DEFAULT_STAGE_POLICY: Dict[str, str] = {
-    # framing & fan-out — cheap is fine
-    "brainstorm":         "cheap",
-    "research":           "cheap",
-    "designer":           "cheap",
-    "writer":             "cheap",
-    "marketer":           "cheap",
-    "business_analyst":   "cheap",
+    # framing & fan-out — OpenRouter cheap/fast by default so the
+    # common path stays HTTP-based instead of bouncing through CLIs.
+    "brainstorm":         "or_cheap",
+    "research":           "or_cheap",
+    "designer":           "or_cheap",
+    "writer":             "or_cheap",
+    "marketer":           "or_cheap",
+    "business_analyst":   "or_cheap",
 
-    # system-shape decisions — quality compounds, prefer strong
-    "architect":          "strong",
+    # system-shape decisions — still prefer a stronger model, but on
+    # OpenRouter rather than a CLI-backed Claude default.
+    "architect":          "or_strong",
     # Code stage uses per-file routing inside CodeAgent (see
     # resolve_model_for_file). The agent-level tier here is just
     # the fallback for non-file-specific LLM calls (planning).
@@ -101,24 +104,23 @@ _DEFAULT_STAGE_POLICY: Dict[str, str] = {
     "code_agent":         "or_cheap",
     "code_improver":      "or_cheap",
     "reviewer":           "or_strong",
+    "verifier":           "or_cheap",
     "docs":               "or_docs",
 
     # verifiers don't call LLMs — listed for completeness
-    "build_verifier":     "cheap",
-    "boot_verifier":      "cheap",
+    "build_verifier":     "or_cheap",
+    "boot_verifier":      "or_cheap",
 }
 
 
-def _load_overrides() -> Dict[str, str]:
+@lru_cache(maxsize=4)
+def _load_override_file(path: str) -> Dict[str, str]:
     """Load env-pointed JSON override, if present.
 
     Format: a dict mapping stage_name → tier name, e.g.
     ``{"reviewer": "balanced", "code": "balanced"}`` when the user wants
     to cap spend.
     """
-    path = os.environ.get("SKYN3T_MODEL_ROUTING")
-    if not path:
-        return {}
     try:
         text = Path(path).read_text(encoding="utf-8")
         data = json.loads(text)
@@ -152,17 +154,161 @@ def _load_overrides() -> Dict[str, str]:
         return {}
 
 
+def _load_env_overrides() -> Dict[str, str]:
+    path = os.environ.get("SKYN3T_MODEL_ROUTING")
+    if not path:
+        return {}
+    return _load_override_file(path)
+
+
+def _load_persisted_overrides() -> Dict[str, Dict[str, Optional[str]]]:
+    try:
+        from skyn3t.config.model_routing import get_model_routing_store
+
+        data = get_model_routing_store().entries()
+    except Exception:
+        logger.debug("persisted model routing lookup failed", exc_info=True)
+        return {}
+    out: Dict[str, Dict[str, Optional[str]]] = {}
+    for k, v in data.items():
+        if not isinstance(v, dict):
+            continue
+        tier = str(v.get("tier") or "").strip()
+        if tier not in _TIERS:
+            logger.warning(
+                "Persisted model routing: stage %s wants tier %s which "
+                "doesn't exist (valid: %s) — ignoring",
+                k, tier, list(_TIERS),
+            )
+            continue
+        applied_via = str(v.get("applied_via") or "").strip().lower() or None
+        out[str(k).lower()] = {
+            "tier": tier,
+            "applied_via": (
+                applied_via if applied_via in {"manual", "recommendation"} else None
+            ),
+        }
+    return out
+
+
+def available_tiers() -> List[Dict[str, Optional[str]]]:
+    return [
+        {"name": name, "backend": backend, "model": model}
+        for name, (backend, model) in _TIERS.items()
+    ]
+
+
+def tier_details(tier_name: str) -> Tuple[Optional[str], Optional[str]]:
+    backend, model = _TIERS.get(tier_name, (None, None))
+    return backend, model
+
+
+def default_tier_for_stage(stage_name: Optional[str]) -> Optional[str]:
+    if not stage_name:
+        return None
+    return _DEFAULT_STAGE_POLICY.get(str(stage_name).strip().lower())
+
+
+def tier_for_backend_model(backend: str, model: Optional[str]) -> Optional[str]:
+    backend_name = str(backend or "").strip()
+    model_name = str(model or "").strip() or None
+    for tier_name, (tier_backend, tier_model) in _TIERS.items():
+        if tier_backend != backend_name:
+            continue
+        if (tier_model or None) == model_name:
+            return tier_name
+    return None
+
+
+def _route_for_stage(stage_name: Optional[str]) -> Dict[str, Optional[str]]:
+    if not stage_name:
+        backend, model = _TIERS["cheap"]
+        return {
+            "stage": None,
+            "tier": "cheap",
+            "backend": backend,
+            "model": model,
+            "source": "fallback",
+            "persisted_via": None,
+        }
+    stage = stage_name.lower()
+    persisted = _load_persisted_overrides()
+    if stage in persisted:
+        tier = str(persisted[stage].get("tier") or "")
+        backend, model = _TIERS.get(tier, _TIERS["cheap"])
+        return {
+            "stage": stage,
+            "tier": tier,
+            "backend": backend,
+            "model": model,
+            "source": "persisted",
+            "persisted_via": persisted[stage].get("applied_via"),
+        }
+    env = _load_env_overrides()
+    if stage in env:
+        tier = env[stage]
+        backend, model = _TIERS.get(tier, _TIERS["cheap"])
+        return {
+            "stage": stage,
+            "tier": tier,
+            "backend": backend,
+            "model": model,
+            "source": "env",
+            "persisted_via": None,
+        }
+    if stage in _DEFAULT_STAGE_POLICY:
+        tier = _DEFAULT_STAGE_POLICY[stage]
+        backend, model = _TIERS.get(tier, _TIERS["cheap"])
+        return {
+            "stage": stage,
+            "tier": tier,
+            "backend": backend,
+            "model": model,
+            "source": "default",
+            "persisted_via": None,
+        }
+    backend, model = _TIERS["cheap"]
+    return {
+        "stage": stage,
+        "tier": "cheap",
+        "backend": backend,
+        "model": model,
+        "source": "fallback",
+        "persisted_via": None,
+    }
+
+
+def describe_stage_route(stage_name: Optional[str]) -> Dict[str, Optional[str]]:
+    return dict(_route_for_stage(stage_name))
+
+
+def list_stage_routes() -> List[Dict[str, Optional[str]]]:
+    known = {
+        *(_DEFAULT_STAGE_POLICY.keys()),
+        *(_load_env_overrides().keys()),
+        *(_load_persisted_overrides().keys()),
+    }
+    return [describe_stage_route(stage) for stage in sorted(known)]
+
+
 def tier_for_stage(stage_name: Optional[str]) -> str:
     """Return the tier label ('cheap' / 'balanced' / 'strong') for a
     stage. Defaults to ``cheap`` when the stage isn't recognized — we'd
     rather under-spend than over-spend on an unknown stage."""
+    return str(_route_for_stage(stage_name).get("tier") or "cheap")
+
+
+def has_stage_policy(stage_name: Optional[str]) -> bool:
+    """Whether a stage has an explicit routing policy entry.
+
+    Used by operator UIs to distinguish between a real routed default
+    (e.g. reviewer → OpenRouter strong) and the router's generic cheap
+    fallback for unknown names.
+    """
     if not stage_name:
-        return "cheap"
-    s = stage_name.lower()
-    overrides = _load_overrides()
-    if s in overrides:
-        return overrides[s]
-    return _DEFAULT_STAGE_POLICY.get(s, "cheap")
+        return False
+    source = _route_for_stage(stage_name).get("source")
+    return source in {"persisted", "env", "default"}
 
 
 def resolve_model(
@@ -181,8 +327,11 @@ def resolve_model(
     (e.g. "if brief mentions security, force reviewer→strong even
     when the override file caps it lower"). Not used today.
     """
-    tier = tier_for_stage(stage_name)
-    return _TIERS.get(tier, _TIERS["cheap"])
+    route = _route_for_stage(stage_name)
+    return (
+        str(route.get("backend") or _TIERS["cheap"][0]),
+        route.get("model"),
+    )
 
 
 # ── Per-file routing for CodeAgent ──────────────────────────────────
@@ -317,6 +466,10 @@ def _backend_cost(backend: str) -> float:
                 override_raw,
             )
     return float(_BACKEND_COST.get(backend, _UNKNOWN_BACKEND_COST))
+
+
+def relative_backend_cost(backend: str) -> float:
+    return _backend_cost(backend)
 
 
 def _expected_cost_per_success(

@@ -152,6 +152,7 @@ class ExplorerAgent(BaseAgent):
                 detail=f"Run GitHub search for `{topic}` and ingest top READMEs.\n\nBudget cost: 1 of {self.budget.max_proposals_per_run}/run.",
                 payload={"topic": topic, "limit": 3, "mode": "search"},
                 source="explorer",
+                auto_triage_eligible=True,
             )
             out.append({"id": p.id, "title": p.title})
         return out

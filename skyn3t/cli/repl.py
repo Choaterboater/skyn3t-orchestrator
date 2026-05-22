@@ -89,6 +89,10 @@ class ReplState:
     busy: bool = False
     busy_label: str = ""
     current_task_id: Optional[str] = None
+    current_prompt: Optional[str] = None
+    last_prompt: Optional[str] = None
+    last_failed_prompt: Optional[str] = None
+    last_interrupted_prompt: Optional[str] = None
     stop: bool = False
     # Routing / model selection
     api_url: str = API_BASE
@@ -273,7 +277,7 @@ async def _ws_listener(state: ReplState) -> None:
 
 async def _poll_listener(state: ReplState) -> None:
     """Fallback: poll a snapshot endpoint every 1s."""
-    async with httpx.AsyncClient(base_url=API_BASE, timeout=5.0) as client:
+    async with httpx.AsyncClient(base_url=state.api_url, timeout=5.0) as client:
         while not state.stop:
             try:
                 resp = await client.get("/api/swarm/snapshot")
@@ -300,14 +304,20 @@ async def _submit_prompt(state: ReplState, prompt: str) -> None:
     """Submit a free-form prompt and stream/poll the result."""
     state.busy = True
     state.busy_label = "thinking"
+    state.current_prompt = prompt
+    state.last_prompt = prompt
     try:
-        async with httpx.AsyncClient(base_url=API_BASE, timeout=60.0) as client:
+        async with httpx.AsyncClient(base_url=state.api_url, timeout=60.0) as client:
             # Try orchestrator submit, fall back to a registered agent's exec.
             task_id: Optional[str] = None
             try:
                 resp = await client.post(
                     "/api/orchestrator/submit",
-                    json={"prompt": prompt, "session_id": state.session_id},
+                    json={
+                        "prompt": prompt,
+                        "session_id": state.session_id,
+                        "agent_name": state.active_agent,
+                    },
                 )
                 if resp.status_code == 200:
                     task_id = resp.json().get("task_id")
@@ -316,7 +326,7 @@ async def _submit_prompt(state: ReplState, prompt: str) -> None:
 
             if not task_id:
                 # Pick an agent and use exec for a synchronous round-trip.
-                agent_name = await _pick_agent(client)
+                agent_name = state.active_agent or await _pick_agent(client)
                 if not agent_name:
                     _add_transcript(
                         state,
@@ -335,10 +345,13 @@ async def _submit_prompt(state: ReplState, prompt: str) -> None:
                     resp.raise_for_status()
                     data = resp.json()
                     if data.get("error"):
+                        state.last_failed_prompt = prompt
                         _add_transcript(state, _info_line(f"error: {data['error']}", "red"))
                     else:
+                        state.last_failed_prompt = None
                         _add_transcript(state, _agent_line(agent_name, data.get("output") or ""))
                 except httpx.HTTPError as exc:
+                    state.last_failed_prompt = prompt
                     _add_transcript(state, _info_line(f"request failed: {exc}", "red"))
                 return
 
@@ -356,8 +369,10 @@ async def _submit_prompt(state: ReplState, prompt: str) -> None:
                 if data.get("success"):
                     out = data.get("output") or {}
                     text = out.get("response") if isinstance(out, dict) else str(out)
+                    state.last_failed_prompt = None
                     _add_transcript(state, _agent_line("orchestrator", text or ""))
                 else:
+                    state.last_failed_prompt = prompt
                     _add_transcript(
                         state,
                         _info_line(f"task failed: {data.get('error')}", "red"),
@@ -367,6 +382,7 @@ async def _submit_prompt(state: ReplState, prompt: str) -> None:
         state.busy = False
         state.busy_label = ""
         state.current_task_id = None
+        state.current_prompt = None
 
 
 async def _pick_agent(client: httpx.AsyncClient) -> Optional[str]:
@@ -388,10 +404,12 @@ async def _pick_agent(client: httpx.AsyncClient) -> Optional[str]:
 
 
 async def _cancel_current(state: ReplState) -> None:
+    if state.current_prompt:
+        state.last_interrupted_prompt = state.current_prompt
     if not state.current_task_id:
         return
     try:
-        async with httpx.AsyncClient(base_url=API_BASE, timeout=5.0) as client:
+        async with httpx.AsyncClient(base_url=state.api_url, timeout=5.0) as client:
             await client.post(f"/api/tasks/{state.current_task_id}/cancel")
     except Exception:
         pass
@@ -409,6 +427,7 @@ HELP_TEXT = """\
 - `/quit`, `/exit` — leave the REPL (Ctrl-D also exits)
 - `/clear` — clear the transcript
 - `/agents` — list registered agents
+- `/tasks` — list currently running tasks
 - `/pipeline NAME [PROMPT...]` — run a pipeline by name
 - `/project BRIEF...` — start a Studio run (defaults to the auto planner)
 - `/project --audience builders --autonomy confirm_first BRIEF...` — steer the run before launch
@@ -416,6 +435,17 @@ HELP_TEXT = """\
 - `/project TEMPLATE :: BRIEF...` — force a specific Studio template
 - `/rag QUERY` — run agentic RAG
 - `/ingest REPO` — kick off a GitHub repo ingestion
+- `/doctor` — run API health checks
+- `/memory` — show session/operator/project memory layers
+- `/memory drafts` — list pending reviewable memory drafts
+- `/memory approve DOC_ID` — promote a draft into trusted memory
+- `/memory reject DOC_ID [reason]` — reject a pending memory draft
+- `/memory evals [STATUS]` — list governed evaluation assets
+- `/memory eval DOC_ID` — inspect one evaluation asset
+- `/memory export-eval DOC_ID [json|jsonl]` — export an approved evaluation asset
+- `/memory SESSION_ID` — inspect one active session memory
+- `/resume` — re-run the last interrupted prompt
+- `/retry` — re-run the last failed prompt
 
 **Routing / model selection**
 
@@ -465,6 +495,9 @@ async def _slash(state: ReplState, raw: str) -> bool:
     if cmd == "/agents":
         await _cmd_agents(state)
         return False
+    if cmd == "/tasks":
+        await _cmd_tasks(state)
+        return False
     if cmd == "/pipeline":
         await _cmd_pipeline(state, rest)
         return False
@@ -476,6 +509,18 @@ async def _slash(state: ReplState, raw: str) -> bool:
         return False
     if cmd == "/ingest":
         await _cmd_ingest(state, rest)
+        return False
+    if cmd == "/doctor":
+        await _cmd_doctor(state)
+        return False
+    if cmd == "/memory":
+        await _cmd_memory(state, rest)
+        return False
+    if cmd == "/resume":
+        await _cmd_resume(state)
+        return False
+    if cmd == "/retry":
+        await _cmd_retry(state)
         return False
     if cmd == "/backend":
         await _cmd_backend(state, rest)
@@ -496,7 +541,7 @@ async def _slash(state: ReplState, raw: str) -> bool:
 
 async def _cmd_agents(state: ReplState) -> None:
     try:
-        async with httpx.AsyncClient(base_url=API_BASE, timeout=10.0) as client:
+        async with httpx.AsyncClient(base_url=state.api_url, timeout=10.0) as client:
             resp = await client.get("/api/agents")
             data = resp.json()
     except Exception as exc:
@@ -521,6 +566,33 @@ async def _cmd_agents(state: ReplState) -> None:
     _add_transcript(state, table)
 
 
+async def _cmd_tasks(state: ReplState) -> None:
+    try:
+        async with httpx.AsyncClient(base_url=state.api_url, timeout=10.0) as client:
+            resp = await client.get("/api/swarm/snapshot")
+            data = resp.json()
+    except Exception as exc:
+        _add_transcript(state, _info_line(f"tasks failed: {exc}", "red"))
+        return
+    tasks = data.get("running_tasks") or []
+    if not tasks:
+        _add_transcript(state, _info_line("no running tasks", "yellow"))
+        return
+    table = Table(title="Running tasks", header_style="bold magenta")
+    table.add_column("task_id", style="cyan")
+    table.add_column("agent")
+    table.add_column("title")
+    table.add_column("session", style="dim")
+    for task in tasks:
+        table.add_row(
+            str(task.get("task_id", "-"))[:8],
+            str(task.get("agent") or "—"),
+            str(task.get("title") or "Untitled"),
+            str(task.get("session_id") or "—"),
+        )
+    _add_transcript(state, table)
+
+
 async def _cmd_pipeline(state: ReplState, rest: str) -> None:
     if not rest:
         _add_transcript(state, _info_line("usage: /pipeline NAME [prompt...]", "yellow"))
@@ -530,7 +602,7 @@ async def _cmd_pipeline(state: ReplState, rest: str) -> None:
     prompt = parts[1] if len(parts) > 1 else ""
     payload = {"name": name, "prompt": prompt, "run": True}
     try:
-        async with httpx.AsyncClient(base_url=API_BASE, timeout=30.0) as client:
+        async with httpx.AsyncClient(base_url=state.api_url, timeout=30.0) as client:
             resp = await client.post(f"/api/pipeline/{name}/run", json=payload)
             if resp.status_code == 404:
                 # Fall back to generic create endpoint
@@ -641,7 +713,7 @@ async def _cmd_project(state: ReplState, rest: str) -> None:
         _add_transcript(state, _info_line(str(exc), "red"))
         return
     try:
-        async with httpx.AsyncClient(base_url=API_BASE, timeout=30.0) as client:
+        async with httpx.AsyncClient(base_url=state.api_url, timeout=30.0) as client:
             resp = await client.post(
                 "/api/studio/start",
                 json={
@@ -695,7 +767,7 @@ async def _cmd_rag(state: ReplState, rest: str) -> None:
         _add_transcript(state, _info_line("usage: /rag QUERY", "yellow"))
         return
     try:
-        async with httpx.AsyncClient(base_url=API_BASE, timeout=60.0) as client:
+        async with httpx.AsyncClient(base_url=state.api_url, timeout=60.0) as client:
             resp = await client.post(
                 "/api/rag/query", json={"query": rest, "n_results": 5}
             )
@@ -720,7 +792,7 @@ async def _cmd_ingest(state: ReplState, rest: str) -> None:
         _add_transcript(state, _info_line("usage: /ingest owner/repo", "yellow"))
         return
     try:
-        async with httpx.AsyncClient(base_url=API_BASE, timeout=15.0) as client:
+        async with httpx.AsyncClient(base_url=state.api_url, timeout=15.0) as client:
             resp = await client.post("/api/ingest", json={"repo": rest})
             if resp.status_code == 404:
                 # fallback to github explorer
@@ -738,6 +810,257 @@ async def _cmd_ingest(state: ReplState, rest: str) -> None:
         _add_transcript(state, _info_line(f"ingest failed: {exc}", "red"))
         return
     _add_transcript(state, _info_line(f"ingest queued: {data}", "green"))
+
+
+async def _cmd_doctor(state: ReplState) -> None:
+    try:
+        async with httpx.AsyncClient(base_url=state.api_url, timeout=10.0) as client:
+            resp = await client.get("/health")
+            data = resp.json()
+    except Exception as exc:
+        _add_transcript(state, _info_line(f"doctor failed: {exc}", "red"))
+        return
+
+    summary = data.get("summary") or {}
+    _add_transcript(
+        state,
+        _info_line(
+            "doctor: "
+            f"status={data.get('status', 'unknown')} "
+            f"healthy={summary.get('healthy', 0)} "
+            f"degraded={summary.get('degraded', 0)} "
+            f"unhealthy={summary.get('unhealthy', 0)}",
+            "green" if data.get("status") == "healthy" else "yellow",
+        ),
+    )
+    checks = data.get("checks") or {}
+    if not isinstance(checks, dict) or not checks:
+        return
+    table = Table(title="health checks", header_style="bold cyan")
+    table.add_column("name", style="cyan")
+    table.add_column("status")
+    table.add_column("detail")
+    for name, check in checks.items():
+        if not isinstance(check, dict):
+            continue
+        detail = check.get("error") or ", ".join(
+            f"{key}={value}" for key, value in list((check.get("details") or {}).items())[:2]
+        )
+        status_text = str(check.get("status") or "unknown")
+        table.add_row(name, status_text, detail)
+    _add_transcript(state, table)
+
+
+async def _cmd_memory(state: ReplState, rest: str) -> None:
+    args = shlex.split(rest) if rest.strip() else []
+    session_id = rest.strip()
+    known_subcommands = {"drafts", "approve", "reject", "evals", "eval", "export-eval"}
+    try:
+        async with httpx.AsyncClient(base_url=state.api_url, timeout=10.0) as client:
+            response_is_json = True
+            if args[:1] == ["drafts"]:
+                resp = await client.get("/api/memory/drafts", params={"limit": 5})
+            elif args[:1] == ["evals"]:
+                status = args[1] if len(args) >= 2 else "draft"
+                resp = await client.get("/api/memory/evaluations", params={"status": status, "limit": 5})
+            elif len(args) >= 2 and args[0] == "eval":
+                resp = await client.get(f"/api/memory/evaluations/{args[1]}")
+            elif len(args) >= 2 and args[0] == "export-eval":
+                export_format = args[2] if len(args) >= 3 else "json"
+                resp = await client.get(
+                    f"/api/memory/evaluations/{args[1]}/export",
+                    params={"format": export_format},
+                )
+                response_is_json = export_format != "jsonl"
+            elif len(args) >= 2 and args[0] == "approve":
+                resp = await client.post(f"/api/memory/drafts/{args[1]}/approve")
+            elif len(args) >= 2 and args[0] == "reject":
+                reason = " ".join(args[2:])
+                resp = await client.post(
+                    f"/api/memory/drafts/{args[1]}/reject",
+                    json={"reason": reason},
+                )
+            elif args[:1] and args[0] in known_subcommands:
+                _add_transcript(state, _info_line(f"unknown /memory usage: {rest}", "yellow"))
+                return
+            elif session_id:
+                resp = await client.get(f"/api/memory/sessions/{session_id}")
+            else:
+                resp = await client.get("/api/memory/layers", params={"limit": 5})
+            if response_is_json:
+                data = resp.json()
+            else:
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {}
+    except Exception as exc:
+        _add_transcript(state, _info_line(f"memory failed: {exc}", "red"))
+        return
+
+    if args[:1] == ["drafts"]:
+        drafts = data.get("drafts") or []
+        if not drafts:
+            _add_transcript(state, _info_line("no pending memory drafts", "yellow"))
+            return
+        table = Table(title="memory drafts", header_style="bold cyan")
+        table.add_column("id", style="cyan")
+        table.add_column("type")
+        table.add_column("layer")
+        table.add_column("title")
+        for draft in drafts:
+            meta = draft.get("meta") or {}
+            table.add_row(
+                str(draft.get("id") or "—"),
+                str(draft.get("doc_type") or "—"),
+                str(meta.get("memory_layer") or "—"),
+                str(draft.get("title") or "—")[:80],
+            )
+        _add_transcript(state, table)
+        return
+
+    if args[:1] == ["evals"]:
+        evaluations = data.get("evaluations") or []
+        if not evaluations:
+            _add_transcript(state, _info_line("no evaluation assets", "yellow"))
+            return
+        table = Table(title="evaluation assets", header_style="bold cyan")
+        table.add_column("id", style="cyan")
+        table.add_column("status")
+        table.add_column("lane")
+        table.add_column("lang")
+        table.add_column("signals")
+        for item in evaluations:
+            table.add_row(
+                str(item.get("id") or "—"),
+                str(item.get("review_status") or "—"),
+                str(item.get("lane") or "—"),
+                str(item.get("language") or "—"),
+                ", ".join(item.get("signals") or []) or "—",
+            )
+        _add_transcript(state, table)
+        return
+
+    if len(args) >= 2 and args[0] == "eval":
+        if data.get("error"):
+            _add_transcript(state, _info_line(str(data["error"]), "yellow"))
+            return
+        evaluation = data.get("evaluation") or {}
+        info = Table(title="evaluation asset", header_style="bold cyan")
+        info.add_column("field", style="cyan")
+        info.add_column("value")
+        info.add_row("id", str(evaluation.get("id") or args[1]))
+        info.add_row("status", str(evaluation.get("review_status") or "—"))
+        info.add_row("lane", str(evaluation.get("lane") or "—"))
+        info.add_row("language", str(evaluation.get("language") or "—"))
+        info.add_row("signals", ", ".join(evaluation.get("signals") or []) or "—")
+        _add_transcript(state, info)
+        checks = evaluation.get("checks") or []
+        if checks:
+            checks_table = Table(title="evaluation checks", header_style="bold magenta")
+            checks_table.add_column("check")
+            for check in checks:
+                checks_table.add_row(str(check))
+            _add_transcript(state, checks_table)
+        return
+
+    if len(args) >= 2 and args[0] == "export-eval":
+        if data.get("error"):
+            _add_transcript(state, _info_line(str(data["error"]), "yellow"))
+            return
+        export_format = args[2] if len(args) >= 3 else "json"
+        if export_format == "jsonl":
+            text = getattr(resp, "text", "").rstrip()
+            _add_transcript(state, Panel(text, title="evaluation export"))
+        else:
+            _add_transcript(
+                state,
+                Panel(json.dumps(data, indent=2), title="evaluation export"),
+            )
+        return
+
+    if len(args) >= 2 and args[0] in {"approve", "reject"}:
+        if data.get("error"):
+            _add_transcript(state, _info_line(str(data["error"]), "yellow"))
+            return
+        action = "approved" if args[0] == "approve" else "rejected"
+        draft = data.get("draft") or {}
+        _add_transcript(
+            state,
+            _info_line(
+                f"{action}: {draft.get('id', args[1])} — {draft.get('title', 'memory draft')}",
+                "green" if action == "approved" else "yellow",
+            ),
+        )
+        return
+
+    if session_id:
+        if data.get("error"):
+            _add_transcript(state, _info_line(str(data["error"]), "yellow"))
+            return
+        context = data.get("context") or {}
+        info = Table(title="session memory", header_style="bold cyan")
+        info.add_column("field", style="cyan")
+        info.add_column("value")
+        info.add_row("session_id", str(data.get("session_id") or session_id))
+        info.add_row("participants", ", ".join(context.get("participants") or []) or "—")
+        info.add_row("history", str(len(context.get("history") or [])))
+        _add_transcript(state, info)
+        activity = data.get("recent_activity") or []
+        if activity:
+            table = Table(title="recent activity", header_style="bold magenta")
+            table.add_column("type", style="cyan")
+            table.add_column("summary")
+            for item in activity:
+                summary = item.get("title") or item.get("content") or item.get("description") or "—"
+                table.add_row(str(item.get("type") or "—"), str(summary)[:90])
+            _add_transcript(state, table)
+        return
+
+    layers = data.get("layers") or {}
+    session = layers.get("session") or {}
+    operator = layers.get("operator") or {}
+    project = layers.get("project") or {}
+    table = Table(title="memory layers", header_style="bold cyan")
+    table.add_column("layer", style="cyan")
+    table.add_column("summary")
+    table.add_row("session", f"{session.get('active_sessions', 0)} active sessions")
+    table.add_row(
+        "operator",
+        f"{operator.get('insight_count', 0)} insights, {operator.get('skill_summary', {}).get('total', 0)} skills",
+    )
+    table.add_row(
+        "project",
+        f"{project.get('tasks', 0)} tasks, {project.get('knowledge_documents', 0)} docs, success={project.get('success_rate', 0.0)}",
+    )
+    _add_transcript(state, table)
+
+
+def _queue_prompt_submission(state: ReplState, prompt: str) -> None:
+    _add_transcript(state, _user_line(prompt))
+    asyncio.create_task(_submit_prompt(state, prompt))
+
+
+async def _cmd_resume(state: ReplState) -> None:
+    if state.busy:
+        _add_transcript(state, _info_line("already busy — wait for the current task first", "yellow"))
+        return
+    prompt = (state.last_interrupted_prompt or "").strip()
+    if not prompt:
+        _add_transcript(state, _info_line("no interrupted prompt to resume", "yellow"))
+        return
+    _queue_prompt_submission(state, prompt)
+
+
+async def _cmd_retry(state: ReplState) -> None:
+    if state.busy:
+        _add_transcript(state, _info_line("already busy — wait for the current task first", "yellow"))
+        return
+    prompt = (state.last_failed_prompt or "").strip()
+    if not prompt:
+        _add_transcript(state, _info_line("no failed prompt to retry", "yellow"))
+        return
+    _queue_prompt_submission(state, prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -1102,7 +1425,8 @@ async def _cmd_whoami(state: ReplState) -> None:
 
 _SLASH_COMMANDS = [
     "/help", "/quit", "/exit", "/clear",
-    "/agents", "/agent", "/pipeline", "/project", "/rag", "/ingest",
+    "/agents", "/tasks", "/agent", "/pipeline", "/project", "/rag", "/ingest",
+    "/doctor", "/memory", "/resume", "/retry",
     "/model", "/backend", "/whoami",
 ]
 
@@ -1300,11 +1624,11 @@ def run() -> None:
 
     # Probe API
     try:
-        with httpx.Client(base_url=API_BASE, timeout=2.0) as client:
+        with httpx.Client(base_url=state.api_url, timeout=2.0) as client:
             client.get("/api/status").raise_for_status()
     except Exception:
         console.print(
-            f"[red]skyn3t API not reachable at {API_BASE}[/red] — start the server "
+            f"[red]skyn3t API not reachable at {state.api_url}[/red] — start the server "
             "with [bold]skyn3t start[/bold] (or `python -m skyn3t.web`)."
         )
         return
@@ -1318,7 +1642,7 @@ def run() -> None:
 
     state.transcript.append(
         _info_line(
-            f"Connected to {API_BASE}. Type /help for commands. "
+            f"Connected to {state.api_url}. Type /help for commands. "
             "Use \"\"\" on its own line for multi-line input.",
             "green",
         )
@@ -1393,6 +1717,13 @@ def run() -> None:
                 if should_exit:
                     break
             else:
+                if state.busy:
+                    _add_transcript(
+                        state,
+                        _info_line("still working on the previous prompt — wait or press Ctrl-C", "yellow"),
+                    )
+                    _paint_snapshot()
+                    continue
                 _add_transcript(state, _user_line(line))
                 prompt_future = asyncio.run_coroutine_threadsafe(_submit_prompt(state, line), loop)
                 try:

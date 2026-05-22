@@ -87,12 +87,34 @@ class Settings(BaseSettings):
     # and as a fast-path for known-problematic entrypoint files.
     openrouter_api_key: Optional[str] = Field(default=None, alias="OPENROUTER_API_KEY")
     max_build_cost_usd: float = Field(default=1.0, alias="SKYN3T_MAX_BUILD_COST_USD")
+    model_routing_path: Path = Field(
+        default=Path("./data/model_routing.json"),
+        alias="SKYN3T_MODEL_ROUTING_PATH",
+    )
 
-    # When True, Cortex proposals with origin='system' are auto-applied
-    # instead of sitting in the pending queue waiting for user approval.
-    # User-originated proposals still require explicit approval.
+    # Legacy master switch for automatic Cortex handling. When false,
+    # system proposals stay fully review-gated and selective auto-triage
+    # rules do not run.
     cortex_auto_approve_system: bool = Field(
         default=True, alias="SKYN3T_CORTEX_AUTO_APPROVE_SYSTEM"
+    )
+    cortex_auto_reject_duplicates: bool = Field(
+        default=True, alias="SKYN3T_CORTEX_AUTO_REJECT_DUPLICATES"
+    )
+    cortex_auto_reject_low_signal_ingest: bool = Field(
+        default=True, alias="SKYN3T_CORTEX_AUTO_REJECT_LOW_SIGNAL_INGEST"
+    )
+    cortex_auto_approve_safe_ingest: bool = Field(
+        default=True, alias="SKYN3T_CORTEX_AUTO_APPROVE_SAFE_INGEST"
+    )
+    cortex_auto_triage_duplicate_window_seconds: int = Field(
+        default=86_400, alias="SKYN3T_CORTEX_AUTO_TRIAGE_DUPLICATE_WINDOW_SECONDS"
+    )
+    cortex_auto_triage_min_ingest_topic_length: int = Field(
+        default=6, alias="SKYN3T_CORTEX_AUTO_TRIAGE_MIN_INGEST_TOPIC_LENGTH"
+    )
+    cortex_auto_triage_max_safe_ingest_limit: int = Field(
+        default=3, alias="SKYN3T_CORTEX_AUTO_TRIAGE_MAX_SAFE_INGEST_LIMIT"
     )
 
     # Execution backend for code agent: inline (fast, no isolation),

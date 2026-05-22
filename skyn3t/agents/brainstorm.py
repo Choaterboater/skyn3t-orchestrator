@@ -137,10 +137,7 @@ class BrainstormAgent(BaseAgent):
             panel_results: List[Dict[str, str]] = []
             panel = self.config.get("panel") if self.config else None
             if panel is None:
-                panel = [
-                    {"backend": "claude_cli", "model": "opus",      "label": "claude-opus"},
-                    {"backend": "kimi_cli",   "model": "kimi-code/kimi-for-coding", "label": "kimi-k2.6"},
-                ]
+                panel = []
             for member in panel:
                 line = await self._consult(brief, member)
                 if line:

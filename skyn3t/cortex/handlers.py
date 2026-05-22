@@ -9,6 +9,8 @@ import logging
 from pathlib import Path
 from typing import Any, Dict
 
+from skyn3t.cortex.external_pattern_synthesizer import ExternalPatternSynthesizer
+from skyn3t.cortex.external_repo_ingest import ExternalRepoDocIngestor
 from skyn3t.cortex.feature_suggester import infer_feature_target_file
 from skyn3t.cortex.review_utils import normalize_review_risks
 
@@ -38,7 +40,7 @@ def _resolve_repo_file(target_file: Any) -> str:
 
 
 def install_handlers(orchestrator) -> None:
-    """Register apply-handlers for kind='feature', 'ingest', and 'studio_debug'."""
+    """Register apply-handlers for the review-gated Cortex proposal kinds."""
     try:
         from skyn3t.core.agent import TaskRequest
         from skyn3t.cortex import get_store  # local import to avoid circular dependency
@@ -206,6 +208,59 @@ def install_handlers(orchestrator) -> None:
             logger.exception("ingest_handler failed")
             return {"ok": False, "error": str(e)}
 
+    async def external_learning_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Approved external-learning proposal → persist attributed governed memory."""
+        memory_store = getattr(orchestrator, "memory_store", None)
+        if memory_store is None:
+            return {"ok": False, "error": "memory_store not initialized"}
+
+        platform = str(payload.get("source_platform") or "external").strip() or "external"
+        repo = str(payload.get("repo") or "").strip()
+        repo_url = str(payload.get("repo_url") or "").strip()
+        lane = str(payload.get("lane") or "").strip() or "fit"
+        query = str(payload.get("query") or payload.get("topic") or "").strip()
+        description = str(payload.get("description") or "").strip()
+        language = str(payload.get("language") or "").strip() or "unknown"
+        license_name = str(payload.get("license") or "unknown").strip() or "unknown"
+        reuse_risk = str(payload.get("reuse_risk") or "unknown").strip() or "unknown"
+        selection_reason = str(payload.get("selection_reason") or lane).strip() or lane
+        stars = int(payload.get("stars") or 0)
+        topics = [str(item).strip() for item in (payload.get("topics") or []) if str(item).strip()]
+        ingestor = ExternalRepoDocIngestor(
+            memory_store=memory_store,
+            rag_engine=getattr(getattr(orchestrator, "_ingestor", None), "rag", None),
+        )
+        result = await ingestor.ingest_repo_approval(
+            platform=platform,
+            repo=repo,
+            repo_url=repo_url,
+            lane=lane,
+            query=query,
+            description=description,
+            language=language,
+            license_name=license_name,
+            reuse_risk=reuse_risk,
+            selection_reason=selection_reason,
+            topics=topics,
+            stars=stars,
+        )
+        pattern = None
+        try:
+            synthesizer = ExternalPatternSynthesizer(memory_store)
+            pattern = await synthesizer.synthesize_for_doc(str(result["doc_id"]))
+        except Exception:
+            logger.warning("external pattern synthesis failed for %s", repo or repo_url, exc_info=True)
+        return {
+            "ok": True,
+            "doc_id": result["doc_id"],
+            "stored_as": "external_learning",
+            "summary_embedding_id": result.get("summary_embedding_id"),
+            "ingested": result.get("ingested_count", 0),
+            "paths": list(result.get("ingested_paths") or []),
+            "warnings": list(result.get("warnings") or []),
+            "pattern": pattern,
+        }
+
     async def studio_debug_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
         """Approved studio_debug → run CodeImproverAgent on target_file with verdict+risks as rationale."""
         risks = normalize_review_risks(payload.get("risks") or [])
@@ -251,5 +306,6 @@ def install_handlers(orchestrator) -> None:
 
     store.register_handler("feature", feature_handler)
     store.register_handler("ingest", ingest_handler)
+    store.register_handler("external_learning", external_learning_handler)
     store.register_handler("studio_debug", studio_debug_handler)
-    logger.info("cortex handlers registered: feature, ingest, studio_debug")
+    logger.info("cortex handlers registered: feature, ingest, external_learning, studio_debug")

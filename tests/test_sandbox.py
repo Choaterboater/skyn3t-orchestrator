@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import pytest
+from fastapi.testclient import TestClient
 
+import skyn3t.web.app as web_app
 from skyn3t.security.sandbox import (
     DockerBackend,
     DockerPoolBackend,
-    ExecutionResult,
     InlineBackend,
     get_backend,
 )
@@ -144,9 +145,6 @@ class TestGetBackend:
 
 class TestExecEndpoint:
     def test_exec_python_inline(self, monkeypatch) -> None:
-        import skyn3t.web.app as web_app
-        from fastapi.testclient import TestClient
-
         monkeypatch.setenv("SKYN3T_EXECUTION_BACKEND", "inline")
         from skyn3t.config.settings import get_settings
 
@@ -164,22 +162,16 @@ class TestExecEndpoint:
         assert data["backend"] == "InlineBackend"
 
     def test_exec_rejects_missing_code(self) -> None:
-        import skyn3t.web.app as web_app
-        from fastapi.testclient import TestClient
-
         client = TestClient(web_app.app)
         response = client.post("/api/exec", json={})
         assert response.status_code == 400
         assert "code is required" in response.json()["error"]
 
     def test_exec_rejects_bad_json(self) -> None:
-        import skyn3t.web.app as web_app
-        from fastapi.testclient import TestClient
-
         client = TestClient(web_app.app)
         response = client.post(
             "/api/exec",
-            data="not json",
+            content="not json",
             headers={"Content-Type": "application/json"},
         )
         assert response.status_code == 400

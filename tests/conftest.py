@@ -45,6 +45,20 @@ def isolate_runtime_state(tmp_path_factory, monkeypatch):
     from skyn3t.core.models import init_db
     from skyn3t.memory.database import close_engine
 
+    def _reset_proposal_store() -> None:
+        try:
+            import skyn3t.cortex.proposals as proposals_module
+
+            store = getattr(proposals_module, "_store", None)
+            if store is not None:
+                try:
+                    asyncio.run(store.cancel_inflight())
+                except Exception:
+                    pass
+            proposals_module._store = None
+        except Exception:
+            pass
+
     get_settings.cache_clear()
     try:
         asyncio.run(close_engine())
@@ -52,12 +66,7 @@ def isolate_runtime_state(tmp_path_factory, monkeypatch):
         pass
     memory_database._async_session_maker = None
     asyncio.run(init_db())
-    try:
-        import skyn3t.cortex.proposals as proposals_module
-
-        proposals_module._store = None
-    except Exception:
-        pass
+    _reset_proposal_store()
 
     yield Path(runtime_root)
 
@@ -67,12 +76,7 @@ def isolate_runtime_state(tmp_path_factory, monkeypatch):
         pass
     memory_database._async_session_maker = None
     get_settings.cache_clear()
-    try:
-        import skyn3t.cortex.proposals as proposals_module
-
-        proposals_module._store = None
-    except Exception:
-        pass
+    _reset_proposal_store()
 
 
 @pytest.fixture

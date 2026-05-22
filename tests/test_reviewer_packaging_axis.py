@@ -8,7 +8,10 @@ score at the documented weight.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+
+import pytest
 
 from skyn3t.agents.reviewer import ReviewerAgent
 from skyn3t.core.events import EventBus
@@ -163,6 +166,51 @@ class TestWebScoring:
         assert family == "web"
         assert score == 10
         assert gaps == []
+
+    def test_nested_scaffold_is_not_rescanned_for_env_vars(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        artifact = _make_web_artifact(tmp_path, with_settings=True, with_useconfig=True)
+
+        from skyn3t.agents import env_scanner
+
+        original_scan = env_scanner.scan
+        scan_calls: list[Path] = []
+
+        def wrapped_scan(root: Path):
+            scan_calls.append(root)
+            return original_scan(root)
+
+        monkeypatch.setattr(env_scanner, "scan", wrapped_scan)
+
+        score, gaps, family = _make_reviewer()._packaging_score(artifact)
+
+        assert family == "web"
+        assert score == 10
+        assert gaps == []
+        assert scan_calls == [artifact]
+
+    def test_artifact_walk_prunes_node_modules_before_descending(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        artifact = _make_web_artifact(tmp_path, with_settings=True, with_useconfig=True)
+        _write(artifact, "node_modules/pkg/index.js", "console.log('skip');")
+
+        original_walk = os.walk
+        visited: list[Path] = []
+
+        def wrapped_walk(root: Path, *args, **kwargs):
+            for dirpath, dirnames, filenames in original_walk(root, *args, **kwargs):
+                visited.append(Path(dirpath))
+                yield dirpath, dirnames, filenames
+
+        monkeypatch.setattr("skyn3t.agents.reviewer.os.walk", wrapped_walk)
+
+        files = _make_reviewer()._artifact_files(artifact)
+
+        names = {path.relative_to(artifact).as_posix() for path in files}
+        assert "node_modules/pkg/index.js" not in names
+        assert all(path.name != "node_modules" for path in visited)
 
 
 # ---------------------------------------------------------------------------

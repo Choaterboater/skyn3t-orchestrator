@@ -1,10 +1,16 @@
 from skyn3t.registry.catalog import build_agent_override, get_agent_catalog_metadata
 
 
-def test_catalog_supplies_verifier_defaults_without_user_overrides():
+def test_catalog_does_not_force_runtime_defaults_without_user_overrides():
     merged = build_agent_override(class_name="VerifierAgent", runtime_name="verifier")
 
-    assert merged == {"backend": "claude_cli", "model": "sonnet"}
+    assert merged == {}
+
+
+def test_catalog_leaves_stage_agents_unpinned_without_user_overrides():
+    merged = build_agent_override(class_name="ArchitectAgent", runtime_name="architect")
+
+    assert merged == {}
 
 
 def test_catalog_keeps_explicit_user_overrides_on_top():

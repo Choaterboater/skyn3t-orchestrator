@@ -55,6 +55,33 @@ def _make_ingestor(tmp_path):
     return ingestor, rag
 
 
+class _FakeMemoryStore:
+    def __init__(self) -> None:
+        self.saved_docs: List[Dict[str, Any]] = []
+
+    async def save_knowledge_doc(
+        self,
+        *,
+        title: str,
+        content: str,
+        source: str,
+        doc_type: str,
+        embedding_id: Optional[str] = None,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        self.saved_docs.append(
+            {
+                "title": title,
+                "content": content,
+                "source": source,
+                "doc_type": doc_type,
+                "embedding_id": embedding_id,
+                "meta": meta or {},
+            }
+        )
+        return f"doc-{len(self.saved_docs)}"
+
+
 def test_ingestor_subscribes_to_system_alert(tmp_path) -> None:
     ingestor, _rag = _make_ingestor(tmp_path)
     # SYSTEM_ALERT must be among the subscribed event types — that's
@@ -183,3 +210,68 @@ def test_ingestor_routes_project_completed_with_failure_verdict(tmp_path) -> Non
     assert "Verdict: go-with-fixes" in doc["content"]
     assert "60/100" in doc["content"]
     assert doc["metadata"]["feature_tags"] == "glassmorphism, dark"
+
+
+def test_ingestor_stages_lessons_as_drafts_until_approved(tmp_path) -> None:
+    rag = _FakeRAG()
+    store = _FakeMemoryStore()
+    bus = MagicMock()
+    bus.subscribe = MagicMock()
+    ingestor = ExperienceIngestor(
+        event_bus=bus,
+        rag_engine=rag,
+        memory_store=store,
+        seen_hashes_path=tmp_path / "seen.json",
+    )
+
+    async def _go():
+        await ingestor.initialize()
+        result = await ingestor.ingest_lesson(
+            agent="reflection-agent",
+            success=True,
+            patterns=["fast feedback"],
+            suggestions=["keep the loop tight"],
+            task_id="task-9",
+        )
+        assert result is None
+
+    asyncio.run(_go())
+
+    assert rag.docs == []
+    assert len(store.saved_docs) == 1
+    draft = store.saved_docs[0]
+    assert draft["doc_type"] == "lesson"
+    assert draft["embedding_id"] is None
+    assert draft["meta"]["review_status"] == "draft"
+    assert draft["meta"]["memory_layer"] == "operator"
+
+
+def test_ingestor_auto_rejects_low_signal_lessons_but_keeps_them(tmp_path) -> None:
+    rag = _FakeRAG()
+    store = _FakeMemoryStore()
+    bus = MagicMock()
+    bus.subscribe = MagicMock()
+    ingestor = ExperienceIngestor(
+        event_bus=bus,
+        rag_engine=rag,
+        memory_store=store,
+        seen_hashes_path=tmp_path / "seen.json",
+    )
+
+    async def _go():
+        await ingestor.initialize()
+        await ingestor.ingest_lesson(
+            agent="reflection-agent",
+            success=False,
+            patterns=[],
+            suggestions=[],
+            task_id="task-10",
+        )
+
+    asyncio.run(_go())
+
+    assert rag.docs == []
+    assert len(store.saved_docs) == 1
+    rejected = store.saved_docs[0]
+    assert rejected["meta"]["review_status"] == "rejected"
+    assert rejected["meta"]["review_reason"] == "no actionable lesson content"

@@ -7,7 +7,7 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 logger = logging.getLogger("skyn3t.config.overrides")
 
@@ -73,6 +73,18 @@ class AgentOverrideStore:
         with self._lock:
             self._data.pop(name, None)
             self._save()
+
+    def unset(self, name: str, keys: Iterable[str]) -> Dict[str, Any]:
+        with self._lock:
+            cur = dict(self._data.get(name, {}))
+            for key in keys:
+                cur.pop(str(key), None)
+            if cur:
+                self._data[name] = cur
+            else:
+                self._data.pop(name, None)
+            self._save()
+            return dict(cur)
 
 
 _store: Optional[AgentOverrideStore] = None

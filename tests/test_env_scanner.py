@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
+from skyn3t.agents import env_scanner
 from skyn3t.agents.env_scanner import ScanResult, scan
 
 # ---------------------------------------------------------------------------
@@ -44,6 +46,25 @@ class TestScanSmoke:
         assert "SHOULD_SKIP" not in result.vars
         assert "ALSO_SKIP" not in result.vars
         assert "GIT_SKIP" not in result.vars
+
+    def test_prunes_skipped_dirs_before_descending(self, tmp_path: Path, monkeypatch) -> None:
+        _write(tmp_path, "node_modules/dep/index.js", "process.env.SHOULD_SKIP")
+        _write(tmp_path, "src/app.js", "process.env.REAL_VAR")
+
+        original_walk = os.walk
+        visited: list[Path] = []
+
+        def wrapped_walk(root: Path, *args, **kwargs):
+            for dirpath, dirnames, filenames in original_walk(root, *args, **kwargs):
+                visited.append(Path(dirpath))
+                yield dirpath, dirnames, filenames
+
+        monkeypatch.setattr(env_scanner.os, "walk", wrapped_walk)
+
+        result = scan(tmp_path)
+
+        assert "REAL_VAR" in result.vars
+        assert all(path.name != "node_modules" for path in visited)
 
     def test_binary_file_is_skipped_not_crashed(self, tmp_path: Path) -> None:
         # Write valid UTF-16 bytes — UTF-8 read should fail and skip.

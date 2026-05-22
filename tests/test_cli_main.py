@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import httpx
 from typer.testing import CliRunner
 
+import skyn3t.cli.doctor as cli_doctor
 import skyn3t.cli.main as cli_main
 from skyn3t.cli.main import app
 
@@ -345,3 +346,513 @@ def test_cli_proposal_reject_posts_reason(monkeypatch):
     assert calls["path"] == "/api/proposals/prop-123/reject"
     assert calls["json"] == {"reason": "not safe enough"}
     assert "Proposal rejected" in result.stdout
+
+
+def test_cli_memory_drafts_renders_pending_items(monkeypatch):
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, path, params=None):
+            assert path == "/api/memory/drafts"
+            assert params == {"limit": 20}
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {
+                    "drafts": [
+                        {
+                            "id": "draft-1",
+                            "title": "Lesson draft",
+                            "doc_type": "lesson",
+                            "source": "reflection",
+                            "meta": {"memory_layer": "operator"},
+                        }
+                    ]
+                },
+            )
+
+    monkeypatch.setattr(cli_main, "_client", lambda: FakeClient())
+
+    result = runner.invoke(app, ["memory", "drafts"])
+
+    assert result.exit_code == 0
+    assert "Memory drafts" in result.stdout
+    assert "draft-1" in result.stdout
+
+
+def test_cli_memory_approve_posts_to_endpoint(monkeypatch):
+    calls = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, path, json=None):
+            calls["path"] = path
+            calls["json"] = json
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {"draft": {"id": "draft-1", "title": "Lesson draft"}},
+            )
+
+    monkeypatch.setattr(cli_main, "_client", lambda: FakeClient())
+
+    result = runner.invoke(app, ["memory", "approve", "draft-1"])
+
+    assert result.exit_code == 0
+    assert calls == {"path": "/api/memory/drafts/draft-1/approve", "json": None}
+    assert "Approved" in result.stdout
+
+
+def test_cli_memory_evals_lists_assets(monkeypatch):
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, path, params=None):
+            assert path == "/api/memory/evaluations"
+            assert params == {"status": "approved", "limit": 20}
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {
+                    "evaluations": [
+                        {
+                            "id": "eval-1",
+                            "title": "External eval",
+                            "review_status": "approved",
+                            "lane": "fit",
+                            "language": "python",
+                            "signals": ["cortex", "autonomy"],
+                        }
+                    ]
+                },
+            )
+
+    monkeypatch.setattr(cli_main, "_client", lambda: FakeClient())
+
+    result = runner.invoke(app, ["memory", "evals", "--status", "approved"])
+
+    assert result.exit_code == 0
+    assert "Evaluation assets" in result.stdout
+    assert "eval-1" in result.stdout
+
+
+def test_cli_memory_export_eval_prints_jsonl(monkeypatch):
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, path, params=None):
+            assert path == "/api/memory/evaluations/eval-1/export"
+            assert params == {"format": "jsonl"}
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                text='{"kind":"evaluation_asset","evaluation":{"id":"eval-1"}}\n',
+            )
+
+    monkeypatch.setattr(cli_main, "_client", lambda: FakeClient())
+
+    result = runner.invoke(app, ["memory", "export-eval", "eval-1", "--format", "jsonl"])
+
+    assert result.exit_code == 0
+    assert '"kind":"evaluation_asset"' in result.stdout
+
+
+def test_cli_export_trajectories_can_include_evaluations(monkeypatch, tmp_path):
+    calls = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, path, params=None):
+            calls["path"] = path
+            calls["params"] = params
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                content=b'{"task_id":"t-1"}\n{"kind":"evaluation_asset"}\n',
+            )
+
+    monkeypatch.setattr(cli_main, "_client", lambda: FakeClient())
+    out_path = tmp_path / "bundle.jsonl"
+
+    result = runner.invoke(
+        app,
+        ["export", "trajectories", "--agent", "designer", "--include-evaluations", "--output", str(out_path)],
+    )
+
+    assert result.exit_code == 0
+    assert calls == {
+        "path": "/api/trajectories/export",
+        "params": {"agent": "designer", "include_evaluations": True},
+    }
+    assert out_path.read_text() == '{"task_id":"t-1"}\n{"kind":"evaluation_asset"}\n'
+    assert "trajectory bundle" in result.stdout
+
+
+def test_cli_skills_candidates_renders_memory_docs(monkeypatch):
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, path, params=None):
+            assert path == "/api/skills/candidates"
+            assert params == {"limit": 20}
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {
+                    "candidates": [
+                        {
+                            "id": "mem-1",
+                            "title": "Skillable lesson",
+                            "doc_type": "lesson",
+                            "meta": {"confidence": 0.8},
+                        }
+                    ]
+                },
+            )
+
+    monkeypatch.setattr(cli_main, "_client", lambda: FakeClient())
+
+    result = runner.invoke(app, ["skills", "candidates"])
+
+    assert result.exit_code == 0
+    assert "Skill candidates" in result.stdout
+    assert "mem-1" in result.stdout
+
+
+def test_cli_skills_draft_posts_memory_doc_id(monkeypatch):
+    calls = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, path, json=None):
+            calls["path"] = path
+            calls["json"] = json
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {
+                    "draft": {"slug": "insight-from-architect-mem1", "name": "Insight from architect mem1"}
+                },
+            )
+
+    monkeypatch.setattr(cli_main, "_client", lambda: FakeClient())
+
+    result = runner.invoke(app, ["skills", "draft", "mem-1"])
+
+    assert result.exit_code == 0
+    assert calls == {"path": "/api/skills/drafts/from-memory/mem-1", "json": None}
+    assert "Created skill draft" in result.stdout
+
+
+def test_cli_skills_approve_draft_posts(monkeypatch):
+    calls = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, path, json=None):
+            calls["path"] = path
+            calls["json"] = json
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {"installed": "draft-install"},
+            )
+
+    monkeypatch.setattr(cli_main, "_client", lambda: FakeClient())
+
+    result = runner.invoke(app, ["skills", "approve-draft", "draft-install"])
+
+    assert result.exit_code == 0
+    assert calls == {"path": "/api/skills/drafts/draft-install/approve", "json": None}
+    assert "Installed skill draft" in result.stdout
+
+
+def test_cli_github_scout_run_posts_and_renders(monkeypatch):
+    calls = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, path, json):
+            calls["path"] = path
+            calls["json"] = json
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {
+                    "filed": 1,
+                    "candidates_seen": 2,
+                    "proposals": [
+                        {
+                            "repo": "octo/agent-flow",
+                            "lane": "fit",
+                            "license": "MIT",
+                            "proposal_id": "prop-1",
+                        }
+                    ],
+                },
+            )
+
+    monkeypatch.setattr(cli_main, "_client", lambda: FakeClient())
+
+    result = runner.invoke(app, ["github", "scout", "--cadence", "weekly", "--limit", "2"])
+
+    assert result.exit_code == 0
+    assert calls["path"] == "/api/github/scout/run"
+    assert calls["json"] == {"cadence": "weekly", "limit": 2, "queries": []}
+    assert "GitHub scout result" in result.stdout
+    assert "octo/agent-flow" in result.stdout
+
+
+def test_cli_github_scout_schedule_posts(monkeypatch):
+    calls = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, path, json):
+            calls["path"] = path
+            calls["json"] = json
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {"job_id": "job-1", "name": "github-scout-daily"},
+            )
+
+    monkeypatch.setattr(cli_main, "_client", lambda: FakeClient())
+
+    result = runner.invoke(
+        app,
+        ["github", "scout", "--every", "daily at 09:00", "--queries", "agent cli memory,design system ui"],
+    )
+
+    assert result.exit_code == 0
+    assert calls["path"] == "/api/github/scout/schedule"
+    assert calls["json"]["schedule_expr"] == "daily at 09:00"
+    assert calls["json"]["queries"] == ["agent cli memory", "design system ui"]
+    assert "Scheduled GitHub scout" in result.stdout
+
+
+def test_cli_repo_scout_run_posts_multi_platform(monkeypatch):
+    calls = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, path, json):
+            calls["path"] = path
+            calls["json"] = json
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {
+                    "filed": 2,
+                    "candidates_seen": 3,
+                    "proposals": [
+                        {
+                            "platform": "gitlab",
+                            "repo": "gitlab-org/agent-lab",
+                            "lane": "fit",
+                            "license": "MIT",
+                            "proposal_id": "prop-1",
+                        }
+                    ],
+                },
+            )
+
+    monkeypatch.setattr(cli_main, "_client", lambda: FakeClient())
+
+    result = runner.invoke(
+        app,
+        [
+            "scout",
+            "run",
+            "--cadence",
+            "weekly",
+            "--platforms",
+            "gitlab,bitbucket",
+            "--queries",
+            "agent cli memory",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls["path"] == "/api/repo-scout/run"
+    assert calls["json"] == {
+        "cadence": "weekly",
+        "limit": 4,
+        "queries": ["agent cli memory"],
+        "platforms": ["gitlab", "bitbucket"],
+    }
+    assert "Repo scout result" in result.stdout
+    assert "gitlab-org/agent-lab" in result.stdout
+
+
+def test_cli_github_scout_platforms_switches_to_generic_endpoint(monkeypatch):
+    calls = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, path, json):
+            calls["path"] = path
+            calls["json"] = json
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {"filed": 0, "candidates_seen": 0, "proposals": []},
+            )
+
+    monkeypatch.setattr(cli_main, "_client", lambda: FakeClient())
+
+    result = runner.invoke(
+        app,
+        ["github", "scout", "--platforms", "github,gitlab"],
+    )
+
+    assert result.exit_code == 0
+    assert calls["path"] == "/api/repo-scout/run"
+    assert calls["json"]["platforms"] == ["github", "gitlab"]
+
+
+def test_cli_doctor_exits_zero_when_all_checks_pass(monkeypatch):
+    monkeypatch.setattr(
+        cli_doctor,
+        "run_doctor",
+        lambda _api_base: cli_doctor.DoctorReport(
+            checks=[cli_doctor.DoctorCheck("api-health", "ok", "Server health is healthy.")]
+        ),
+    )
+
+    result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "Doctor" in result.stdout
+    assert "api-health" in result.stdout
+    assert "OK" in result.stdout
+
+
+def test_cli_doctor_exits_nonzero_when_any_check_fails(monkeypatch):
+    monkeypatch.setattr(
+        cli_doctor,
+        "run_doctor",
+        lambda _api_base: cli_doctor.DoctorReport(
+            checks=[cli_doctor.DoctorCheck("api-health", "fail", "SkyN3t API is unreachable.")]
+        ),
+    )
+
+    result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code == 1
+    assert "SkyN3t API is unreachable." in result.stdout
+
+
+def test_cli_memory_summary_renders_layers(monkeypatch):
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, path, params=None):
+            assert path == "/api/memory/layers"
+            assert params == {"limit": 5}
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {
+                    "enabled": True,
+                    "layers": {
+                        "session": {"active_sessions": 2, "sessions": ["sess-1"]},
+                        "operator": {
+                            "insight_count": 3,
+                            "skill_summary": {"total": 4},
+                            "recent_insights": [{"agent": "writer", "capability": "ui", "insight": "Use cards"}],
+                            "top_skills": [{"name": "layout-skill", "score": 0.8, "tags": ["ui"]}],
+                        },
+                        "project": {
+                            "tasks": 10,
+                            "knowledge_documents": 5,
+                            "recent_documents": [{"title": "Landing page pattern", "doc_type": "lesson", "source": "repo"}],
+                        },
+                    },
+                },
+            )
+
+    monkeypatch.setattr(cli_main, "_client", lambda: FakeClient())
+
+    result = runner.invoke(app, ["memory", "summary"])
+
+    assert result.exit_code == 0
+    assert "Memory Layers" in result.stdout
+    assert "Session memory" in result.stdout
+    assert "Operator memory" in result.stdout
+    assert "Project knowledge" in result.stdout
+
+
+def test_cli_memory_session_renders_recent_activity(monkeypatch):
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, path, params=None):
+            assert path == "/api/memory/sessions/sess-1"
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {
+                    "session_id": "sess-1",
+                    "context": {"participants": ["writer"], "history": [{"event": "x"}]},
+                    "recent_activity": [{"type": "task", "title": "Build dashboard"}],
+                },
+            )
+
+    monkeypatch.setattr(cli_main, "_client", lambda: FakeClient())
+
+    result = runner.invoke(app, ["memory", "session", "sess-1"])
+
+    assert result.exit_code == 0
+    assert "Session Memory" in result.stdout
+    assert "Build dashboard" in result.stdout

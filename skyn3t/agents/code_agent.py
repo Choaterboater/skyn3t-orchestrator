@@ -2,7 +2,6 @@
 
 import ast
 import asyncio
-import io
 import logging
 import os
 import re as _RE

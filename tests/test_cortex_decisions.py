@@ -139,6 +139,7 @@ async def test_cortex_bootstrap_publishes_decision_on_skip(monkeypatch):
         and d.payload["input"].get("component") == "auto_cleanup"
         for d in decisions
     )
+    await cb.stop()
 
 
 # ---------------------------------------------------------------------

@@ -252,6 +252,18 @@ class CortexBootstrap:
                 ("TASK_FAILED", "TASK_FAILED_FINAL", "SYSTEM_ALERT"),
             ),
             (
+                "repo_scout",
+                "_repo_scout",
+                lambda: _import_and_build(
+                    "skyn3t.cortex.repo_scout", "GitHubRepoScout",
+                    orchestrator=self.orchestrator,
+                    event_bus=self.event_bus,
+                ),
+                ("ingest", "external_learning"),
+                (),
+                ("SYSTEM_ALERT",),
+            ),
+            (
                 "curiosity",
                 "_curiosity",
                 lambda: _import_and_build(

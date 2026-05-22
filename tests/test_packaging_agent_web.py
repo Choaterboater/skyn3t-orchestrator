@@ -185,6 +185,25 @@ class TestWebFileGeneration:
         # API_URL is url → url input type
         assert '"url"' in settings
 
+    @pytest.mark.asyncio
+    async def test_nested_scaffold_is_not_scanned_twice(self, tmp_path: Path, monkeypatch) -> None:
+        artifact = _make_react_vite_scaffold(tmp_path)
+
+        from skyn3t.agents import packaging_agent as packaging_module
+
+        original_scan = packaging_module.scan_env
+        scan_calls: list[Path] = []
+
+        def wrapped_scan(root: Path) -> ScanResult:
+            scan_calls.append(root)
+            return original_scan(root)
+
+        monkeypatch.setattr(packaging_module, "scan_env", wrapped_scan)
+
+        await _run_packaging(artifact)
+
+        assert scan_calls == [artifact]
+
 
 # ---------------------------------------------------------------------------
 # App.jsx patching

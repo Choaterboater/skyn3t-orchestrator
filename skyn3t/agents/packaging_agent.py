@@ -124,12 +124,15 @@ class PackagingAgent(BaseAgent):
             decided_port = decisions.get("backend_port")
             if isinstance(decided_port, int):
                 detection.port_override = decided_port
-        # Scan both the scaffold dir (frontend) AND the artifact root
-        # (backend, in monorepo layouts). The scanner aggregates by var
-        # name, so vars referenced in both places just get more entries
-        # in their `used_in` list.
+        # Scan the artifact root once. That already covers the common
+        # artifact/scaffold nested layout, so avoid walking the same tree
+        # twice before packaging and review scoring.
         env_scan = scan_env(artifact_dir)
-        if scaffold_dir.is_dir() and scaffold_dir != artifact_dir:
+        try:
+            scaffold_nested_in_artifact = scaffold_dir.relative_to(artifact_dir) != Path(".")
+        except ValueError:
+            scaffold_nested_in_artifact = False
+        if scaffold_dir.is_dir() and scaffold_dir != artifact_dir and not scaffold_nested_in_artifact:
             scaffold_scan = scan_env(scaffold_dir)
             for name, ref in scaffold_scan.vars.items():
                 if name in env_scan.vars:

@@ -37,6 +37,7 @@ function looksLikeBuild(text: string): boolean {
 export default function CortexPage() {
   const qc = useQueryClient();
   const [filter, setFilter] = useState<"pending" | "all">("pending");
+  const [kindFilter, setKindFilter] = useState<"all" | "feature" | "ingest">("all");
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["proposals", filter],
@@ -63,6 +64,32 @@ export default function CortexPage() {
     decided.sort((a, b) => (b.decided_at ?? 0) - (a.decided_at ?? 0));
     return { pending, decided };
   }, [data]);
+  const visiblePending = useMemo(
+    () =>
+      grouped.pending.filter((p) => kindFilter === "all" || p.kind === kindFilter),
+    [grouped.pending, kindFilter],
+  );
+  const pendingGroups = useMemo(() => {
+    const groups = new Map<
+      string,
+      { key: string; kind: string; source: string; count: number; example: Proposal }
+    >();
+    for (const p of grouped.pending) {
+      const key = `${p.kind}::${p.source ?? "unknown"}`;
+      const current = groups.get(key);
+      if (current) current.count += 1;
+      else {
+        groups.set(key, {
+          key,
+          kind: p.kind,
+          source: p.source ?? "unknown",
+          count: 1,
+          example: p,
+        });
+      }
+    }
+    return Array.from(groups.values()).sort((a, b) => b.count - a.count);
+  }, [grouped.pending]);
 
   return (
     <div className="space-y-6">
@@ -86,6 +113,15 @@ export default function CortexPage() {
         error={cortexStatus.error}
       />
 
+      {grouped.pending.length > 0 && (
+        <PendingTriagePanel
+          total={grouped.pending.length}
+          kindFilter={kindFilter}
+          onKindFilterChange={setKindFilter}
+          groups={pendingGroups}
+        />
+      )}
+
       {isLoading && <p className="text-text-secondary">Loading…</p>}
       {error && (
         <p className="text-status-red text-sm">
@@ -95,12 +131,13 @@ export default function CortexPage() {
 
       <section className="space-y-3">
         <SectionTitle>
-          Pending ({grouped.pending.length})
+          Pending ({visiblePending.length}
+          {kindFilter !== "all" ? ` / ${grouped.pending.length}` : ""})
         </SectionTitle>
-        {grouped.pending.length === 0 ? (
+        {visiblePending.length === 0 ? (
           <Empty>No pending proposals. The system is quiet.</Empty>
         ) : (
-          grouped.pending.map((p) => (
+          visiblePending.map((p) => (
             <ProposalCard key={p.id} p={p} onChanged={invalidate} />
           ))
         )}
@@ -119,6 +156,81 @@ export default function CortexPage() {
         </section>
       )}
     </div>
+  );
+}
+
+function PendingTriagePanel({
+  total,
+  kindFilter,
+  onKindFilterChange,
+  groups,
+}: {
+  total: number;
+  kindFilter: "all" | "feature" | "ingest";
+  onKindFilterChange: (value: "all" | "feature" | "ingest") => void;
+  groups: Array<{ key: string; kind: string; source: string; count: number; example: Proposal }>;
+}) {
+  return (
+    <section className="rounded-lg border border-border bg-bg-2 p-4 space-y-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <SectionTitle>Pending triage</SectionTitle>
+          <p className="text-xs text-text-secondary mt-1 max-w-3xl">
+            These are review-gated proposals. Approve when you want the system to
+            adopt the suggested change or learning topic; reject when it feels noisy,
+            overfit, or irrelevant.
+          </p>
+        </div>
+        <div className="flex bg-bg-3 border border-border rounded p-0.5 text-xs">
+          {(["all", "feature", "ingest"] as const).map((value) => (
+            <button
+              key={value}
+              onClick={() => onKindFilterChange(value)}
+              className={[
+                "px-3 py-1 rounded uppercase tracking-wider",
+                kindFilter === value
+                  ? "bg-accent-soft text-accent border border-accent-line"
+                  : "text-text-secondary hover:text-text-primary",
+              ].join(" ")}
+            >
+              {value} {value === "all" ? `(${total})` : ""}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="grid gap-3 md:grid-cols-2">
+        {groups.map((group) => {
+          const triage = proposalTriage(group.example);
+          return (
+            <div
+              key={group.key}
+              className="rounded border border-border bg-bg-3 p-3 space-y-2"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="text-sm font-medium truncate">
+                    {group.kind} · {group.source}
+                  </div>
+                  <div className="text-[0.65rem] text-text-dim font-mono">
+                    {group.count} pending
+                  </div>
+                </div>
+                <span className="rounded border border-accent-line bg-accent-soft px-2 py-0.5 text-[0.65rem] uppercase tracking-wider text-accent">
+                  {triage.label}
+                </span>
+              </div>
+              <div className="text-xs text-text-secondary">
+                {triage.approveWhen}
+              </div>
+              <div className="text-[0.65rem] text-text-dim">
+                Example: {proposalSubject(group.example) || group.example.title || group.example.summary}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 
@@ -645,6 +757,9 @@ function ProposalCard({
   });
 
   const decisionable = p.status === "pending";
+  const triage = proposalTriage(p);
+  const subject = proposalSubject(p);
+  const highlights = proposalHighlights(p);
 
   return (
     <article
@@ -659,6 +774,11 @@ function ProposalCard({
             <span className="text-[0.65rem] font-mono uppercase tracking-wider text-text-dim shrink-0">
               {p.kind}
             </span>
+            {subject && (
+              <span className="text-[0.65rem] px-1.5 py-0.5 rounded border border-border bg-bg-3 text-text-secondary font-mono shrink-0">
+                {subject}
+              </span>
+            )}
             <h3
               className="font-medium truncate"
               title={p.title || p.summary}
@@ -678,6 +798,31 @@ function ProposalCard({
         </div>
         <StatusPill status={p.status} />
       </header>
+
+      {!compact && (
+        <div className="px-3 pb-3 space-y-2">
+          <div className="rounded border border-border bg-bg-3 p-2.5 space-y-1">
+            <div className="flex items-center gap-2 text-[0.65rem] uppercase tracking-wider">
+              <span className="text-accent font-medium">{triage.label}</span>
+              <span className="text-text-dim">approve when</span>
+            </div>
+            <p className="text-xs text-text-secondary">{triage.approveWhen}</p>
+            <p className="text-[0.65rem] text-text-dim">{triage.rejectWhen}</p>
+          </div>
+          {highlights.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {highlights.map((item) => (
+                <span
+                  key={item}
+                  className="text-[0.65rem] px-1.5 py-0.5 rounded border border-border bg-bg-3 text-text-secondary font-mono"
+                >
+                  {item}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {p.detail && (
         <div className="px-3 pb-2">
@@ -745,6 +890,71 @@ function ProposalCard({
       )}
     </article>
   );
+}
+
+function proposalSubject(p: Proposal): string | null {
+  const payload = p.payload ?? {};
+  if (p.kind === "feature" && typeof payload.stack === "string" && payload.stack) {
+    return `stack:${payload.stack}`;
+  }
+  if (p.kind === "ingest" && typeof payload.topic === "string" && payload.topic) {
+    return `topic:${payload.topic}`;
+  }
+  if (typeof payload.kind === "string" && payload.kind) {
+    return payload.kind;
+  }
+  return null;
+}
+
+function proposalHighlights(p: Proposal): string[] {
+  const payload = p.payload ?? {};
+  const out: string[] = [];
+  if (typeof payload.winner_samples === "number" && typeof payload.winner_success_rate === "number") {
+    out.push(`winner ${payload.winner_samples} @ ${Math.round(payload.winner_success_rate * 100)}%`);
+  }
+  if (typeof payload.loser_samples === "number" && typeof payload.loser_success_rate === "number") {
+    out.push(`loser ${payload.loser_samples} @ ${Math.round(payload.loser_success_rate * 100)}%`);
+  }
+  if (typeof payload.limit === "number") {
+    out.push(`limit ${payload.limit}`);
+  }
+  if (typeof payload.mode === "string" && payload.mode) {
+    out.push(`mode ${payload.mode}`);
+  }
+  return out;
+}
+
+function proposalTriage(p: Proposal): {
+  label: string;
+  approveWhen: string;
+  rejectWhen: string;
+} {
+  const payload = p.payload ?? {};
+  if (p.kind === "feature" && payload.kind === "build_pattern_bias") {
+    return {
+      label: "template default change",
+      approveWhen:
+        "Approve if you want future scaffolds on this stack to follow the higher-success pattern shown here.",
+      rejectWhen:
+        "Reject if the sample looks too narrow, the winning shape is obviously incomplete, or you do not want this template behavior to become the new default.",
+    };
+  }
+  if (p.kind === "ingest") {
+    return {
+      label: "external learning topic",
+      approveWhen:
+        "Approve if this topic is relevant to SkyN3t and you want it to ingest outside material for future memory/skill synthesis.",
+      rejectWhen:
+        "Reject if the topic is noisy, duplicate, off-mission, or you do not want external docs on this area right now.",
+    };
+  }
+  return {
+    label: "manual review",
+    approveWhen:
+      "Approve if the summary clearly describes a useful change to SkyN3t itself and the detail matches what you want applied.",
+    rejectWhen:
+      "Reject if the proposal is vague, duplicated, overfit, or not something you want the system acting on.",
+  };
 }
 
 function SectionTitle({ children }: { children: React.ReactNode }) {
