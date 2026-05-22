@@ -2,7 +2,32 @@
 
 **SkyN3t** — *Just A Rather Very Intelligent System*
 
-A multi-agent orchestrator with a **persistent collective brain**: self-healing, Retrieval-Augmented Generation (RAG), autonomous task execution, and a shared consciousness that lets agents think, learn, and remember together.
+A multi-agent orchestration system that coordinates multiple AI agents, tracks their work, stores what they learn, and exposes the system through a CLI and a FastAPI web dashboard.
+
+## What it does
+
+SkyN3t manages agent registration, task routing, monitoring, shared memory, and recovery. It supports persistent memory, Retrieval-Augmented Generation (RAG), real-time coordination between agents, and autonomous system improvement through self-healing and self-tuning components.
+
+## What it can be used for
+
+- Running multi-agent workflows and task pipelines
+- Coordinating different AI providers and tool-backed agents
+- Building systems that remember past tasks and reuse knowledge
+- Monitoring agent activity and system state in real time
+- Creating autonomous or semi-autonomous assistant platforms
+- Supporting research, software tasks, and knowledge retrieval with shared context
+
+## How it works
+
+An orchestrator sends tasks to agents over an event-driven bus. Agents publish outputs and insights back into the system, where they are stored in SQLite and ingested into a vector store for semantic recall. A shared "collective consciousness" layer gives agents access to common working memory and session context, while self-healing, self-tuning, and meta-agent components observe the system and help it adapt over time.
+
+## Different AI models and LLMs
+
+SkyN3t is built to work with multiple LLM backends, not just one model. In the repo, that includes Claude, OpenAI, Copilot CLI, Kimi CLI, and OpenRouter-backed models. It routes different work to different model tiers, so lighter tasks can use cheaper or faster models while harder reasoning and review stages can use stronger ones.
+
+## How it is different from Hermes and similar systems
+
+Compared with Hermes Agent, OpenClaw, and Paperclip, SkyN3t is positioned as a broader orchestration system rather than just a prompt runner or chat wrapper. It focuses on inter-agent coordination, shared memory, RAG-backed recall, self-healing, self-tuning, and stronger autonomy across a persistent agent swarm.
 
 ## Documentation
 
