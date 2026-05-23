@@ -22,15 +22,15 @@ from skyn3t.agents.decisions import load_decisions
 from skyn3t.config.settings import get_settings
 from skyn3t.core.agent import AgentCapability, TaskRequest, TaskResult
 from skyn3t.core.event_context import push_event_context
-from skyn3t.studio.mission_setup import (
-    augment_brief_with_mission_setup,
-    mission_setup_stage_hints,
-    normalize_mission_setup,
-)
 from skyn3t.studio.clarification import (
     format_user_intent_brief_block,
     parse_user_intent,
     user_keeps_category_defaults,
+)
+from skyn3t.studio.mission_setup import (
+    augment_brief_with_mission_setup,
+    mission_setup_stage_hints,
+    normalize_mission_setup,
 )
 from skyn3t.studio.penpot_handoff import materialize_penpot_handoff
 from skyn3t.studio.registry import get_agent

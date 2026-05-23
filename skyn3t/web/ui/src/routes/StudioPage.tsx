@@ -1,6 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, ProjectDetail, ProjectRow, Template } from "../api/client";
+import {
+  buildClarificationAnswers,
+  clarificationOptionEntry,
+  clarificationSubmitReady,
+  missingClarificationQuestions,
+} from "./clarificationForm";
 
 // Studio (build) page — the biggest single view in the old dashboard.
 // Splits into three regions:
@@ -1083,29 +1089,53 @@ function ClarificationCard({ slug, data }: { slug: string; data: any }) {
     ? data.clarification.question_options
     : [];
   const [answers, setAnswers] = useState<string[]>([]);
+  const [sent, setSent] = useState(false);
+  const briefFallback = String(data?.brief_raw || data?.brief || "").trim();
 
   useEffect(() => {
-    setAnswers(questions.map(() => ""));
-  }, [questions.join("\n")]);
+    setAnswers((prev) => {
+      if (prev.length === questions.length) {
+        return prev;
+      }
+      return questions.map((_, index) => prev[index] ?? "");
+    });
+    setSent(false);
+  }, [questions.join("\n"), questions.length]);
 
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["studio_project", slug] });
     qc.invalidateQueries({ queryKey: ["studio_projects"] });
   };
 
+  const payloadAnswers = buildClarificationAnswers(
+    questions,
+    answers,
+    questionOptions,
+    briefFallback,
+  );
+
   const submit = useMutation({
-    mutationFn: () => api.clarifyProject(slug, answers.map((a) => a.trim())),
-    onSuccess: invalidate,
+    mutationFn: () => api.clarifyProject(slug, payloadAnswers),
+    onSuccess: () => {
+      setSent(true);
+      invalidate();
+    },
   });
 
-  const busy = submit.isPending;
+  const busy = submit.isPending || sent;
   const askedBy = String(data?.clarification?.asked_by || "agent");
-  const ready = questions.length > 0 && answers.every((answer) => answer.trim().length > 0);
+  const ready = clarificationSubmitReady(questions, answers, questionOptions);
+  const missing = missingClarificationQuestions(questions, answers, questionOptions);
 
   function setAnswer(index: number, value: string) {
-    const next = [...answers];
-    next[index] = value;
-    setAnswers(next);
+    setAnswers((prev) => {
+      const next = [...prev];
+      while (next.length < questions.length) {
+        next.push("");
+      }
+      next[index] = value;
+      return next;
+    });
   }
 
   return (
@@ -1113,7 +1143,7 @@ function ClarificationCard({ slug, data }: { slug: string; data: any }) {
       <div className="flex items-baseline justify-between gap-3">
         <SectionTitle>Quick questions · {askedBy}</SectionTitle>
         <span className="text-[0.65rem] uppercase tracking-wider text-status-yellow">
-          Waiting on answers
+          {sent ? "Resuming build" : "Waiting on answers"}
         </span>
       </div>
       <p className="text-xs text-text-secondary">
@@ -1122,19 +1152,27 @@ function ClarificationCard({ slug, data }: { slug: string; data: any }) {
       </p>
       <div className="space-y-3">
         {questions.map((question: string, index: number) => {
-          const optionEntry = questionOptions.find(
-            (entry: any) => String(entry?.question || "").trim() === question,
-          ) ?? questionOptions[index];
+          const optionEntry = clarificationOptionEntry(
+            question,
+            index,
+            questionOptions,
+          );
           const options = Array.isArray(optionEntry?.options)
             ? optionEntry.options
             : [];
           const placeholder =
             String(optionEntry?.placeholder || "").trim() ||
-            "Type the answer that should guide the build…";
+            (options.length > 0
+              ? "Or type a custom answer…"
+              : "Optional — leave blank to use your original brief.");
+          const missingRequired =
+            missing.includes(question) && !String(answers[index] ?? "").trim();
           return (
             <div
               key={`${index}-${question}`}
-              className="block rounded-lg border border-border bg-bg-2/80 p-3 space-y-2"
+              className={`block rounded-lg border bg-bg-2/80 p-3 space-y-2 ${
+                missingRequired ? "border-status-yellow/60" : "border-border"
+              }`}
             >
               <div className="text-xs font-medium text-text-primary">
                 {index + 1}. {question}
@@ -1181,17 +1219,24 @@ function ClarificationCard({ slug, data }: { slug: string; data: any }) {
       )}
       <div className="flex flex-wrap items-center gap-2">
         <button
+          type="button"
           onClick={() => submit.mutate()}
           disabled={busy || !ready}
           className="rounded bg-accent px-3 py-2 text-xs font-medium text-bg-0 disabled:opacity-60"
         >
-          <i className="fa-solid fa-play mr-1.5" />
-          Send answers and resume
+          <i className={`fa-solid ${sent ? "fa-spinner fa-spin" : "fa-play"} mr-1.5`} />
+          {sent ? "Resuming…" : "Send answers and resume"}
         </button>
         <span className="text-xs text-text-dim">
-          {ready
-            ? "All questions answered."
-            : "Fill in every answer to resume the pipeline."}
+          {sent
+            ? "Answers sent — the pipeline is restarting."
+            : ready
+              ? "Ready to send."
+              : missing.length > 0
+                ? `Pick an answer for: ${missing.slice(0, 2).join("; ")}${
+                    missing.length > 2 ? "…" : ""
+                  }`
+                : "Answer the highlighted questions to continue."}
         </span>
       </div>
     </section>

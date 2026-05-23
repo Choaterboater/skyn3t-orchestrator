@@ -4,9 +4,8 @@ import json
 
 import pytest
 
-from skyn3t.core.model_router import has_stage_policy
 from skyn3t.config.model_routing import ModelRoutingStore
-from skyn3t.core.model_router import describe_stage_route, tier_for_stage
+from skyn3t.core.model_router import describe_stage_route, has_stage_policy, tier_for_stage
 from skyn3t.studio.templates import TEMPLATES
 
 

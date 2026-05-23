@@ -1029,6 +1029,27 @@ async def test_studio_project_clarify_rejects_missing_project(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_studio_project_clarify_rejects_non_waiting_project(monkeypatch):
+    class FakeRunner:
+        def get_project(self, slug):
+            return {
+                "slug": slug,
+                "status": "running",
+                "clarification": {"questions": ["What kind of thing is this?"]},
+            }
+
+    monkeypatch.setattr(web_app, "_get_studio_runner", lambda _app: FakeRunner())
+
+    result = await web_app.studio_project_clarify(
+        "demo",
+        {"answers": ["Web app (works in a browser)"]},
+    )
+
+    assert result.status_code == 409
+    assert json.loads(result.body)["error"] == "project is not waiting for clarification"
+
+
+@pytest.mark.asyncio
 async def test_proposals_list_filters_system_origin(tmp_path, monkeypatch):
     from skyn3t.cortex.proposals import ProposalStore
 

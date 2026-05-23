@@ -1502,7 +1502,7 @@ def _manifest_shadcn_utils(brief: str) -> str:
 
 
 def _manifest_shadcn_index_css(brief: str, *, palette_hexes: Optional[List[str]] = None) -> str:
-    primary = (palette_hexes or [None])[0] or "222.2 47.4% 11.2%"
+    _ = brief, palette_hexes  # palette→CSS var mapping reserved for a follow-up pass
     return (
         "@tailwind base;\n"
         "@tailwind components;\n"

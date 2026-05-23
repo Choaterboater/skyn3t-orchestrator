@@ -3620,8 +3620,37 @@ async def studio_project_clarify(slug: str, payload: dict):
     answers = payload.get("answers") or []
     if not isinstance(answers, list):
         return JSONResponse({"error": "answers must be a list"}, status_code=400)
-    if runner.get_project(slug) is None:
+    project = runner.get_project(slug)
+    if project is None:
         return JSONResponse({"error": "project not found"}, status_code=404)
+    status = str(project.get("status") or "").strip().lower()
+    if status != "awaiting_clarification":
+        return JSONResponse(
+            {
+                "error": "project is not waiting for clarification",
+                "status": project.get("status"),
+            },
+            status_code=409,
+        )
+    clarification = project.get("clarification") or {}
+    questions = clarification.get("questions") or []
+    if questions:
+        normalized_answers = [str(a).strip() for a in answers]
+        if len(normalized_answers) < len(questions):
+            normalized_answers.extend([""] * (len(questions) - len(normalized_answers)))
+        if len(normalized_answers) > len(questions):
+            normalized_answers = normalized_answers[: len(questions)]
+        if any(not answer for answer in normalized_answers):
+            return JSONResponse(
+                {
+                    "error": f"expected {len(questions)} non-empty answers",
+                    "question_count": len(questions),
+                },
+                status_code=400,
+            )
+        answers = normalized_answers
+    elif not answers:
+        return JSONResponse({"error": "answers required"}, status_code=400)
     try:
         # Run async in background so the request returns fast
         task = asyncio.create_task(runner.resume(slug, [str(a) for a in answers]))
