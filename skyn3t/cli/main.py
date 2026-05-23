@@ -6,7 +6,10 @@ import asyncio
 import json
 import os
 import shlex
+import shutil
+import sys
 import time as time_mod
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -20,6 +23,7 @@ from rich.table import Table
 
 from skyn3t.config.settings import get_settings
 from skyn3t.studio.mission_setup import mission_setup_labels, normalize_mission_setup
+from skyn3t.studio.penpot_handoff import build_penpot_package
 from skyn3t.studio.repo_target import normalize_repo_target, resolve_repo_target
 
 API_BASE = os.environ.get("SKYN3T_API_URL", "http://localhost:6660")
@@ -32,11 +36,33 @@ app = typer.Typer(
     no_args_is_help=False,
 )
 
+_LOCAL_WIZARD_BACKENDS: List[Dict[str, str]] = [
+    {
+        "backend": "copilot_cli",
+        "label": "Copilot CLI",
+        "command": "copilot",
+        "summary": "Best all-around local default; good for chat and coding.",
+    },
+    {
+        "backend": "claude_cli",
+        "label": "Claude CLI",
+        "command": "claude",
+        "summary": "Best local reasoning/review choice when you want one strong backend.",
+    },
+    {
+        "backend": "kimi_cli",
+        "label": "Kimi CLI",
+        "command": "kimi",
+        "summary": "Cheap local-first option for lightweight chat and fan-out work.",
+    },
+]
+
 
 def _print_getting_started() -> None:
     """Show a compact first-run path instead of dropping into the REPL."""
     quickstart = Table(show_header=False, box=box.SIMPLE, pad_edge=False)
-    quickstart.add_row("[bold cyan]skyn3t init[/bold cyan]", "Initialize data directories and the database")
+    quickstart.add_row("[bold cyan]skyn3t[/bold cyan]", "Open the interactive chat console when the server is already running")
+    quickstart.add_row("[bold cyan]skyn3t init[/bold cyan]", "Initialize data + launch the local-backend setup wizard")
     quickstart.add_row("[bold cyan]skyn3t start[/bold cyan]", "Start the API and dashboard on localhost:6660")
     quickstart.add_row("[bold cyan]skyn3t status[/bold cyan]", "Check whether the system is up")
     quickstart.add_row("[bold cyan]skyn3t project \"build a habit tracker\"[/bold cyan]", "Start a Studio run from one brief")
@@ -54,10 +80,31 @@ def _print_getting_started() -> None:
     )
 
 
+def _interactive_cli_ready() -> bool:
+    try:
+        return bool(sys.stdin.isatty()) and bool(console.is_terminal)
+    except Exception:
+        return False
+
+
+def _server_is_reachable() -> bool:
+    try:
+        with _client() as client:
+            resp = client.get("/api/status")
+            return resp.status_code < 500
+    except Exception:
+        return False
+
+
 @app.callback(invoke_without_command=True)
 def _default(ctx: typer.Context) -> None:
     """Show a guided entry screen when invoked with no subcommand."""
     if ctx.invoked_subcommand is None:
+        if _interactive_cli_ready() and _server_is_reachable():
+            from skyn3t.cli.repl import run as run_repl
+
+            run_repl()
+            return
         _print_getting_started()
 
 
@@ -78,7 +125,7 @@ def project(
         help="Mission audience: auto, general, builders, team, leaders, investors",
     ),
     autonomy: str = typer.Option(
-        "move_fast",
+        "balanced",
         "--autonomy",
         help="Mission mode: balanced, confirm_first, move_fast",
     ),
@@ -92,6 +139,11 @@ def project(
         "--focus-file",
         help="Optional repo-relative file path to focus code changes on",
     ),
+    watch: bool = typer.Option(
+        True,
+        "--watch/--no-watch",
+        help="Stay attached and stream the project build in the terminal",
+    ),
 ) -> None:
     """🚀 Start a Studio project from one brief."""
     audience_map = {
@@ -103,7 +155,7 @@ def project(
         "investors": "investors",
     }
     audience = str(audience or "auto").strip().lower()
-    autonomy = str(autonomy or "move_fast").strip().lower()
+    autonomy = str(autonomy or "balanced").strip().lower()
     allowed_autonomy = {"balanced", "confirm_first", "move_fast"}
     if audience not in audience_map:
         _error("Unknown audience. Use one of: auto, general, builders, team, leaders, investors.")
@@ -164,8 +216,16 @@ def project(
         f"• Repo: {repo_target['local_path'] or 'Current SkyN3t workspace'}\n"
         + (f"• Focus file: {repo_target['focus_file']}\n" if repo_target["focus_file"] else "")
         + "\n"
-        "Watch it in the dashboard or use [bold]skyn3t repl[/bold] to keep chatting."
+        "Use [bold]skyn3t[/bold] or [bold]skyn3t repl[/bold] for interactive chat while builds run."
     )
+    if watch and _interactive_cli_ready():
+        try:
+            _watch_studio_project(slug)
+        except KeyboardInterrupt:
+            console.print(
+                "[yellow]Detached from live build watch.[/yellow] "
+                "[dim]The project is still running in the background.[/dim]"
+            )
 
 agent_app = typer.Typer(help="Agent management commands", no_args_is_help=True)
 task_app = typer.Typer(help="Task management commands", no_args_is_help=True)
@@ -215,6 +275,257 @@ def _server_unavailable() -> None:
         "Could not connect to SkyN3t server at [bold]localhost:6660[/bold].\n"
         "Is the server running? Try: [bold]skyn3t start[/bold]"
     )
+
+
+def _env_file_path() -> Path:
+    return Path(".env").resolve()
+
+
+def _upsert_env_setting(path: Path, key: str, value: str) -> None:
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    out: List[str] = []
+    replaced = False
+    for line in lines:
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            out.append(line)
+            continue
+        existing_key, _existing_value = line.split("=", 1)
+        if existing_key.strip() != key:
+            out.append(line)
+            continue
+        out.append(f"{key}={value}")
+        replaced = True
+    if not replaced:
+        if out and out[-1] != "":
+            out.append("")
+        out.append(f"{key}={value}")
+    text = "\n".join(out).rstrip("\n") + "\n"
+    path.write_text(text, encoding="utf-8")
+
+
+def _detect_local_wizard_backends() -> List[Dict[str, str]]:
+    available: List[Dict[str, str]] = []
+    for entry in _LOCAL_WIZARD_BACKENDS:
+        command_path = shutil.which(entry["command"])
+        if command_path:
+            available.append({**entry, "path": command_path})
+    return available
+
+
+def _wizard_stage_policies(backend: str) -> Dict[str, str]:
+    from skyn3t.core.model_router import list_stage_routes
+
+    stages = [
+        str(item.get("stage") or "").strip().lower()
+        for item in list_stage_routes()
+        if str(item.get("stage") or "").strip()
+    ]
+    if backend == "copilot_cli":
+        return {
+            stage: ("ui" if stage in {"code", "code_agent", "code_improver"} else "balanced")
+            for stage in stages
+        }
+    if backend == "claude_cli":
+        return {stage: "strong" for stage in stages}
+    if backend == "kimi_cli":
+        return {stage: "cheap" for stage in stages}
+    return {}
+
+
+def _apply_install_wizard_choice(
+    backend: str,
+    *,
+    apply_routing_profile: bool,
+    env_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    from skyn3t.config.model_routing import get_model_routing_store
+
+    target_env = env_path or _env_file_path()
+    _upsert_env_setting(target_env, "SKYN3T_LLM_BACKEND", backend)
+
+    applied_policies: Dict[str, str] = {}
+    if apply_routing_profile:
+        applied_policies = _wizard_stage_policies(backend)
+        if applied_policies:
+            get_model_routing_store().set_many(applied_policies, applied_via="manual")
+
+    return {
+        "backend": backend,
+        "env_path": str(target_env),
+        "routing_applied": bool(applied_policies),
+        "routing_stage_count": len(applied_policies),
+    }
+
+
+def _run_install_wizard() -> Optional[str]:
+    available = _detect_local_wizard_backends()
+    if not available:
+        console.print(
+            "[yellow]No local CLI backends detected.[/yellow] "
+            "[dim]Install Copilot CLI, Claude CLI, or Kimi CLI and re-run "
+            "[bold]skyn3t init --wizard[/bold] if you want guided setup.[/dim]"
+        )
+        return None
+
+    table = Table(title="Local backend setup", box=box.SIMPLE, header_style="bold cyan")
+    table.add_column("#", justify="right", style="cyan")
+    table.add_column("Backend", style="white")
+    table.add_column("Command", style="dim")
+    table.add_column("Why choose it", style="white")
+    for index, entry in enumerate(available, start=1):
+        table.add_row(
+            str(index),
+            entry["label"],
+            entry["command"],
+            entry["summary"],
+        )
+    console.print(table)
+    console.print(
+        "[dim]This writes your fallback backend to .env and can also apply a "
+        "local-only routing profile. You can still change routing later from env or the UI.[/dim]"
+    )
+    choice = typer.prompt(
+        "Choose your default local backend",
+        default="1",
+    ).strip()
+    try:
+        selected = available[int(choice) - 1]
+    except (ValueError, IndexError):
+        raise typer.BadParameter("Pick one of the numbered local backend options.")
+
+    apply_profile = typer.confirm(
+        "Apply a local-only routing profile now?",
+        default=True,
+    )
+    result = _apply_install_wizard_choice(
+        selected["backend"],
+        apply_routing_profile=apply_profile,
+    )
+    routing_line = (
+        f"routing profile updated for {result['routing_stage_count']} stages"
+        if result["routing_applied"]
+        else "routing profile left unchanged"
+    )
+    return (
+        "Setup wizard saved\n"
+        f"• Backend: {selected['label']} ({selected['backend']})\n"
+        f"• Env: {result['env_path']}\n"
+        f"• Routing: {routing_line}"
+    )
+
+
+def _local_penpot_package(slug: str) -> Optional[bytes]:
+    project_dir = Path(get_settings().projects_dir).expanduser().resolve() / slug
+    if not project_dir.is_dir():
+        return None
+    return build_penpot_package(project_dir)
+
+
+def _studio_history_label(event_name: str) -> str:
+    labels = {
+        "PROJECT_QUEUED": "Queued",
+        "PROJECT_STARTED": "Started",
+        "PROJECT_STAGE_STARTED": "Stage started",
+        "PROJECT_STAGE_COMPLETED": "Stage completed",
+        "PROJECT_STAGE_FAILED": "Stage failed",
+        "PROJECT_AWAITING_CLARIFICATION": "Waiting for clarification",
+        "PROJECT_RESUMED": "Resumed",
+        "PROJECT_COMPLETED": "Project finished",
+        "PROJECT_FAILED": "Runner failed",
+        "PROJECT_REAPED": "Recovered",
+    }
+    return labels.get(str(event_name or "").upper(), str(event_name or "update").replace("_", " ").title())
+
+
+def _watch_studio_project(slug: str) -> None:
+    console.print(
+        Panel.fit(
+            f"[bold cyan]Live build watch[/bold cyan]\n"
+            f"Project: [bold]{slug}[/bold]\n"
+            "Press [bold]Ctrl-C[/bold] to stop watching without stopping the build.",
+            border_style="cyan",
+        )
+    )
+    seen_history = 0
+    seen_clarification: Optional[tuple[str, ...]] = None
+    terminal_statuses = {"done", "needs_fixes", "failed"}
+    try:
+        with _client() as client:
+            while True:
+                resp = client.get(f"/api/studio/projects/{slug}")
+                resp.raise_for_status()
+                project = resp.json()
+                history = project.get("history") or []
+                if not isinstance(history, list):
+                    history = []
+                for item in history[seen_history:]:
+                    event_name = str(item.get("event") or "")
+                    label = _studio_history_label(event_name)
+                    stage = str(item.get("stage") or "").strip()
+                    message = str(item.get("message") or "").strip()
+                    line = f"[cyan]{label}[/cyan]"
+                    if stage:
+                        line += f" · [bold]{stage}[/bold]"
+                    if message:
+                        line += f" · {message}"
+                    console.print(line)
+                seen_history = len(history)
+
+                status = str(project.get("status") or "").strip().lower()
+                if status == "awaiting_clarification":
+                    clarification = project.get("clarification") or {}
+                    questions = tuple(
+                        str(question).strip()
+                        for question in (clarification.get("questions") or [])
+                        if str(question).strip()
+                    )
+                    if questions and questions != seen_clarification:
+                        console.print(
+                            Panel(
+                                "\n".join(
+                                    f"{index}. {question}" for index, question in enumerate(questions, start=1)
+                                ),
+                                title="[bold yellow]Clarification needed[/bold yellow]",
+                                border_style="yellow",
+                            )
+                        )
+                        answers = [
+                            typer.prompt(f"{index}. {question}")
+                            for index, question in enumerate(questions, start=1)
+                        ]
+                        clarify_resp = client.post(
+                            f"/api/studio/projects/{slug}/clarify",
+                            json={"answers": answers},
+                        )
+                        clarify_resp.raise_for_status()
+                        data = clarify_resp.json()
+                        if not data.get("ok"):
+                            raise typer.Exit(1)
+                        console.print("[green]Clarifications sent. Resuming build…[/green]")
+                        seen_clarification = questions
+
+                if status in terminal_statuses:
+                    title = "Project finished" if status != "failed" else "Project failed"
+                    border = "green" if status != "failed" else "red"
+                    next_action = str(project.get("next_action") or "").strip()
+                    summary = next_action or ("Build completed." if status != "failed" else "Build failed.")
+                    console.print(
+                        Panel.fit(
+                            f"[bold]{slug}[/bold]\n{summary}",
+                            title=f"[bold {border}]{title}[/bold {border}]",
+                            border_style=border,
+                        )
+                    )
+                    return
+
+                time_mod.sleep(1.0)
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
 
 
 def _extract_text(out: Any) -> str:
@@ -499,7 +810,13 @@ def start(
 
 
 @app.command()
-def init() -> None:
+def init(
+    wizard: bool = typer.Option(
+        True,
+        "--wizard/--no-wizard",
+        help="Run the local-backend setup wizard in interactive terminals",
+    ),
+) -> None:
     """🔧 Initialize the SkyN3t system (directories + database)."""
     from skyn3t.core.models import init_db
 
@@ -518,12 +835,17 @@ def init() -> None:
         try:
             asyncio.run(_init())
             progress.update(t, completed=True)
-            _success(
+            message = (
                 "System initialized successfully!\n"
                 f"• Data directory: [cyan]{get_settings().data_dir}[/cyan]\n"
                 f"• Logs directory: [cyan]{get_settings().logs_dir}[/cyan]\n"
                 f"• Vector DB: [cyan]{get_settings().vector_db_path}[/cyan]"
             )
+            if wizard and _interactive_cli_ready():
+                wizard_summary = _run_install_wizard()
+                if wizard_summary:
+                    message += f"\n\n{wizard_summary}"
+            _success(message)
         except Exception as exc:
             progress.update(t, completed=True)
             _error(f"Initialization failed: {exc}")
@@ -2222,6 +2544,48 @@ def export_trajectories(
         fh.write(resp.content)
     label = "trajectory bundle" if include_evaluations else "trajectories"
     console.print(f"[green]✅ Exported {label} to {output}[/green]")
+
+
+@export_app.command("penpot")
+def export_penpot(
+    slug: str = typer.Argument(..., help="Studio project slug"),
+    output: str = typer.Option("", "--output", "-o", help="Output zip path"),
+) -> None:
+    """📦 Export a Penpot-oriented design handoff package for a Studio project."""
+    out_path = output or f"{slug}-penpot-handoff.zip"
+    package_bytes: Optional[bytes] = None
+    used_local_fallback = False
+    try:
+        with _client() as client:
+            resp = client.get(f"/api/studio/projects/{slug}/design-handoff/penpot/package")
+            resp.raise_for_status()
+            package_bytes = resp.content
+    except httpx.ConnectError:
+        package_bytes = _local_penpot_package(slug)
+        used_local_fallback = package_bytes is not None
+        if package_bytes is None:
+            _server_unavailable()
+            raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            package_bytes = _local_penpot_package(slug)
+            used_local_fallback = package_bytes is not None
+            if package_bytes is None:
+                _error(f"Server error: {exc.response.text}")
+                raise typer.Exit(1)
+        else:
+            _error(f"Server error: {exc.response.text}")
+            raise typer.Exit(1)
+
+    with open(out_path, "wb") as fh:
+        fh.write(package_bytes or b"")
+    if used_local_fallback:
+        console.print(
+            f"[green]✅ Exported Penpot handoff package to {out_path}[/green]\n"
+            "[dim]Used the local project artifacts because the API route was unavailable.[/dim]"
+        )
+    else:
+        console.print(f"[green]✅ Exported Penpot handoff package to {out_path}[/green]")
 
 
 # ---------------------------------------------------------------------------

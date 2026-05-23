@@ -138,6 +138,26 @@ _CODE_ROUTING_CALLERS = {
 }
 
 
+def _settings_fallbacks() -> dict[str, Optional[str]]:
+    try:
+        from skyn3t.config.settings import get_settings
+
+        settings = get_settings()
+        return {
+            "llm_backend": getattr(settings, "llm_backend", None),
+            "llm_model": getattr(settings, "llm_model", None),
+            "anthropic_api_key": getattr(settings, "anthropic_api_key", None),
+            "openrouter_api_key": getattr(settings, "openrouter_api_key", None),
+        }
+    except Exception:
+        return {
+            "llm_backend": None,
+            "llm_model": None,
+            "anthropic_api_key": None,
+            "openrouter_api_key": None,
+        }
+
+
 class LLMClient:
     """Unified LLM facade with graceful fallbacks.
 
@@ -168,14 +188,32 @@ class LLMClient:
                  skip_backends: Optional[List[str]] = None,
                  backend_is_policy: bool = False,
                  routing_hint: Optional[str] = None):
-        self.default_model = default_model or os.environ.get("SKYN3T_LLM_MODEL")
-        self._backend_name = (backend or os.environ.get("SKYN3T_LLM_BACKEND") or "auto").lower()
+        settings_fallbacks = _settings_fallbacks()
+        self.default_model = (
+            default_model
+            or os.environ.get("SKYN3T_LLM_MODEL")
+            or settings_fallbacks.get("llm_model")
+        )
+        self._backend_name = (
+            backend
+            or os.environ.get("SKYN3T_LLM_BACKEND")
+            or settings_fallbacks.get("llm_backend")
+            or "auto"
+        ).lower()
         # Cross-model debate: callers can list backends to skip (e.g. the
         # retry path passes the backend the prior attempt used). The auto
         # chain then naturally falls through to a different model.
         self._skip_backends: set = set(skip_backends or [])
-        self._anthropic_key = anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY")
-        self._openrouter_key = openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")
+        self._anthropic_key = (
+            anthropic_api_key
+            or os.environ.get("ANTHROPIC_API_KEY")
+            or settings_fallbacks.get("anthropic_api_key")
+        )
+        self._openrouter_key = (
+            openrouter_api_key
+            or os.environ.get("OPENROUTER_API_KEY")
+            or settings_fallbacks.get("openrouter_api_key")
+        )
         self._impl: Optional[Any] = None  # lazy
         # Seed module fallback if this is the first explicit bus we've seen.
         _try_register_default(event_bus)

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import skyn3t.adapters.llm_client as llm_client_module
 from skyn3t.adapters.llm_client import (
     LLMClient,
     _append_sandbox_artifacts,
@@ -12,6 +13,26 @@ from skyn3t.adapters.llm_client import (
     _drop_cross_provider_model_name,
 )
 from skyn3t.core.events import EventBus, EventType
+
+
+def test_llm_client_reads_defaults_from_settings(monkeypatch):
+    monkeypatch.setattr(
+        llm_client_module,
+        "_settings_fallbacks",
+        lambda: {
+            "llm_backend": "openrouter",
+            "llm_model": "openai/gpt-4.1",
+            "anthropic_api_key": "anthropic-key",
+            "openrouter_api_key": "router-key",
+        },
+    )
+
+    client = LLMClient()
+
+    assert client.backend == "openrouter"
+    assert client.default_model == "openai/gpt-4.1"
+    assert client._anthropic_key == "anthropic-key"
+    assert client._openrouter_key == "router-key"
 
 
 @pytest.mark.asyncio

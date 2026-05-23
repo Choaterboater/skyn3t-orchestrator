@@ -1,5 +1,7 @@
 """Tests for the top-level SkyN3t CLI entry flow."""
 
+import io
+import zipfile
 from types import SimpleNamespace
 
 import httpx
@@ -7,7 +9,10 @@ from typer.testing import CliRunner
 
 import skyn3t.cli.doctor as cli_doctor
 import skyn3t.cli.main as cli_main
+import skyn3t.config.model_routing as routing_config
+import skyn3t.core.models as core_models
 from skyn3t.cli.main import app
+from skyn3t.config.model_routing import ModelRoutingStore
 
 runner = CliRunner()
 
@@ -18,6 +23,64 @@ def test_cli_no_args_shows_getting_started_panel():
     assert result.exit_code == 0
     assert "SkyN3t Getting Started" in result.stdout
     assert "skyn3t repl" in result.stdout
+
+
+def test_cli_no_args_launches_repl_when_interactive_server_is_up(monkeypatch):
+    called = {"repl": False}
+
+    monkeypatch.setattr(cli_main, "_interactive_cli_ready", lambda: True)
+    monkeypatch.setattr(cli_main, "_server_is_reachable", lambda: True)
+
+    import skyn3t.cli.repl as cli_repl
+
+    monkeypatch.setattr(cli_repl, "run", lambda: called.__setitem__("repl", True))
+
+    result = runner.invoke(app, [])
+
+    assert result.exit_code == 0
+    assert called["repl"] is True
+
+
+def test_apply_install_wizard_choice_writes_env_and_routing(tmp_path, monkeypatch):
+    env_path = tmp_path / ".env"
+    store = ModelRoutingStore(tmp_path / "model_routing.json")
+    monkeypatch.setattr(routing_config, "_store", store)
+
+    result = cli_main._apply_install_wizard_choice(
+        "copilot_cli",
+        apply_routing_profile=True,
+        env_path=env_path,
+    )
+
+    assert "SKYN3T_LLM_BACKEND=copilot_cli" in env_path.read_text(encoding="utf-8")
+    assert result["routing_applied"] is True
+    assert store.entries()["code"]["tier"] == "ui"
+    assert store.entries()["reviewer"]["tier"] == "balanced"
+
+
+def test_cli_init_runs_setup_wizard_when_interactive(monkeypatch, tmp_path):
+    called = {"wizard": False}
+
+    async def _fake_init_db():
+        return None
+
+    fake_settings = SimpleNamespace(
+        data_dir=tmp_path / "data",
+        logs_dir=tmp_path / "logs",
+        vector_db_path=str(tmp_path / "vectors"),
+        ensure_directories=lambda: None,
+    )
+
+    monkeypatch.setattr(cli_main, "_interactive_cli_ready", lambda: True)
+    monkeypatch.setattr(cli_main, "_run_install_wizard", lambda: called.__setitem__("wizard", True) or "Setup wizard saved")
+    monkeypatch.setattr(cli_main, "get_settings", lambda: fake_settings)
+    monkeypatch.setattr(core_models, "init_db", _fake_init_db)
+
+    result = runner.invoke(app, ["init"])
+
+    assert result.exit_code == 0
+    assert called["wizard"] is True
+    assert "Setup wizard saved" in result.stdout
 
 
 def test_cli_project_starts_studio_with_auto_template(monkeypatch):
@@ -52,13 +115,44 @@ def test_cli_project_starts_studio_with_auto_template(monkeypatch):
     assert calls["json"] == {
         "template": "auto",
         "brief": "build a habit tracker",
-        "mission_setup": {"audience": "", "autonomy": "move_fast"},
+        "mission_setup": {"audience": "", "autonomy": "balanced"},
         "repo_target": {"local_path": "", "focus_file": ""},
     }
     assert "demo-123" in result.stdout
     assert "Next: Queued" in result.stdout
-    assert "Mode: Move fast" in result.stdout
+    assert "Mode: Balanced" in result.stdout
     assert "Repo: Current SkyN3t workspace" in result.stdout
+
+
+def test_cli_project_starts_live_watch_in_interactive_terminal(monkeypatch):
+    watched = {"slug": None}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, path, json):
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {
+                    "accepted": True,
+                    "slug": "demo-live",
+                    "title": "Auto-planned",
+                    "next_action": "Queued — waiting for a worker slot.",
+                },
+            )
+
+    monkeypatch.setattr(cli_main, "_client", lambda: FakeClient())
+    monkeypatch.setattr(cli_main, "_interactive_cli_ready", lambda: True)
+    monkeypatch.setattr(cli_main, "_watch_studio_project", lambda slug: watched.__setitem__("slug", slug))
+
+    result = runner.invoke(app, ["project", "build a live dashboard"])
+
+    assert result.exit_code == 0
+    assert watched["slug"] == "demo-live"
 
 
 def test_cli_project_sends_custom_mission_setup(monkeypatch):
@@ -503,6 +597,80 @@ def test_cli_export_trajectories_can_include_evaluations(monkeypatch, tmp_path):
     }
     assert out_path.read_text() == '{"task_id":"t-1"}\n{"kind":"evaluation_asset"}\n'
     assert "trajectory bundle" in result.stdout
+
+
+def test_cli_export_penpot_package(monkeypatch, tmp_path):
+    calls = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, path, params=None):
+            calls["path"] = path
+            calls["params"] = params
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                content=b"PK\x03\x04fakezip",
+            )
+
+    monkeypatch.setattr(cli_main, "_client", lambda: FakeClient())
+    out_path = tmp_path / "demo-penpot.zip"
+
+    result = runner.invoke(
+        app,
+        ["export", "penpot", "demo", "--output", str(out_path)],
+    )
+
+    assert result.exit_code == 0
+    assert calls == {
+        "path": "/api/studio/projects/demo/design-handoff/penpot/package",
+        "params": None,
+    }
+    assert out_path.read_bytes() == b"PK\x03\x04fakezip"
+    assert "Penpot handoff package" in result.stdout
+
+
+def test_cli_export_penpot_falls_back_to_local_project(monkeypatch, tmp_path):
+    project_dir = tmp_path / "demo"
+    project_dir.mkdir(parents=True)
+    (project_dir / "brand.md").write_text("# Brand\n", encoding="utf-8")
+    (project_dir / "tokens.json").write_text('{"font":{}}', encoding="utf-8")
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, path, params=None):
+            request = httpx.Request("GET", f"http://localhost:6660{path}")
+            response = httpx.Response(404, request=request, text="Not Found")
+            raise httpx.HTTPStatusError("Not Found", request=request, response=response)
+
+    monkeypatch.setattr(cli_main, "_client", lambda: FakeClient())
+    monkeypatch.setattr(
+        cli_main,
+        "get_settings",
+        lambda: SimpleNamespace(projects_dir=tmp_path),
+    )
+    out_path = tmp_path / "demo-penpot.zip"
+
+    result = runner.invoke(
+        app,
+        ["export", "penpot", "demo", "--output", str(out_path)],
+    )
+
+    assert result.exit_code == 0
+    with zipfile.ZipFile(io.BytesIO(out_path.read_bytes())) as archive:
+        names = archive.namelist()
+    assert "penpot_manifest.json" in names
+    assert "brand.md" in names
+    assert "local project artifacts" in result.stdout
 
 
 def test_cli_skills_candidates_renders_memory_docs(monkeypatch):

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, ProjectRow, Template } from "../api/client";
+import { api, ProjectDetail, ProjectRow, Template } from "../api/client";
 
 // Studio (build) page — the biggest single view in the old dashboard.
 // Splits into three regions:
@@ -171,6 +171,8 @@ function ProjectList({
       <ul>
         {sorted.map((p) => {
           const active = p.slug === selected;
+          const artifactCount = artifactPaths(p.artifacts).length;
+          const designCount = designArtifactPaths(artifactPaths(p.artifacts)).length;
           return (
             <li key={p.slug}>
               <button
@@ -210,6 +212,16 @@ function ProjectList({
                     {p.brief}
                   </div>
                 )}
+                <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[0.65rem]">
+                  <span className="rounded-full border border-border bg-bg-3 px-2 py-0.5 text-text-dim">
+                    {artifactCount} artifact{artifactCount === 1 ? "" : "s"}
+                  </span>
+                  {designCount > 0 && (
+                    <span className="rounded-full border border-accent-line bg-accent-soft px-2 py-0.5 text-accent">
+                      Penpot ready · {designCount}
+                    </span>
+                  )}
+                </div>
               </button>
             </li>
           );
@@ -251,76 +263,190 @@ function ProjectDetailView({
     return <p className="text-text-secondary">Project not found.</p>;
   }
 
+  const artifacts = artifactPaths(data.artifacts);
+  const designArtifacts = designArtifactPaths(artifacts);
+  const preferredArtifact = preferredArtifactPath(artifacts);
+  const stageSummary = summarizeStages(data.stages);
+  const quality = data.quality_summary;
+  const verification = data.build_verification;
+  const penpotReady = designArtifacts.length > 0;
+
   return (
-    <div className="space-y-5 min-w-0">
-      <div className="flex items-baseline justify-between gap-3">
-        <div className="min-w-0">
-          <h2 className="text-2xl font-semibold truncate" title={data.title || slug}>
-            {data.title || slug}
-          </h2>
-          <div className="text-xs text-text-dim font-mono mt-0.5 truncate">
-            {data.template ?? "—"} · {slug}
+    <div className="space-y-6 min-w-0">
+      <section className="rounded-2xl border border-accent-line/60 bg-[radial-gradient(circle_at_top_right,rgba(15,240,252,0.12),transparent_32%),linear-gradient(180deg,rgba(18,25,35,0.96),rgba(6,10,16,0.98))] p-5 shadow-[0_18px_48px_rgba(0,0,0,0.28)]">
+        <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <StatusPill status={data.status} />
+              <span className="rounded-full border border-border bg-bg-3 px-2 py-0.5 text-[0.65rem] uppercase tracking-wider text-text-dim">
+                {data.template ?? "template unknown"}
+              </span>
+              <span className="rounded-full border border-border bg-bg-3 px-2 py-0.5 text-[0.65rem] uppercase tracking-wider text-text-dim">
+                {stageSummary.done}/{stageSummary.total || 0} stages
+              </span>
+              <span className="rounded-full border border-border bg-bg-3 px-2 py-0.5 text-[0.65rem] uppercase tracking-wider text-text-dim">
+                {artifacts.length} artifact{artifacts.length === 1 ? "" : "s"}
+              </span>
+              {penpotReady && (
+                <span className="rounded-full border border-accent-line bg-accent-soft px-2 py-0.5 text-[0.65rem] uppercase tracking-wider text-accent">
+                  Penpot ready · {designArtifacts.length}
+                </span>
+              )}
+            </div>
+            <h2
+              className="mt-3 text-3xl font-semibold tracking-tight text-text-primary"
+              title={data.title || slug}
+            >
+              {data.title || slug}
+            </h2>
+            <div className="text-xs text-text-dim font-mono mt-1 truncate">
+              {slug}
+            </div>
+            <p className="mt-3 max-w-3xl text-sm leading-6 text-text-secondary">
+              {data.next_action ||
+                "Studio is holding the latest project state here so you can inspect, package, and continue the mission."}
+            </p>
+          </div>
+          <div className="flex shrink-0 flex-wrap items-center gap-2">
+            {preferredArtifact && (
+              <a
+                href={artifactOpenUrl(slug, preferredArtifact)}
+                target="_blank"
+                rel="noreferrer"
+                className="rounded bg-accent px-3 py-2 text-xs font-medium text-bg-0"
+              >
+                <i className="fa-solid fa-play mr-1.5" />
+                {primaryArtifactLabel(preferredArtifact)}
+              </a>
+            )}
+            <a
+              href={projectZipUrl(slug)}
+              className="rounded border border-border bg-bg-3 px-3 py-2 text-xs font-medium text-text-primary hover:border-border-strong"
+            >
+              <i className="fa-solid fa-download mr-1.5" />
+              Download zip
+            </a>
+            <button
+              onClick={() => {
+                if (
+                  window.confirm(
+                    `Delete project ${slug}? This removes data/projects/${slug}.`,
+                  )
+                ) {
+                  del.mutate();
+                }
+              }}
+              disabled={del.isPending}
+              className="rounded border border-status-red/40 px-3 py-2 text-xs font-medium text-status-red hover:bg-status-red/10 disabled:opacity-60"
+            >
+              <i className="fa-solid fa-trash mr-1.5" />
+              Delete
+            </button>
+            {penpotReady && (
+              <span className="rounded-full border border-accent-line bg-accent-soft px-2 py-1 text-[0.65rem] uppercase tracking-wider text-accent">
+                Optional Penpot export
+              </span>
+            )}
           </div>
         </div>
-        <div className="flex items-center gap-2 shrink-0">
-          <StatusPill status={data.status} />
-          <button
-            onClick={() => {
-              if (
-                window.confirm(
-                  `Delete project ${slug}? This removes data/projects/${slug}.`,
-                )
-              ) {
-                del.mutate();
-              }
-            }}
-            disabled={del.isPending}
-            className="text-xs px-2 py-1 rounded border border-status-red/40 text-status-red hover:bg-status-red/10 disabled:opacity-60"
-          >
-            <i className="fa-solid fa-trash mr-1" />
-            Delete
-          </button>
+
+        <div className="mt-5 grid gap-4 xl:grid-cols-[minmax(0,1.4fr)_minmax(320px,0.9fr)]">
+          <div className="rounded-xl border border-border bg-bg-2/80 p-4">
+            <SectionTitle>Mission pulse</SectionTitle>
+            <div className="space-y-3">
+              <div>
+                <div className="text-[0.7rem] uppercase tracking-wider text-text-dim">
+                  Current focus
+                </div>
+                <p className="mt-1 text-sm leading-6 text-text-primary">
+                  {data.next_action || "Waiting for the next mission update."}
+                </p>
+              </div>
+              {data.brief && (
+                <div>
+                  <div className="text-[0.7rem] uppercase tracking-wider text-text-dim">
+                    Mission brief
+                  </div>
+                  <p className="mt-1 text-sm leading-6 text-text-secondary whitespace-pre-wrap break-words">
+                    {data.brief}
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-border bg-bg-2/80 p-4">
+            <SectionTitle>Open result</SectionTitle>
+            <div className="space-y-3 text-sm text-text-secondary">
+              <p>
+                Jump straight into the main output for this build, or download
+                the full project bundle if you want to inspect everything.
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {preferredArtifact ? (
+                  <a
+                    href={artifactOpenUrl(slug, preferredArtifact)}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="rounded border border-border bg-bg-3 px-3 py-2 text-xs font-medium text-text-primary hover:border-border-strong"
+                  >
+                    <i className="fa-solid fa-eye mr-1.5" />
+                    {primaryArtifactLabel(preferredArtifact)}
+                  </a>
+                ) : null}
+                <a
+                  href={projectZipUrl(slug)}
+                  className="rounded border border-border bg-bg-3 px-3 py-2 text-xs font-medium text-text-primary hover:border-border-strong"
+                >
+                  <i className="fa-solid fa-file-zipper mr-1.5" />
+                  Download project zip
+                </a>
+              </div>
+            </div>
+          </div>
         </div>
-      </div>
+      </section>
 
-      {data.brief && (
-        <section>
-          <SectionTitle>Brief</SectionTitle>
-          <p className="text-sm text-text-primary bg-bg-2 border border-border rounded-lg p-3 whitespace-pre-wrap break-words">
-            {data.brief}
-          </p>
-        </section>
-      )}
-
-      {data.next_action && (
-        <section>
-          <SectionTitle>Next action</SectionTitle>
-          <p className="text-sm text-text-secondary">{data.next_action}</p>
-        </section>
+      {data.status === "awaiting_clarification" && (
+        <ClarificationCard slug={slug} data={data} />
       )}
 
       {data.status === "awaiting_approval" && (
         <ApprovalCard slug={slug} data={data} />
       )}
 
-      {data.build_verification && (
-        <section>
-          <SectionTitle>Build verification</SectionTitle>
-          <BuildVerificationCard v={data.build_verification} />
-        </section>
-      )}
+      <div className="grid gap-5 xl:grid-cols-2">
+        {penpotReady && (
+          <section>
+            <SectionTitle>Design exports (optional)</SectionTitle>
+            <DesignHandoffCard slug={slug} artifacts={artifacts} />
+          </section>
+        )}
 
-      {data.quality_summary && (
+        {verification && (
+          <section>
+            <SectionTitle>Build verification</SectionTitle>
+            <BuildVerificationCard v={verification} />
+          </section>
+        )}
+
+        {quality && (
+          <section>
+            <SectionTitle>Quality</SectionTitle>
+            <QualityCard q={quality} />
+          </section>
+        )}
+
         <section>
-          <SectionTitle>Quality</SectionTitle>
-          <QualityCard q={data.quality_summary} />
+          <SectionTitle>Artifacts ({artifacts.length})</SectionTitle>
+          <ArtifactList slug={slug} artifacts={artifacts} />
         </section>
-      )}
+      </div>
 
       {Array.isArray(data.stages) && data.stages.length > 0 && (
         <section>
           <SectionTitle>Stages</SectionTitle>
-          <ol className="space-y-2">
+          <ol className="grid gap-3 xl:grid-cols-2">
             {data.stages.map((s: any, i: number) => (
               <StageRow key={i} stage={s} index={i} />
             ))}
@@ -328,33 +454,29 @@ function ProjectDetailView({
         </section>
       )}
 
-      {Array.isArray(data.artifacts) && data.artifacts.length > 0 && (
-        <section>
-          <SectionTitle>Artifacts ({data.artifacts.length})</SectionTitle>
-          <ul className="text-sm font-mono text-text-secondary bg-bg-2 border border-border rounded-lg p-3 space-y-0.5 max-h-64 overflow-y-auto">
-            {data.artifacts.map((path: string) => (
-              <li key={path} className="truncate" title={path}>
-                {path}
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
-
       {Array.isArray(data.history) && data.history.length > 0 && (
         <section>
           <SectionTitle>History</SectionTitle>
-          <ol className="text-xs space-y-1 max-h-64 overflow-y-auto bg-bg-2 border border-border rounded-lg p-3">
+          <ol className="text-xs space-y-2 max-h-72 overflow-y-auto rounded-xl border border-border bg-bg-2 p-3">
             {data.history.map((h: any, i: number) => (
-              <li key={i} className="flex gap-3">
-                <span className="text-text-dim font-mono shrink-0">
-                  {new Date(h.ts * 1000).toLocaleTimeString()}
-                </span>
-                <span className="text-accent font-mono shrink-0">{h.event}</span>
-                {h.message && (
-                  <span className="text-text-secondary truncate" title={h.message}>
-                    {h.message}
+              <li
+                key={i}
+                className="rounded-lg border border-border bg-bg-3/70 px-3 py-2"
+              >
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-text-dim font-mono shrink-0">
+                    {new Date(h.ts * 1000).toLocaleTimeString()}
                   </span>
+                  <span className="text-accent font-mono shrink-0">{h.event}</span>
+                  {h.status && <StatusPill status={h.status} />}
+                </div>
+                {h.message && (
+                  <p
+                    className="mt-1.5 text-text-secondary whitespace-pre-wrap break-words"
+                    title={h.message}
+                  >
+                    {h.message}
+                  </p>
                 )}
               </li>
             ))}
@@ -365,10 +487,238 @@ function ProjectDetailView({
   );
 }
 
+function DesignHandoffCard({
+  slug,
+  artifacts,
+}: {
+  slug: string;
+  artifacts: string[];
+}) {
+  const designArtifacts = designArtifactPaths(artifacts);
+
+  return (
+    <div className="rounded-xl border border-border bg-bg-2 p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <div className="text-sm font-medium text-text-primary">
+            Optional Penpot export
+          </div>
+          <p className="mt-1 text-xs leading-5 text-text-secondary">
+            Use this only if you want to take the generated design assets into
+            Penpot for another design pass.
+          </p>
+        </div>
+        {designArtifacts.length > 0 ? (
+          <span className="rounded-full border border-accent-line bg-accent-soft px-2 py-0.5 text-[0.65rem] uppercase tracking-wider text-accent">
+            Optional · {designArtifacts.length}
+          </span>
+        ) : (
+          <span className="rounded-full border border-border bg-bg-3 px-2 py-0.5 text-[0.65rem] uppercase tracking-wider text-text-dim">
+            Waiting on design assets
+          </span>
+        )}
+      </div>
+
+      {designArtifacts.length > 0 ? (
+        <>
+          <div className="mt-4 flex flex-wrap gap-2">
+            <a
+              href={projectPenpotPackageUrl(slug)}
+              className="rounded bg-accent px-3 py-2 text-xs font-medium text-bg-0"
+            >
+              <i className="fa-solid fa-compass-drafting mr-1.5" />
+              Download handoff
+            </a>
+            <a
+              href={projectPenpotManifestUrl(slug)}
+              target="_blank"
+              rel="noreferrer"
+              className="rounded border border-accent-line bg-accent-soft px-3 py-2 text-xs font-medium text-accent"
+            >
+              <i className="fa-solid fa-file-code mr-1.5" />
+              Open manifest
+            </a>
+          </div>
+          <div className="mt-4 flex flex-wrap gap-2">
+            {designArtifacts.map((path) => (
+              <a
+                key={path}
+                href={artifactOpenUrl(slug, path)}
+                target="_blank"
+                rel="noreferrer"
+                className="rounded-full border border-border bg-bg-3 px-2.5 py-1 text-[0.7rem] font-mono text-text-secondary hover:border-border-strong hover:text-text-primary"
+                title={path}
+              >
+                {path}
+              </a>
+            ))}
+          </div>
+        </>
+      ) : (
+        <p className="mt-4 rounded-lg border border-border bg-bg-3 px-3 py-2 text-xs leading-5 text-text-dim">
+          As soon as this mission writes files like <code>tokens.json</code>,{" "}
+          <code>palette.json</code>, <code>brand.md</code>,{" "}
+          <code>components.md</code>, or <code>logo.svg</code>, the Penpot
+          export buttons will appear here.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function ArtifactList({ slug, artifacts }: { slug: string; artifacts: string[] }) {
+  if (!artifacts.length) {
+    return (
+      <div className="rounded-xl border border-border bg-bg-2 p-4 text-sm text-text-dim">
+        No artifacts yet.
+      </div>
+    );
+  }
+
+  return (
+    <ul className="max-h-80 space-y-2 overflow-y-auto rounded-xl border border-border bg-bg-2 p-3">
+      {artifacts.map((path) => (
+        <li
+          key={path}
+          className="flex items-center justify-between gap-3 rounded-lg border border-border bg-bg-3/70 px-3 py-2"
+        >
+          <div className="min-w-0">
+            <div className="truncate font-mono text-xs text-text-primary" title={path}>
+              {path}
+            </div>
+            <div className="mt-0.5 text-[0.65rem] uppercase tracking-wider text-text-dim">
+              {artifactPreviewMode(path) === "preview" ? "previewable output" : "saved artifact"}
+            </div>
+          </div>
+          <a
+            href={artifactOpenUrl(slug, path)}
+            target="_blank"
+            rel="noreferrer"
+            className="shrink-0 rounded border border-border px-2.5 py-1 text-[0.7rem] font-medium text-text-secondary hover:border-border-strong hover:text-text-primary"
+          >
+            Open
+          </a>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function artifactPaths(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => (typeof item === "string" ? item : ""))
+    .filter(Boolean);
+}
+
+function designArtifactPaths(artifacts: string[]): string[] {
+  const patterns = [
+    /(^|\/)tokens\.(json|css)$/i,
+    /(^|\/)palette\.json$/i,
+    /(^|\/)brand\.md$/i,
+    /(^|\/)components\.md$/i,
+    /(^|\/)logo\.svg$/i,
+    /(^|\/)readme\.md$/i,
+  ];
+  const seen = new Set<string>();
+  const matches: string[] = [];
+
+  for (const pattern of patterns) {
+    for (const path of artifacts) {
+      if (pattern.test(path) && !seen.has(path)) {
+        seen.add(path);
+        matches.push(path);
+      }
+    }
+  }
+
+  for (const path of artifacts) {
+    const name = path.split("/").pop() || path;
+    if (
+      !seen.has(path) &&
+      /(design|token|palette|brand|logo|component)/i.test(name)
+    ) {
+      seen.add(path);
+      matches.push(path);
+    }
+  }
+
+  return matches.slice(0, 8);
+}
+
+function preferredArtifactPath(artifacts: string[]): string {
+  return (
+    artifacts.find((path) => /(^|\/)(readme\.md|spec\.md|plan\.md|index\.html)$/i.test(path)) ??
+    artifacts.find((path) => !/review\.md$/i.test(path)) ??
+    artifacts[0] ??
+    ""
+  );
+}
+
+function primaryArtifactLabel(path: string): string {
+  return artifactPreviewMode(path) === "preview"
+    ? "Open app preview"
+    : "Open key artifact";
+}
+
+function artifactPreviewMode(path: string): "preview" | "file" {
+  const normalized = String(path || "").trim().toLowerCase().split("?")[0];
+  if (/\.(html?|svg|pdf|png|jpe?g|gif|webp|avif)$/i.test(normalized)) {
+    return "preview";
+  }
+  return "file";
+}
+
+function artifactOpenUrl(slug: string, path: string): string {
+  return artifactPreviewMode(path) === "preview"
+    ? projectPreviewUrl(slug, path)
+    : projectFileUrl(slug, path);
+}
+
+function projectZipUrl(slug: string): string {
+  return `/api/studio/projects/${encodeURIComponent(slug)}/zip`;
+}
+
+function projectPenpotPackageUrl(slug: string): string {
+  return `/api/studio/projects/${encodeURIComponent(slug)}/design-handoff/penpot/package`;
+}
+
+function projectPenpotManifestUrl(slug: string): string {
+  return `/api/studio/projects/${encodeURIComponent(slug)}/design-handoff/penpot`;
+}
+
+function projectFileUrl(slug: string, path: string): string {
+  return `/api/studio/projects/${encodeURIComponent(slug)}/file?path=${encodeURIComponent(path)}`;
+}
+
+function projectPreviewUrl(slug: string, path: string): string {
+  const safePath = String(path || "")
+    .split("/")
+    .filter((part) => part && part !== ".")
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+  return `/api/studio/projects/${encodeURIComponent(slug)}/preview/${safePath}`;
+}
+
+function summarizeStages(stages: ProjectDetail["stages"] | undefined): {
+  total: number;
+  done: number;
+} {
+  const stageList = Array.isArray(stages) ? stages : [];
+  return {
+    total: stageList.length,
+    done: stageList.filter((stage) =>
+      ["done", "completed", "passed"].includes(
+        String(stage.status ?? "").toLowerCase(),
+      ),
+    ).length,
+  };
+}
+
 function StageRow({ stage, index }: { stage: any; index: number }) {
   const status = stage.status ?? "pending";
   return (
-    <li className="rounded-lg border border-border bg-bg-2 p-3">
+    <li className="rounded-xl border border-border bg-[linear-gradient(180deg,rgba(22,31,43,0.92),rgba(10,15,22,0.96))] p-3 shadow-[0_10px_28px_rgba(0,0,0,0.16)]">
       <div className="flex items-baseline justify-between gap-3 min-w-0">
         <div className="min-w-0">
           <span className="text-xs font-mono text-text-dim mr-2">
@@ -473,7 +823,8 @@ function NewProjectForm({
     queryKey: ["studio_templates"],
     queryFn: api.templates,
   });
-  const [template, setTemplate] = useState<string>("");
+  const [template, setTemplate] = useState<string>("auto");
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [brief, setBrief] = useState("");
   const [slug, setSlug] = useState("");
   const [missionGoal, setMissionGoal] = useState("");
@@ -487,7 +838,7 @@ function NewProjectForm({
         slug?: string;
         mission_setup?: Record<string, unknown>;
         repo_target?: Record<string, unknown>;
-      } = { template };
+      } = { template: effectiveTemplate };
       if (brief.trim()) payload.brief = brief.trim();
       if (slug.trim()) payload.slug = slug.trim();
       if (missionGoal.trim()) payload.mission_setup = { goal: missionGoal.trim() };
@@ -507,39 +858,55 @@ function NewProjectForm({
 
   function onSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!template) return;
     start.mutate();
   }
 
   const list: Template[] = templates.data?.templates ?? [];
   const selectedTemplate = list.find((t) => t.key === template);
+  const effectiveTemplate = template || "auto";
 
   return (
     <form onSubmit={onSubmit} className="space-y-4 max-w-2xl">
       <SectionTitle>Brief the swarm</SectionTitle>
-      <div>
-        <label className="text-xs uppercase tracking-wider text-text-secondary block mb-1">
-          Template
-        </label>
-        <select
-          value={template}
-          onChange={(e) => setTemplate(e.target.value)}
-          className="w-full bg-bg-2 border border-border rounded px-3 py-2 text-sm outline-none focus:border-accent"
-          required
+      <p className="text-xs text-text-secondary">
+        Describe what you want in plain language. SkyN3t uses the{" "}
+        <span className="font-mono text-accent">auto</span> pipeline and asks
+        simple follow-ups when needed.
+      </p>
+
+      {showAdvanced && (
+        <div>
+          <label className="text-xs uppercase tracking-wider text-text-secondary block mb-1">
+            Template (advanced)
+          </label>
+          <select
+            value={effectiveTemplate}
+            onChange={(e) => setTemplate(e.target.value)}
+            className="w-full bg-bg-2 border border-border rounded px-3 py-2 text-sm outline-none focus:border-accent"
+          >
+            {list.map((t) => (
+              <option key={t.key} value={t.key}>
+                {t.title}
+              </option>
+            ))}
+          </select>
+          {selectedTemplate?.description && (
+            <p className="text-xs text-text-secondary mt-1">
+              {selectedTemplate.description}
+            </p>
+          )}
+        </div>
+      )}
+
+      {!showAdvanced && (
+        <button
+          type="button"
+          onClick={() => setShowAdvanced(true)}
+          className="text-xs text-text-dim underline underline-offset-2 hover:text-text-secondary"
         >
-          <option value="">Pick a template…</option>
-          {list.map((t) => (
-            <option key={t.key} value={t.key}>
-              {t.title}
-            </option>
-          ))}
-        </select>
-        {selectedTemplate?.description && (
-          <p className="text-xs text-text-secondary mt-1">
-            {selectedTemplate.description}
-          </p>
-        )}
-      </div>
+          Advanced: pick a fixed template
+        </button>
+      )}
 
       <div>
         <label className="text-xs uppercase tracking-wider text-text-secondary block mb-1">
@@ -591,7 +958,7 @@ function NewProjectForm({
         />
       </div>
 
-      {selectedTemplate?.stages && selectedTemplate.stages.length > 0 && (
+      {showAdvanced && selectedTemplate?.stages && selectedTemplate.stages.length > 0 && (
         <div className="rounded-lg border border-border bg-bg-2 p-3">
           <div className="text-xs uppercase tracking-wider text-text-secondary mb-2">
             Stages
@@ -611,7 +978,7 @@ function NewProjectForm({
       <div className="flex items-center gap-3">
         <button
           type="submit"
-          disabled={!template || start.isPending}
+          disabled={start.isPending}
           className="rounded bg-accent text-bg-0 font-medium px-4 py-2 text-sm disabled:opacity-60"
         >
           {start.isPending ? "Starting…" : "Start build"}
@@ -658,6 +1025,93 @@ function StatusPill({ status }: { status: string }) {
     >
       {s}
     </span>
+  );
+}
+
+function ClarificationCard({ slug, data }: { slug: string; data: any }) {
+  const qc = useQueryClient();
+  const questions = Array.isArray(data?.clarification?.questions)
+    ? data.clarification.questions
+        .map((q: unknown) => String(q ?? "").trim())
+        .filter(Boolean)
+    : [];
+  const [answers, setAnswers] = useState<string[]>([]);
+
+  useEffect(() => {
+    setAnswers(questions.map(() => ""));
+  }, [questions.join("\n")]);
+
+  const invalidate = () => {
+    qc.invalidateQueries({ queryKey: ["studio_project", slug] });
+    qc.invalidateQueries({ queryKey: ["studio_projects"] });
+  };
+
+  const submit = useMutation({
+    mutationFn: () => api.clarifyProject(slug, answers.map((a) => a.trim())),
+    onSuccess: invalidate,
+  });
+
+  const busy = submit.isPending;
+  const askedBy = String(data?.clarification?.asked_by || "agent");
+  const ready = questions.length > 0 && answers.every((answer) => answer.trim().length > 0);
+
+  return (
+    <section className="border border-status-yellow/40 bg-status-yellow/5 rounded-lg p-4 space-y-4">
+      <div className="flex items-baseline justify-between gap-3">
+        <SectionTitle>Clarification required · {askedBy}</SectionTitle>
+        <span className="text-[0.65rem] uppercase tracking-wider text-status-yellow">
+          Waiting on answers
+        </span>
+      </div>
+      <p className="text-xs text-text-secondary">
+        The project paused because the swarm needs a few concrete decisions
+        before it can keep building. Answer these here and Studio will resume.
+      </p>
+      <div className="space-y-3">
+        {questions.map((question: string, index: number) => (
+          <label
+            key={`${index}-${question}`}
+            className="block rounded-lg border border-border bg-bg-2/80 p-3"
+          >
+            <div className="text-xs font-medium text-text-primary">
+              {index + 1}. {question}
+            </div>
+            <textarea
+              value={answers[index] ?? ""}
+              onChange={(e) => {
+                const next = [...answers];
+                next[index] = e.target.value;
+                setAnswers(next);
+              }}
+              rows={3}
+              className="mt-2 w-full rounded border border-border bg-bg-3 px-3 py-2 text-sm text-text-primary outline-none focus:border-accent"
+              placeholder="Type the answer that should guide the build…"
+            />
+          </label>
+        ))}
+      </div>
+      {submit.error && (
+        <p className="text-xs text-status-red">
+          Could not send answers:{" "}
+          {submit.error instanceof Error ? submit.error.message : "error"}
+        </p>
+      )}
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          onClick={() => submit.mutate()}
+          disabled={busy || !ready}
+          className="rounded bg-accent px-3 py-2 text-xs font-medium text-bg-0 disabled:opacity-60"
+        >
+          <i className="fa-solid fa-play mr-1.5" />
+          Send answers and resume
+        </button>
+        <span className="text-xs text-text-dim">
+          {ready
+            ? "All questions answered."
+            : "Fill in every answer to resume the pipeline."}
+        </span>
+      </div>
+    </section>
   );
 }
 

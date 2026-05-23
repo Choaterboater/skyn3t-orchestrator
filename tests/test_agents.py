@@ -523,6 +523,18 @@ class TestCodeAgent:
 
 
 class TestBrainstormAgent:
+    def test_heuristic_questions_ask_for_deliverable_shape_on_generic_product_brief(self):
+        from skyn3t.agents.brainstorm import BrainstormAgent
+
+        agent = BrainstormAgent(event_bus=EventBus())
+
+        questions = agent._heuristic_clarification_questions(
+            "Launch a new product for our company",
+            mode="balanced",
+        )
+
+        assert any("real working app/codebase" in question for question in questions)
+
     @pytest.mark.asyncio
     async def test_require_clarification_forces_kickoff_questions(self, tmp_path, monkeypatch):
         from skyn3t.agents.brainstorm import BrainstormAgent
@@ -530,8 +542,9 @@ class TestBrainstormAgent:
         agent = BrainstormAgent(event_bus=EventBus())
         await agent.initialize()
 
-        async def no_questions(_brief: str, *, force: bool = False):
+        async def no_questions(_brief: str, *, force: bool = False, mode: str = "balanced"):
             assert force is True
+            assert mode == "balanced"
             return []
 
         monkeypatch.setattr(agent, "_maybe_ask_clarifications", no_questions)
@@ -549,8 +562,66 @@ class TestBrainstormAgent:
 
         assert result.success is True
         assert result.output["needs_clarification"] is True
-        assert len(result.output["questions"]) == 3
+        assert len(result.output["questions"]) == 4
         assert (tmp_path / "_clarifications.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_confirm_first_tops_up_short_clarification_list(self, tmp_path, monkeypatch):
+        from skyn3t.agents.brainstorm import BrainstormAgent
+
+        agent = BrainstormAgent(event_bus=EventBus())
+        await agent.initialize()
+
+        async def one_question(_brief: str, *, force: bool = False, mode: str = "balanced"):
+            assert force is False
+            assert mode == "confirm_first"
+            return ["Who is this for?"]
+
+        monkeypatch.setattr(agent, "_maybe_ask_clarifications", one_question)
+
+        task = TaskRequest(
+            title="Brainstorm",
+            input_data={
+                "brief": "Build a project planning assistant",
+                "artifact_dir": str(tmp_path),
+                "mission_setup": {"autonomy": "confirm_first"},
+            },
+        )
+
+        result = await agent.execute(task)
+
+        assert result.success is True
+        assert result.output["needs_clarification"] is True
+        assert len(result.output["questions"]) == 4
+        assert result.output["questions"][0] == "Who is this for?"
+        assert any("real working app/codebase" in q for q in result.output["questions"])
+
+    @pytest.mark.asyncio
+    async def test_skip_clarification_bypasses_question_pass(self, tmp_path, monkeypatch):
+        from skyn3t.agents.brainstorm import BrainstormAgent
+
+        agent = BrainstormAgent(event_bus=EventBus())
+        await agent.initialize()
+
+        async def should_not_run(*args, **kwargs):
+            raise AssertionError("clarification check should be skipped")
+
+        monkeypatch.setattr(agent, "_maybe_ask_clarifications", should_not_run)
+
+        task = TaskRequest(
+            title="Brainstorm",
+            input_data={
+                "brief": "Build a launch brief for our new product",
+                "artifact_dir": str(tmp_path),
+                "skip_clarification": True,
+            },
+        )
+
+        result = await agent.execute(task)
+
+        assert result.success is True
+        assert result.output["summary"] == "Brainstormed 6 angles; primary direction set."
+        assert not (tmp_path / "_clarifications.json").exists()
 
 
 class TestSchedulerAgent:

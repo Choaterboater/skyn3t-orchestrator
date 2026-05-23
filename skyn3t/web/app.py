@@ -36,6 +36,7 @@ from skyn3t.observability.health import get_health_registry
 from skyn3t.observability.metrics import generate_metrics
 from skyn3t.observability.tracing import get_tracer
 from skyn3t.registry.catalog import get_agent_catalog_metadata
+from skyn3t.studio.penpot_handoff import build_penpot_manifest, build_penpot_package
 
 # Global orchestrator instance
 orchestrator: Optional[Orchestrator] = None
@@ -1589,6 +1590,65 @@ async def llm_backends():
 async def llm_models(backend: str = "auto"):
     from skyn3t.adapters.model_catalog import list_models
     return {"backend": backend, "models": await list_models(backend)}
+
+
+def _resolve_repl_chat_defaults(
+    requested_backend: Optional[str],
+    requested_model: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    settings = get_settings()
+    backend = requested_backend
+    model = requested_model
+
+    if not backend:
+        configured_backend = str(getattr(settings, "llm_backend", "") or "").strip().lower()
+        if configured_backend and configured_backend != "auto":
+            backend = configured_backend
+            model = model or getattr(settings, "llm_model", None)
+        elif getattr(settings, "openrouter_api_key", None):
+            backend = "openrouter"
+
+    if backend == "openrouter" and not model:
+        model = getattr(settings, "llm_model", None) or "openai/gpt-4.1"
+
+    return backend, model
+
+
+@app.post("/api/llm/complete")
+async def llm_complete(data: Dict[str, Any]):
+    """Run a raw LLM completion for REPL-style chat."""
+    prompt = str(data.get("prompt") or data.get("message") or "").strip()
+    if not prompt:
+        return JSONResponse({"error": "prompt required"}, status_code=400)
+
+    system = str(data.get("system") or "").strip() or None
+    requested_backend = str(data.get("backend") or "").strip() or None
+    requested_model = str(data.get("model") or "").strip() or None
+    backend, model = _resolve_repl_chat_defaults(requested_backend, requested_model)
+    try:
+        from skyn3t.adapters import LLMClient
+
+        client = LLMClient(
+            default_model=model,
+            backend=backend,
+            event_bus=event_bus,
+            caller_name="repl_chat",
+        )
+        response = await client.complete(
+            prompt,
+            system=system,
+            max_tokens=1200,
+            temperature=0.4,
+            timeout=120.0,
+        )
+        info = client.describe()
+        return {
+            "response": response,
+            "backend": info.get("backend"),
+            "model": info.get("default_model"),
+        }
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 @app.post("/api/orchestrator/submit")
@@ -3530,6 +3590,28 @@ async def studio_project_zip(slug: str):
     except FileNotFoundError:
         return JSONResponse({"error": "not found"}, status_code=404)
     return FileResponse(str(zip_path), media_type="application/zip", filename=f"{slug}.zip")
+
+
+@app.get("/api/studio/projects/{slug}/design-handoff/penpot")
+async def studio_project_penpot_manifest(slug: str):
+    runner = _get_studio_runner(app)
+    if runner.get_project(slug) is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    artifact_dir = Path(runner.projects_root) / slug
+    return build_penpot_manifest(artifact_dir)
+
+
+@app.get("/api/studio/projects/{slug}/design-handoff/penpot/package")
+async def studio_project_penpot_package(slug: str):
+    runner = _get_studio_runner(app)
+    if runner.get_project(slug) is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    artifact_dir = Path(runner.projects_root) / slug
+    content = build_penpot_package(artifact_dir)
+    headers = {
+        "Content-Disposition": f'attachment; filename="{slug}-penpot-handoff.zip"',
+    }
+    return Response(content=content, media_type="application/zip", headers=headers)
 
 
 @app.post("/api/studio/projects/{slug}/clarify")

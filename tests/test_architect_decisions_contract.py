@@ -35,6 +35,9 @@ class TestDeriveDecisions:
         d = derive_decisions(
             {"frontend": "react-vite-tailwind", "backend": "express"}
         )
+        assert d["frontend_bundle"] == "react-vite-tailwind"
+        assert d["backend_bundle"] == "express"
+        assert d["family"] == "fullstack"
         assert d["frontend_port"] == 5173
         assert d["backend_port"] == 3000
         assert d["framework"] == "express"
@@ -42,6 +45,7 @@ class TestDeriveDecisions:
 
     def test_next_bundle(self):
         d = derive_decisions({"frontend": "next", "backend": "next"})
+        assert d["family"] == "fullstack"
         assert d["frontend_port"] == 3000
         assert d["backend_port"] == 3000
         assert d["framework"] == "next"
@@ -51,6 +55,7 @@ class TestDeriveDecisions:
         d = derive_decisions(
             {"frontend": "react-vite", "backend": "hono-node"}
         )
+        assert d["family"] == "fullstack"
         assert d["frontend_port"] == 5173
         assert d["backend_port"] == 3000
         assert d["framework"] == "hono-node"
@@ -58,6 +63,15 @@ class TestDeriveDecisions:
 
     def test_static_bundle_has_no_backend_port(self):
         d = derive_decisions({"frontend": "vanilla-vite", "backend": "none"})
+        assert d["family"] == "web"
+        assert d["frontend_port"] == 5173
+        assert d["backend_port"] is None
+        assert d["framework"] == "none"
+        assert d["backend_language"] == "none"
+
+    def test_react_vite_tailwind_web_bundle_has_no_backend_port(self):
+        d = derive_decisions({"frontend": "react-vite-tailwind", "backend": "none"})
+        assert d["family"] == "web"
         assert d["frontend_port"] == 5173
         assert d["backend_port"] is None
         assert d["framework"] == "none"
@@ -65,6 +79,7 @@ class TestDeriveDecisions:
 
     def test_unknown_bundle_returns_none_ports(self):
         d = derive_decisions({"frontend": "svelte", "backend": "rocket"})
+        assert d["family"] == "fullstack"
         assert d["frontend_port"] is None
         assert d["backend_port"] is None
         assert d["framework"] == "rocket"
@@ -72,6 +87,7 @@ class TestDeriveDecisions:
 
     def test_empty_stack_does_not_crash(self):
         d = derive_decisions({})
+        assert d["family"] == "unknown"
         assert d["framework"] == "none"
         assert d["backend_language"] == "none"
 
@@ -82,7 +98,10 @@ class TestWriteAndLoadDecisions:
         path = write_decisions(tmp_path, stack)
         assert path.name == "decisions.json"
         loaded = load_decisions(tmp_path)
+        assert loaded["frontend_bundle"] == "react-vite-tailwind"
+        assert loaded["backend_bundle"] == "express"
         assert loaded["backend_port"] == 3000
+        assert loaded["family"] == "fullstack"
         assert loaded["framework"] == "express"
 
     def test_load_missing_returns_none(self, tmp_path: Path):

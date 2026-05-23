@@ -8,15 +8,19 @@ the right.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import os
+import re
 import secrets
 import shlex
+import shutil
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Deque, List, Optional
+from typing import Any, Deque, Dict, List, Optional
 
 import httpx
 from rich.console import Console, Group
@@ -79,6 +83,11 @@ EVENT_GLYPHS = {
     "SYSTEM_ALERT": "🚨",
 }
 
+_LOW_SIGNAL_ACTIVITY_TYPES = {
+    "AGENT_REGISTERED",
+    "LLM_EXCHANGE",
+}
+
 
 @dataclass
 class ReplState:
@@ -103,6 +112,7 @@ class ReplState:
     known_backends: List[str] = field(default_factory=list)
     known_models: List[str] = field(default_factory=list)
     known_agents: List[str] = field(default_factory=list)
+    render_version: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -114,31 +124,57 @@ def _glyph(event_type: str) -> str:
     return EVENT_GLYPHS.get(event_type, "•")
 
 
+def _terminal_width() -> int:
+    return shutil.get_terminal_size((120, 40)).columns
+
+
+def _activity_sidebar_enabled(items: List[Text]) -> bool:
+    return bool(items) and _terminal_width() >= 120
+
+
 def _format_event(evt: dict) -> Optional[Text]:
-    et = evt.get("event_type") or evt.get("type") or ""
+    et = str(evt.get("event_type") or evt.get("type") or "").upper()
+    kind = str(evt.get("kind") or "").lower()
+    if et in _LOW_SIGNAL_ACTIVITY_TYPES or kind == "convo":
+        return None
+
+    if kind == "project" and not et.startswith("PROJECT_"):
+        payload = evt.get("meta", {}).get("payload") if isinstance(evt.get("meta"), dict) else {}
+        payload_kind = str((payload or {}).get("kind") or "").upper()
+        if payload_kind.startswith("PROJECT_"):
+            et = payload_kind
+
     data = evt.get("data") or {}
     if isinstance(data, dict) and "data" in data and "event_type" in data:
         # nested {"type": "event", "data": {...}}
         evt = data
-        et = evt.get("event_type", et)
+        et = str(evt.get("event_type", et) or "").upper()
         data = evt.get("data") or {}
+        if et in _LOW_SIGNAL_ACTIVITY_TYPES:
+            return None
 
     glyph = _glyph(et)
-    source = evt.get("source") or (data.get("agent") if isinstance(data, dict) else None) or ""
-    snippet = ""
+    source = (
+        evt.get("from")
+        or evt.get("source")
+        or (data.get("agent") if isinstance(data, dict) else None)
+        or ""
+    )
+    snippet = str(evt.get("label") or "").strip()
     if isinstance(data, dict):
-        for k in ("message", "thought", "title", "query", "summary", "stage", "repo", "name"):
-            v = data.get(k)
-            if v:
-                snippet = str(v)
-                break
+        if not snippet:
+            for k in ("message", "thought", "title", "query", "summary", "stage", "repo", "name"):
+                v = data.get(k)
+                if v:
+                    snippet = str(v)
+                    break
         if not snippet:
             snippet = ", ".join(f"{k}={v}" for k, v in list(data.items())[:2])
     elif data:
         snippet = str(data)
     snippet = snippet.replace("\n", " ").strip()
-    if len(snippet) > 70:
-        snippet = snippet[:67] + "..."
+    if len(snippet) > 64:
+        snippet = snippet[:61] + "..."
 
     style = "white"
     if et.startswith("TASK_FAIL"):
@@ -154,9 +190,37 @@ def _format_event(evt: dict) -> Optional[Text]:
     elif et.startswith("INGEST_"):
         style = "blue"
 
-    label = source or et.lower()
+    verb = ""
+    if et in {"TASK_STARTED", "TASK_EXECUTION_STARTED"}:
+        verb = "started"
+    elif et == "TASK_COMPLETED":
+        verb = "finished"
+    elif et.startswith("TASK_FAIL"):
+        verb = "failed"
+    elif et == "PIPELINE_STARTED":
+        verb = "pipeline"
+    elif et == "PIPELINE_COMPLETED":
+        verb = "pipeline done"
+    elif et == "PIPELINE_STAGE_COMPLETED":
+        verb = "stage done"
+    elif et == "PIPELINE_STAGE_FAILED":
+        verb = "stage failed"
+    elif et.startswith("PROJECT_"):
+        verb = _studio_history_label(et)
+    elif et == "AGENT_THOUGHT":
+        verb = "thinking"
+    elif et.startswith("AGENT_MESSAGE"):
+        verb = "message"
+    elif et.startswith("RAG_"):
+        verb = "retrieving"
+    elif et.startswith("INGEST_"):
+        verb = "ingesting"
+
+    label = str(source or evt.get("kind") or et.lower() or "agent")
     line = Text(f"{glyph} ", style=style)
     line.append(label, style=f"bold {style}")
+    if verb:
+        line.append(f"  {verb}", style=style)
     if snippet:
         line.append(f"  {snippet}", style="dim")
     return line
@@ -164,70 +228,102 @@ def _format_event(evt: dict) -> Optional[Text]:
 
 def _render_layout(state: ReplState) -> Layout:
     layout = Layout()
-    layout.split_column(
-        Layout(name="header", size=3),
-        Layout(name="body"),
-    )
-    layout["body"].split_row(
-        Layout(name="transcript", ratio=2),
-        Layout(name="activity", ratio=1, minimum_size=32),
-    )
+    act_tail = list(state.activity)[-8:]
+    if _activity_sidebar_enabled(act_tail):
+        layout.split_column(
+            Layout(name="header", size=4),
+            Layout(name="body", ratio=1),
+        )
+        layout["body"].split_row(
+            Layout(name="transcript", ratio=3),
+            Layout(name="activity", size=38),
+        )
+    else:
+        sections: List[Layout] = [
+            Layout(name="header", size=4),
+            Layout(name="transcript", ratio=1),
+        ]
+        if act_tail:
+            sections.append(Layout(name="activity", size=max(8, min(12, len(act_tail) + 2))))
+        layout.split_column(*sections)
 
     dot = Text("●", style="green" if state.connected else "red")
-    title = Text("SkyN3t", style="bold cyan")
-    title.append(f"  ·  session: {state.session_id}", style="dim")
-    title.append("  ·  model: orchestrator", style="dim")
-    if state.active_agent or state.active_backend or state.active_model:
-        agent = state.active_agent or "—"
-        be = state.active_backend or "auto"
-        mdl = state.active_model or "default"
-        title.append(f"  ·  {agent} → {be}/{mdl}", style="dim")
-    else:
-        title.append("  ·  no agent selected", style="dim")
+    title = Text("SkyN3t Chat", style="bold cyan")
+    title.append(f"  ·  session {state.session_id}", style="dim")
+    route_target = state.active_agent or "chat"
+    route_backend = state.active_backend or "auto"
+    route_model = state.active_model or "default"
+    title.append(f"  ·  {route_target} → {route_backend}/{route_model}", style="dim")
     title.append("   ")
     title.append_text(dot)
     if state.busy:
         title.append("  ")
         title.append(f"⏳ {state.busy_label}", style="yellow")
-    layout["header"].update(Panel(title, border_style="cyan"))
+    hint = Text('Enter to send  •  """ for multi-line  •  /help for commands', style="dim")
+    layout["header"].update(Panel(Group(title, hint), border_style="cyan"))
 
-    # Transcript: cap last ~60 entries
-    tail = state.transcript[-60:]
+    # Transcript: cap recent entries so long replies don't swamp the next prompt.
+    tail = state.transcript[-14:]
     transcript = Group(*tail) if tail else Text("(empty — type a prompt below)", style="dim")
-    layout["transcript"].update(
-        Panel(transcript, title="Transcript", border_style="white")
-    )
+    layout["transcript"].update(Panel(transcript, title="Chat", border_style="white"))
 
-    # Activity: tail
-    act_tail = list(state.activity)[-200:]
-    activity = Group(*act_tail) if act_tail else Text("(no activity yet)", style="dim")
-    layout["activity"].update(
-        Panel(activity, title="Swarm activity", border_style="magenta")
-    )
+    if act_tail:
+        activity = Group(*act_tail)
+        layout["activity"].update(Panel(activity, title="Agents at work", border_style="magenta"))
 
     return layout
 
 
+def _touch_state(state: ReplState) -> None:
+    state.render_version += 1
+
+
 def _add_transcript(state: ReplState, renderable: Any) -> None:
     state.transcript.append(renderable)
+    _touch_state(state)
+
+
+def _add_activity(state: ReplState, renderable: Text) -> None:
+    if state.activity and state.activity[-1].plain == renderable.plain:
+        return
+    state.activity.append(renderable)
+    _touch_state(state)
 
 
 def _user_line(text: str) -> Text:
-    t = Text("> you: ", style="bold blue")
+    t = Text("You  ", style="bold cyan")
     t.append(text, style="white")
     return t
 
 
 def _agent_line(name: str, text: str) -> Any:
-    header = Text("★ ", style="bold green")
-    header.append(f"{name}", style="bold green")
-    header.append(f"  [{datetime.now().strftime('%H:%M:%S')}]", style="dim")
     md = Markdown(text) if text else Text("(no output)", style="dim")
-    return Group(header, md, Text(""))
+    title = Text(f"{name}", style="bold green")
+    title.append(f"  {datetime.now().strftime('%H:%M:%S')}", style="dim")
+    return Panel(md, title=title, border_style="green", padding=(0, 1))
 
 
 def _info_line(text: str, style: str = "yellow") -> Text:
     return Text(text, style=style)
+
+
+def _studio_history_label(event_name: str) -> str:
+    labels = {
+        "PROJECT_QUEUED": "Queued",
+        "PROJECT_STARTED": "Started",
+        "PROJECT_STAGE_STARTED": "Stage started",
+        "PROJECT_STAGE_COMPLETED": "Stage completed",
+        "PROJECT_STAGE_FAILED": "Stage failed",
+        "PROJECT_AWAITING_CLARIFICATION": "Waiting for clarification",
+        "PROJECT_RESUMED": "Resumed",
+        "PROJECT_COMPLETED": "Project finished",
+        "PROJECT_FAILED": "Runner failed",
+        "PROJECT_REAPED": "Recovered",
+    }
+    return labels.get(
+        str(event_name or "").upper(),
+        str(event_name or "update").replace("_", " ").title(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +358,7 @@ async def _ws_listener(state: ReplState) -> None:
                         payload = msg.get("data", msg) if isinstance(msg, dict) else {}
                         line = _format_event(payload)
                         if line is not None:
-                            state.activity.append(line)
+                            _add_activity(state, line)
                     break  # ws closed cleanly
             except ConnectionClosed:
                 pass
@@ -287,7 +383,7 @@ async def _poll_listener(state: ReplState) -> None:
                     for evt in items[-20:]:
                         line = _format_event(evt)
                         if line is not None:
-                            state.activity.append(line)
+                            _add_activity(state, line)
                 else:
                     state.connected = False
             except Exception:
@@ -306,8 +402,12 @@ async def _submit_prompt(state: ReplState, prompt: str) -> None:
     state.busy_label = "thinking"
     state.current_prompt = prompt
     state.last_prompt = prompt
+    _touch_state(state)
     try:
         async with httpx.AsyncClient(base_url=state.api_url, timeout=60.0) as client:
+            if not state.active_agent:
+                await _submit_chat_prompt(state, client, prompt)
+                return
             # Try orchestrator submit, fall back to a registered agent's exec.
             task_id: Optional[str] = None
             try:
@@ -326,33 +426,7 @@ async def _submit_prompt(state: ReplState, prompt: str) -> None:
 
             if not task_id:
                 # Pick an agent and use exec for a synchronous round-trip.
-                agent_name = state.active_agent or await _pick_agent(client)
-                if not agent_name:
-                    _add_transcript(
-                        state,
-                        _info_line(
-                            "No agents registered. Add one with `skyn3t agent add ...`",
-                            "red",
-                        ),
-                    )
-                    return
-                try:
-                    resp = await client.post(
-                        f"/api/agents/{agent_name}/exec",
-                        json={"prompt": prompt},
-                        timeout=120.0,
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    if data.get("error"):
-                        state.last_failed_prompt = prompt
-                        _add_transcript(state, _info_line(f"error: {data['error']}", "red"))
-                    else:
-                        state.last_failed_prompt = None
-                        _add_transcript(state, _agent_line(agent_name, data.get("output") or ""))
-                except httpx.HTTPError as exc:
-                    state.last_failed_prompt = prompt
-                    _add_transcript(state, _info_line(f"request failed: {exc}", "red"))
+                await _exec_prompt_direct(state, client, prompt)
                 return
 
             # Poll the task result
@@ -360,6 +434,18 @@ async def _submit_prompt(state: ReplState, prompt: str) -> None:
             while not state.stop:
                 try:
                     resp = await client.get(f"/api/tasks/{task_id}/result")
+                    if resp.status_code == 404:
+                        await _best_effort_cancel_task(client, task_id)
+                        await _exec_prompt_direct(
+                            state,
+                            client,
+                            prompt,
+                            notice=(
+                                "orchestrator result API unavailable — "
+                                "falling back to direct agent reply"
+                            ),
+                        )
+                        return
                     data = resp.json() if resp.status_code == 200 else {}
                 except Exception:
                     data = {}
@@ -383,6 +469,82 @@ async def _submit_prompt(state: ReplState, prompt: str) -> None:
         state.busy_label = ""
         state.current_task_id = None
         state.current_prompt = None
+        _touch_state(state)
+
+
+async def _submit_chat_prompt(
+    state: ReplState,
+    client: httpx.AsyncClient,
+    prompt: str,
+) -> None:
+    try:
+        resp = await client.post(
+            "/api/llm/complete",
+            json={
+                "prompt": prompt,
+                "backend": state.active_backend,
+                "model": state.active_model,
+            },
+            timeout=120.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        response = str(data.get("response") or "").strip()
+        if not response:
+            state.last_failed_prompt = prompt
+            _add_transcript(state, _info_line("empty response from chat backend", "red"))
+            return
+        backend = str(data.get("backend") or state.active_backend or "auto")
+        state.last_failed_prompt = None
+        _add_transcript(state, _agent_line(backend, response))
+    except httpx.HTTPError as exc:
+        state.last_failed_prompt = prompt
+        _add_transcript(state, _info_line(f"chat request failed: {exc}", "red"))
+
+
+async def _exec_prompt_direct(
+    state: ReplState,
+    client: httpx.AsyncClient,
+    prompt: str,
+    *,
+    notice: Optional[str] = None,
+) -> None:
+    agent_name = state.active_agent or await _pick_agent(client)
+    if not agent_name:
+        _add_transcript(
+            state,
+            _info_line(
+                "No agents registered. Add one with `skyn3t agent add ...`",
+                "red",
+            ),
+        )
+        return
+    if notice:
+        _add_transcript(state, _info_line(notice, "yellow"))
+    try:
+        resp = await client.post(
+            f"/api/agents/{agent_name}/exec",
+            json={"prompt": prompt},
+            timeout=120.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("error"):
+            state.last_failed_prompt = prompt
+            _add_transcript(state, _info_line(f"error: {data['error']}", "red"))
+        else:
+            state.last_failed_prompt = None
+            _add_transcript(state, _agent_line(agent_name, data.get("output") or ""))
+    except httpx.HTTPError as exc:
+        state.last_failed_prompt = prompt
+        _add_transcript(state, _info_line(f"request failed: {exc}", "red"))
+
+
+async def _best_effort_cancel_task(client: httpx.AsyncClient, task_id: str) -> None:
+    try:
+        await client.post(f"/api/tasks/{task_id}/cancel")
+    except Exception:
+        pass
 
 
 async def _pick_agent(client: httpx.AsyncClient) -> Optional[str]:
@@ -476,6 +638,47 @@ PROJECT_TEMPLATE_KEYS = {
     "product_idea",
     "frontend_redesign",
 }
+
+_PROJECT_INTENT_PREFIXES = (
+    "build ",
+    "build me ",
+    "create ",
+    "create me ",
+    "make ",
+    "make me ",
+    "start ",
+    "start me ",
+    "generate ",
+    "generate me ",
+    "design ",
+    "launch ",
+    "ship ",
+)
+
+_PROJECT_INTENT_TERMS = (
+    "app",
+    "application",
+    "website",
+    "site",
+    "landing page",
+    "dashboard",
+    "tracker",
+    "habit tracker",
+    "tool",
+    "platform",
+    "portal",
+    "service",
+    "api",
+    "backend",
+    "frontend",
+    "game",
+    "saas",
+    "project",
+    "product",
+    "mvp",
+    "workflow",
+    "cli",
+)
 
 
 async def _slash(state: ReplState, raw: str) -> bool:
@@ -618,19 +821,105 @@ async def _cmd_pipeline(state: ReplState, rest: str) -> None:
 
 
 async def _cmd_project(state: ReplState, rest: str) -> None:
-    usage = (
+    parsed = await asyncio.to_thread(_parse_project_command, rest)
+    if parsed.get("error"):
+        _add_transcript(state, _info_line(str(parsed["error"]), "yellow"))
+        return
+    template = str(parsed["template"])
+    brief = str(parsed["brief"])
+    audience = str(parsed["audience"])
+    autonomy = str(parsed["autonomy"])
+    repo_target = parsed["repo_target"]
+    try:
+        async with httpx.AsyncClient(base_url=state.api_url, timeout=30.0) as client:
+            resp = await client.post(
+                "/api/studio/start",
+                json={
+                    "template": template,
+                    "brief": brief,
+                    "mission_setup": {
+                        "audience": _project_audience_map()[audience],
+                        "autonomy": autonomy,
+                    },
+                    "repo_target": repo_target,
+                },
+            )
+            if resp.status_code == 404:
+                _add_transcript(
+                    state, _info_line("project studio not yet available", "yellow")
+                )
+                return
+            data = resp.json()
+    except Exception as exc:
+        _add_transcript(state, _info_line(f"project failed: {exc}", "red"))
+        return
+    if data.get("accepted"):
+        slug = data.get("slug") or "pending"
+        repo_target = normalize_repo_target(data.get("repo_target") or repo_target)
+        next_action = data.get("next_action") or "Queued — waiting for a worker slot."
+        _add_transcript(
+            state,
+            _info_line(
+                "project queued: "
+                f"{slug} · template={template} · audience={audience} · mode={autonomy}"
+                + f" · next={next_action}"
+                + (
+                    f" · repo={repo_target['local_path']}"
+                    if repo_target["local_path"]
+                    else ""
+                )
+                + (
+                    f" · focus={repo_target['focus_file']}"
+                    if repo_target["focus_file"]
+                    else ""
+                ),
+                "green",
+            ),
+        )
+        return
+    _add_transcript(state, _info_line(f"project failed: {data}", "red"))
+
+
+def _project_usage() -> str:
+    return (
         "usage: /project [--audience auto|general|builders|team|leaders|investors] "
         "[--autonomy balanced|confirm_first|move_fast] [--repo-path PATH_OR_GITHUB_URL] [--focus-file PATH] BRIEF... "
         "or /project [options] TEMPLATE :: BRIEF..."
     )
+
+
+def _project_audience_map() -> Dict[str, str]:
+    return {
+        "auto": "",
+        "general": "general",
+        "builders": "builders",
+        "team": "team",
+        "leaders": "leaders",
+        "investors": "investors",
+    }
+
+
+def _looks_like_project_request(prompt: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(prompt or "").strip().lower())
+    if not normalized or normalized.startswith("/"):
+        return False
+    if not normalized.startswith(_PROJECT_INTENT_PREFIXES):
+        return False
+    return any(term in normalized for term in _PROJECT_INTENT_TERMS)
+
+
+def _should_route_prompt_to_project(state: ReplState, prompt: str) -> bool:
+    return state.active_agent is None and _looks_like_project_request(prompt)
+
+
+def _parse_project_command(rest: str) -> Dict[str, Any]:
+    usage = _project_usage()
     if not rest:
-        _add_transcript(state, _info_line(usage, "yellow"))
-        return
+        return {"error": usage}
     try:
         tokens = shlex.split(rest)
     except ValueError:
-        _add_transcript(state, _info_line(usage, "yellow"))
-        return
+        return {"error": usage}
     audience = "auto"
     autonomy = "move_fast"
     repo_path = ""
@@ -673,20 +962,13 @@ async def _cmd_project(state: ReplState, rest: str) -> None:
             continue
         cleaned.append(token)
         i += 1
-    audience_map = {
-        "auto": "",
-        "general": "general",
-        "builders": "builders",
-        "team": "team",
-        "leaders": "leaders",
-        "investors": "investors",
-    }
+
+    audience_map = _project_audience_map()
     audience = str(audience or "auto").strip().lower()
     autonomy = str(autonomy or "move_fast").strip().lower()
     allowed_autonomy = {"balanced", "confirm_first", "move_fast"}
     if audience not in audience_map or autonomy not in allowed_autonomy:
-        _add_transcript(state, _info_line(usage, "yellow"))
-        return
+        return {"error": usage}
     template = "auto"
     brief = " ".join(cleaned).strip()
 
@@ -702,25 +984,156 @@ async def _cmd_project(state: ReplState, rest: str) -> None:
             brief = parts[1]
 
     if not brief:
-        _add_transcript(state, _info_line(usage, "yellow"))
-        return
+        return {"error": usage}
     try:
-        repo_target = await asyncio.to_thread(
-            resolve_repo_target,
+        repo_target = resolve_repo_target(
             {"local_path": repo_path, "focus_file": focus_file},
         )
     except ValueError as exc:
-        _add_transcript(state, _info_line(str(exc), "red"))
-        return
+        return {"error": str(exc)}
+    return {
+        "template": template,
+        "brief": brief,
+        "audience": audience,
+        "autonomy": autonomy,
+        "repo_target": repo_target,
+    }
+
+
+def _watch_project_in_repl(
+    state: ReplState,
+    slug: str,
+    *,
+    paint: Any,
+    prompt_reader: Any,
+) -> None:
+    seen_history = 0
+    seen_clarification: Optional[tuple[str, ...]] = None
+    terminal_statuses = {"done", "needs_fixes", "failed"}
     try:
-        async with httpx.AsyncClient(base_url=state.api_url, timeout=30.0) as client:
-            resp = await client.post(
+        with httpx.Client(base_url=state.api_url, timeout=30.0) as client:
+            while True:
+                updated = False
+                resp = client.get(f"/api/studio/projects/{slug}")
+                resp.raise_for_status()
+                project = resp.json()
+                history = project.get("history") or []
+                if not isinstance(history, list):
+                    history = []
+                for item in history[seen_history:]:
+                    event_name = str(item.get("event") or "")
+                    label = _studio_history_label(event_name)
+                    stage = str(item.get("stage") or "").strip()
+                    message = str(item.get("message") or "").strip()
+                    line = f"{label}"
+                    if stage:
+                        line += f" · {stage}"
+                    if message:
+                        line += f" · {message}"
+                    _add_transcript(state, _info_line(line, "cyan"))
+                    updated = True
+                seen_history = len(history)
+                if updated:
+                    paint()
+
+                status = str(project.get("status") or "").strip().lower()
+                if status == "awaiting_clarification":
+                    clarification = project.get("clarification") or {}
+                    questions = tuple(
+                        str(question).strip()
+                        for question in (clarification.get("questions") or [])
+                        if str(question).strip()
+                    )
+                    if questions and questions != seen_clarification:
+                        _add_transcript(
+                            state,
+                            Panel(
+                                "\n".join(
+                                    f"{index}. {question}"
+                                    for index, question in enumerate(questions, start=1)
+                                )
+                                + "\n\nReply inline now. After the last answer, the build resumes.",
+                                title="Clarification needed",
+                                border_style="yellow",
+                            ),
+                        )
+                        paint()
+                        answers = [
+                            str(prompt_reader(index, question)).strip()
+                            for index, question in enumerate(questions, start=1)
+                        ]
+                        clarify_resp = client.post(
+                            f"/api/studio/projects/{slug}/clarify",
+                            json={"answers": answers},
+                        )
+                        clarify_resp.raise_for_status()
+                        data = clarify_resp.json()
+                        if not data.get("ok"):
+                            _add_transcript(
+                                state,
+                                _info_line(f"clarification failed: {data}", "red"),
+                            )
+                            paint()
+                            return
+                        _add_transcript(
+                            state,
+                            _info_line("clarifications sent. Resuming build…", "green"),
+                        )
+                        seen_clarification = questions
+                        paint()
+
+                if status in terminal_statuses:
+                    title = "Project finished" if status != "failed" else "Project failed"
+                    border = "green" if status != "failed" else "red"
+                    next_action = str(project.get("next_action") or "").strip()
+                    summary = next_action or (
+                        "Build completed." if status != "failed" else "Build failed."
+                    )
+                    _add_transcript(
+                        state,
+                        Panel(
+                            f"{slug}\n{summary}",
+                            title=title,
+                            border_style=border,
+                        ),
+                    )
+                    paint()
+                    return
+                time.sleep(1.0)
+    except Exception as exc:
+        _add_transcript(state, _info_line(f"project watch failed: {exc}", "red"))
+        paint()
+
+
+def _run_project_command(
+    state: ReplState,
+    rest: str,
+    *,
+    paint: Any,
+    prompt_reader: Any,
+) -> None:
+    parsed = _parse_project_command(rest)
+    if parsed.get("error"):
+        _add_transcript(state, _info_line(str(parsed["error"]), "yellow"))
+        paint()
+        return
+
+    template = str(parsed["template"])
+    brief = str(parsed["brief"])
+    audience = str(parsed["audience"])
+    autonomy = str(parsed["autonomy"])
+    repo_target = parsed["repo_target"]
+    _add_transcript(state, _info_line("starting project build…", "cyan"))
+    paint()
+    try:
+        with httpx.Client(base_url=state.api_url, timeout=30.0) as client:
+            resp = client.post(
                 "/api/studio/start",
                 json={
                     "template": template,
                     "brief": brief,
                     "mission_setup": {
-                        "audience": audience_map[audience],
+                        "audience": _project_audience_map()[audience],
                         "autonomy": autonomy,
                     },
                     "repo_target": repo_target,
@@ -730,36 +1143,44 @@ async def _cmd_project(state: ReplState, rest: str) -> None:
                 _add_transcript(
                     state, _info_line("project studio not yet available", "yellow")
                 )
+                paint()
                 return
+            resp.raise_for_status()
             data = resp.json()
     except Exception as exc:
         _add_transcript(state, _info_line(f"project failed: {exc}", "red"))
+        paint()
         return
-    if data.get("accepted"):
-        slug = data.get("slug") or "pending"
-        repo_target = normalize_repo_target(data.get("repo_target") or repo_target)
-        next_action = data.get("next_action") or "Queued — waiting for a worker slot."
-        _add_transcript(
-            state,
-            _info_line(
-                "project queued: "
-                f"{slug} · template={template} · audience={audience} · mode={autonomy}"
-                + f" · next={next_action}"
-                + (
-                    f" · repo={repo_target['local_path']}"
-                    if repo_target["local_path"]
-                    else ""
-                )
-                + (
-                    f" · focus={repo_target['focus_file']}"
-                    if repo_target["focus_file"]
-                    else ""
-                ),
-                "green",
+
+    if not data.get("accepted"):
+        _add_transcript(state, _info_line(f"project failed: {data}", "red"))
+        paint()
+        return
+
+    slug = data.get("slug") or "pending"
+    repo_target = normalize_repo_target(data.get("repo_target") or repo_target)
+    next_action = data.get("next_action") or "Queued — waiting for a worker slot."
+    _add_transcript(
+        state,
+        _info_line(
+            "project queued: "
+            f"{slug} · template={template} · audience={audience} · mode={autonomy}"
+            + f" · next={next_action}"
+            + (
+                f" · repo={repo_target['local_path']}"
+                if repo_target["local_path"]
+                else ""
+            )
+            + (
+                f" · focus={repo_target['focus_file']}"
+                if repo_target["focus_file"]
+                else ""
             ),
-        )
-        return
-    _add_transcript(state, _info_line(f"project failed: {data}", "red"))
+            "green",
+        ),
+    )
+    paint()
+    _watch_project_in_repl(state, str(slug), paint=paint, prompt_reader=prompt_reader)
 
 
 async def _cmd_rag(state: ReplState, rest: str) -> None:
@@ -1538,20 +1959,6 @@ async def _warmup(state: ReplState) -> None:
                         if isinstance(name, str):
                             known_agents.append(name)
                     state.known_agents = known_agents
-                # default active_agent if not set: prefer 'writer', else first
-                if state.active_agent is None and state.known_agents:
-                    state.active_agent = next(
-                        (n for n in state.known_agents if n == "writer"),
-                        state.known_agents[0],
-                    )
-                    try:
-                        r2 = await client.get(f"/api/agents/{state.active_agent}/config")
-                        if r2.status_code == 200:
-                            cfg = (r2.json() or {}).get("config") or {}
-                            state.active_backend = cfg.get("backend") or "auto"
-                            state.active_model = cfg.get("model")
-                    except Exception:
-                        pass
     except Exception:
         pass
     # models for current backend
@@ -1578,10 +1985,14 @@ async def _warmup(state: ReplState) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _read_one(session: Any) -> Optional[str]:
+def _read_one(
+    session: Any,
+    prompt_label: str = "> ",
+    multiline_label: str = "... ",
+) -> Optional[str]:
     """Read one logical input (single line or multi-line block)."""
     try:
-        first = session.prompt("> ")
+        first = session.prompt(prompt_label, multiline=False)
     except (EOFError, KeyboardInterrupt):
         raise
     if first.strip() == '"""':
@@ -1589,7 +2000,7 @@ def _read_one(session: Any) -> Optional[str]:
         lines: List[str] = []
         while True:
             try:
-                ln = session.prompt("... ")
+                ln = session.prompt(multiline_label, multiline=False)
             except (EOFError, KeyboardInterrupt):
                 raise
             if ln.strip() == '"""':
@@ -1599,17 +2010,86 @@ def _read_one(session: Any) -> Optional[str]:
     return str(first)
 
 
-def _read_one_basic() -> Optional[str]:
-    first = input("> ")
+def _read_one_basic(
+    prompt_label: str = "> ",
+    multiline_label: str = "... ",
+) -> Optional[str]:
+    first = input(prompt_label)
     if first.strip() == '"""':
         lines: List[str] = []
         while True:
-            ln = input("... ")
+            ln = input(multiline_label)
             if ln.strip() == '"""':
                 break
             lines.append(ln)
         return "\n".join(lines)
     return str(first)
+
+
+def _wait_for_repl_future(
+    future: concurrent.futures.Future[Any],
+    *,
+    state: ReplState,
+    paint: Any,
+    timeout: float,
+    tick: float = 0.1,
+) -> Any:
+    """Wait for a background REPL task while keeping the screen responsive."""
+    deadline = time.monotonic() + timeout
+    last_render_version = state.render_version
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise concurrent.futures.TimeoutError()
+        try:
+            return future.result(timeout=min(tick, remaining))
+        except concurrent.futures.TimeoutError:
+            if state.render_version != last_render_version:
+                paint()
+                last_render_version = state.render_version
+
+
+def _run_plain_prompt(
+    state: ReplState,
+    line: str,
+    *,
+    paint: Any,
+    prompt_reader: Any,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    if state.busy:
+        _add_transcript(
+            state,
+            _info_line("still working on the previous prompt — wait or press Ctrl-C", "yellow"),
+        )
+        paint()
+        return
+
+    _add_transcript(state, _user_line(line))
+
+    if _should_route_prompt_to_project(state, line):
+        _add_transcript(state, _info_line("routing this into a project build…", "cyan"))
+        paint()
+        _run_project_command(state, line, paint=paint, prompt_reader=prompt_reader)
+        return
+
+    prompt_future = asyncio.run_coroutine_threadsafe(_submit_prompt(state, line), loop)
+    paint()
+    try:
+        _wait_for_repl_future(
+            prompt_future,
+            state=state,
+            paint=paint,
+            timeout=600,
+        )
+    except KeyboardInterrupt:
+        cancel_future = asyncio.run_coroutine_threadsafe(_cancel_current(state), loop)
+        cancel_future.result(timeout=5)
+        _add_transcript(state, _info_line("cancelled", "yellow"))
+    except concurrent.futures.TimeoutError:
+        _add_transcript(state, _info_line("timed out waiting for reply", "red"))
+    except Exception as exc:
+        _add_transcript(state, _info_line(f"error: {exc}", "red"))
 
 
 # ---------------------------------------------------------------------------
@@ -1640,7 +2120,8 @@ def run() -> None:
             "[bold]pip install prompt_toolkit[/bold]."
         )
 
-    state.transcript.append(
+    _add_transcript(
+        state,
         _info_line(
             f"Connected to {state.api_url}. Type /help for commands. "
             "Use \"\"\" on its own line for multi-line input.",
@@ -1682,6 +2163,21 @@ def run() -> None:
         except Exception:
             pass
 
+    def _prompt_reader(index: int, question: str) -> str:
+        del question
+        return (
+            _read_one(
+                pt_session,
+                prompt_label=f"clarify {index}> ",
+                multiline_label="clarify... ",
+            )
+            if pt_session is not None
+            else _read_one_basic(
+                prompt_label=f"clarify {index}> ",
+                multiline_label="clarify... ",
+            )
+        ) or ""
+
     try:
         # Initial snapshot
         _paint_snapshot()
@@ -1708,6 +2204,25 @@ def run() -> None:
                 continue
 
             if line.startswith("/"):
+                if line == "/project" or line.startswith("/project "):
+                    rest = line[len("/project"):].strip()
+                    try:
+                        _run_project_command(
+                            state,
+                            rest,
+                            paint=_paint_snapshot,
+                            prompt_reader=_prompt_reader,
+                        )
+                    except KeyboardInterrupt:
+                        _add_transcript(
+                            state,
+                            _info_line(
+                                "detached from project watch — build keeps running in the background",
+                                "yellow",
+                            ),
+                        )
+                    _paint_snapshot()
+                    continue
                 command_future = asyncio.run_coroutine_threadsafe(_slash(state, line), loop)
                 try:
                     should_exit = command_future.result(timeout=120)
@@ -1717,23 +2232,13 @@ def run() -> None:
                 if should_exit:
                     break
             else:
-                if state.busy:
-                    _add_transcript(
-                        state,
-                        _info_line("still working on the previous prompt — wait or press Ctrl-C", "yellow"),
-                    )
-                    _paint_snapshot()
-                    continue
-                _add_transcript(state, _user_line(line))
-                prompt_future = asyncio.run_coroutine_threadsafe(_submit_prompt(state, line), loop)
-                try:
-                    prompt_future.result(timeout=600)
-                except KeyboardInterrupt:
-                    cancel_future = asyncio.run_coroutine_threadsafe(_cancel_current(state), loop)
-                    cancel_future.result(timeout=5)
-                    _add_transcript(state, _info_line("cancelled", "yellow"))
-                except Exception as exc:
-                    _add_transcript(state, _info_line(f"error: {exc}", "red"))
+                _run_plain_prompt(
+                    state,
+                    line,
+                    paint=_paint_snapshot,
+                    prompt_reader=_prompt_reader,
+                    loop=loop,
+                )
 
             # Repaint the swarm/transcript snapshot above the next prompt
             _paint_snapshot()

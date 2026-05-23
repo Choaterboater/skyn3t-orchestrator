@@ -1,7 +1,9 @@
 """Tests for web event broadcasting helpers."""
 
 import asyncio
+import io
 import json
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -209,6 +211,79 @@ async def test_track_studio_task_marks_project_failed_on_crash():
         "next_action": "Project stopped while starting.",
     }
     assert len(web_app.app.state.studio_tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_llm_complete_returns_response(monkeypatch):
+    class FakeLLMClient:
+        def __init__(self, *, default_model=None, backend=None, event_bus=None, caller_name=None):
+            self.default_model = default_model
+            self.backend = backend
+            self.event_bus = event_bus
+            self.caller_name = caller_name
+
+        async def complete(self, prompt, *, system=None, max_tokens=None, temperature=None, timeout=None):
+            assert prompt == "hey"
+            assert system == "be helpful"
+            assert max_tokens == 1200
+            assert temperature == 0.4
+            assert timeout == 120.0
+            return "hey back"
+
+        def describe(self):
+            return {"backend": self.backend or "auto", "default_model": self.default_model}
+
+    monkeypatch.setattr("skyn3t.adapters.LLMClient", FakeLLMClient)
+
+    result = await web_app.llm_complete(
+        {
+            "prompt": "hey",
+            "system": "be helpful",
+            "backend": "copilot_cli",
+            "model": "gpt-5.4",
+        }
+    )
+
+    assert result == {
+        "response": "hey back",
+        "backend": "copilot_cli",
+        "model": "gpt-5.4",
+    }
+
+
+@pytest.mark.asyncio
+async def test_llm_complete_prefers_openrouter_fast_path_when_unconfigured(monkeypatch):
+    calls = {}
+
+    class FakeLLMClient:
+        def __init__(self, *, default_model=None, backend=None, event_bus=None, caller_name=None):
+            calls["backend"] = backend
+            calls["default_model"] = default_model
+
+        async def complete(self, prompt, *, system=None, max_tokens=None, temperature=None, timeout=None):
+            return "fast reply"
+
+        def describe(self):
+            return {
+                "backend": calls.get("backend"),
+                "default_model": calls.get("default_model"),
+            }
+
+    class FakeSettings:
+        llm_backend = "auto"
+        llm_model = None
+        openrouter_api_key = "configured"
+
+    monkeypatch.setattr(web_app, "get_settings", lambda: FakeSettings())
+    monkeypatch.setattr("skyn3t.adapters.LLMClient", FakeLLMClient)
+
+    result = await web_app.llm_complete({"prompt": "hey"})
+
+    assert result == {
+        "response": "fast reply",
+        "backend": "openrouter",
+        "model": "openai/gpt-4.1",
+    }
 
 
 @pytest.mark.asyncio
@@ -1370,6 +1445,75 @@ async def test_routing_policy_patch_accepts_recommendation_metadata(monkeypatch,
 
 
 @pytest.mark.asyncio
+async def test_studio_project_penpot_manifest_returns_design_handoff(monkeypatch, tmp_path):
+    project_dir = tmp_path / "demo"
+    project_dir.mkdir(parents=True)
+    (project_dir / "palette.json").write_text(
+        json.dumps(
+            {
+                "primary": "#112233",
+                "secondary": "#223344",
+                "accent": "#334455",
+                "bg": "#0B1020",
+                "text": "#F8FAFC",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (project_dir / "tokens.json").write_text(
+        json.dumps(
+            {
+                "font": {
+                    "heading": {"value": "Inter", "type": "fontFamily"},
+                    "body": {"value": "Inter", "type": "fontFamily"},
+                    "mono": {"value": "JetBrains Mono", "type": "fontFamily"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeRunner:
+        projects_root = tmp_path
+
+        def get_project(self, slug):
+            return {"slug": slug} if slug == "demo" else None
+
+    monkeypatch.setattr(web_app, "_get_studio_runner", lambda _app: FakeRunner())
+
+    result = await web_app.studio_project_penpot_manifest("demo")
+
+    assert result["tool_target"] == "penpot"
+    assert result["handoff_kind"] == "design_tokens_package"
+    assert result["colors"][0]["name"] == "primary"
+
+
+@pytest.mark.asyncio
+async def test_studio_project_penpot_package_returns_zip(monkeypatch, tmp_path):
+    project_dir = tmp_path / "demo"
+    project_dir.mkdir(parents=True)
+    (project_dir / "brand.md").write_text("# Brand\n", encoding="utf-8")
+    (project_dir / "tokens.json").write_text('{"font":{}}', encoding="utf-8")
+
+    class FakeRunner:
+        projects_root = tmp_path
+
+        def get_project(self, slug):
+            return {"slug": slug} if slug == "demo" else None
+
+    monkeypatch.setattr(web_app, "_get_studio_runner", lambda _app: FakeRunner())
+
+    response = await web_app.studio_project_penpot_package("demo")
+
+    assert response.media_type == "application/zip"
+    assert "penpot-handoff.zip" in response.headers["content-disposition"]
+    with zipfile.ZipFile(io.BytesIO(response.body)) as archive:
+        names = archive.namelist()
+    assert "penpot_manifest.json" in names
+    assert "brand.md" in names
+
+
+@pytest.mark.asyncio
 async def test_agent_config_reset_clears_backend_model_only(monkeypatch, tmp_path):
     import skyn3t.config.agent_overrides as override_config
 
@@ -1502,6 +1646,8 @@ def test_dashboard_html_surfaces_guided_overview():
     assert "New mission" in dashboard_html
     assert "What SkyN3t will do" in dashboard_html
     assert "Current handoff" in dashboard_html
+    assert "Penpot handoff" in dashboard_html
+    assert "Download Penpot" in dashboard_html
     assert "Latest stage results" in dashboard_html
     assert "Live collaboration" in dashboard_html
     assert "Mission thread" in dashboard_html
@@ -1523,6 +1669,8 @@ def test_dashboard_html_surfaces_guided_overview():
     assert "studioRepoTargetSummaryHtml" in dashboard_html
     assert "studioArtifactPreviewMode" in dashboard_html
     assert "studioPreviewArtifactUrl" in dashboard_html
+    assert "studioPenpotPackageUrl" in dashboard_html
+    assert "studioRenderDesignHandoffCard" in dashboard_html
     assert "Current SkyN3t workspace" in dashboard_html
     assert "Local git repo path or GitHub URL" in dashboard_html
     assert "another local git repo or GitHub repo URL" in dashboard_html

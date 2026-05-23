@@ -28,12 +28,12 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from skyn3t.agents.decisions import load_decisions
 from skyn3t.agents.env_scanner import EnvVarRef, ScanResult
 from skyn3t.agents.env_scanner import scan as scan_env
-from skyn3t.agents.stack_detector import StackDetection
+from skyn3t.agents.stack_detector import Family, StackDetection
 from skyn3t.agents.stack_detector import detect as detect_stack
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
@@ -114,13 +114,15 @@ class PackagingAgent(BaseAgent):
         scaffold_dir = Path(scaffold_dir_raw).expanduser().resolve()
         verify_enabled = bool(data.get("packaging_verify", True))
 
-        detection = detect_stack(artifact_dir)
-        # Honour the architect's decisions.json contract: if a backend
-        # port was pinned upstream, every Dockerfile/compose/README
-        # rendered downstream uses it (instead of re-deriving from a
-        # local lookup table that may disagree).
         decisions = load_decisions(artifact_dir)
+        detection = detect_stack(artifact_dir)
+        # Honour the architect's decisions.json contract: if a family or
+        # backend port was pinned upstream, packaging should follow that
+        # committed shape instead of re-deriving it from a partial scaffold.
         if decisions is not None:
+            decided_family = str(decisions.get("family") or "").strip().lower()
+            if decided_family in {"web", "server", "fullstack", "unknown"}:
+                detection.family = cast(Family, decided_family)
             decided_port = decisions.get("backend_port")
             if isinstance(decided_port, int):
                 detection.port_override = decided_port

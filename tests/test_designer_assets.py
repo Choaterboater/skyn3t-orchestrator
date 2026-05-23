@@ -58,6 +58,8 @@ def test_design_tokens_w3c_shape():
         leaf = tokens["font"][role]
         assert leaf["type"] == "fontFamily"
         assert leaf["value"] == FONTS[role]
+    assert tokens["surface"]["base"]["value"] == "#FFFFFF0A"
+    assert tokens["surface"]["text-dim"]["value"] == "#E2E8F0A6"
 
 
 def test_design_tokens_serializes_to_json():

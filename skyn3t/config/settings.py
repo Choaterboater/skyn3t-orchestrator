@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     # LLM Defaults
     default_llm_provider: str = Field(default="openai", alias="DEFAULT_LLM_PROVIDER")
     default_model: str = Field(default="gpt-4-turbo-preview", alias="DEFAULT_MODEL")
+    llm_backend: str = Field(default="auto", alias="SKYN3T_LLM_BACKEND")
+    llm_model: Optional[str] = Field(default=None, alias="SKYN3T_LLM_MODEL")
 
     # Orchestrator
     max_concurrent_tasks: int = Field(default=10, alias="MAX_CONCURRENT_TASKS")

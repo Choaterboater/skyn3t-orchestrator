@@ -15,6 +15,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from skyn3t.agents.decisions import write_decisions
+from skyn3t.agents.stack_templates import _needs_backend
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
 
@@ -74,6 +75,34 @@ _RISKS_BY_TARGET: Dict[str, List[str]] = {
         "Auto-update is a footgun; prefer package managers.",
     ],
 }
+
+
+_LOCAL_FIRST_FRONTENDS = {"react-vite", "react-vite-tailwind"}
+_LOCAL_FIRST_BACKENDS = {"express", "hono-node", "hono"}
+
+
+def _normalize_stack_for_brief(brief: str, stack: Dict[str, Any]) -> Dict[str, Any]:
+    """Prefer a browser-only bundle when the brief doesn't truly need a backend.
+
+    The architect used to be forced into React/Vite + Express bundles for simple
+    product briefs like habit trackers, todo apps, and journals. That created a
+    fake-fullstack path: the frontend immediately called backend routes the
+    scaffold never truly supported. For generic browser apps with no backend
+    signals, coerce the chosen bundle onto the local-first web shape instead.
+    """
+    if not isinstance(stack, dict):
+        return stack
+    frontend = str(stack.get("frontend") or "").strip().lower()
+    backend = str(stack.get("backend") or "").strip().lower()
+    if frontend not in _LOCAL_FIRST_FRONTENDS or backend not in _LOCAL_FIRST_BACKENDS:
+        return stack
+    if _needs_backend(brief):
+        return stack
+    normalized = dict(stack)
+    normalized["backend"] = "none"
+    normalized["db"] = "none"
+    normalized["infra"] = "local-node"
+    return normalized
 
 
 class ArchitectAgent(BaseAgent):
@@ -209,6 +238,7 @@ class ArchitectAgent(BaseAgent):
             "to Express and corrupt package.json):\n"
             "  - {frontend: 'react-vite-tailwind', backend: 'express', db: 'better-sqlite3', infra: 'docker-compose', ci: 'github-actions'}\n"
             "  - {frontend: 'react-vite-tailwind', backend: 'express', db: 'none', infra: 'docker-compose', ci: 'github-actions'}\n"
+            "  - {frontend: 'react-vite-tailwind', backend: 'none', db: 'none', infra: 'local-node', ci: 'github-actions'}\n"
             "  - {frontend: 'react-vite', backend: 'express', db: 'better-sqlite3', infra: 'local-node', ci: 'github-actions'}\n"
             "  - {frontend: 'react-vite', backend: 'hono-node', db: 'better-sqlite3', infra: 'docker-compose', ci: 'github-actions'}\n"
             "  - {frontend: 'next', backend: 'next', db: 'better-sqlite3', infra: 'vercel', ci: 'github-actions'}\n"
@@ -222,6 +252,10 @@ class ArchitectAgent(BaseAgent):
             "- If the brief mentions a feature that isn't in any bundle (e.g. Hono\n"
             "  + Postgres), pick the CLOSEST bundle and accept the substitution\n"
             "  rather than inventing new values.\n"
+            "- Prefer backend='none' for browser-only apps (habit trackers, todo\n"
+            "  apps, journals, dashboards with local persistence) unless the brief\n"
+            "  explicitly requires secrets, third-party API integrations,\n"
+            "  server-side CRUD, health endpoints, or backend persistence.\n"
             "- 'none' means the role is genuinely not needed (e.g. a CLI tool sets\n"
             "  frontend=none).\n\n"
             "Return ONLY valid JSON for one bundle, nothing else. No code fences."
@@ -236,6 +270,7 @@ class ArchitectAgent(BaseAgent):
             k in llm_stack for k in ("frontend", "backend", "db", "infra", "ci")
         ):
             stack = llm_stack
+        stack = _normalize_stack_for_brief(brief, stack)
 
         stack_path = artifact_dir / "tech_stack.json"
         stack_path.write_text(json.dumps(stack, indent=2), encoding="utf-8")

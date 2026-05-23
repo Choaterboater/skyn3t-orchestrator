@@ -39,7 +39,7 @@ MISSION_AUTONOMY: Dict[str, Dict[str, str]] = {
 
 DEFAULT_MISSION_SETUP: Dict[str, str] = {
     "audience": "",
-    "autonomy": "move_fast",
+    "autonomy": "balanced",
 }
 
 
@@ -123,6 +123,6 @@ def mission_setup_stage_hints(value: Any) -> Dict[str, Any]:
     if setup["autonomy"] == "confirm_first":
         hints["require_clarification"] = True
     elif setup["autonomy"] == "move_fast":
-        hints["clarifications"] = True
+        hints["skip_clarification"] = True
 
     return hints

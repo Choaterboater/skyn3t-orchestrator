@@ -25,7 +25,8 @@ Stages today (in order of "cheap is fine" → "strong matters"):
                  quality compounds across N files.
   reviewer     — judges output. Strong matters more here than
                  anywhere else; cheap models miss real issues.
-  build_verifier / boot_verifier — local subprocess, no LLM call.
+  build_verifier / boot_verifier / integration_verifier — local subprocess,
+               no LLM call.
 
 Tier name → CLI backend mapping:
   cheap   → kimi_cli  (free, fast, "good enough" for fan-out)
@@ -93,23 +94,24 @@ _DEFAULT_STAGE_POLICY: Dict[str, str] = {
     # system-shape decisions — still prefer a stronger model, but on
     # OpenRouter rather than a CLI-backed Claude default.
     "architect":          "or_strong",
-    # Code stage uses per-file routing inside CodeAgent (see
-    # resolve_model_for_file). The agent-level tier here is just
-    # the fallback for non-file-specific LLM calls (planning).
-    # Flipped from "balanced" (copilot_cli) to "or_cheap"
-    # (openrouter/owl-alpha free) — copilot_cli was timing out on
-    # most calls, causing ~50min wall-time on builds. OpenRouter is
-    # HTTP-based with a 120s timeout instead of the 240s CLI idle.
-    "code":               "or_cheap",
-    "code_agent":         "or_cheap",
-    "code_improver":      "or_cheap",
+    "architecture":       "or_strong",
+    # Code-stage planning still uses the agent-level route before
+    # per-file specialization kicks in. Keep it on the HTTP path, but
+    # use a code-focused model instead of the ultra-cheap general tier.
+    "code":               "or_backend",
+    "code_agent":         "or_backend",
+    "code_improver":      "or_backend",
     "reviewer":           "or_strong",
+    "contract_verifier":  "or_strong",
+    "consistency_reviewer": "or_strong",
+    "packaging_agent":    "or_cheap",
     "verifier":           "or_cheap",
     "docs":               "or_docs",
 
     # verifiers don't call LLMs — listed for completeness
     "build_verifier":     "or_cheap",
     "boot_verifier":      "or_cheap",
+    "integration_verifier": "or_cheap",
 }
 
 

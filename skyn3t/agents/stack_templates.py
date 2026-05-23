@@ -177,6 +177,7 @@ def detect_stack_from_handoff(
     *,
     architecture_text: str = "",
     tech_stack: Optional[Dict[str, Any]] = None,
+    decisions: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Pick a stack template using the brief plus upstream architect hints.
 
@@ -188,6 +189,7 @@ def detect_stack_from_handoff(
     planner.
     """
     direct = detect_stack(brief)
+    direct = _stack_from_decisions(decisions, direct)
     if direct:
         return direct
 
@@ -205,10 +207,11 @@ def detect_stack_from_handoff(
         # mentions both. This happens when tech_stack.json drifts but the
         # architecture overview still says "Vite + React SPA + Express".
         if any(token in signal_text for token in ("vite", "react spa", "single-page app", "single page app")):
-            return "react_vite"
+            return _stack_from_decisions(decisions, "react_vite")
         if any(token in signal_text for token in ("next.js", "nextjs", "app router", "route handlers")):
-            return "next"
+            return _stack_from_decisions(decisions, "next")
         inferred = detect_stack(signal_text)
+        inferred = _stack_from_decisions(decisions, inferred)
         if inferred:
             return inferred
 
@@ -216,7 +219,52 @@ def detect_stack_from_handoff(
     # often to a SPA scaffold than to a static site. This keeps the deterministic
     # browser-first template path available for homelab/service-board briefs.
     if _needs_design_system(brief):
+        return _stack_from_decisions(decisions, "react_vite")
+    return _stack_from_decisions(decisions, None)
+
+
+def _stack_from_decisions(
+    decisions: Optional[Dict[str, Any]],
+    inferred: Optional[str],
+) -> Optional[str]:
+    """Let explicit architect shape decisions win over weaker brief guesses."""
+    if not decisions:
+        return inferred
+    family = str(decisions.get("family") or "").strip().lower()
+    framework = str(decisions.get("framework") or "").strip().lower()
+    frontend_bundle = str(decisions.get("frontend_bundle") or "").strip().lower()
+    bundle_locked = _stack_from_bundle(frontend_bundle, framework)
+    if bundle_locked:
+        return bundle_locked
+    if framework == "next":
+        return "next"
+    if family == "fullstack":
+        if inferred == "next":
+            return inferred
         return "react_vite"
+    if family == "web":
+        if inferred in {"react_vite", "next", "static_site"}:
+            return inferred
+        return "react_vite"
+    if family == "server" and inferred in {"react_vite", "next", "static_site"}:
+        return None
+    return inferred
+
+
+def _stack_from_bundle(frontend_bundle: str, backend_bundle: str) -> Optional[str]:
+    """Map the architect's exact bundle names onto supported deterministic templates.
+
+    The architect speaks in bundle ids like ``react-vite-tailwind`` and
+    ``vanilla-vite`` while the deterministic scaffold layer exposes a smaller
+    set of stable template keys. Prefer the direct bundle contract when
+    available instead of re-deriving from free-form prose.
+    """
+    if backend_bundle == "next" or frontend_bundle == "next":
+        return "next"
+    if frontend_bundle in {"react-vite", "react-vite-tailwind", "vue-vite"}:
+        return "react_vite"
+    if frontend_bundle == "vanilla-vite":
+        return "static_site"
     return None
 
 
@@ -239,10 +287,12 @@ def plan_for_stack(
        The architect's ``decisions.json`` (when present) is a stronger
        signal than brief detection: if the architect committed to a
        Node backend framework (``express``, ``hono-node``), the
-       backend tier ships regardless of brief signals. This stops the
+       backend tier ships regardless of brief signals; if the architect
+       explicitly locked the family to ``web``, brief heuristics are not
+       allowed to quietly add a backend anyway. This stops both
        "architect said Express + port 3000 but no server code shipped"
-       class of consistency-reviewer finding that dominated tactrax /
-       crack-track / e79bc0 reviews.
+       and "architect picked web-only but codegen invented a server"
+       review failures.
 
     2. **Configurable tier** — when the brief signals "the user should be
        able to edit config from the UI" (set API keys, change host/port,
@@ -263,7 +313,10 @@ def plan_for_stack(
         return None
     plan: FilePlan = list(base)
     if stack in _BROWSER_FIRST_STACKS:
-        if _needs_backend(brief) or _decisions_pin_node_backend(decisions):
+        backend_preference = _decisions_backend_preference(decisions)
+        if backend_preference is True or (
+            backend_preference is not False and _needs_backend(brief)
+        ):
             services = _detect_services(brief)
             plan = plan + _backend_tier_files(services)
             # Configurable tier rides on backend tier — pointless to add
@@ -450,6 +503,20 @@ def _decisions_pin_node_backend(decisions: Optional[Dict[str, Any]]) -> bool:
     if language == "node" and isinstance(backend_port, int):
         return True
     return False
+
+
+def _decisions_backend_preference(decisions: Optional[Dict[str, Any]]) -> Optional[bool]:
+    """Return whether decisions.json explicitly wants or forbids a backend tier."""
+    if not decisions:
+        return None
+    family = str(decisions.get("family") or "").strip().lower()
+    if family == "web":
+        return False
+    if family == "fullstack":
+        return True
+    if _decisions_pin_node_backend(decisions):
+        return True
+    return None
 
 
 def _detect_services(brief: str) -> List[str]:

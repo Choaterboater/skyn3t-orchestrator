@@ -1287,7 +1287,7 @@ class DesignerAgent(BaseAgent):
     @staticmethod
     def _render_design_tokens(palette: Dict[str, str], fonts: Dict[str, str]) -> Dict[str, Any]:
         """Emit a W3C design-tokens-shape JSON dict. Compatible with Style
-        Dictionary, Tokens Studio, Tailwind plugins, etc."""
+        Dictionary, Penpot token plugins, Tailwind plugins, etc."""
         def color_token(value: str) -> Dict[str, str]:
             return {"value": value, "type": "color"}
 
@@ -1308,12 +1308,12 @@ class DesignerAgent(BaseAgent):
                 "info": color_token(palette["accent"]),
             },
             "surface": {
-                "base": color_token("rgba(255, 255, 255, 0.04)"),
-                "elevated": color_token("rgba(255, 255, 255, 0.07)"),
-                "border": color_token("rgba(255, 255, 255, 0.08)"),
-                "border-strong": color_token("rgba(255, 255, 255, 0.14)"),
-                "text-dim": color_token("rgba(226, 232, 240, 0.65)"),
-                "muted": color_token("rgba(226, 232, 240, 0.45)"),
+                "base": color_token("#FFFFFF0A"),
+                "elevated": color_token("#FFFFFF12"),
+                "border": color_token("#FFFFFF14"),
+                "border-strong": color_token("#FFFFFF24"),
+                "text-dim": color_token("#E2E8F0A6"),
+                "muted": color_token("#E2E8F073"),
             },
             "radius": {
                 "sm": {"value": "8px", "type": "dimension"},
@@ -1431,7 +1431,7 @@ class DesignerAgent(BaseAgent):
             "| `brand.md` | Narrative brand guide: palette, type, voice, logo concepts. |",
             "| `palette.json` | Raw 5-color palette (primary/secondary/accent/bg/text). |",
             "| `tokens.css` | CSS custom properties — `@import` into any web project. |",
-            "| `tokens.json` | W3C design-tokens shape — feed into Style Dictionary, Tokens Studio, Tailwind plugins. |",
+            "| `tokens.json` | W3C design-tokens shape — feed into Style Dictionary, Tokens Studio, Penpot token plugins, or Tailwind tooling. |",
             "| `logo.svg` | Vector logo at 240×240. Drop into a hero, app icon, or favicon pipeline. |",
             "| `components.md` | Component class hints (Tailwind-shaped) for primary surfaces. |",
             "| `brand_voice_guide.md` | Long-form voice + copy patterns. |",
@@ -1462,6 +1462,12 @@ class DesignerAgent(BaseAgent):
             f"- Heading: `{fonts.get('heading', 'system-ui')}`",
             f"- Body: `{fonts.get('body', 'system-ui')}`",
             f"- Mono: `{fonts.get('mono', 'ui-monospace')}`",
+            "",
+            "## Penpot handoff",
+            "",
+            "- Import `logo.svg` directly into Penpot for a starting mark.",
+            "- Load `tokens.json` through a Penpot token plugin if you want color/text tokens to land faster.",
+            "- Keep `brand.md` and `components.md` open while building Penpot components and variants.",
             "",
         ]
         return "\n".join(out)

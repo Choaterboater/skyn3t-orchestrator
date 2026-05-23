@@ -27,6 +27,8 @@ from skyn3t.studio.mission_setup import (
     mission_setup_stage_hints,
     normalize_mission_setup,
 )
+from skyn3t.studio.clarification import format_user_intent_brief_block, parse_user_intent
+from skyn3t.studio.penpot_handoff import materialize_penpot_handoff
 from skyn3t.studio.registry import get_agent
 from skyn3t.studio.repo_target import (
     augment_brief_with_repo_target,
@@ -265,7 +267,11 @@ class StudioRunner:
                                            event_bus=self.event_bus, caller_name="planner")
                 except Exception:
                     pass
-                planned = await plan_pipeline(brief=effective_brief, llm_client=llm_client)
+                planned = await plan_pipeline(
+                    brief=effective_brief,
+                    llm_client=llm_client,
+                    user_intent=user_intent or manifest.get("user_intent"),
+                )
                 # Belt-and-braces guard: if the brief asks for runnable
                 # software but no code-producing agent made it into the
                 # plan, force CodeAgent in. v52 surfaced a case where the
@@ -438,11 +444,19 @@ class StudioRunner:
             return manifest
         try:
             # Fold answers into brief
-            questions = (manifest.get("clarification") or {}).get("questions", [])
+            clarification = manifest.get("clarification") or {}
+            questions = clarification.get("questions", [])
+            question_options = clarification.get("question_options") or []
+            user_intent = parse_user_intent(questions, answers, question_options)
             qa_block = "\n\n## User clarifications\n"
             for q, a in zip(questions, answers):
                 qa_block += f"- **Q:** {q}\n  **A:** {a}\n"
+            intent_block = format_user_intent_brief_block(user_intent)
+            if intent_block:
+                qa_block += "\n" + intent_block
             new_brief = (manifest.get("brief") or "") + qa_block
+            if user_intent:
+                manifest["user_intent"] = user_intent
             # Reset to running, clear stages so the pipeline reruns from scratch with
             # answers in the brief. (The clarifications field is preserved as history.)
             manifest["clarification_history"] = manifest.get("clarification_history", []) + [
@@ -479,7 +493,11 @@ class StudioRunner:
                 from skyn3t.studio.templates import StageSpec, Template
                 llm_client = LLMClient(default_model=None, backend=None,
                                        event_bus=self.event_bus, caller_name="planner")
-                planned = await plan_pipeline(brief=effective_brief, llm_client=llm_client)
+                planned = await plan_pipeline(
+                    brief=effective_brief,
+                    llm_client=llm_client,
+                    user_intent=user_intent or manifest.get("user_intent"),
+                )
                 template = Template(key="auto", title="Auto-planned",
                                     description=f"Re-planned after clarification: {new_brief[:80]}",
                                     stages=[StageSpec(name=p.name, agent=p.agent,
@@ -692,6 +710,75 @@ class StudioRunner:
                 logger.exception("telegram thread update failed")
 
     @staticmethod
+    def _studio_dashboard_url(slug: str) -> str:
+        try:
+            from skyn3t.config.settings import get_settings
+
+            settings = get_settings()
+            base = (settings.public_url or "").rstrip("/")
+            if not base:
+                port = settings.web_port
+                host = "localhost" if settings.web_host in ("0.0.0.0", "") else settings.web_host
+                base = f"http://{host}:{port}"
+            return f"{base}/studio?slug={slug}"
+        except Exception:
+            return f"/studio?slug={slug}"
+
+    async def _dispatch_clarification_notifications(
+        self,
+        manifest: dict,
+        slug: str,
+        agent_name: str,
+        questions: list[str],
+    ) -> None:
+        dashboard_url = self._studio_dashboard_url(slug)
+        message = (
+            f"🟡 Clarification needed — answer {len(questions)} question(s) in Studio to continue."
+            + (f"\n{dashboard_url}" if dashboard_url else "")
+        )
+        try:
+            await self._post_discord_thread_update(manifest, message)
+        except Exception:
+            logger.debug("clarification thread update failed", exc_info=True)
+
+        discord_meta = manifest.setdefault("discord", {})
+        if not str(discord_meta.get("thread_id") or ""):
+            try:
+                from skyn3t.studio.approval_gate import load_gate_config as _load_gate_cfg
+                from skyn3t.studio.notify_dispatcher import (
+                    dispatch_clarification as _notify_clarification,
+                )
+
+                result = await _notify_clarification(
+                    slug, agent_name, dashboard_url, questions, _load_gate_cfg()
+                )
+                if result.get("thread_id"):
+                    discord_meta["thread_id"] = str(result["thread_id"])
+                if result.get("message_id"):
+                    discord_meta["message_id"] = str(result["message_id"])
+                if result.get("channel_id"):
+                    discord_meta["channel_id"] = str(result["channel_id"])
+            except Exception:
+                logger.exception("discord clarification notification failed")
+
+        telegram_meta = manifest.setdefault("telegram", {})
+        if not telegram_meta.get("starter_message_id"):
+            try:
+                from skyn3t.integrations.telegram_dispatch import (
+                    dispatch_clarification as _telegram_clarification,
+                )
+
+                result = await _telegram_clarification(
+                    slug, agent_name, questions, dashboard_url
+                )
+                if result.get("message_id"):
+                    telegram_meta["starter_message_id"] = int(result["message_id"])
+                if result.get("chat_id"):
+                    telegram_meta["chat_id"] = str(result["chat_id"])
+            except Exception:
+                logger.exception("telegram clarification notification failed")
+
+    @staticmethod
     def _merge_telegram_thread_context(manifest: dict, extra: Optional[dict]) -> bool:
         """Persist Telegram reply context from the launch request."""
         if not isinstance(extra, dict):
@@ -760,7 +847,11 @@ class StudioRunner:
                 event_bus=self.event_bus,
                 caller_name="planner",
             )
-            planned = await plan_pipeline(brief=manifest["brief"], llm_client=llm_client)
+            planned = await plan_pipeline(
+                brief=manifest["brief"],
+                llm_client=llm_client,
+                user_intent=manifest.get("user_intent"),
+            )
             template = Template(
                 key="auto",
                 title="Auto-planned",
@@ -1210,6 +1301,7 @@ class StudioRunner:
                     manifest["clarification"] = {
                         "asked_by": stage.agent,
                         "questions": output.get("questions", []),
+                        "question_options": output.get("question_options", []),
                         "asked_at": time.time(),
                     }
                     question_count = len(output.get("questions", []))
@@ -1242,6 +1334,13 @@ class StudioRunner:
                     self._publish("PROJECT_AWAITING_CLARIFICATION",
                                    {"slug": slug, "stage": stage.name,
                                     "questions": output.get("questions", [])})
+                    await self._dispatch_clarification_notifications(
+                        manifest,
+                        slug,
+                        stage.agent,
+                        list(output.get("questions", [])),
+                    )
+                    self._save_manifest(artifact_dir, manifest)
                     # IMPORTANT: do NOT continue to next stage. Return now; user will resume.
                     return manifest
 
@@ -1786,6 +1885,9 @@ class StudioRunner:
                         manifest.get("quality_summary"),
                         quality_candidate,
                     )
+                for generated in self._refresh_penpot_handoff(artifact_dir):
+                    if generated not in manifest["artifacts"]:
+                        manifest["artifacts"].append(generated)
                 manifest["next_action"] = (
                     f"Handing off to {stage.handoff_to}."
                     if stage.handoff_to
@@ -2290,6 +2392,21 @@ class StudioRunner:
                                             verdict = "no"
                                             build_result = integration_result
                                             failed_verifier = "integration"
+                                else:
+                                    verdict = "no"
+                                    build_result = {
+                                        "verdict": "no",
+                                        "summary": (
+                                            "Integration verifier could not run after the server booted."
+                                        ),
+                                        "failure_hint": (
+                                            "The project booted, but SkyN3t could not verify that frontend "
+                                            "API calls match backend routes. Treat this as a blocked release "
+                                            "until the integration contract check runs cleanly."
+                                        ),
+                                    }
+                                    manifest["integration_verification"] = build_result
+                                    failed_verifier = "integration"
 
                     if not skip_fix_loops and verdict == "no":
                         manifest["status"] = "failed"
@@ -2341,6 +2458,13 @@ class StudioRunner:
                         sb.flush()
                     except Exception:
                         logger.exception("build_pattern record failed")
+            if manifest.get("status") != "failed":
+                manifest["status"], manifest["next_action"], manifest["error"] = (
+                    self._finalize_project_outcome(
+                            manifest.get("quality_summary"),
+                            manifest=manifest,
+                    )
+                )
             completion_message = (
                 manifest["next_action"]
                 if manifest.get("status") in {"done", "needs_fixes"}
@@ -4321,6 +4445,13 @@ class StudioRunner:
                     break
         return entries
 
+    def _refresh_penpot_handoff(self, artifact_dir: Path) -> List[str]:
+        try:
+            return materialize_penpot_handoff(artifact_dir)
+        except Exception:
+            logger.debug("penpot handoff materialization failed", exc_info=True)
+            return []
+
     def _normalize_manifest(self, manifest: Dict[str, Any]) -> Dict[str, Any]:
         manifest.setdefault("stages", [])
         manifest.setdefault("artifacts", [])
@@ -4485,7 +4616,8 @@ class StudioRunner:
         Composite gate: a run only earns "done" when
           - reviewer verdict is "go" AND reviewer score >= threshold, AND
           - build_verification verdict is "yes" (or "skipped"), AND
-          - boot_verification verdict is "yes" (or "skipped").
+          - boot_verification verdict is "yes" (or "skipped"), AND
+          - integration_verification verdict is "yes" (or "skipped").
 
         Any failure of those three downgrades to "needs_fixes" (when
         recoverable) or "failed" (when irrecoverable). The previous
@@ -4498,13 +4630,17 @@ class StudioRunner:
         # available. These are independent of the reviewer.
         build_verdict = None
         boot_verdict = None
+        integration_verdict = None
         if manifest is not None:
             bv = manifest.get("build_verification") or {}
             boot = manifest.get("boot_verification") or {}
+            integration = manifest.get("integration_verification") or {}
             if isinstance(bv, dict):
                 build_verdict = bv.get("verdict")
             if isinstance(boot, dict):
                 boot_verdict = boot.get("verdict")
+            if isinstance(integration, dict):
+                integration_verdict = integration.get("verdict")
 
         # 1. Hard failures from verifiers — these can't be reviewer-
         # overridden. A program that doesn't boot isn't "done".
@@ -4521,6 +4657,13 @@ class StudioRunner:
                 "Server failed to boot — see boot_verification.failure_hint "
                 "for the diagnosed cross-file issue.",
                 "boot verifier said no",
+            )
+        if integration_verdict == "no":
+            return (
+                "needs_fixes",
+                "Frontend/backend integration failed — see "
+                "integration_verification.failure_hint for the contract issue.",
+                "integration verifier said no",
             )
 
         # 2. Reviewer-driven outcome, with the score threshold layered on.

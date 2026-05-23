@@ -1096,6 +1096,7 @@ class CodeAgent(BaseAgent):
                 brief,
                 architecture_text=architecture_text,
                 tech_stack=tech_stack,
+                decisions=decisions,
             )
             template_plan = (
                 plan_for_stack(template_key, brief, decisions=decisions)

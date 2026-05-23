@@ -640,6 +640,39 @@ class TestStudioRunner:
     ):
         from skyn3t.studio.runner import StudioRunner
 
+        async def fake_discord_notify(slug, agent_name, dashboard_url, questions, cfg):
+            assert slug == "demo"
+            assert agent_name == "WriterAgent"
+            assert dashboard_url == "https://studio.test/demo"
+            assert questions == ["Who is the audience?"]
+            return {
+                "discord": True,
+                "thread_id": "discord-thread-1",
+                "message_id": "discord-message-1",
+                "channel_id": "discord-channel-1",
+            }
+
+        async def fake_telegram_notify(slug, agent_name, questions, dashboard_url):
+            assert slug == "demo"
+            assert agent_name == "WriterAgent"
+            assert questions == ["Who is the audience?"]
+            assert dashboard_url == "https://studio.test/demo"
+            return {"ok": True, "message_id": 777, "chat_id": "42"}
+
+        monkeypatch.setattr(
+            "skyn3t.studio.notify_dispatcher.dispatch_clarification",
+            fake_discord_notify,
+        )
+        monkeypatch.setattr(
+            "skyn3t.integrations.telegram_dispatch.dispatch_clarification",
+            fake_telegram_notify,
+        )
+        monkeypatch.setattr(
+            StudioRunner,
+            "_studio_dashboard_url",
+            staticmethod(lambda slug: f"https://studio.test/{slug}"),
+        )
+
         class ClarifyingAgent:
             async def initialize(self) -> None:
                 return None
@@ -700,6 +733,10 @@ class TestStudioRunner:
         assert stage["handoff_to"] == "ReviewerAgent"
         saved_manifest = json.loads((tmp_path / "demo" / "project.json").read_text())
         assert saved_manifest["stages"][0]["files"] == ["_clarifications.json"]
+        assert saved_manifest["discord"]["thread_id"] == "discord-thread-1"
+        assert saved_manifest["discord"]["message_id"] == "discord-message-1"
+        assert saved_manifest["telegram"]["starter_message_id"] == 777
+        assert saved_manifest["telegram"]["chat_id"] == "42"
 
     async def test_run_pipeline_tags_nested_agent_events_with_project_context(
         self, event_bus, tmp_path, monkeypatch
@@ -865,7 +902,8 @@ class TestStudioRunner:
             "autonomy": "move_fast",
         }
         assert fake_agent.last_task.input_data["audience"] == "Builders / developers"
-        assert fake_agent.last_task.input_data["clarifications"] is True
+        assert fake_agent.last_task.input_data["skip_clarification"] is True
+        assert "clarifications" not in fake_agent.last_task.input_data
         assert fake_agent.last_task.input_data["repo_root"] == repo_root.resolve().as_posix()
         assert fake_agent.last_task.input_data["repo_label"] == "customer-portal"
         assert fake_agent.last_task.input_data["target_file"] == "src/login.tsx"
@@ -877,7 +915,7 @@ class TestStudioRunner:
         assert "## Codebase target" in fake_agent.last_task.input_data["brief"]
         assert "Primary audience: Builders / developers" in fake_agent.last_task.input_data["brief"]
 
-    async def test_start_defaults_to_move_fast_without_explicit_mission_setup(
+    async def test_start_defaults_to_balanced_without_explicit_mission_setup(
         self, event_bus, tmp_path, monkeypatch
     ):
         from skyn3t.studio.runner import StudioRunner
@@ -922,13 +960,13 @@ class TestStudioRunner:
         runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
         manifest = await runner.start("demo", "Draft a launch brief", slug="demo-defaults")
 
-        assert manifest["mission_setup"] == {"audience": "", "autonomy": "move_fast"}
+        assert manifest["mission_setup"] == {"audience": "", "autonomy": "balanced"}
         assert fake_agent.last_task is not None
         assert fake_agent.last_task.input_data["mission_setup"] == {
             "audience": "",
-            "autonomy": "move_fast",
+            "autonomy": "balanced",
         }
-        assert fake_agent.last_task.input_data["clarifications"] is True
+        assert "skip_clarification" not in fake_agent.last_task.input_data
         assert "require_clarification" not in fake_agent.last_task.input_data
 
     async def test_reserve_project_rejects_focus_file_without_repo_path(
@@ -1614,6 +1652,110 @@ class TestStudioRunner:
         assert manifest["error"] == "server failed to start within 45s"
         assert manifest["next_action"] == "Retrying with the boot failure as a hint."
         assert manifest["_retry_hint"] == "server/config-store.js is still a generated TODO stub"
+
+    async def test_integration_verifier_unavailable_blocks_release(
+        self, event_bus, tmp_path, monkeypatch
+    ):
+        from skyn3t.studio.runner import StudioRunner
+
+        class WriterStageAgent:
+            async def initialize(self) -> None:
+                return None
+
+            async def execute(self, task: TaskRequest) -> TaskResult:
+                artifact_dir = Path(task.input_data["artifact_dir"]).resolve()
+                scaffold_dir = artifact_dir / "scaffold"
+                scaffold_dir.mkdir(parents=True, exist_ok=True)
+                (scaffold_dir / "package.json").write_text(
+                    '{"name":"demo"}\n',
+                    encoding="utf-8",
+                )
+                return TaskResult(
+                    task_id=task.task_id,
+                    success=True,
+                    output={"files": [str(scaffold_dir / "package.json")]},
+                )
+
+        def fake_get_agent(name, *args, **kwargs):
+            if name == "WriterAgent":
+                return WriterStageAgent()
+            raise AssertionError(f"unexpected agent {name}")
+
+        monkeypatch.setattr("skyn3t.studio.runner.get_agent", fake_get_agent)
+        monkeypatch.setattr(
+            "skyn3t.studio.runner.get_template",
+            lambda _key: SimpleNamespace(
+                title="Writer template",
+                description="Create a scaffold.",
+                stages=[
+                    SimpleNamespace(
+                        name="writer",
+                        agent="WriterAgent",
+                        capability="copywriting",
+                        handoff_to=None,
+                        input_extra={},
+                    )
+                ],
+            ),
+        )
+
+        runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
+
+        async def fake_build(scaffold_dir: str, brief: str):
+            return {
+                "verdict": "yes",
+                "stack": "node",
+                "summary": "build ok",
+                "command": "npm run build",
+            }
+
+        async def fake_boot(scaffold_dir: str, brief: str):
+            return {
+                "verdict": "yes",
+                "kind": "node-express",
+                "summary": "boot ok",
+                "command": "node index.js",
+            }
+
+        async def fake_retry(manifest, brief, slug):
+            return None
+
+        monkeypatch.setattr(runner, "_run_build_verifier", fake_build)
+        monkeypatch.setattr(runner, "_run_boot_verifier", fake_boot)
+        monkeypatch.setattr(runner, "_run_integration_verifier", lambda *args, **kwargs: None)
+        monkeypatch.setattr(runner, "_maybe_auto_retry", fake_retry)
+
+        manifest = await runner.start("demo", "Build a dashboard", slug="integration-missing")
+
+        assert manifest["status"] == "failed"
+        assert manifest["error"] == "Integration verifier could not run after the server booted."
+        assert manifest["next_action"] == "Retrying with the integration failure as a hint."
+        assert manifest["_retry_hint"].startswith("The project booted")
+        assert manifest["integration_verification"]["verdict"] == "no"
+
+    async def test_finalize_project_outcome_blocks_integration_failure(
+        self, event_bus, tmp_path
+    ):
+        from skyn3t.studio.runner import StudioRunner
+
+        runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
+        status, next_action, error = runner._finalize_project_outcome(
+            {
+                "source": "reviewer",
+                "verdict": "go",
+                "score": 92,
+                "summary": "Reviewer says this is ready.",
+            },
+            manifest={
+                "build_verification": {"verdict": "yes"},
+                "boot_verification": {"verdict": "yes"},
+                "integration_verification": {"verdict": "no"},
+            },
+        )
+
+        assert status == "needs_fixes"
+        assert "integration" in next_action.lower()
+        assert error == "integration verifier said no"
 
     async def test_unresolved_stub_failure_uses_stub_retry_hint(
         self, event_bus, tmp_path, monkeypatch

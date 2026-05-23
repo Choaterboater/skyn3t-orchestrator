@@ -1,4 +1,4 @@
-"""Notification dispatcher for the approval gate.
+"""Notification dispatcher for approval + clarification gate events.
 
 Supports two Discord delivery paths:
 
@@ -117,6 +117,38 @@ def _build_embed_payload(
         "embeds": [
             {
                 "title": f"Approve architecture for {slug}",
+                "url": dashboard_url or None,
+                "description": description,
+            }
+        ],
+    }
+
+
+def _build_clarification_payload(
+    slug: str,
+    agent_name: str,
+    dashboard_url: str,
+    questions: list[str],
+) -> dict:
+    preview = [
+        "Pipeline paused for clarification before it can keep building.",
+        "",
+        f"Agent: **{agent_name}**",
+    ]
+    if questions:
+        preview.append("")
+        preview.append("**Questions:**")
+        preview.extend(f"{idx}. {q}" for idx, q in enumerate(questions[:3], start=1))
+        if len(questions) > 3:
+            preview.append(f"…and {len(questions) - 3} more.")
+    description = "\n".join(preview)
+    if len(description) > _DISCORD_DESCRIPTION_MAX:
+        description = description[:_DISCORD_DESCRIPTION_MAX].rstrip() + "…"
+    return {
+        "content": f"\U0001F7E1 `{slug}` needs clarification from **{agent_name}**",
+        "embeds": [
+            {
+                "title": f"Clarification needed for {slug}",
                 "url": dashboard_url or None,
                 "description": description,
             }
@@ -257,5 +289,48 @@ async def dispatch(
     if webhook:
         if await _post_via_webhook(webhook, payload):
             return {"discord": True}
+    return {"discord": False}
 
+
+async def dispatch_clarification(
+    slug: str,
+    agent_name: str,
+    dashboard_url: str,
+    questions: list[str],
+    cfg: Dict[str, Any],
+) -> Dict[str, bool]:
+    """Send notifications about a clarification pause."""
+    notify_cfg = (cfg or {}).get("notify") or {}
+    webhook = str(notify_cfg.get("discord_webhook") or "").strip()
+    channel_id = str(notify_cfg.get("discord_bot_channel_id") or "").strip()
+
+    if not webhook and not channel_id:
+        return {}
+
+    key = (slug, f"{agent_name}:clarification")
+    async with _lock:
+        last = _last_dispatch.get(key, 0.0)
+        now = time.monotonic()
+        if now - last < _THROTTLE_WINDOW_SECONDS:
+            return {"discord": False, "throttled": True}
+        _last_dispatch[key] = now
+
+    payload = _build_clarification_payload(slug, agent_name, dashboard_url, questions)
+
+    if channel_id and _discord_token():
+        message = await _post_via_bot(channel_id, payload)
+        if message is not None:
+            result: Dict[str, Any] = {"discord": True}
+            message_id = str(message.get("id") or "")
+            if message_id:
+                result["message_id"] = message_id
+                thread_id = await start_thread_for_message(channel_id, message_id, f"{slug}-clarify")
+                if thread_id:
+                    result["thread_id"] = thread_id
+                    result["channel_id"] = channel_id
+            return result
+
+    if webhook:
+        if await _post_via_webhook(webhook, payload):
+            return {"discord": True}
     return {"discord": False}

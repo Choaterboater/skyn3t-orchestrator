@@ -15,9 +15,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger("skyn3t.studio.planner")
+from skyn3t.studio.clarification import apply_user_intent_plan, skip_force_code_for_intent
 
-_TARGET_FILE_PATTERN = re.compile(
+logger = logging.getLogger("skyn3t.studio.planner") = re.compile(
     r"\b([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+\.\w+|target_file\s*[:=]\s*\S+)",
     re.IGNORECASE,
 )
@@ -123,7 +123,12 @@ class PlannedStage:
     input_extra: Dict[str, Any] = field(default_factory=dict)
 
 
-async def plan_pipeline(*, brief: str, llm_client=None) -> List[PlannedStage]:
+async def plan_pipeline(
+    *,
+    brief: str,
+    llm_client=None,
+    user_intent: Optional[Dict[str, Any]] = None,
+) -> List[PlannedStage]:
     """Pick stages relevant to this brief. Brainstorm first + Reviewer last
     are always included; in-between is dynamic."""
     chosen_agents: List[str] = []
@@ -152,6 +157,7 @@ async def plan_pipeline(*, brief: str, llm_client=None) -> List[PlannedStage]:
         chosen_agents,
         expected_artifacts,
         rationales,
+        user_intent=user_intent,
     )
 
     # Strip DesignerAgent when the brief ALREADY locks the visual
@@ -162,6 +168,13 @@ async def plan_pipeline(*, brief: str, llm_client=None) -> List[PlannedStage]:
     # JSON tokens — costing 3-5 min for redundant output.
     chosen_agents, expected_artifacts, rationales = _strip_redundant_designer(
         brief, chosen_agents, expected_artifacts, rationales,
+    )
+
+    chosen_agents, expected_artifacts, rationales = apply_user_intent_plan(
+        user_intent,
+        chosen_agents,
+        expected_artifacts,
+        rationales,
     )
 
     # Brainstorm first (if not chosen) + Reviewer last (always)
@@ -627,6 +640,8 @@ def _ensure_code_stage(
     chosen_agents: List[str],
     expected_artifacts: List[str],
     rationales: Dict[str, str],
+    *,
+    user_intent: Optional[Dict[str, Any]] = None,
 ) -> tuple[List[str], List[str], Dict[str, str]]:
     target_match = _EXPLICIT_TARGET_FILE_PATTERN.search(brief or "")
     if target_match:
@@ -639,6 +654,9 @@ def _ensure_code_stage(
         return chosen_agents, expected_artifacts, rationales
 
     if "CodeImproverAgent" in chosen_agents or "CodeAgent" in chosen_agents:
+        return chosen_agents, expected_artifacts, rationales
+
+    if skip_force_code_for_intent(user_intent):
         return chosen_agents, expected_artifacts, rationales
 
     if _should_force_code_agent(brief):
