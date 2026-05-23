@@ -397,6 +397,7 @@ class ProposalStore:
             payload = dict(p.payload or {})
             payload.setdefault("_proposal_id", p.id)
             payload.setdefault("_proposal_kind", p.kind)
+            payload.setdefault("_proposal_source", p.source)
             result = await handler(payload)
             ok = True
             if isinstance(result, dict) and "ok" in result:
@@ -485,6 +486,22 @@ class ProposalStore:
                     return _AutoTriageDecision("auto_rejected", low_signal_reason)
 
             if (
+                getattr(settings, "cortex_auto_approve_scout_ingest", True)
+                and self._is_safe_auto_approve_scout_ingest(
+                    payload,
+                    source=source,
+                    max_limit=max(
+                        1,
+                        int(getattr(settings, "cortex_auto_triage_max_scout_ingest_limit", 10)),
+                    ),
+                )
+            ):
+                return _AutoTriageDecision(
+                    "auto_approved",
+                    "auto-approved GitHub scout ingest",
+                )
+
+            if (
                 auto_triage_eligible
                 and getattr(settings, "cortex_auto_approve_safe_ingest", True)
                 and self._is_safe_auto_approve_ingest(
@@ -533,6 +550,28 @@ class ProposalStore:
         except (TypeError, ValueError):
             return False
         return bool(topic) and mode == "search" and 0 < limit <= max_limit
+
+    @staticmethod
+    def _is_safe_auto_approve_scout_ingest(
+        payload: Dict[str, Any],
+        *,
+        source: str,
+        max_limit: int,
+    ) -> bool:
+        if not str(source or "").strip().lower().startswith("repo_scout:github"):
+            return False
+        repo = str(payload.get("repo") or "").strip()
+        if not repo or "/" not in repo or repo.count("/") != 1:
+            return False
+        reuse_risk = str(payload.get("reuse_risk") or "").lower()
+        if reuse_risk == "high":
+            return False
+        raw_limit = payload.get("limit", 8)
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            return False
+        return 0 < limit <= max_limit
 
     def _invalid_studio_debug_reason(self, payload: Dict[str, Any]) -> Optional[str]:
         raw_target = payload.get("target_file")

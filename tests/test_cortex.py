@@ -518,6 +518,141 @@ async def test_ingest_handler_caps_limit_and_returns_errors(tmp_path, monkeypatc
     }
 
 
+@pytest.mark.asyncio
+async def test_create_auto_approves_scout_github_ingest(tmp_path, monkeypatch):
+    enabled = SimpleNamespace(
+        cortex_auto_approve_system=True,
+        cortex_auto_reject_duplicates=True,
+        cortex_auto_reject_low_signal_ingest=True,
+        cortex_auto_approve_safe_ingest=True,
+        cortex_auto_triage_duplicate_window_seconds=86_400,
+        cortex_auto_triage_min_ingest_topic_length=6,
+        cortex_auto_triage_max_safe_ingest_limit=3,
+        cortex_auto_approve_scout_ingest=True,
+        cortex_auto_triage_max_scout_ingest_limit=10,
+    )
+    monkeypatch.setattr("skyn3t.config.settings.get_settings", lambda: enabled)
+    store = ProposalStore(root=tmp_path / "proposals")
+    applied = asyncio.Event()
+
+    async def handler(payload):
+        applied.set()
+        return {"ok": True, "ingested": 1, "summary": "ok", "errors": []}
+
+    store.register_handler("ingest", handler)
+    proposal = store.create(
+        kind="ingest",
+        title="Scout GitHub repo: octo/agent-flow",
+        summary="fit lane",
+        detail="detail",
+        payload={
+            "repo": "octo/agent-flow",
+            "repo_key": "github:octo/agent-flow",
+            "query": "agent cli memory",
+            "limit": 8,
+            "lane": "fit",
+            "reuse_risk": "low",
+        },
+        source="repo_scout:github",
+    )
+
+    assert proposal.requires_approval is False
+    await asyncio.wait_for(applied.wait(), timeout=1)
+    current = store.get(proposal.id)
+    assert current is not None
+    assert current.status == "applied"
+    assert current.triage_decision == "auto_approved"
+
+
+@pytest.mark.asyncio
+async def test_ingest_handler_spawns_feature_for_scout_github(tmp_path, monkeypatch):
+    from skyn3t.cortex.handlers import install_handlers
+
+    enabled = SimpleNamespace(
+        cortex_scout_spawn_features=True,
+        cortex_scout_spawn_min_ingested=1,
+    )
+    monkeypatch.setattr("skyn3t.config.settings.get_settings", lambda: enabled)
+    store = ProposalStore(root=tmp_path / "proposals")
+    monkeypatch.setattr("skyn3t.cortex.get_store", lambda: store)
+
+    class StubIngestor:
+        async def execute(self, req):
+            return SimpleNamespace(
+                success=True,
+                output={
+                    "ingested": [{"repo": "octo/agent-flow", "path": "README.md"}],
+                    "summary": "done",
+                    "errors": [],
+                },
+            )
+
+    orchestrator = SimpleNamespace(agents={"github_ingestor": StubIngestor()})
+    install_handlers(orchestrator)
+
+    result = await store._handlers["ingest"](
+        {
+            "_proposal_id": "ingest-1",
+            "_proposal_source": "repo_scout:github",
+            "repo": "octo/scout-bridge-demo",
+            "repo_key": "github:octo/scout-bridge-demo",
+            "query": "agent cli memory",
+            "lane": "fit",
+            "reuse_risk": "low",
+            "limit": 8,
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["spawned_feature_id"]
+    feature = store.get(result["spawned_feature_id"])
+    assert feature is not None
+    assert feature.kind == "feature"
+    assert feature.status == "pending"
+    assert feature.requires_approval is True
+
+
+@pytest.mark.asyncio
+async def test_ingest_handler_does_not_spawn_feature_for_explorer(tmp_path, monkeypatch):
+    from skyn3t.cortex.handlers import install_handlers
+
+    enabled = SimpleNamespace(
+        cortex_scout_spawn_features=True,
+        cortex_scout_spawn_min_ingested=1,
+    )
+    monkeypatch.setattr("skyn3t.config.settings.get_settings", lambda: enabled)
+    store = ProposalStore(root=tmp_path / "proposals")
+    monkeypatch.setattr("skyn3t.cortex.get_store", lambda: store)
+
+    class StubIngestor:
+        async def execute(self, req):
+            return SimpleNamespace(
+                success=True,
+                output={
+                    "ingested": [{"repo": "octo/agent-flow", "path": "README.md"}],
+                    "summary": "done",
+                    "errors": [],
+                },
+            )
+
+    orchestrator = SimpleNamespace(agents={"github_ingestor": StubIngestor()})
+    install_handlers(orchestrator)
+
+    result = await store._handlers["ingest"](
+        {
+            "_proposal_id": "ingest-2",
+            "_proposal_source": "explorer",
+            "topic": "agentic rag",
+            "limit": 3,
+            "mode": "search",
+        }
+    )
+
+    assert result["ok"] is True
+    assert "spawned_feature_id" not in result
+    assert not [p for p in store.list() if p.kind == "feature"]
+
+
 def test_proposal_store_create_can_force_review_gate(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "skyn3t.config.settings.get_settings",

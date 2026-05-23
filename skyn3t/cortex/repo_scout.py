@@ -482,8 +482,9 @@ class MultiSourceRepoScout:
             )
             if candidate.platform == "github":
                 detail += (
-                    "Approval path: this creates an ingest proposal only. No code or ideas are "
-                    "trusted until an operator approves the proposal."
+                    "Ingest path: GitHub docs are auto-ingested into RAG when this proposal is "
+                    "filed (no manual ingest approval). A separate feature proposal will appear "
+                    "if ingestion succeeds — approve that to adapt the pattern into SkyN3t code."
                 )
                 kind = "ingest"
             else:
@@ -520,7 +521,7 @@ class MultiSourceRepoScout:
                     "stars": candidate.stars,
                 },
                 source=f"repo_scout:{candidate.platform}",
-                force_requires_approval=True,
+                force_requires_approval=(kind != "ingest"),
             )
             filed.append(
                 {

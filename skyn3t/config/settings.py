@@ -118,6 +118,21 @@ class Settings(BaseSettings):
     cortex_auto_triage_max_safe_ingest_limit: int = Field(
         default=3, alias="SKYN3T_CORTEX_AUTO_TRIAGE_MAX_SAFE_INGEST_LIMIT"
     )
+    # GitHub repo-scout ingest is operational knowledge gathering — auto-run
+    # without a manual ingest approval step. Follow-on SkyN3t code changes still
+    # require a separate feature proposal approval.
+    cortex_auto_approve_scout_ingest: bool = Field(
+        default=True, alias="SKYN3T_CORTEX_AUTO_APPROVE_SCOUT_INGEST"
+    )
+    cortex_auto_triage_max_scout_ingest_limit: int = Field(
+        default=10, alias="SKYN3T_CORTEX_AUTO_TRIAGE_MAX_SCOUT_INGEST_LIMIT"
+    )
+    cortex_scout_spawn_features: bool = Field(
+        default=True, alias="SKYN3T_CORTEX_SCOUT_SPAWN_FEATURES"
+    )
+    cortex_scout_spawn_min_ingested: int = Field(
+        default=1, alias="SKYN3T_CORTEX_SCOUT_SPAWN_MIN_INGESTED"
+    )
 
     # Execution backend for code agent: inline (fast, no isolation),
     # docker (real sandbox), or auto (probe docker, fall back to inline).

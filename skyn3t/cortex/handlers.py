@@ -13,6 +13,7 @@ from skyn3t.cortex.external_pattern_synthesizer import ExternalPatternSynthesize
 from skyn3t.cortex.external_repo_ingest import ExternalRepoDocIngestor
 from skyn3t.cortex.feature_suggester import infer_feature_target_file
 from skyn3t.cortex.review_utils import normalize_review_risks
+from skyn3t.cortex.scout_adaptation import maybe_spawn_feature_after_scout_ingest
 
 logger = logging.getLogger("skyn3t.cortex.handlers")
 REPO_ROOT = Path(__file__).resolve().parents[2].resolve()
@@ -198,12 +199,23 @@ def install_handlers(orchestrator) -> None:
             result = await ingestor.execute(req)
             ok = bool(getattr(result, "success", False))
             out = getattr(result, "output", {}) or {}
-            return {
+            ingested = list(out.get("ingested") or [])
+            response: Dict[str, Any] = {
                 "ok": ok,
-                "ingested": len(out.get("ingested", []) or []),
+                "ingested": len(ingested),
                 "summary": out.get("summary", ""),
                 "errors": list(out.get("errors") or []),
             }
+            if ok:
+                spawned_feature_id = maybe_spawn_feature_after_scout_ingest(
+                    payload=payload,
+                    source=str(payload.get("_proposal_source") or ""),
+                    parent_proposal_id=str(payload.get("_proposal_id") or ""),
+                    ingested=ingested,
+                )
+                if spawned_feature_id:
+                    response["spawned_feature_id"] = spawned_feature_id
+            return response
         except Exception as e:
             logger.exception("ingest_handler failed")
             return {"ok": False, "error": str(e)}

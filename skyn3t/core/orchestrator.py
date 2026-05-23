@@ -85,6 +85,7 @@ class Orchestrator:
         self._ingestor: Optional[ExperienceIngestor] = None
         self._tuner: Optional[SelfTuningEngine] = None
         self._meta_agent: Optional[MetaAgent] = None
+        self._rag: Optional[Any] = None
         self._feature_suggester: Optional[Any] = None
         self._review_watcher: Optional[Any] = None
         self._curiosity: Optional[Any] = None
@@ -141,7 +142,10 @@ class Orchestrator:
 
     def enable_experience_ingestion(self, ingestor: Optional[ExperienceIngestor] = None) -> None:
         """Enable automatic experience → RAG ingestion."""
-        self._ingestor = ingestor or ExperienceIngestor(event_bus=self.event_bus)
+        self._ingestor = ingestor or ExperienceIngestor(
+            event_bus=self.event_bus,
+            memory_store=self._memory,
+        )
 
     def enable_self_tuning(self, tuner: Optional[SelfTuningEngine] = None) -> None:
         """Enable automatic self-tuning based on reflection."""
@@ -154,6 +158,16 @@ class Orchestrator:
             memory_store=self._memory,
             consciousness=self._consciousness,
         )
+
+    def _wire_rag_agents(self) -> None:
+        """Attach the shared RAG engine to agents that missed it at construct time."""
+        rag = getattr(self, "_rag", None)
+        if rag is None:
+            return
+        for name in ("github_ingestor", "explorer", "project_memory", "docs_ingestor"):
+            agent = self.agents.get(name)
+            if agent is not None and getattr(agent, "rag", None) is None:
+                agent.rag = rag
 
     async def _execute_plan_task(self, task: TaskRequest, agent_name: Optional[str]) -> str:
         """Adapter for planner to submit tasks through the orchestrator."""
@@ -197,6 +211,10 @@ class Orchestrator:
             await self._planner.start()
         if self._ingestor:
             await self._ingestor.initialize()
+            # Share the experience ingestor's RAG engine with agents
+            # (github_ingestor, docs_ingestor, …) registered below.
+            if getattr(self._ingestor, "rag", None) is not None:
+                self._rag = self._ingestor.rag
         if self._meta_agent:
             await self._meta_agent.start()
 
@@ -205,6 +223,7 @@ class Orchestrator:
         try:
             from skyn3t.registry import register_default_roster
             roster = await register_default_roster(self)
+            self._wire_rag_agents()
             logger.info("default roster: registered=%s skipped=%s",
                         roster.get("registered"), roster.get("skipped"))
         except Exception:

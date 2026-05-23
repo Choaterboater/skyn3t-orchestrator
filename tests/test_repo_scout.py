@@ -32,7 +32,12 @@ class _FakeStore:
         proposal.summary = summary
         proposal.detail = detail
         proposal.source = source
-        proposal.requires_approval = bool(kwargs.get("force_requires_approval", False))
+        if kwargs.get("force_requires_approval"):
+            proposal.requires_approval = True
+        elif kind == "ingest" and str(source).startswith("repo_scout:github"):
+            proposal.requires_approval = False
+        else:
+            proposal.requires_approval = True
         self.created.append(proposal)
         return proposal
 
@@ -91,7 +96,7 @@ async def test_repo_scout_files_ingest_proposals(monkeypatch):
     assert result["ok"] is True
     assert result["filed"] == 2
     assert all(proposal.kind == "ingest" for proposal in store.created)
-    assert all(proposal.requires_approval is True for proposal in store.created)
+    assert all(proposal.requires_approval is False for proposal in store.created)
     assert {proposal.payload["repo"] for proposal in store.created} == {
         "octo/trending-ui",
         "octo/agent-flow",
