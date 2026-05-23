@@ -30,15 +30,15 @@ cd "$PROJECT_DIR"
 case "$MODE" in
     web)
         echo "🌐 Starting SkyN3t web server..."
-        exec python -m skyn3t.cli.main start "$@"
+        exec python -m skyn3t start "$@"
         ;;
     cli)
         echo "💬 Starting SkyN3t CLI..."
-        exec python -m skyn3t.cli.main "$@"
+        exec python -m skyn3t "$@"
         ;;
     init)
         echo "🔧 Initializing SkyN3t..."
-        exec python -m skyn3t.cli.main init
+        exec python -m skyn3t init
         ;;
     *)
         echo "Unknown mode: $MODE"
