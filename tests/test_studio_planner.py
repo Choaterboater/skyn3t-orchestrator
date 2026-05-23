@@ -220,3 +220,27 @@ async def test_plan_pipeline_injects_research_for_third_party_integrations():
     assert "ResearchAgent" in agents
     # CodeAgent should also be there
     assert "CodeAgent" in agents
+
+
+@pytest.mark.asyncio
+async def test_plan_pipeline_skips_marketer_for_mission_setup_audience_only():
+    brief = (
+        "Build a habit tracker\n\n"
+        "## Mission setup\n"
+        "- Primary audience: General users\n"
+        "- Operating mode: confirm first"
+    )
+    stages = await plan_pipeline(brief=brief, llm_client=None)
+    agents = [stage.agent for stage in stages]
+
+    assert "CodeAgent" in agents
+    assert "MarketerAgent" not in agents
+
+
+@pytest.mark.asyncio
+async def test_plan_pipeline_keeps_marketer_for_explicit_gtm_brief():
+    brief = "Build a SaaS app and write the go-to-market launch plan"
+    stages = await plan_pipeline(brief=brief, llm_client=None)
+    agents = [stage.agent for stage in stages]
+
+    assert "MarketerAgent" in agents

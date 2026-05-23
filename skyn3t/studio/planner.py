@@ -178,6 +178,14 @@ async def plan_pipeline(
         rationales,
     )
 
+    chosen_agents, expected_artifacts, rationales = _strip_optional_marketing_agents(
+        brief,
+        chosen_agents,
+        expected_artifacts,
+        rationales,
+        user_intent=user_intent,
+    )
+
     # Brainstorm first (if not chosen) + Reviewer last (always)
     if "BrainstormAgent" not in chosen_agents:
         chosen_agents.insert(0, "BrainstormAgent")
@@ -351,14 +359,11 @@ def _heuristic_plan(brief: str) -> tuple[List[str], List[str], Dict[str, str]]:
             "output would just rephrase what the brief said. Saves ~3-5 min."
         )
 
-    needs_marketing = _mentions_any(
-        b,
-        ["launch", "campaign", "marketing", "audience", "positioning", "channels", "growth", "go-to-market", "gtm"],
-    )
+    needs_marketing = _explicit_marketing_brief(b)
     if needs_marketing:
         chosen.append("MarketerAgent")
         arts.append("positioning.md")
-        why["MarketerAgent"] = "brief mentions launch/marketing/positioning"
+        why["MarketerAgent"] = "brief asks for GTM/marketing deliverables"
 
     needs_biz = _mentions_any(
         b,
@@ -546,6 +551,74 @@ def _should_force_code_agent(brief: str) -> bool:
             return False
         return True
     return False
+
+
+def _user_brief_portion(brief: str) -> str:
+    """Strip auto-appended mission/clarification blocks before keyword scans."""
+    text = str(brief or "")
+    for marker in ("\n## Mission setup", "\n## User clarifications", "\n---"):
+        idx = text.find(marker)
+        if idx != -1:
+            text = text[:idx]
+    return text.strip()
+
+
+_MARKETING_BRIEF_KEYWORDS: List[str] = [
+    "go-to-market",
+    "go to market",
+    "gtm",
+    "marketing plan",
+    "marketing strategy",
+    "marketing campaign",
+    "marketing site",
+    "product hunt",
+    "channel plan",
+    "growth marketing",
+    "launch campaign",
+    "launch plan",
+    "landing page copy",
+    "positioning doc",
+    "positioning statement",
+]
+
+
+def _explicit_marketing_brief(brief: str) -> bool:
+    portion = _user_brief_portion(brief).lower()
+    if _mentions_any(portion, _MARKETING_BRIEF_KEYWORDS):
+        return True
+    return _mentions_any(portion, ["marketing", "positioning", "gtm"])
+
+
+def _strip_optional_marketing_agents(
+    brief: str,
+    chosen_agents: List[str],
+    expected_artifacts: List[str],
+    rationales: Dict[str, str],
+    *,
+    user_intent: Optional[Dict[str, Any]] = None,
+) -> tuple[List[str], List[str], Dict[str, str]]:
+    """Drop GTM agents from code-first builds unless the user explicitly asked."""
+    deliverable = str((user_intent or {}).get("deliverable_kind") or "").strip().lower()
+    if deliverable == "content" or _explicit_marketing_brief(brief):
+        return chosen_agents, expected_artifacts, rationales
+    has_code = "CodeAgent" in chosen_agents or "CodeImproverAgent" in chosen_agents
+    if not has_code:
+        return chosen_agents, expected_artifacts, rationales
+    for agent in ("MarketerAgent", "BusinessAnalystAgent"):
+        if agent not in chosen_agents:
+            continue
+        chosen_agents = [name for name in chosen_agents if name != agent]
+        rationales.pop(agent, None)
+        rationales[f"{agent}_skipped"] = (
+            "code-first build without an explicit GTM/marketing ask"
+        )
+    drop_artifacts = {"positioning.md", "channel_plan.md", "market_scan.md", "launch_checklist.md"}
+    expected_artifacts = [
+        artifact
+        for artifact in expected_artifacts
+        if str(artifact).strip().lower() not in drop_artifacts
+    ]
+    return chosen_agents, expected_artifacts, rationales
 
 
 def _mentions_any(text: str, keywords: List[str]) -> bool:

@@ -5021,7 +5021,7 @@ class StudioRunner:
         # consistency_reviewer ran 8 minutes (480s) in observed
         # multi-blocker reviews on the deep profile. 300s base * 1.4 =
         # 420s wasn't enough. Treat it as medium.
-        medium_stages = {"designer", "architect", "consistency_reviewer"}
+        medium_stages = {"designer", "architect", "consistency_reviewer", "marketer", "business", "writer"}
         if stage_name in heavy_stages:
             base = 1800.0
         elif stage_name in medium_stages:
