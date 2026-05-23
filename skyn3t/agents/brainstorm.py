@@ -12,12 +12,20 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
+from skyn3t.studio.clarification import (
+    category_assumption_spec,
+    clarification_payload,
+    kickoff_specs,
+    merge_clarification_specs,
+    select_clarification_specs,
+)
 
 logger = logging.getLogger("skyn3t.agents.brainstorm")
 
@@ -107,26 +115,62 @@ class BrainstormAgent(BaseAgent):
                 brief = "(no brief provided - produce an exploration of likely directions)"
 
             # Clarification check: ambiguous briefs should ask questions instead of guessing.
-            # Skip if user already provided clarifications (passed via input_data.clarifications).
-            if not input_data.get("clarifications"):
-                questions = await self._maybe_ask_clarifications(
+            # Skip only when the user already answered questions, or the mission setup
+            # explicitly requested a move-fast run.
+            mission_setup = input_data.get("mission_setup") or {}
+            autonomy = str(mission_setup.get("autonomy") or "balanced").strip().lower()
+            if not input_data.get("clarifications") and not input_data.get("skip_clarification"):
+                clarification = await self._maybe_ask_clarifications(
                     brief,
                     force=require_clarification,
+                    mode=autonomy,
                 )
-                if require_clarification and not questions:
-                    questions = self._kickoff_questions(brief)
-                if questions:
-                    # Write a marker file so the runner can pick it up
+                raw_specs = clarification.get("specs") if clarification else []
+                specs: List[Dict[str, Any]] = (
+                    list(raw_specs) if isinstance(raw_specs, list) else []
+                )
+                if require_clarification and not specs:
+                    specs = kickoff_specs()
+                elif autonomy == "confirm_first" and clarification:
+                    specs = merge_clarification_specs(
+                        specs,
+                        kickoff_specs(),
+                        limit=4,
+                    )
+                assumption_hints = input_data.get("category_assumption_hints") or []
+                if isinstance(assumption_hints, list) and assumption_hints:
+                    assumption_spec = category_assumption_spec(assumption_hints)
+                    if assumption_spec:
+                        specs = merge_clarification_specs(
+                            specs,
+                            [assumption_spec],
+                            limit=4,
+                        )
+                if specs:
+                    payload = clarification_payload(specs)
+                    questions = payload["questions"]
+                    question_options = payload["question_options"]
                     ad = Path(artifact_dir)
                     ad.mkdir(parents=True, exist_ok=True)
                     clarify_path = ad / "_clarifications.json"
-                    clarify_path.write_text(json.dumps({"questions": questions, "asked_by": self.name},
-                                                        indent=2), encoding="utf-8")
+                    clarify_path.write_text(
+                        json.dumps(
+                            {
+                                "questions": questions,
+                                "question_options": question_options,
+                                "asked_by": self.name,
+                            },
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
                     return TaskResult(
-                        task_id=task.task_id, success=True,
+                        task_id=task.task_id,
+                        success=True,
                         output={
                             "needs_clarification": True,
                             "questions": questions,
+                            "question_options": question_options,
                             "files": [str(clarify_path)],
                             "summary": f"Need {len(questions)} clarifications before proceeding.",
                         },
@@ -215,10 +259,19 @@ class BrainstormAgent(BaseAgent):
             return TaskResult(task_id=task.task_id, success=False, error=str(e))
 
     # ------- helpers ----------
-    async def _maybe_ask_clarifications(self, brief: str, *, force: bool = False) -> List[str]:
-        """Ask LLM if brief is ambiguous; if so return up to 3 short questions."""
+    async def _maybe_ask_clarifications(
+        self,
+        brief: str,
+        *,
+        force: bool = False,
+        mode: str = "balanced",
+    ) -> Optional[Dict[str, Any]]:
+        """Return plain-language clarification specs when the brief is ambiguous."""
         if not brief or len(brief.strip()) < 10:
-            return []
+            return None
+        heuristic_specs = select_clarification_specs(brief, force=force, mode=mode)
+        if force or mode == "confirm_first":
+            return {"specs": heuristic_specs}
         try:
             client = self.get_llm() if hasattr(self, "get_llm") else None
             if client is None:
@@ -230,16 +283,23 @@ class BrainstormAgent(BaseAgent):
                 "You are a senior product manager triaging a project brief. Decide if the brief "
                 "is specific enough to act on. Reply with valid JSON only:\n"
                 '{"clear": true/false, "questions": ["q1", "q2"]}\n'
-                "Set clear=true if you can confidently produce useful artifacts (architecture, brand, "
-                "code) without further input. Set clear=false ONLY when there are critical ambiguities. "
-                "Limit to AT MOST 3 short, specific questions. Don't ask about preferences a designer "
-                "could just pick (color, font). DO ask about platform/audience/scope when unclear. "
+                "Use plain everyday language only — never say fullstack, backend/API, or SaaS. "
+                "Good topics: what they get at the end, website vs web app vs phone app, "
+                "who it is for, and the one workflow that must work. "
+                "Set clear=true only when the swarm can move forward without risking the wrong "
+                "product shape. Limit to AT MOST 4 short questions. "
+                "Don't ask about color, font, or other designer preferences. "
                 "Return empty questions array if clear."
             )
             if force:
                 system += (
-                    " The user explicitly wants an early confirmation pass, so ask 2-3 short kickoff "
+                    " The user explicitly wants an early confirmation pass, so ask 3-4 short kickoff "
                     "questions even if the brief looks mostly clear."
+                )
+            elif mode == "balanced":
+                system += (
+                    " In balanced mode, prefer asking when the choice would change website vs web app "
+                    "vs phone app, who the product is for, or what demo-worthy workflow must land first."
                 )
             prompt = f"Brief:\n{brief}\n\nReply JSON."
             out = await asyncio.wait_for(
@@ -247,25 +307,57 @@ class BrainstormAgent(BaseAgent):
                 timeout=30,
             )
             if not out or "[deterministic-stub]" in out:
-                return []
-            import re as _re
-            m = _re.search(r"\{[\s\S]*\}", out)
+                return {"specs": heuristic_specs} if heuristic_specs else None
+            m = re.search(r"\{[\s\S]*\}", out)
             if not m:
-                return []
+                return {"specs": heuristic_specs} if heuristic_specs else None
             data = json.loads(m.group(0))
-            if data.get("clear"):
-                return []
-            qs = data.get("questions") or []
-            return [str(q)[:200] for q in qs if q][:3]
+            if data.get("clear") and not heuristic_specs and not force:
+                return None
+            llm_specs = [
+                {
+                    "id": f"llm_{idx}",
+                    "question": str(q)[:200],
+                    "options": [],
+                    "free_text": True,
+                }
+                for idx, q in enumerate(data.get("questions") or [])
+                if q
+            ]
+            merged = merge_clarification_specs(heuristic_specs, llm_specs, limit=4)
+            return {"specs": merged} if merged else None
         except Exception:
-            return []
+            return {"specs": heuristic_specs} if heuristic_specs else None
 
     def _kickoff_questions(self, brief: str) -> List[str]:
-        return [
-            "Who is the primary user or customer for this first version?",
-            "What must the first deliverable do end-to-end before you would call it useful?",
-            "What important constraint, non-goal, or risk should the swarm avoid?",
-        ]
+        return [str(spec["question"]) for spec in kickoff_specs()]
+
+    def _heuristic_clarification_questions(
+        self,
+        brief: str,
+        *,
+        force: bool = False,
+        mode: str = "balanced",
+    ) -> List[str]:
+        specs = select_clarification_specs(brief, force=force, mode=mode)
+        return [str(spec["question"]) for spec in specs]
+
+    def _merge_questions(self, *groups: List[str], limit: int = 4) -> List[str]:
+        merged: List[str] = []
+        seen = set()
+        for group in groups:
+            for question in group:
+                clean = re.sub(r"\s+", " ", str(question or "").strip())
+                if not clean:
+                    continue
+                key = clean.rstrip(" ?.!").lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(clean[:200])
+                if len(merged) >= limit:
+                    return merged
+        return merged
 
     def _seed(self, brief: str) -> int:
         return int(hashlib.sha256(brief.encode("utf-8")).hexdigest()[:8], 16)

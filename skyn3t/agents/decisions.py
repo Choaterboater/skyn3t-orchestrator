@@ -8,10 +8,13 @@ instead of each re-deriving ports/language/framework from the scaffold.
 Shape::
 
     {
+      "frontend_bundle": str,      # e.g. "react-vite-tailwind"
+      "backend_bundle": str,       # e.g. "express"
       "frontend_port": int | null,
       "backend_port": int | null,
       "framework": str,           # the architect's bundle backend, e.g. "express"
       "backend_language": str,    # "node" | "python" | "none"
+      "family": str,              # "web" | "server" | "fullstack" | "unknown"
     }
 
 Adding fields is safe — readers use ``dict.get`` and ignore unknowns.
@@ -56,6 +59,16 @@ _BACKEND_LANGUAGE: Dict[str, str] = {
 }
 
 
+def _derive_family(frontend: str, backend: str) -> str:
+    if frontend != "none" and backend != "none":
+        return "fullstack"
+    if frontend != "none":
+        return "web"
+    if backend != "none":
+        return "server"
+    return "unknown"
+
+
 def derive_decisions(stack: Dict[str, Any]) -> Dict[str, Any]:
     """Build the decisions dict from the architect's chosen stack bundle.
 
@@ -66,10 +79,13 @@ def derive_decisions(stack: Dict[str, Any]) -> Dict[str, Any]:
     backend = str(stack.get("backend", "")).strip() or "none"
     frontend = str(stack.get("frontend", "")).strip() or "none"
     return {
+        "frontend_bundle": frontend,
+        "backend_bundle": backend,
         "frontend_port": _FRONTEND_PORT.get(frontend),
         "backend_port": _BACKEND_PORT.get(backend),
         "framework": backend,
         "backend_language": _BACKEND_LANGUAGE.get(backend, "unknown"),
+        "family": _derive_family(frontend, backend),
     }
 
 

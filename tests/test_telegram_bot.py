@@ -374,6 +374,29 @@ async def test_dispatch_throttles_duplicates(monkeypatch):
     assert second.get("throttled") is True
 
 
+@pytest.mark.asyncio
+async def test_dispatch_clarification_posts_when_configured(monkeypatch):
+    s = get_settings()
+    monkeypatch.setattr(s, "telegram_token", "test-token")
+    monkeypatch.setattr(s, "telegram_user_id", "42")
+    tgd._last_dispatch.clear()
+
+    async def fake_send(token, chat_id, text, reply_to_message_id=None, reply_markup=None, parse_mode="Markdown"):
+        assert "needs clarification" in text
+        assert "Who is this for?" in text
+        return {"message_id": 888}
+
+    monkeypatch.setattr(tgd, "send_message", fake_send)
+
+    result = await tgd.dispatch_clarification(
+        "clarify-test",
+        "BrainstormAgent",
+        ["Who is this for?"],
+        "http://x",
+    )
+    assert result == {"ok": True, "message_id": 888, "chat_id": "42"}
+
+
 # ---------------------------------------------------------------------------
 # Reject slash-command + follow-up message (key consistency fix)
 # ---------------------------------------------------------------------------

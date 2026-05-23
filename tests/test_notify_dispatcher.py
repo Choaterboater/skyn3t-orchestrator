@@ -109,3 +109,28 @@ async def test_http_exception_suppressed(monkeypatch):
         "gate-1", "ArchitectAgent", "/studio/gate-1", cfg
     )
     assert result == {"discord": False}
+
+
+@pytest.mark.asyncio
+async def test_clarification_dispatch_posts_payload(monkeypatch):
+    posts: list[dict[str, Any]] = []
+
+    def fake_client(*args, **kwargs):
+        return _FakeAsyncClient(posts)
+
+    monkeypatch.setattr(notify_dispatcher.httpx, "AsyncClient", fake_client)
+    cfg = {"notify": {"discord_webhook": "https://example.test/hook/clarify"}}
+    result = await notify_dispatcher.dispatch_clarification(
+        "clarify-1",
+        "BrainstormAgent",
+        "/studio/clarify-1",
+        ["Who is this for?", "Do you need accounts?"],
+        cfg,
+    )
+    assert result == {"discord": True}
+    assert len(posts) == 1
+    sent = posts[0]
+    assert sent["url"] == "https://example.test/hook/clarify"
+    assert "clarify-1" in sent["json"]["content"]
+    assert "needs clarification" in sent["json"]["content"]
+    assert "Who is this for?" in sent["json"]["embeds"][0]["description"]

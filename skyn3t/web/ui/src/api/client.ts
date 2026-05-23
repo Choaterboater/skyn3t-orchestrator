@@ -159,6 +159,11 @@ export type ProjectDetail = ProjectRow & {
     description?: string;
     agents?: string[];
   };
+  clarification?: {
+    asked_by?: string;
+    questions?: string[];
+    asked_at?: number;
+  } | null;
 };
 
 export type Template = {
@@ -434,6 +439,11 @@ export const api = {
     fetchJson<{ ok: boolean }>(
       `/api/studio/projects/${encodeURIComponent(slug)}/reject`,
       { method: "POST", body: JSON.stringify({ feedback }) },
+    ),
+  clarifyProject: (slug: string, answers: string[]) =>
+    fetchJson<{ ok: boolean; resuming?: string; answer_count?: number }>(
+      `/api/studio/projects/${encodeURIComponent(slug)}/clarify`,
+      { method: "POST", body: JSON.stringify({ answers }) },
     ),
   templates: () =>
     fetchJson<{ templates: Template[]; mission_setup?: any }>("/api/studio/templates"),

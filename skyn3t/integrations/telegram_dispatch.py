@@ -292,6 +292,41 @@ def _format_approval_message(
     return body
 
 
+def _build_dashboard_keyboard(dashboard_url: str) -> Optional[dict]:
+    if dashboard_url and _is_publicly_routable(dashboard_url):
+        return {"inline_keyboard": [[{"text": "🔗 Open dashboard", "url": dashboard_url}]]}
+    return None
+
+
+def _format_clarification_message(
+    slug: str,
+    agent_name: str,
+    questions: list[str],
+    dashboard_url: str,
+) -> str:
+    safe_slug = escape_markdown(slug)
+    safe_agent = escape_markdown(agent_name)
+    parts = [
+        f"🟡 *{safe_slug}* needs clarification",
+        "",
+        f"Agent: *{safe_agent}*",
+    ]
+    if questions:
+        parts.append("")
+        parts.append("Questions:")
+        for idx, question in enumerate(questions[:3], start=1):
+            parts.append(f"{idx}. {escape_markdown(question)}")
+        if len(questions) > 3:
+            parts.append(f"…and {len(questions) - 3} more.")
+    if dashboard_url and _is_publicly_routable(dashboard_url):
+        parts.append("")
+        parts.append(f"Dashboard: {dashboard_url}")
+    body = "\n".join(parts)
+    if len(body) > _TELEGRAM_MESSAGE_MAX:
+        body = body[: _TELEGRAM_MESSAGE_MAX].rstrip() + "…"
+    return body
+
+
 async def _telegram_post(token: str, method: str, payload: dict) -> Optional[dict]:
     """POST to the Bot API. Returns parsed JSON ``result`` on success,
     ``None`` on failure.
@@ -445,6 +480,44 @@ async def dispatch_approval(
     text = _format_approval_message(slug, agent_name, summary, dashboard_url, plain_english)
     keyboard = _build_inline_keyboard(slug, dashboard_url)
 
+    message = await send_message(token, chat_id, text, reply_markup=keyboard)
+    if message is None:
+        return {"ok": False, "message_id": None, "chat_id": chat_id}
+    return {
+        "ok": True,
+        "message_id": int(message.get("message_id") or 0),
+        "chat_id": str(chat_id),
+    }
+
+
+async def dispatch_clarification(
+    slug: str,
+    agent_name: str,
+    questions: list[str],
+    dashboard_url: str,
+) -> Dict[str, Any]:
+    """Send a project's clarification notification to the configured user."""
+    try:
+        from skyn3t.config.settings import get_settings
+        settings = get_settings()
+        token = settings.telegram_token
+        chat_id = settings.telegram_user_id
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "message_id": None, "chat_id": ""}
+
+    if not token or not chat_id:
+        return {"ok": False, "message_id": None, "chat_id": ""}
+
+    key = (slug, f"{agent_name}:clarification")
+    async with _lock:
+        last = _last_dispatch.get(key, 0.0)
+        now = time.monotonic()
+        if now - last < _THROTTLE_WINDOW_SECONDS:
+            return {"ok": False, "throttled": True, "chat_id": chat_id}
+        _last_dispatch[key] = now
+
+    text = _format_clarification_message(slug, agent_name, questions, dashboard_url)
+    keyboard = _build_dashboard_keyboard(dashboard_url)
     message = await send_message(token, chat_id, text, reply_markup=keyboard)
     if message is None:
         return {"ok": False, "message_id": None, "chat_id": chat_id}

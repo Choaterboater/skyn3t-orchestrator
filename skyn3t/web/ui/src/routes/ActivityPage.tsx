@@ -17,10 +17,12 @@ type SwarmEvent = {
   meta?: Record<string, any>;
 };
 
+const LOW_SIGNAL_KINDS = new Set(["convo"]);
+
 export default function ActivityPage() {
   const [events, setEvents] = useState<SwarmEvent[]>([]);
   const [connected, setConnected] = useState(false);
-  const [kindFilter, setKindFilter] = useState<string>("");
+  const [kindFilter, setKindFilter] = useState<string>("useful");
   const wsRef = useRef<WebSocket | null>(null);
 
   // Snapshot the running tasks + active agents so the right rail is
@@ -122,15 +124,22 @@ export default function ActivityPage() {
     };
   }, []);
 
+  const dedupedEvents = useMemo(() => dedupeActivityEvents(events), [events]);
+
   const kinds = useMemo(() => {
     const s = new Set<string>();
-    for (const e of events) if (e.kind) s.add(e.kind);
+    for (const e of dedupedEvents) if (e.kind) s.add(e.kind);
     return Array.from(s).sort();
-  }, [events]);
+  }, [dedupedEvents]);
 
-  const visible = kindFilter
-    ? events.filter((e) => e.kind === kindFilter)
-    : events;
+  const usefulCount = useMemo(
+    () => filterActivityEvents(dedupedEvents, "useful").length,
+    [dedupedEvents],
+  );
+  const visible = useMemo(
+    () => filterActivityEvents(dedupedEvents, kindFilter),
+    [dedupedEvents, kindFilter],
+  );
 
   return (
     <div className="space-y-6">
@@ -152,9 +161,14 @@ export default function ActivityPage() {
           <div className="flex items-center gap-2 mb-2 flex-wrap">
             <span className="text-xs text-text-secondary">Filter:</span>
             <Chip
-              active={!kindFilter}
-              onClick={() => setKindFilter("")}
-              label={`all (${events.length})`}
+              active={kindFilter === "useful"}
+              onClick={() => setKindFilter("useful")}
+              label={`useful (${usefulCount})`}
+            />
+            <Chip
+              active={kindFilter === "all"}
+              onClick={() => setKindFilter("all")}
+              label={`all (${dedupedEvents.length})`}
             />
             {kinds.map((k) => (
               <Chip
@@ -192,9 +206,11 @@ export default function ActivityPage() {
 function EventRow({ e }: { e: SwarmEvent }) {
   const ts = parseEventTs(e.ts);
   const color = kindColor(e.kind, e.event_type);
+  const headline = activityHeadline(e);
+  const detail = activityDetail(e);
   return (
     <li className="px-3 py-2 text-sm hover:bg-bg-3 min-w-0">
-      <div className="flex items-baseline gap-3 min-w-0">
+      <div className="flex items-center gap-3 min-w-0">
         <span className="text-[0.65rem] text-text-dim font-mono shrink-0">
           {ts ? ts.toLocaleTimeString() : "—"}
         </span>
@@ -203,19 +219,15 @@ function EventRow({ e }: { e: SwarmEvent }) {
         >
           {e.kind ?? "event"}
         </span>
-        <span className="font-mono text-xs text-accent shrink-0">
-          {e.from ?? "?"}
-        </span>
-        {e.to && (
-          <>
-            <i className="fa-solid fa-arrow-right text-text-dim text-[0.6rem] shrink-0" />
-            <span className="font-mono text-xs text-accent shrink-0">{e.to}</span>
-          </>
-        )}
-        <span className="truncate text-text-secondary" title={e.label}>
-          {e.label}
-        </span>
       </div>
+      <div className="mt-1 text-sm text-text-primary break-words" title={headline}>
+        {headline}
+      </div>
+      {detail && (
+        <div className="mt-1 text-[0.7rem] font-mono text-text-dim break-words">
+          {detail}
+        </div>
+      )}
     </li>
   );
 }
@@ -338,6 +350,66 @@ function parseEventTs(ts: unknown): Date | null {
     return isNaN(d.getTime()) ? null : d;
   }
   return null;
+}
+
+export function isLowSignalEvent(e: SwarmEvent): boolean {
+  return LOW_SIGNAL_KINDS.has(String(e.kind || "").toLowerCase());
+}
+
+export function dedupeActivityEvents(events: SwarmEvent[]): SwarmEvent[] {
+  const out: SwarmEvent[] = [];
+  let lastKey = "";
+  for (const event of events) {
+    const key = [
+      event.kind ?? "",
+      event.event_type ?? "",
+      event.from ?? "",
+      event.to ?? "",
+      event.label ?? "",
+    ].join("::");
+    if (key === lastKey) continue;
+    out.push(event);
+    lastKey = key;
+  }
+  return out;
+}
+
+export function filterActivityEvents(events: SwarmEvent[], kindFilter: string): SwarmEvent[] {
+  if (kindFilter === "all") return events;
+  if (!kindFilter || kindFilter === "useful") {
+    return events.filter((e) => !isLowSignalEvent(e));
+  }
+  return events.filter((e) => e.kind === kindFilter);
+}
+
+function humanizeEventType(eventType: string | undefined): string {
+  return String(eventType || "event")
+    .toLowerCase()
+    .replace(/_/g, " ");
+}
+
+export function activityHeadline(e: SwarmEvent): string {
+  const label = String(e.label || "").trim();
+  if (label && label !== e.from && label !== e.to) return label;
+  const eventType = String(e.event_type || "").toUpperCase();
+  if (eventType === "PROJECT_BRIEF_EXPANDED") {
+    const preview = String(e.meta?.payload?.preview || e.meta?.preview || "").trim();
+    if (preview) return `Brief expanded · ${preview.slice(0, 160)}`;
+    return "Brief expanded with product defaults";
+  }
+  return humanizeEventType(e.event_type);
+}
+
+export function activityDetail(e: SwarmEvent): string {
+  const parts: string[] = [];
+  if (e.from) parts.push(e.from);
+  if (e.to && e.to !== e.from) parts.push(`→ ${e.to}`);
+  if (e.event_type) parts.push(humanizeEventType(e.event_type));
+  const defaults = e.meta?.payload?.category_defaults;
+  if (Array.isArray(defaults) && defaults.length) {
+    parts.push(`Assumed: ${defaults.slice(0, 3).join(", ")}`);
+  }
+  return parts.join(" · ");
 }
 
 function kindColor(kind: string | undefined, eventType?: string | undefined): string {

@@ -252,7 +252,7 @@ class ReviewerAgent(BaseAgent):
         # ReviewWatcher consumes the lowercase strings unchanged.
         elif verdict_score >= 75 and not any("Missing core" in r for r in risks):
             verdict = "go"
-        elif verdict_score >= 50:
+        elif verdict_score >= (60 if self._brief_implies_visual_ui(brief, scaffold_dir) else 50):
             verdict = "go-with-fixes"
         else:
             verdict = "no-go"
@@ -572,6 +572,30 @@ class ReviewerAgent(BaseAgent):
         ):
             return True
         return False
+
+    @staticmethod
+    def _brief_implies_visual_ui(brief: str, scaffold_dir: Path) -> bool:
+        text = (brief or "").strip().lower()
+        if not text or not scaffold_dir.exists():
+            return False
+        return any(
+            cue in text
+            for cue in (
+                "dashboard",
+                "ui",
+                "ux",
+                "frontend",
+                "website",
+                "landing page",
+                "theme",
+                "design",
+                "visual",
+                "polished",
+                "habit",
+                "tracker",
+                "app",
+            )
+        )
 
     @staticmethod
     def _sanitize_llm_review_md(review_md: Optional[str]) -> Optional[str]:

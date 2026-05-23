@@ -821,7 +821,8 @@
         }
         .studio-project-mode.hidden, .studio-launch-mode.hidden { display:none; }        .studio-board-hero-top { display:flex; justify-content:space-between; gap:0.85rem; align-items:flex-start; }
         .studio-board-hero-copy { display:flex; flex-direction:column; gap:0.3rem; }        .studio-board-hero-copy .muted { font-size: 0.76rem; }
-        .studio-board-actions { display:flex; flex-wrap:wrap; gap:0.5rem; justify-content:flex-end; }
+        .studio-board-actions { display:flex; flex-wrap:wrap; gap:0.5rem; justify-content:flex-end; align-items:flex-start; }
+        .studio-board-actions-group { display:flex; flex-wrap:wrap; gap:0.5rem; justify-content:flex-end; }
         .studio-board-layout { display:grid; grid-template-columns: minmax(360px, 1.1fr) minmax(420px, 1fr); gap:0.85rem; align-items:stretch; }
         .studio-board-rail { display:flex; flex-direction:column; gap:0.85rem; min-height:0; }
         .studio-board-card { border: 1px solid var(--border); border-radius: 0.6rem; background: var(--bg-1); padding: 0.8rem 0.85rem; display:flex; flex-direction:column; gap:0.7rem; min-height: 0; }
@@ -862,6 +863,11 @@
         .studio-file-pill:hover { border-color: var(--cyan); color: var(--text-primary); }        .studio-handoff-card .sh-title { font-size: 0.78rem; font-weight: 600; color: var(--text-primary); }
         .studio-handoff-card .sh-copy { margin-top: 0.25rem; font-size: 0.74rem; color: var(--text-secondary); }
         .studio-handoff-card .sh-meta { margin-top: 0.35rem; font-size: 0.68rem; color: var(--text-dim); font-family: 'JetBrains Mono', monospace; }
+        .studio-design-card-head { display:flex; justify-content:space-between; gap:0.75rem; align-items:flex-start; }
+        .studio-design-card-copy { margin-top:0.35rem; font-size:0.78rem; line-height:1.55; color:var(--text-secondary); }
+        .studio-design-card-actions { margin-top:0.75rem; display:flex; flex-wrap:wrap; gap:0.5rem; }
+        .studio-design-artifacts { display:flex; flex-wrap:wrap; gap:0.4rem; margin-top:0.75rem; }
+        .studio-design-card-note { margin-top:0.6rem; font-size:0.7rem; color:var(--text-dim); line-height:1.45; }
         .studio-feed-list { display: flex; flex-direction: column; gap: 0.55rem; max-height: 320px; overflow-y: auto; }
         .studio-feed-empty { color: var(--text-dim); font-size: 0.76rem; text-align: center; padding: 1rem 0.5rem; }
         .studio-feed-list .convo-row { margin: 0; }
@@ -2445,6 +2451,11 @@
             font-size: 1.02rem;
             line-height: 1.14;
         }
+        .studio-board-hero-copy-meta {
+            font-size: 0.79rem;
+            line-height: 1.5;
+            color: var(--text-secondary);
+        }
         .studio-board-card,
         .studio-inspector-card,
         .studio-handoff-card,
@@ -2515,6 +2526,19 @@
         .studio-handoff-card {
             border-radius: 0.85rem;
             padding: 0.9rem;
+        }
+        .studio-design-card {
+            position: relative;
+            overflow: hidden;
+        }
+        .studio-design-card::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            width: 3px;
+            background: rgba(34, 211, 238, 0.72);
         }
         .studio-stage-row {
             position: relative;
@@ -7238,6 +7262,95 @@
             return `/api/studio/projects/${safeSlug}/preview/${safePath}`;
         }
 
+        function studioArtifactPaths(artifacts) {
+            return ((artifacts || []) || [])
+                .map(item => (typeof item === 'string' ? item : (item.path || item.name || '')))
+                .filter(Boolean);
+        }
+
+        function studioPenpotManifestUrl(slug) {
+            return `/api/studio/projects/${encodeURIComponent(String(slug || '').trim())}/design-handoff/penpot`;
+        }
+
+        function studioPenpotPackageUrl(slug) {
+            return `/api/studio/projects/${encodeURIComponent(String(slug || '').trim())}/design-handoff/penpot/package`;
+        }
+
+        function studioDesignArtifactPaths(artifacts) {
+            const paths = studioArtifactPaths(artifacts);
+            const patterns = [
+                /(^|\/)tokens\.(json|css)$/i,
+                /(^|\/)palette\.json$/i,
+                /(^|\/)brand\.md$/i,
+                /(^|\/)components\.md$/i,
+                /(^|\/)logo\.svg$/i,
+                /(^|\/)readme\.md$/i,
+            ];
+            const seen = new Set();
+            const matches = [];
+            patterns.forEach(pattern => {
+                paths.forEach(path => {
+                    if (pattern.test(path) && !seen.has(path)) {
+                        seen.add(path);
+                        matches.push(path);
+                    }
+                });
+            });
+            paths.forEach(path => {
+                const name = String(path).split('/').pop() || path;
+                if (
+                    !seen.has(path)
+                    && /(design|token|palette|brand|logo|component)/i.test(name)
+                ) {
+                    seen.add(path);
+                    matches.push(path);
+                }
+            });
+            return matches.slice(0, 8);
+        }
+
+        function studioRenderDesignHandoffCard(slug, artifacts, options = {}) {
+            const projectSlug = String(slug || '').trim();
+            if (!projectSlug) return '';
+            const designArtifacts = studioDesignArtifactPaths(artifacts);
+            const packageUrl = studioPenpotPackageUrl(projectSlug);
+            const manifestUrl = studioPenpotManifestUrl(projectSlug);
+            const compact = !!options.compact;
+            const artifactPills = designArtifacts.length
+                ? `<div class="studio-design-artifacts">${designArtifacts.map(path => `
+                    <button class="studio-file-pill" type="button" onclick="studioOpenArtifact(decodeURIComponent('${encodeURIComponent(path)}'))">${escapeHTML(path)}</button>
+                `).join('')}</div>`
+                : '';
+            if (!designArtifacts.length) {
+                if (compact) return '';
+                return `
+                    <div class="studio-handoff-card studio-design-card">
+                        <div class="studio-design-card-head">
+                            <div class="sh-title">Design export</div>
+                            <span class="studio-pill">waiting on design assets</span>
+                        </div>
+                        <div class="studio-design-card-copy">This mission will expose a design export package as soon as SkyN3t writes brand, palette, token, logo, or component assets.</div>
+                        <div class="studio-design-card-note">Optional: download the package and refine visuals in Penpot or another design tool, then feed updated choices into a follow-up mission.</div>
+                    </div>
+                `;
+            }
+            return `
+                <div class="studio-handoff-card studio-design-card">
+                    <div class="studio-design-card-head">
+                        <div class="sh-title">Design export</div>
+                        <span class="studio-pill">ready · ${designArtifacts.length} asset${designArtifacts.length === 1 ? '' : 's'}</span>
+                    </div>
+                    <div class="studio-design-card-copy">Optional design export for refining the current UI in Penpot without losing mission context.</div>
+                    ${artifactPills}
+                    <div class="studio-design-card-actions">
+                        <a class="btn btn-primary btn-xs" href="${packageUrl}"><i class="fa-solid fa-compass-drafting"></i> Download export</a>
+                        <a class="btn btn-ghost btn-xs" href="${manifestUrl}" target="_blank" rel="noopener noreferrer"><i class="fa-solid fa-file-code"></i> Open manifest</a>
+                    </div>
+                    <div class="studio-design-card-note">Package includes the design-facing outputs SkyN3t already generated, so the handoff stays grounded in the actual project instead of a disconnected mockup.</div>
+                </div>
+            `;
+        }
+
         function studioSetClarificationDraft(slug, index, value) {
             const key = String(slug || '');
             if (!key) return;
@@ -7883,10 +7996,16 @@
                         : '<span class="muted">—</span>',
                 },
                 { key: 'created_at', label: 'Created', render: r => escapeHTML(studioRelativeTime(r.created_at)) },
-                { key: '_actions', label: '', render: r => {
+                {                 key: '_actions', label: '', render: r => {
                     const s = safeSlug(r.slug);
+                    const raw = r._raw || {};
+                    const artifacts = (raw.manifest && raw.manifest.artifacts) || raw.artifacts || [];
+                    const penpotAction = studioDesignArtifactPaths(artifacts).length
+                        ? `<a class="btn btn-ghost btn-xs" data-row-action title="Download design export" href="${studioPenpotPackageUrl(r.slug)}" onclick="event.stopPropagation();"><i class="fa-solid fa-compass-drafting"></i></a>`
+                        : '';
                     return `<span style="white-space:nowrap;">
                         <button class="btn btn-ghost btn-xs" data-row-action title="Open" onclick="event.stopPropagation(); studioOpenProject('${s}')"><i class="fa-solid fa-folder-open"></i></button>
+                        ${penpotAction}
                         <a class="btn btn-ghost btn-xs" data-row-action title="Download zip" href="/api/studio/projects/${encodeURIComponent(r.slug)}/zip" onclick="event.stopPropagation();"><i class="fa-solid fa-download"></i></a>
                         <button class="btn btn-ghost btn-xs" data-row-action title="Delete project" onclick="event.stopPropagation(); studioDeleteProject('${s}', this)"><i class="fa-solid fa-trash"></i></button>
                     </span>`;
@@ -7907,6 +8026,7 @@
                     const arts = manifest.artifacts || proj.artifacts || [];
                     const latestStage = studioLatestStageRecord(manifest);
                     const currentHandoff = [manifest.current_stage, manifest.current_agent].filter(Boolean).join(' · ');
+                    const designArtifacts = studioDesignArtifactPaths(arts);
                     const artList = arts.length
                         ? arts.slice(0, 30).map(a => {
                             const path = (typeof a === 'string') ? a : (a.path || a.name || '');
@@ -7929,6 +8049,7 @@
                         <dt>Next action</dt><dd>${escapeHTML(manifest.next_action || dash)}</dd>
                         <dt>Current handoff</dt><dd>${escapeHTML(currentHandoff || dash)}</dd>
                         <dt>Latest result</dt><dd>${escapeHTML((latestStage && (latestStage.summary || latestStage.error || latestStage.next_action)) || dash)}</dd>
+                        <dt>Design export</dt><dd>${designArtifacts.length ? `<a class="btn btn-ghost btn-xs" href="${studioPenpotPackageUrl(row.slug)}" onclick="event.stopPropagation();"><i class="fa-solid fa-compass-drafting"></i> Download export</a>` : '<span class="muted">Waiting for design artifacts.</span>'}</dd>
                         <dt>Artifacts</dt><dd><ul style="list-style:none;margin:0;padding:0;max-height:200px;overflow-y:auto;">${artList}</ul>${more}</dd>
                     </dl>${clarifyBlock}`;
                 },
@@ -8109,6 +8230,8 @@
                 manifest.quality_summary,
                 manifest.status,
             );
+            const designArtifacts = studioDesignArtifactPaths(arts);
+            const designReady = designArtifacts.length > 0;
             const safeSlug = String(slug || '').replace(/'/g, "\\'");
             const projectEvents = studioProjectFeedEvents(manifest);
             if (dl) {
@@ -8133,10 +8256,12 @@
                         <div class="studio-board-hero-copy">
                             <strong>${escapeHTML(projectTitle)}</strong>
                             <div class="muted" style="margin-left:0;">${escapeHTML(latestSummary || 'SkyN3t is keeping this mission ready to inspect.')}</div>
+                            ${designReady ? `<div class="studio-board-hero-copy-meta">Design export ready · ${designArtifacts.length} design asset${designArtifacts.length === 1 ? '' : 's'} already available for this mission.</div>` : ''}
                             <div class="studio-pill-row">
                                 ${studioRenderStatusBadge(String(manifest.status || '').toLowerCase())}
                                 <span class="studio-pill">${escapeHTML(workflow.title || manifest.title || slug || 'Studio run')}</span>
                                 <span class="studio-pill">${arts.length} artifacts</span>
+                                ${designReady ? `<span class="studio-pill">Design export · ${designArtifacts.length}</span>` : ''}
                                 ${quality ? studioRenderQualityBadge(quality, {compact: true}) : ''}
                                 <span class="studio-pill">audience · ${escapeHTML(missionLabels.audience)}</span>
                                 <span class="studio-pill">mode · ${escapeHTML(missionLabels.autonomy)}</span>
@@ -8144,9 +8269,15 @@
                             </div>
                         </div>
                         <div class="studio-board-actions">
-                            <button class="btn btn-primary btn-xs" type="button" onclick="studioRunAgain('${safeSlug}')"><i class="fa-solid fa-rotate-right"></i> Run again</button>
-                            <button class="btn btn-ghost btn-xs" type="button" onclick="studioEditMissionFromProject('${safeSlug}')"><i class="fa-solid fa-pen-to-square"></i> Edit as new mission</button>
-                            <a class="btn btn-ghost btn-xs" href="/api/studio/projects/${encodeURIComponent(slug)}/zip"><i class="fa-solid fa-download"></i> Download zip</a>
+                            <div class="studio-board-actions-group">
+                                <button class="btn btn-primary btn-xs" type="button" onclick="studioRunAgain('${safeSlug}')"><i class="fa-solid fa-rotate-right"></i> Run again</button>
+                                <button class="btn btn-ghost btn-xs" type="button" onclick="studioEditMissionFromProject('${safeSlug}')"><i class="fa-solid fa-pen-to-square"></i> Edit as new mission</button>
+                            </div>
+                            <div class="studio-board-actions-group">
+                                ${designReady ? `<a class="btn btn-primary btn-xs" href="${studioPenpotPackageUrl(slug)}"><i class="fa-solid fa-compass-drafting"></i> Download export</a>` : ''}
+                                ${designReady ? `<a class="btn btn-ghost btn-xs" href="${studioPenpotManifestUrl(slug)}" target="_blank" rel="noopener noreferrer"><i class="fa-solid fa-file-code"></i> Open manifest</a>` : ''}
+                                <a class="btn btn-ghost btn-xs" href="/api/studio/projects/${encodeURIComponent(slug)}/zip"><i class="fa-solid fa-download"></i> Download zip</a>
+                            </div>
                         </div>
                     </div>
                     <div class="muted" style="margin-left:0;font-size:.76rem;">${escapeHTML(String(manifest.brief || '').slice(0, 280))}</div>
@@ -8156,7 +8287,7 @@
             }
             if (artifactMeta) {
                 artifactMeta.textContent = arts.length
-                    ? `${arts.length} saved output${arts.length === 1 ? '' : 's'} · pick one to inspect or demo without leaving the board.`
+                    ? `${arts.length} saved output${arts.length === 1 ? '' : 's'} · pick one to inspect or demo without leaving the board.${designReady ? ` ${designArtifacts.length} design asset${designArtifacts.length === 1 ? '' : 's'} are ready for optional design export.` : ''}`
                     : 'No artifacts yet — SkyN3t is still building the project.';
             }
             if (!arts.length) {
@@ -8386,6 +8517,8 @@
             const quality = studioNormalizeQualitySummary(manifest.quality_summary, status);
             const currentCard = stageCards.find(stage => stage.status === 'running' || stage.status === 'waiting') || null;
             const latestStage = studioLatestStageRecord(manifest);
+            const projectSlug = studioProjectSlug(proj);
+            const designHandoffCard = studioRenderDesignHandoffCard(projectSlug, artifacts);
 
             const handoffCard = (() => {
                 if (currentCard) {
@@ -8541,6 +8674,7 @@
                         <div class="muted" style="margin-left:0;margin-top:.4rem;font-size:.74rem;">${escapeHTML(String(manifest.brief || '').slice(0, 260))}</div>
                     </div>
                     ${qualityCard}
+                    ${designHandoffCard ? `<div class="studio-inspector-card"><h4>Design handoff</h4>${designHandoffCard}</div>` : ''}
                     <div class="studio-inspector-card">
                         <h4>Current handoff</h4>
                         ${handoffCard}
