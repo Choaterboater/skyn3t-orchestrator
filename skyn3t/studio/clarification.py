@@ -90,10 +90,9 @@ def select_clarification_specs(
     mode: str = "balanced",
 ) -> List[Dict[str, Any]]:
     """Pick up to four plain-language specs worth asking for this brief."""
-    if force or mode == "confirm_first":
-        return kickoff_specs()
-
     text = re.sub(r"\s+", " ", (brief or "").lower()).strip()
+    if force:
+        return kickoff_specs()
     words = [word for word in re.split(r"[^a-z0-9]+", text) if word]
     generic_brief = len(words) <= 12
 
@@ -116,13 +115,19 @@ def select_clarification_specs(
     )
     deliverable_signals = (
         "working app",
+        "fully working",
         "working prototype",
+        "npm run dev",
+        "npm run build",
         "codebase",
         "scaffold",
         "landing page",
         "marketing site",
         "website",
         "web app",
+        "single-page",
+        "localstorage",
+        "habit tracker",
         "mobile app",
         "desktop app",
         "brand kit",
@@ -148,6 +153,11 @@ def select_clarification_specs(
         "upload",
         "search",
         "track",
+        "streak",
+        "habit",
+        "check-in",
+        "check in",
+        "check-ins",
         "checkout",
         "book",
         "schedule",
@@ -246,9 +256,16 @@ def parse_user_intent(
             if key:
                 intent["deliverable_kind"] = key
         elif spec_id == "platform" or _looks_like_platform_question(question):
-            key = matched_option_id or _infer_platform_id(answer)
-            if key:
-                intent["platform_kind"] = key
+            answer_lower = answer.lower()
+            if any(
+                token in answer_lower
+                for token in ("docker", "docker compose", "compose up")
+            ):
+                intent["platform_kind"] = "web_app"
+            else:
+                key = matched_option_id or _infer_platform_id(answer)
+                if key:
+                    intent["platform_kind"] = key
         elif spec_id == "audience" or _looks_like_audience_question(question):
             key = matched_option_id or _infer_audience_id(answer)
             if key:
@@ -422,19 +439,46 @@ def _match_option_id(entry: Dict[str, Any], answer: str) -> Optional[str]:
 
 def _infer_outcome_id(answer: str) -> Optional[str]:
     text = answer.lower()
+    # Runnable signals must win over incidental "design"/"brand" mentions in the
+    # same sentence (e.g. "Complete build working with great design and branding").
+    runnable_signals = (
+        "complete build",
+        "fully working",
+        "working app",
+        "working product",
+        "production ready",
+        "production-ready",
+        "runnable",
+        "full product",
+        "full stack",
+        "docker compose",
+        "npm run",
+    )
+    if any(token in text for token in runnable_signals):
+        return "runnable"
+    if any(
+        token in text
+        for token in ("run", "use", "app", "code", "working", "prototype", "build")
+    ):
+        return "runnable"
     if any(token in text for token in ("plan", "write-up", "writeup", "strategy", "roadmap")):
         return "plan"
+    if any(token in text for token in ("design only", "branding only", "logo only")):
+        return "design"
     if any(token in text for token in ("design", "brand", "logo", "palette")):
         return "design"
     if any(token in text for token in ("content", "copy", "blog", "email", "landing copy")):
         return "content"
-    if any(token in text for token in ("run", "use", "app", "code", "working", "prototype")):
-        return "runnable"
     return None
 
 
 def _infer_platform_id(answer: str) -> Optional[str]:
     text = answer.lower()
+    # "Website Docker" means a containerized web app, not a static marketing site.
+    if any(token in text for token in ("docker", "docker compose", "compose up")):
+        return "web_app"
+    if "web app" in text or "browser" in text:
+        return "web_app"
     if "website" in text or "marketing site" in text or "landing" in text:
         return "website"
     if any(token in text for token in ("phone", "mobile", "iphone", "android")):

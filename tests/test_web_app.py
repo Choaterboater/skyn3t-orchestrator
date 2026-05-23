@@ -917,6 +917,22 @@ async def test_reject_skill_draft_updates_memory(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_github_scout_config_returns_auto_mode(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "skyn3t.config.settings.get_settings",
+        lambda: SimpleNamespace(cortex_scout_default_limit=3),
+    )
+
+    result = await web_app.github_scout_config()
+
+    assert result["mode"] == "auto"
+    assert result["default_limit"] == 3
+    assert "trending" in result["discovery_lanes"]
+
+
+@pytest.mark.asyncio
 async def test_run_github_scout_returns_component_result(monkeypatch):
     class FakeScout:
         is_running = False

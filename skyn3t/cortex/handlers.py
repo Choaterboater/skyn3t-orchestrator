@@ -52,6 +52,11 @@ def install_handlers(orchestrator) -> None:
 
     async def feature_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
         """Approved feature idea → draft and apply a targeted self-update patch."""
+        if str(payload.get("kind") or "").strip() == "build_pattern_bias":
+            from skyn3t.cortex.build_pattern_bias import apply_build_pattern_bias
+
+            return await apply_build_pattern_bias(payload)
+
         idea = payload.get("idea") or payload.get("summary") or "improvement"
         try:
             improver = orchestrator.agents.get("code_improver")

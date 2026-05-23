@@ -211,6 +211,33 @@ export type CortexComponentStatus = {
   error?: string | null;
 };
 
+export type ScoutLastResult = {
+  ok?: boolean;
+  filed?: number;
+  error?: string;
+  warnings?: string[];
+  proposals?: Array<{
+    proposal_id?: string;
+    kind?: string;
+    repo?: string;
+    lane?: string;
+  }>;
+};
+
+export type GithubScoutStatus = {
+  available: boolean;
+  state?: string;
+  busy_reason?: string | null;
+  last_result?: ScoutLastResult;
+};
+
+export type GithubScoutConfig = {
+  mode: string;
+  default_limit: number;
+  discovery_lanes: string[];
+  summary?: string;
+};
+
 export type CortexStatus = {
   running: boolean;
   booted: boolean;
@@ -514,6 +541,13 @@ export const api = {
       body: JSON.stringify({ idea }),
     }),
   cortexStatus: () => fetchJson<CortexStatus>("/api/cortex/status"),
+  githubScoutStatus: () => fetchJson<GithubScoutStatus>("/api/github/scout/status"),
+  githubScoutConfig: () => fetchJson<GithubScoutConfig>("/api/github/scout/config"),
+  runGithubScout: (payload: { limit?: number; queries?: string[] }) =>
+    fetchJson<{ ok?: boolean; started?: boolean; state?: string; error?: string }>(
+      "/api/github/scout/run",
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
   traces: (limit = 50) =>
     fetchJson<{ traces: any[] }>(`/traces?limit=${limit}`).then(
       (d) => d.traces ?? [],

@@ -20,8 +20,41 @@ _DEFAULT_FIT_QUERIES = [
     "developer workflow automation testing packaging",
 ]
 _DEFAULT_PLATFORMS = ["github", "gitlab", "bitbucket"]
+
+
+def default_fit_queries() -> List[str]:
+    """Configured via SKYN3T_CORTEX_SCOUT_FIT_QUERIES; falls back to built-ins."""
+    try:
+        from skyn3t.config.settings import get_settings
+
+        configured = [
+            str(item).strip()
+            for item in (get_settings().cortex_scout_fit_queries or [])
+            if str(item).strip()
+        ]
+        if configured:
+            return configured
+    except Exception:
+        pass
+    return list(_DEFAULT_FIT_QUERIES)
 _PERMISSIVE_LICENSE_MARKERS = ("mit", "apache", "bsd", "isc", "unlicense", "zlib", "mpl-2.0")
 _RESTRICTIVE_LICENSE_MARKERS = ("gpl", "agpl", "lgpl", "sspl", "commons clause")
+# Boost repos whose metadata looks relevant to SkyN3t's mission (agents, RAG, cortex).
+_RELEVANCE_TERMS = (
+    "agent",
+    "orchestrat",
+    "multi-agent",
+    "rag",
+    "retriev",
+    "cortex",
+    "llm",
+    "mcp",
+    "self-heal",
+    "proposal",
+    "memory",
+    "workflow",
+    "autonom",
+)
 
 
 @dataclass
@@ -201,7 +234,7 @@ class MultiSourceRepoScout:
         cadence = str(cfg.get("cadence") or "daily").strip() or "daily"
         fit_queries = [
             str(item).strip()
-            for item in (cfg.get("queries") or _DEFAULT_FIT_QUERIES)
+            for item in (cfg.get("queries") or default_fit_queries())
             if str(item).strip()
         ]
         platforms = self._normalize_platforms(cfg.get("platforms"))
@@ -627,31 +660,49 @@ class MultiSourceRepoScout:
         return filed
 
     @staticmethod
+    def _relevance_boost(candidate: _ScoutCandidate) -> float:
+        """How well repo metadata matches SkyN3t learning goals (not raw stars)."""
+        haystack = " ".join(
+            [
+                candidate.description or "",
+                candidate.language or "",
+                " ".join(candidate.topics or []),
+                candidate.query or "",
+            ]
+        ).lower()
+        hits = sum(1 for term in _RELEVANCE_TERMS if term in haystack)
+        return min(hits * 0.35, 2.0)
+
+    @staticmethod
     def _candidate_score(candidate: _ScoutCandidate) -> float:
         score = 0.0
         if candidate.lane == "fit":
-            score += 2.0
+            score += 2.5
         elif candidate.lane == "activity":
             score += 1.4
         else:
-            score += 1.0
+            score += 0.8
+
+        score += MultiSourceRepoScout._relevance_boost(candidate)
 
         if candidate.platform == "github":
-            score += min(candidate.stars / 5000.0, 4.0)
+            score += min(candidate.stars / 8000.0, 2.0)
         elif candidate.platform == "gitlab":
-            score += min(candidate.stars / 1500.0, 3.5)
+            score += min(candidate.stars / 2000.0, 1.8)
         else:
-            score += 1.0
+            score += 0.5
 
         if candidate.language:
-            score += 0.3
-        if candidate.description:
             score += 0.2
+        if candidate.description:
+            score += 0.15
         risk = MultiSourceRepoScout._license_reuse_risk(candidate.license_name)
         if risk == "low":
-            score += 0.3
+            score += 0.4
         elif risk == "high":
-            score -= 0.3
+            score -= 1.0
+        elif risk == "unknown":
+            score -= 0.15
         return score
 
     @staticmethod

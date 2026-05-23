@@ -58,10 +58,20 @@ _LOCAL_WIZARD_BACKENDS: List[Dict[str, str]] = [
 ]
 
 
-def _print_getting_started() -> None:
-    """Show a compact first-run path instead of dropping into the REPL."""
+def _print_getting_started(*, server_up: bool = False) -> None:
+    """Show a compact first-run path when the REPL cannot start yet."""
+    if not server_up:
+        console.print(
+            "[yellow]Backend is not running.[/yellow] In one terminal run "
+            f"[bold]skyn3t start[/bold] (dashboard on localhost:{get_settings().web_port}). "
+            "In another, run [bold]skyn3t[/bold] again — that opens the chat REPL."
+        )
+        console.print()
     quickstart = Table(show_header=False, box=box.SIMPLE, pad_edge=False)
-    quickstart.add_row("[bold cyan]skyn3t[/bold cyan]", "Chat or build in plain language — no slash commands required")
+    quickstart.add_row(
+        "[bold cyan]skyn3t[/bold cyan]",
+        "Interactive chat (after [bold]skyn3t start[/bold] is running)",
+    )
     quickstart.add_row("[bold cyan]skyn3t init[/bold cyan]", "Initialize data + launch the local-backend setup wizard")
     quickstart.add_row(
         "[bold cyan]skyn3t start[/bold cyan]",
@@ -103,14 +113,14 @@ def _server_is_reachable() -> bool:
 
 @app.callback(invoke_without_command=True)
 def _default(ctx: typer.Context) -> None:
-    """Show a guided entry screen when invoked with no subcommand."""
+    """Open the REPL when the API is up; otherwise show how to get there."""
     if ctx.invoked_subcommand is None:
         if _interactive_cli_ready() and _server_is_reachable():
             from skyn3t.cli.repl import run as run_repl
 
             run_repl()
             return
-        _print_getting_started()
+        _print_getting_started(server_up=_server_is_reachable())
 
 
 @app.command()
@@ -2417,6 +2427,14 @@ def _run_repo_scout_command(
             f"• Job ID: [bold]{data.get('job_id', 'unknown')}[/bold]\n"
             f"• Name: [cyan]{data.get('name', title.lower())}[/cyan]\n"
             f"• Schedule: {every}"
+        )
+        return
+
+    if data.get("started") and not data.get("proposals"):
+        _success(
+            f"{title} started in background\n"
+            f"• Poll: [cyan]GET /api/repo-scout/status[/cyan]\n"
+            f"• State: {data.get('state', 'running')}"
         )
         return
 

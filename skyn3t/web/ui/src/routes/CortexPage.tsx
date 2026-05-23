@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import {
   api,
   CortexComponentStatus,
   CortexStatus,
+  HttpError,
   Proposal,
 } from "../api/client";
 
@@ -106,6 +107,7 @@ export default function CortexPage() {
         <FilterToggle value={filter} onChange={setFilter} />
       </header>
 
+      <GitHubScoutPanel onFinished={invalidate} />
       <FileIdeaForm onFiled={invalidate} />
       <CortexStatusPanel
         data={cortexStatus.data}
@@ -156,6 +158,134 @@ export default function CortexPage() {
         </section>
       )}
     </div>
+  );
+}
+
+function GitHubScoutPanel({ onFinished }: { onFinished: () => void }) {
+  const qc = useQueryClient();
+  const [limit, setLimit] = useState(2);
+  const [runMessage, setRunMessage] = useState<string | null>(null);
+
+  const scoutConfig = useQuery({
+    queryKey: ["github-scout-config"],
+    queryFn: () => api.githubScoutConfig(),
+    staleTime: 60_000,
+  });
+
+  useEffect(() => {
+    const configured = scoutConfig.data?.default_limit;
+    if (configured) setLimit(configured);
+  }, [scoutConfig.data?.default_limit]);
+
+  const status = useQuery({
+    queryKey: ["github-scout-status"],
+    queryFn: () => api.githubScoutStatus(),
+    refetchInterval: (q) =>
+      q.state.data?.state === "running" ? 2_500 : 15_000,
+  });
+
+  const run = useMutation({
+    mutationFn: () =>
+      api.runGithubScout({
+        limit: Math.max(1, Math.min(10, limit)),
+      }),
+    onSuccess: () => {
+      setRunMessage(null);
+      qc.invalidateQueries({ queryKey: ["github-scout-status"] });
+    },
+    onError: (err: unknown) => {
+      let msg = "Scout could not start";
+      if (err instanceof HttpError) {
+        try {
+          const body = JSON.parse(err.body) as { error?: string; reason?: string };
+          msg = body.error || body.reason || err.message;
+        } catch {
+          msg = err.message;
+        }
+        qc.invalidateQueries({ queryKey: ["github-scout-status"] });
+      } else if (err instanceof Error) {
+        msg = err.message;
+      }
+      setRunMessage(msg);
+    },
+  });
+
+  const state = status.data?.state ?? "idle";
+  const busy = status.data?.busy_reason;
+  const lr = status.data?.last_result;
+  const running = state === "running";
+
+  const wasRunning = useRef(false);
+  useEffect(() => {
+    if (wasRunning.current && !running) {
+      onFinished();
+    }
+    wasRunning.current = running;
+  }, [running, onFinished]);
+
+  let statusLine = "Idle — runs in the background; skipped while Studio builds are active.";
+  let statusTone = "text-text-secondary";
+  if (running) {
+    statusLine = busy
+      ? `Waiting — ${busy}`
+      : "Scout running… discovering repos, ingesting docs, filing proposals.";
+    statusTone = "text-accent";
+  } else if (lr?.ok) {
+    const repos = (lr.proposals ?? [])
+      .map((p) => p.repo)
+      .filter(Boolean)
+      .join(", ");
+    statusLine = `Done — filed ${lr.filed ?? 0} proposal(s)${repos ? `: ${repos}` : ""}.`;
+    statusTone = "text-status-green";
+  } else if (lr?.error || state === "failed") {
+    statusLine = lr?.error ?? busy ?? "Scout finished with errors.";
+    statusTone = "text-status-red";
+  } else if (busy) {
+    statusLine = `Skipped — ${busy}`;
+    statusTone = "text-status-yellow";
+  }
+
+  return (
+    <section className="rounded-lg border border-border bg-bg-2 p-4 space-y-3">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <SectionTitle>GitHub Scout</SectionTitle>
+          <p className="text-xs text-text-secondary mt-1 max-w-2xl">
+            {scoutConfig.data?.summary ||
+              "Automatically finds the best public repos (trending + SkyN3t relevance), ingests docs into RAG, and files proposals for your review."}
+          </p>
+        </div>
+        <RuntimeBadge ok={!running && state !== "failed"}>
+          {running ? "running" : state}
+        </RuntimeBadge>
+      </div>
+
+      <div className="flex flex-wrap gap-3 items-end">
+        <label className="w-24 space-y-1">
+          <span className="text-[0.65rem] uppercase tracking-wider text-text-secondary">
+            Top picks
+          </span>
+          <input
+            type="number"
+            min={1}
+            max={10}
+            value={limit}
+            onChange={(e) => setLimit(parseInt(e.target.value, 10) || 2)}
+            className="w-full bg-bg-3 border border-border rounded px-3 py-2 text-sm outline-none focus:border-accent font-mono"
+          />
+        </label>
+        <button
+          type="button"
+          onClick={() => run.mutate()}
+          disabled={running || run.isPending}
+          className="rounded bg-accent text-bg-0 text-sm font-medium px-4 py-2 disabled:opacity-60 shrink-0"
+        >
+          <i className="fa-brands fa-github mr-1.5" />
+          {run.isPending || running ? "Running…" : "Run GitHub Scout"}
+        </button>
+      </div>
+      <p className={`text-xs ${statusTone}`}>{runMessage ?? statusLine}</p>
+    </section>
   );
 }
 

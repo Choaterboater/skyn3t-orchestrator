@@ -38,6 +38,8 @@ from skyn3t.cli.main import (
 )
 from skyn3t.cli.studio_approval import (
     approval_gate_key,
+    approval_renderables,
+    approval_summary,
     edit_markdown_in_editor,
     fetch_approval_document,
     resolve_approval_choice,
@@ -173,6 +175,10 @@ class ReplState:
     last_studio_activity_key: Optional[str] = None
     live_activity_key: Optional[str] = None
     live_activity_line: Optional[Text] = None
+    studio_approval_gate_seen: Optional[tuple[Any, ...]] = None
+    studio_clarification_gate_seen: Optional[tuple[str, ...]] = None
+    studio_clarification_questions: Optional[tuple[str, ...]] = None
+    studio_clarification_answers: List[str] = field(default_factory=list)
     paint_callback: Any = None
 
 
@@ -774,6 +780,131 @@ def _add_activity(state: ReplState, renderable: Text) -> None:
     _touch_state(state)
 
 
+def _studio_clarification_questions(project: Dict[str, Any]) -> tuple[str, ...]:
+    clarification = project.get("clarification") or {}
+    return tuple(
+        str(question).strip()
+        for question in (clarification.get("questions") or [])
+        if str(question).strip()
+    )
+
+
+def _emit_studio_clarification_prompt(
+    state: ReplState,
+    project: Dict[str, Any],
+) -> bool:
+    """Show planner questions in chat when a build is paused for clarification."""
+    status = str(project.get("status") or "").strip().lower()
+    if status != "awaiting_clarification":
+        state.studio_clarification_gate_seen = None
+        state.studio_clarification_questions = None
+        state.studio_clarification_answers = []
+        return False
+    questions = _studio_clarification_questions(project)
+    if not questions or questions == state.studio_clarification_gate_seen:
+        return False
+    slug = str(project.get("slug") or state.studio_slug or "").strip()
+    if slug:
+        state.studio_slug = slug
+    state.studio_clarification_gate_seen = questions
+    state.studio_clarification_questions = questions
+    state.studio_clarification_answers = []
+    _add_transcript(
+        state,
+        Panel(
+            "\n".join(f"{index}. {question}" for index, question in enumerate(questions, start=1))
+            + "\n\nReply in chat — one message per question, in order.",
+            title="Clarification needed",
+            border_style="yellow",
+        ),
+    )
+    _add_studio_activity(
+        state,
+        Text("? clarification needed — answer in chat", style="bold yellow"),
+        event_name="STUDIO_CLARIFY",
+        status="awaiting_clarification",
+        message=questions[0][:80],
+    )
+    return True
+
+
+def _handle_studio_clarification_reply(state: ReplState, line: str) -> bool:
+    """Collect clarification answers in the main REPL (web-started builds)."""
+    questions = state.studio_clarification_questions
+    if not questions:
+        return False
+    answer = str(line or "").strip()
+    if not answer:
+        _add_transcript(state, _info_line("please enter an answer", "yellow"))
+        return True
+    state.studio_clarification_answers.append(answer)
+    index = len(state.studio_clarification_answers)
+    if index < len(questions):
+        _add_transcript(
+            state,
+            _info_line(f"got it — next: {questions[index]}", "cyan"),
+        )
+        return True
+    slug = state.studio_slug
+    if not slug:
+        _add_transcript(state, _info_line("no active studio project", "red"))
+        return True
+    try:
+        with httpx.Client(base_url=state.api_url, timeout=30.0) as client:
+            resp = client.post(
+                f"/api/studio/projects/{slug}/clarify",
+                json={"answers": list(state.studio_clarification_answers)},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if not data.get("ok"):
+                raise RuntimeError(str(data.get("error") or data))
+    except Exception as exc:
+        _add_transcript(state, _info_line(f"clarification failed: {exc}", "red"))
+        return True
+    state.studio_clarification_questions = None
+    state.studio_clarification_answers = []
+    state.studio_clarification_gate_seen = None
+    _add_transcript(state, _info_line("clarifications sent — build resuming…", "green"))
+    return True
+
+
+def _emit_studio_approval_prompt(
+    state: ReplState,
+    project: Dict[str, Any],
+    *,
+    client: httpx.Client,
+) -> bool:
+    """Surface architecture approval in the REPL transcript (once per gate)."""
+    status = str(project.get("status") or "").strip().lower()
+    if status != "awaiting_approval":
+        state.studio_approval_gate_seen = None
+        return False
+    gate_key = approval_gate_key(project)
+    if gate_key == state.studio_approval_gate_seen:
+        return False
+    state.studio_approval_gate_seen = gate_key
+    slug = str(project.get("slug") or state.studio_slug or "").strip()
+    if slug:
+        state.studio_slug = slug
+    summary = approval_summary(project)
+    try:
+        original = fetch_approval_document(client, slug) if slug else ""
+    except Exception as exc:
+        original = f"(could not load architecture.md: {exc})"
+    for renderable in approval_renderables(project, original):
+        _add_transcript(state, renderable)
+    _add_studio_activity(
+        state,
+        Text(f"⏸ approval required · {summary}", style="bold yellow"),
+        event_name="STUDIO_APPROVAL",
+        status="awaiting_approval",
+        stage=summary,
+        message="approve / approve with edits / reject …",
+    )
+    return True
+
+
 def _add_studio_activity(
     state: ReplState,
     renderable: Text,
@@ -929,8 +1060,14 @@ async def _studio_sync_listener(state: ReplState) -> None:
                 if detail.status_code != 200:
                     await asyncio.sleep(3)
                     continue
-                if _apply_studio_project_activity(state, detail.json()):
-                    _request_repaint(state)
+                project = detail.json()
+                with httpx.Client(base_url=state.api_url, timeout=30.0) as sync_client:
+                    if _emit_studio_clarification_prompt(state, project):
+                        _request_repaint(state)
+                    elif _emit_studio_approval_prompt(state, project, client=sync_client):
+                        _request_repaint(state)
+                    elif _apply_studio_project_activity(state, project):
+                        _request_repaint(state)
             except Exception:
                 pass
             await asyncio.sleep(2)
@@ -1160,6 +1297,8 @@ Slash commands are optional power-user shortcuts — `/help` lists them all.
 - `/approve [SLUG]` — approve a paused Studio gate (uses last project if omitted)
 - `/approve-edits [SLUG]` — edit architecture.md in `$EDITOR`, then approve
 - `/reject FEEDBACK...` — reject the paused gate and re-run with feedback
+- When a build pauses for approval, the architecture preview appears in chat — reply with
+  **approve**, **approve with edits**, or **reject** *feedback…* (same as the web UI)
 - `/project --audience builders --autonomy confirm_first BRIEF...` — steer the run before launch
 - `/project --repo-path ../customer-portal --focus-file src/login.tsx BRIEF...` — target another local git repo or GitHub URL
 - `/project TEMPLATE :: BRIEF...` — force a specific Studio template
@@ -1397,6 +1536,23 @@ async def _cmd_pipeline(state: ReplState, rest: str) -> None:
     )
 
 
+def _match_studio_slug_hint(hint: str, projects: List[dict]) -> Optional[str]:
+    """Resolve a partial slug (e.g. ``build-choatelab``) to a unique project slug."""
+    needle = str(hint or "").strip().lower()
+    if not needle:
+        return None
+    slugs = [str(p.get("slug") or "").strip() for p in projects if p.get("slug")]
+    if needle in slugs:
+        return needle
+    prefix = [s for s in slugs if s.lower().startswith(needle)]
+    if len(prefix) == 1:
+        return prefix[0]
+    contains = [s for s in slugs if needle in s.lower()]
+    if len(contains) == 1:
+        return contains[0]
+    return None
+
+
 def _resolve_studio_slug(state: ReplState, rest: str) -> Optional[str]:
     slug = str(rest or "").strip()
     if slug:
@@ -1436,6 +1592,8 @@ async def _cmd_studio_approve(
                 )
                 return
             original = fetch_approval_document(client, slug)
+            for renderable in approval_renderables(project, original):
+                _add_transcript(state, renderable)
             edited: Optional[str] = None
             if with_edits:
                 edited = edit_markdown_in_editor(original)
@@ -1452,6 +1610,7 @@ async def _cmd_studio_approve(
     except Exception as exc:
         _add_transcript(state, _info_line(f"approve failed: {exc}", "red"))
         return
+    state.studio_approval_gate_seen = None
     _add_transcript(state, _info_line(message, "green"))
 
 
@@ -1480,10 +1639,71 @@ async def _cmd_studio_reject(state: ReplState, rest: str) -> None:
     except Exception as exc:
         _add_transcript(state, _info_line(f"reject failed: {exc}", "red"))
         return
+    state.studio_approval_gate_seen = None
     _add_transcript(
         state,
         _info_line(f"rejected {slug} — re-running stage with feedback", "green"),
     )
+
+
+def _parse_studio_approval_plain(line: str) -> Optional[tuple[str, str, str]]:
+    """Map natural language to approval choice. Returns (choice, feedback, error)."""
+    stripped = str(line or "").strip()
+    if not stripped:
+        return None
+    lower = stripped.lower()
+    if lower in {"approve", "approved"}:
+        return ("a", "", "")
+    if lower.startswith("approve with edits") or lower.startswith("approve edits"):
+        return ("e", "", "")
+    if lower.startswith("reject "):
+        return ("r", stripped[7:].strip(), "")
+    if lower == "reject":
+        return ("r", "", "reject needs feedback — e.g. reject use SQLite only")
+    return None
+
+
+async def _handle_studio_approval_plain(state: ReplState, line: str) -> bool:
+    """Handle approve / approve with edits / reject when a gate is open."""
+    parsed = _parse_studio_approval_plain(line)
+    if parsed is None:
+        return False
+    choice, feedback, err = parsed
+    if err:
+        _add_transcript(state, _info_line(err, "yellow"))
+        return True
+    slug = state.studio_slug
+    if not slug:
+        _add_transcript(state, _info_line("no active studio project for approval", "yellow"))
+        return True
+    try:
+        with httpx.Client(base_url=state.api_url, timeout=30.0) as client:
+            resp = client.get(f"/api/studio/projects/{slug}")
+            resp.raise_for_status()
+            project = resp.json()
+            if str(project.get("status") or "").lower() != "awaiting_approval":
+                return False
+            original = fetch_approval_document(client, slug)
+            edited: Optional[str] = None
+            if choice == "e":
+                edited = edit_markdown_in_editor(original)
+                if edited is None:
+                    _add_transcript(state, _info_line("edit cancelled", "yellow"))
+                    return True
+            message = resolve_approval_choice(
+                client,
+                slug,
+                original=original,
+                choice=choice,
+                edited=edited,
+                feedback=feedback,
+            )
+    except Exception as exc:
+        _add_transcript(state, _info_line(f"approval failed: {exc}", "red"))
+        return True
+    state.studio_approval_gate_seen = None
+    _add_transcript(state, _info_line(message, "green"))
+    return True
 
 
 async def _cmd_project(state: ReplState, rest: str) -> None:
@@ -1593,7 +1813,7 @@ def _resolve_status_query_slug(state: ReplState, prompt: str) -> Optional[str]:
         return slug
     build_words = ("build", "project", "studio", "run", "habit", "tracker", "mvp")
     if state.studio_slug and any(cue in normalized for cue in _STATUS_QUERY_CUES):
-        if any(word in normalized for word in build_words) or len(normalized.split()) <= 6:
+        if any(word in normalized for word in build_words):
             return state.studio_slug
     if normalized.rstrip("?") in {"status", "progress"} and state.studio_slug:
         return state.studio_slug
@@ -1647,7 +1867,23 @@ def _show_project_status_in_repl(state: ReplState, slug: str) -> None:
         with httpx.Client(base_url=state.api_url, timeout=30.0) as client:
             resp = client.get(f"/api/studio/projects/{slug}")
             if resp.status_code == 404:
-                _add_transcript(state, _info_line(f"project not found: {slug}", "red"))
+                list_resp = client.get("/api/studio/projects")
+                if list_resp.status_code == 200:
+                    matched = _match_studio_slug_hint(
+                        slug, list_resp.json().get("projects") or []
+                    )
+                    if matched:
+                        slug = matched
+                        resp = client.get(f"/api/studio/projects/{slug}")
+            if resp.status_code == 404:
+                _add_transcript(
+                    state,
+                    _info_line(
+                        f"project not found: {slug} "
+                        "(try /status with no slug, or a longer prefix)",
+                        "red",
+                    ),
+                )
                 return
             resp.raise_for_status()
             project = resp.json()
@@ -1663,9 +1899,9 @@ def _show_project_status_in_repl(state: ReplState, slug: str) -> None:
 
 async def _cmd_status(state: ReplState, rest: str) -> None:
     slug = rest.strip() or state.studio_slug
-    if not slug:
-        try:
-            with httpx.Client(base_url=state.api_url, timeout=30.0) as client:
+    try:
+        with httpx.Client(base_url=state.api_url, timeout=30.0) as client:
+            if not slug:
                 resp = client.get("/api/studio/projects")
                 resp.raise_for_status()
                 projects = resp.json().get("projects") or []
@@ -1678,9 +1914,19 @@ async def _cmd_status(state: ReplState, rest: str) -> None:
                         key=lambda item: float(item.get("updated_at") or item.get("created_at") or 0),
                     )
                     slug = str(latest.get("slug") or "").strip()
-        except Exception as exc:
-            _add_transcript(state, _info_line(f"status lookup failed: {exc}", "red"))
-            return
+            else:
+                probe = client.get(f"/api/studio/projects/{slug}")
+                if probe.status_code == 404:
+                    list_resp = client.get("/api/studio/projects")
+                    if list_resp.status_code == 200:
+                        matched = _match_studio_slug_hint(
+                            slug, list_resp.json().get("projects") or []
+                        )
+                        if matched:
+                            slug = matched
+    except Exception as exc:
+        _add_transcript(state, _info_line(f"status lookup failed: {exc}", "red"))
+        return
     if not slug:
         _add_transcript(
             state,
@@ -1854,6 +2100,8 @@ def _watch_project_in_repl(
                 if status == "awaiting_approval":
                     gate_key = approval_gate_key(project)
                     if gate_key != seen_approval:
+                        _emit_studio_approval_prompt(state, project, client=client)
+                        paint()
                         try:
                             message = run_interactive_approval(
                                 console=Console(),
@@ -1869,6 +2117,7 @@ def _watch_project_in_repl(
                                     "Feedback for architect",
                                 ),
                                 edit_text=edit_markdown_in_editor,
+                                display=False,
                             )
                         except Exception as exc:
                             _add_transcript(
@@ -2885,9 +3134,26 @@ def _run_plain_prompt(
 
     _add_transcript(state, _user_line(line))
 
+    if _handle_studio_clarification_reply(state, line):
+        paint()
+        return
+
     status_slug = _resolve_status_query_slug(state, line)
     if status_slug:
         _show_project_status_in_repl(state, status_slug)
+        paint()
+        return
+
+    approval_future = asyncio.run_coroutine_threadsafe(
+        _handle_studio_approval_plain(state, line),
+        loop,
+    )
+    try:
+        if approval_future.result(timeout=120):
+            paint()
+            return
+    except Exception as exc:
+        _add_transcript(state, _info_line(f"approval error: {exc}", "red"))
         paint()
         return
 

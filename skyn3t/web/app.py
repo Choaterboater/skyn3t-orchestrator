@@ -2795,6 +2795,24 @@ async def _schedule_repo_scout(
     return {"job_id": job_id, "name": name, "created": True, "config": config}
 
 
+@app.get("/api/github/scout/config")
+async def github_scout_config():
+    """Scout UI config — auto mode ranks trending + relevance; no manual search required."""
+    from skyn3t.config.settings import get_settings
+
+    settings = get_settings()
+    return {
+        "mode": "auto",
+        "default_limit": max(1, min(int(settings.cortex_scout_default_limit), 10)),
+        "discovery_lanes": ["trending", "fit", "activity"],
+        "summary": (
+            "Scout discovers candidates from GitHub trending and internal relevance "
+            "signals, then files the top matches by score (fit lane, license safety, "
+            "and SkyN3t-related metadata — not a fixed search string)."
+        ),
+    }
+
+
 @app.get("/api/repo-scout/status")
 async def repo_scout_status():
     """Poll background repo scout progress without blocking the server."""

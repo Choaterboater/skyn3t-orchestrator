@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from skyn3t.cortex.repo_scout import GitHubRepoScout, _ScoutCandidate
+from skyn3t.cortex.repo_scout import GitHubRepoScout, MultiSourceRepoScout, _ScoutCandidate
 
 
 class _FakeProposal:
@@ -248,3 +248,31 @@ async def test_repo_scout_scheduled_trigger_parses_prompt_and_runs(monkeypatch):
     await asyncio.sleep(0)
 
     assert ran["config"] == {"cadence": "weekly", "limit": 3}
+
+
+def test_candidate_score_prefers_fit_and_relevance_over_raw_trending():
+    fit_agent = _ScoutCandidate(
+        platform="github",
+        lane="fit",
+        query="multi agent orchestrator",
+        full_name="org/agent-rag",
+        description="Multi-agent orchestrator with RAG and cortex memory",
+        stars=800,
+        language="Python",
+        url="https://github.com/org/agent-rag",
+        license_name="MIT",
+    )
+    trending_ui = _ScoutCandidate(
+        platform="github",
+        lane="popularity",
+        query="trending:daily",
+        full_name="org/ui-kit",
+        description="CSS components",
+        stars=20000,
+        language="TypeScript",
+        url="https://github.com/org/ui-kit",
+        license_name="MIT",
+    )
+    assert MultiSourceRepoScout._candidate_score(fit_agent) > MultiSourceRepoScout._candidate_score(
+        trending_ui
+    )

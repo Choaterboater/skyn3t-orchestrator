@@ -139,6 +139,19 @@ class Settings(BaseSettings):
     cortex_scout_run_timeout_seconds: int = Field(
         default=300, alias="SKYN3T_CORTEX_SCOUT_RUN_TIMEOUT_SECONDS"
     )
+    cortex_scout_fit_queries: List[str] = Field(
+        default_factory=lambda: [
+            "multi agent orchestrator cli memory rag",
+            "cortex autonomy self-healing proposal review agent learning",
+            "design system ui components app builder",
+            "game framework rendering ui workflow",
+            "developer workflow automation testing packaging",
+        ],
+        alias="SKYN3T_CORTEX_SCOUT_FIT_QUERIES",
+    )
+    cortex_scout_default_limit: int = Field(
+        default=2, alias="SKYN3T_CORTEX_SCOUT_DEFAULT_LIMIT"
+    )
 
     # Execution backend for code agent: inline (fast, no isolation),
     # docker (real sandbox), or auto (probe docker, fall back to inline).
@@ -186,6 +199,18 @@ class Settings(BaseSettings):
         if v is None:
             return []
         return [str(v).strip()]
+
+    @field_validator("cortex_scout_fit_queries", mode="before")
+    @classmethod
+    def parse_scout_fit_queries(cls, v: Any) -> List[str]:
+        if isinstance(v, str):
+            return [part.strip() for part in v.split(",") if part.strip()]
+        if isinstance(v, list):
+            return [str(part).strip() for part in v if str(part).strip()]
+        if v is None:
+            return []
+        text = str(v).strip()
+        return [text] if text else []
 
     @field_validator(
         "data_dir",
