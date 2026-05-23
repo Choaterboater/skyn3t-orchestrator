@@ -125,7 +125,10 @@ class BrainstormAgent(BaseAgent):
                     force=require_clarification,
                     mode=autonomy,
                 )
-                specs = clarification.get("specs") if clarification else []
+                raw_specs = clarification.get("specs") if clarification else []
+                specs: List[Dict[str, Any]] = (
+                    list(raw_specs) if isinstance(raw_specs, list) else []
+                )
                 if require_clarification and not specs:
                     specs = kickoff_specs()
                 elif autonomy == "confirm_first" and clarification:
