@@ -100,10 +100,30 @@ def test_render_layout_uses_sidebar_for_activity_when_wide(monkeypatch):
 def test_render_layout_stacks_activity_when_narrow(monkeypatch):
     state = repl.ReplState()
     state.activity.append(Text("• task"))
-    monkeypatch.setattr(repl, "_terminal_width", lambda: 100)
+    monkeypatch.setattr(repl, "_terminal_width", lambda: 80)
     layout = repl._render_layout(state)
 
     assert [child.name for child in layout.children] == ["header", "transcript", "activity"]
+
+
+def test_render_layout_sidebar_uses_ratio_not_fixed_width(monkeypatch):
+    state = repl.ReplState()
+    state.activity.append(Text("• architect thinking"))
+    monkeypatch.setattr(repl, "_terminal_width", lambda: 160)
+    monkeypatch.setattr(repl, "_terminal_height", lambda: 40)
+    layout = repl._render_layout(state)
+
+    activity = layout["body"]["activity"]
+    transcript = layout["body"]["transcript"]
+    assert activity.ratio >= 1
+    assert activity.size is None
+    assert transcript.ratio > activity.ratio
+
+
+def test_layout_frame_height_reserves_prompt_band(monkeypatch):
+    monkeypatch.setattr(repl, "_terminal_height", lambda: 40)
+    assert repl._layout_frame_height() == 37
+    assert repl._prompt_reserve_lines() == 3
 
 
 def test_format_event_filters_llm_exchange():

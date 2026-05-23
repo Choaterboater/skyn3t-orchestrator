@@ -190,6 +190,15 @@ class Settings(BaseSettings):
         Path(self.vector_db_path).mkdir(parents=True, exist_ok=True)
 
 
+def resolve_api_base(settings: Settings | None = None) -> str:
+    """Return the SkyN3t API base URL for CLI/REPL clients."""
+    if url := os.environ.get("SKYN3T_API_URL"):
+        return url.rstrip("/")
+    cfg = settings or get_settings()
+    host = "localhost" if cfg.web_host in ("0.0.0.0", "::") else cfg.web_host
+    return f"http://{host}:{cfg.web_port}"
+
+
 @lru_cache
 def get_settings() -> Settings:
     """Get cached settings instance."""

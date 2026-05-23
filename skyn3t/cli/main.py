@@ -21,12 +21,12 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.syntax import Syntax
 from rich.table import Table
 
-from skyn3t.config.settings import get_settings
+from skyn3t.config.settings import get_settings, resolve_api_base
 from skyn3t.studio.mission_setup import mission_setup_labels, normalize_mission_setup
 from skyn3t.studio.penpot_handoff import build_penpot_package
 from skyn3t.studio.repo_target import normalize_repo_target, resolve_repo_target
 
-API_BASE = os.environ.get("SKYN3T_API_URL", "http://localhost:6660")
+API_BASE = resolve_api_base()
 
 console = Console()
 app = typer.Typer(
@@ -61,11 +61,16 @@ _LOCAL_WIZARD_BACKENDS: List[Dict[str, str]] = [
 def _print_getting_started() -> None:
     """Show a compact first-run path instead of dropping into the REPL."""
     quickstart = Table(show_header=False, box=box.SIMPLE, pad_edge=False)
-    quickstart.add_row("[bold cyan]skyn3t[/bold cyan]", "Open the interactive chat console when the server is already running")
+    quickstart.add_row("[bold cyan]skyn3t[/bold cyan]", "Chat or build in plain language — no slash commands required")
     quickstart.add_row("[bold cyan]skyn3t init[/bold cyan]", "Initialize data + launch the local-backend setup wizard")
-    quickstart.add_row("[bold cyan]skyn3t start[/bold cyan]", "Start the API and dashboard on localhost:6660")
+    quickstart.add_row(
+        "[bold cyan]skyn3t start[/bold cyan]",
+        f"Start the API and dashboard on localhost:{get_settings().web_port}",
+    )
     quickstart.add_row("[bold cyan]skyn3t status[/bold cyan]", "Check whether the system is up")
-    quickstart.add_row("[bold cyan]skyn3t project \"build a habit tracker\"[/bold cyan]", "Start a Studio run from one brief")
+    quickstart.add_row("[bold cyan]skyn3t project --examples[/bold cyan]", "List preset briefs like the web UI showcase")
+    quickstart.add_row("[bold cyan]skyn3t studio approve SLUG[/bold cyan]", "Approve a paused Studio build from the terminal")
+    quickstart.add_row("[bold cyan]skyn3t project \"build a habit tracker\"[/bold cyan]", "Start a Studio run from your own brief")
     quickstart.add_row("[bold cyan]skyn3t repl[/bold cyan]", "Open the interactive console when you want it")
 
     console.print(
@@ -115,10 +120,46 @@ def repl() -> None:
     run_repl()
 
 
+def _print_studio_examples() -> None:
+    from skyn3t.studio.examples import list_studio_examples
+
+    table = Table(title="Studio examples", box=box.ROUNDED, show_lines=True)
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Title", style="bold")
+    table.add_column("Template", style="dim")
+    table.add_column("Summary")
+    for item in list_studio_examples():
+        table.add_row(
+            str(item.get("id") or ""),
+            str(item.get("title") or ""),
+            str(item.get("template") or "auto"),
+            str(item.get("subtitle") or ""),
+        )
+    console.print(table)
+    console.print(
+        "\nRun a preset: [bold cyan]skyn3t project --example habit-tracker[/bold cyan]\n"
+        "Custom brief: [bold cyan]skyn3t project \"describe what you want\"[/bold cyan]"
+    )
+
+
 @app.command()
 def project(
-    brief: str = typer.Argument(..., help="Describe the project you want SkyN3t to build"),
+    brief: Optional[str] = typer.Argument(
+        None,
+        help="Describe the project you want SkyN3t to build",
+    ),
     template: str = typer.Option("auto", "--template", "-t", help="Studio template key; defaults to auto"),
+    example: Optional[str] = typer.Option(
+        None,
+        "--example",
+        "-e",
+        help="Run a preset brief by id (same cards as the web UI — see --examples)",
+    ),
+    list_examples: bool = typer.Option(
+        False,
+        "--examples",
+        help="List preset briefs like the web UI showcase",
+    ),
     audience: str = typer.Option(
         "auto",
         "--audience",
@@ -146,6 +187,34 @@ def project(
     ),
 ) -> None:
     """🚀 Start a Studio project from one brief."""
+    from skyn3t.studio.examples import get_studio_example
+
+    if list_examples:
+        _print_studio_examples()
+        return
+
+    if example:
+        preset = get_studio_example(example)
+        if preset is None:
+            _error(
+                f"Unknown example [bold]{example}[/bold]. "
+                "Run [bold]skyn3t project --examples[/bold] to list ids."
+            )
+            raise typer.Exit(1)
+        brief = str(preset.get("brief") or "").strip()
+        preset_template = str(preset.get("template") or "").strip()
+        if preset_template and template == "auto":
+            template = preset_template
+        console.print(
+            f"[dim]Using preset[/dim] [bold cyan]{preset.get('title')}[/bold cyan] "
+            f"([cyan]{preset.get('id')}[/cyan] · template [bold]{template}[/bold])"
+        )
+
+    if not brief or not str(brief).strip():
+        console.print("[yellow]Provide a brief or pick a preset.[/yellow]\n")
+        _print_studio_examples()
+        raise typer.Exit(0)
+
     audience_map = {
         "auto": "",
         "general": "general",
@@ -177,19 +246,15 @@ def project(
         _error(str(exc))
         raise typer.Exit(1)
     labels = mission_setup_labels(mission_setup)
+    start_payload = {
+        "template": template,
+        "brief": brief,
+        "mission_setup": mission_setup,
+        "repo_target": repo_target,
+    }
     try:
         with _client() as client:
-            resp = client.post(
-                "/api/studio/start",
-                json={
-                    "template": template,
-                    "brief": brief,
-                    "mission_setup": mission_setup,
-                    "repo_target": repo_target,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            data = _post_studio_start(client, start_payload)
     except httpx.ConnectError:
         _server_unavailable()
         raise typer.Exit(1)
@@ -216,7 +281,11 @@ def project(
         f"• Repo: {repo_target['local_path'] or 'Current SkyN3t workspace'}\n"
         + (f"• Focus file: {repo_target['focus_file']}\n" if repo_target["focus_file"] else "")
         + "\n"
-        "Use [bold]skyn3t[/bold] or [bold]skyn3t repl[/bold] for interactive chat while builds run."
+        + (
+            "Watching live progress below…"
+            if watch and _interactive_cli_ready()
+            else "Use [bold]skyn3t[/bold] or [bold]skyn3t repl[/bold] for interactive chat while builds run."
+        )
     )
     if watch and _interactive_cli_ready():
         try:
@@ -226,6 +295,108 @@ def project(
                 "[yellow]Detached from live build watch.[/yellow] "
                 "[dim]The project is still running in the background.[/dim]"
             )
+    elif watch:
+        console.print(
+            "[dim]Re-run in a terminal to stream live progress, or open "
+            f"[bold]http://localhost:{get_settings().web_port}/studio[/bold].[/dim]"
+        )
+
+studio_app = typer.Typer(help="Studio build management", no_args_is_help=True)
+
+
+@studio_app.command("approve")
+def studio_approve(
+    slug: str = typer.Argument(..., help="Studio project slug"),
+    with_edits: bool = typer.Option(
+        False,
+        "--with-edits",
+        help="Edit architecture.md in $EDITOR before approving",
+    ),
+    file: Optional[str] = typer.Option(
+        None,
+        "--file",
+        "-f",
+        help="Approve with markdown content from this file",
+    ),
+) -> None:
+    """Approve a Studio project paused at the architect gate."""
+    from skyn3t.cli.studio_approval import (
+        fetch_approval_document,
+        resolve_approval_choice,
+    )
+
+    try:
+        with _client() as client:
+            resp = client.get(f"/api/studio/projects/{slug}")
+            resp.raise_for_status()
+            project = resp.json()
+            if str(project.get("status") or "").lower() != "awaiting_approval":
+                _error(
+                    f"Project [bold]{slug}[/bold] is not awaiting approval "
+                    f"(status={project.get('status')})."
+                )
+                raise typer.Exit(1)
+            original = fetch_approval_document(client, slug)
+            edited: Optional[str] = None
+            if file:
+                edited = Path(file).expanduser().read_text(encoding="utf-8")
+            elif with_edits:
+                edited = typer.edit(original, extension=".md")
+                if edited is None:
+                    console.print("[yellow]Edit cancelled — nothing submitted.[/yellow]")
+                    raise typer.Exit(0)
+            message = resolve_approval_choice(
+                client,
+                slug,
+                original=original,
+                choice="e" if edited is not None else "a",
+                edited=edited,
+            )
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+    except (RuntimeError, ValueError) as exc:
+        _error(str(exc))
+        raise typer.Exit(1)
+
+    _success(message)
+
+
+@studio_app.command("reject")
+def studio_reject(
+    slug: str = typer.Argument(..., help="Studio project slug"),
+    feedback: str = typer.Argument(..., help="What the gated stage should change"),
+) -> None:
+    """Reject a Studio approval gate and re-run the stage with feedback."""
+    from skyn3t.cli.studio_approval import submit_reject
+
+    try:
+        with _client() as client:
+            resp = client.get(f"/api/studio/projects/{slug}")
+            resp.raise_for_status()
+            project = resp.json()
+            if str(project.get("status") or "").lower() != "awaiting_approval":
+                _error(
+                    f"Project [bold]{slug}[/bold] is not awaiting approval "
+                    f"(status={project.get('status')})."
+                )
+                raise typer.Exit(1)
+            submit_reject(client, slug, feedback)
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+    except RuntimeError as exc:
+        _error(str(exc))
+        raise typer.Exit(1)
+
+    _success(f"Rejected [bold]{slug}[/bold] — re-running stage with your feedback.")
+
 
 agent_app = typer.Typer(help="Agent management commands", no_args_is_help=True)
 task_app = typer.Typer(help="Task management commands", no_args_is_help=True)
@@ -240,6 +411,7 @@ schedule_app = typer.Typer(help="Schedule recurring tasks", no_args_is_help=True
 memory_app = typer.Typer(help="Memory inspection commands", no_args_is_help=True)
 skills_app = typer.Typer(help="Skill registry commands", no_args_is_help=True)
 
+app.add_typer(studio_app, name="studio")
 app.add_typer(agent_app, name="agent")
 app.add_typer(task_app, name="task")
 app.add_typer(pipeline_app, name="pipeline")
@@ -258,8 +430,51 @@ app.add_typer(skills_app, name="skills")
 # ---------------------------------------------------------------------------
 
 
+_STUDIO_START_TIMEOUT = 120.0
+_STUDIO_TERMINAL_STATUSES = frozenset({"done", "needs_fixes", "failed"})
+
+
 def _client() -> httpx.Client:
     return httpx.Client(base_url=API_BASE, timeout=30.0)
+
+
+def _studio_progress_snapshot(project: dict) -> tuple[str, str, str, str]:
+    return (
+        str(project.get("status") or "").strip().lower(),
+        str(project.get("current_stage") or "").strip(),
+        str(project.get("current_agent") or "").strip(),
+        str(project.get("next_action") or "").strip(),
+    )
+
+
+def _format_studio_progress_line(project: dict) -> str:
+    status, stage, agent, next_action = _studio_progress_snapshot(project)
+    parts: List[str] = [f"[bold]{status or 'unknown'}[/bold]"]
+    if stage:
+        parts.append(f"stage [bold]{stage}[/bold]")
+    if agent:
+        parts.append(f"via [bold]{agent}[/bold]")
+    if next_action:
+        parts.append(next_action)
+    return " · ".join(parts)
+
+
+def _post_studio_start(client: httpx.Client, payload: dict) -> dict:
+    """POST /api/studio/start with a spinner — reserve_project can take ~30s."""
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+        transient=True,
+    ) as progress:
+        progress.add_task("Queuing Studio project (may take ~30s)…", total=None)
+        resp = client.post(
+            "/api/studio/start",
+            json=payload,
+            timeout=_STUDIO_START_TIMEOUT,
+        )
+    resp.raise_for_status()
+    return resp.json()
 
 
 def _error(message: str) -> None:
@@ -271,8 +486,9 @@ def _success(message: str) -> None:
 
 
 def _server_unavailable() -> None:
+    port = get_settings().web_port
     _error(
-        "Could not connect to SkyN3t server at [bold]localhost:6660[/bold].\n"
+        f"Could not connect to SkyN3t server at [bold]localhost:{port}[/bold].\n"
         "Is the server running? Try: [bold]skyn3t start[/bold]"
     )
 
@@ -430,7 +646,8 @@ def _studio_history_label(event_name: str) -> str:
         "PROJECT_STAGE_COMPLETED": "Stage completed",
         "PROJECT_STAGE_FAILED": "Stage failed",
         "PROJECT_AWAITING_CLARIFICATION": "Waiting for clarification",
-        "PROJECT_RESUMED": "Resumed",
+        "PROJECT_AWAITING_APPROVAL": "Waiting for approval",
+        "PROJECT_RESUMED_AFTER_APPROVAL": "Resumed after approval",
         "PROJECT_COMPLETED": "Project finished",
         "PROJECT_FAILED": "Runner failed",
         "PROJECT_REAPED": "Recovered",
@@ -449,13 +666,18 @@ def _watch_studio_project(slug: str) -> None:
     )
     seen_history = 0
     seen_clarification: Optional[tuple[str, ...]] = None
-    terminal_statuses = {"done", "needs_fixes", "failed"}
+    seen_approval: Optional[tuple[Any, ...]] = None
+    last_snapshot: Optional[tuple[str, str, str, str]] = None
     try:
         with _client() as client:
             while True:
                 resp = client.get(f"/api/studio/projects/{slug}")
                 resp.raise_for_status()
                 project = resp.json()
+                snapshot = _studio_progress_snapshot(project)
+                if snapshot != last_snapshot:
+                    console.print(f"[dim]Status[/dim] · {_format_studio_progress_line(project)}")
+                    last_snapshot = snapshot
                 history = project.get("history") or []
                 if not isinstance(history, list):
                     history = []
@@ -505,7 +727,43 @@ def _watch_studio_project(slug: str) -> None:
                         console.print("[green]Clarifications sent. Resuming build…[/green]")
                         seen_clarification = questions
 
-                if status in terminal_statuses:
+                if status == "awaiting_approval":
+                    from skyn3t.cli.studio_approval import (
+                        approval_gate_key,
+                        run_interactive_approval,
+                    )
+
+                    gate_key = approval_gate_key(project)
+                    if gate_key != seen_approval:
+                        try:
+                            message = run_interactive_approval(
+                                console=console,
+                                client=client,
+                                slug=slug,
+                                project=project,
+                                prompt_choice=lambda: typer.prompt(
+                                    "Approve?",
+                                    default="a",
+                                ),
+                                prompt_feedback=lambda: typer.prompt(
+                                    "Feedback for the architect"
+                                ),
+                                edit_text=lambda text: typer.edit(
+                                    text,
+                                    extension=".md",
+                                ),
+                            )
+                        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                            _error(str(exc))
+                            raise typer.Exit(1) from exc
+                        if message:
+                            console.print(f"[green]{message}[/green]")
+                            seen_approval = gate_key
+                            seen_history = len(project.get("history") or [])
+                            last_snapshot = None
+                            continue
+
+                if status in _STUDIO_TERMINAL_STATUSES:
                     title = "Project finished" if status != "failed" else "Project failed"
                     border = "green" if status != "failed" else "red"
                     next_action = str(project.get("next_action") or "").strip()
@@ -774,8 +1032,8 @@ def proposal_reject(
 
 @app.command()
 def start(
-    host: str = typer.Option("0.0.0.0", "--host", "-h", help="Host to bind to"),
-    port: int = typer.Option(6660, "--port", "-p", help="Port to bind to"),
+    host: Optional[str] = typer.Option(None, "--host", "-h", help="Host to bind to"),
+    port: Optional[int] = typer.Option(None, "--port", "-p", help="Port to bind to"),
     reload: bool = typer.Option(False, "--reload", help="Enable auto-reload"),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of worker processes"),
     access_log: bool = typer.Option(
@@ -792,8 +1050,12 @@ def start(
     """🚀 Start the SkyN3t orchestrator server."""
     import uvicorn
 
+    settings = get_settings()
+    host = host if host is not None else settings.web_host
+    port = port if port is not None else settings.web_port
+
     banner = (
-        f"[bold cyan]SkyN3t Orchestrator[/bold cyan]  [dim]v{get_settings().app_version}[/dim]\n"
+        f"[bold cyan]SkyN3t Orchestrator[/bold cyan]  [dim]v{settings.app_version}[/dim]\n"
         f"Starting server on [bold]{host}:{port}[/bold] ..."
     )
     console.print(Panel.fit(banner, title="🚀 Launch", border_style="cyan"))

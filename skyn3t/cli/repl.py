@@ -30,10 +30,27 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from skyn3t.config.settings import resolve_api_base
+from skyn3t.cli.main import (
+    _STUDIO_START_TIMEOUT,
+    _format_studio_progress_line,
+    _studio_progress_snapshot,
+)
+from skyn3t.cli.studio_approval import (
+    approval_gate_key,
+    edit_markdown_in_editor,
+    fetch_approval_document,
+    resolve_approval_choice,
+    run_interactive_approval,
+    submit_reject,
+)
 from skyn3t.studio.repo_target import normalize_repo_target, resolve_repo_target
 
-API_BASE = os.environ.get("SKYN3T_API_URL", "http://localhost:6660")
-WS_URL = API_BASE.replace("http://", "ws://").replace("https://", "wss://")
+API_BASE = resolve_api_base()
+
+
+def _ws_url() -> str:
+    return API_BASE.replace("http://", "ws://").replace("https://", "wss://")
 
 # Optional dependencies ------------------------------------------------------
 try:
@@ -104,7 +121,7 @@ class ReplState:
     last_interrupted_prompt: Optional[str] = None
     stop: bool = False
     # Routing / model selection
-    api_url: str = API_BASE
+    api_url: str = field(default_factory=resolve_api_base)
     active_agent: Optional[str] = None     # name of agent prompts route to
     active_backend: Optional[str] = None   # session-level override (None = use agent default)
     active_model: Optional[str] = None
@@ -113,6 +130,7 @@ class ReplState:
     known_models: List[str] = field(default_factory=list)
     known_agents: List[str] = field(default_factory=list)
     render_version: int = 0
+    studio_slug: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -128,8 +146,46 @@ def _terminal_width() -> int:
     return shutil.get_terminal_size((120, 40)).columns
 
 
+def _terminal_height() -> int:
+    return shutil.get_terminal_size((120, 40)).lines
+
+
+def _prompt_reserve_lines() -> int:
+    """Keep the `>` input band visible below the painted layout."""
+    return 3
+
+
+def _layout_frame_height() -> int:
+    """Total rows for header + body panels (excludes the input prompt)."""
+    return max(12, _terminal_height() - _prompt_reserve_lines())
+
+
+def _activity_line_budget() -> int:
+    """Activity rows to show — scales with layout body height."""
+    body_rows = _layout_frame_height() - 4  # header
+    return max(6, min(18, body_rows - 3))
+
+
+def _transcript_entry_budget() -> int:
+    """Recent chat entries that fit above the input prompt."""
+    body_rows = _layout_frame_height() - 4
+    return max(4, min(10, body_rows // 5))
+
+
+def _body_column_ratios() -> tuple[int, int]:
+    """Transcript (left) vs activity sidebar (right) width ratios."""
+    width = _terminal_width()
+    if width >= 180:
+        return (7, 3)
+    if width >= 140:
+        return (5, 2)
+    if width >= 100:
+        return (4, 1)
+    return (2, 1)
+
+
 def _activity_sidebar_enabled(items: List[Text]) -> bool:
-    return bool(items) and _terminal_width() >= 120
+    return bool(items) and _terminal_width() >= 100
 
 
 def _format_event(evt: dict) -> Optional[Text]:
@@ -173,8 +229,8 @@ def _format_event(evt: dict) -> Optional[Text]:
     elif data:
         snippet = str(data)
     snippet = snippet.replace("\n", " ").strip()
-    if len(snippet) > 64:
-        snippet = snippet[:61] + "..."
+    if len(snippet) > 96:
+        snippet = snippet[:93] + "..."
 
     style = "white"
     if et.startswith("TASK_FAIL"):
@@ -228,23 +284,27 @@ def _format_event(evt: dict) -> Optional[Text]:
 
 def _render_layout(state: ReplState) -> Layout:
     layout = Layout()
-    act_tail = list(state.activity)[-8:]
+    frame_h = _layout_frame_height()
+    act_tail = list(state.activity)[-_activity_line_budget():]
     if _activity_sidebar_enabled(act_tail):
+        transcript_ratio, activity_ratio = _body_column_ratios()
         layout.split_column(
             Layout(name="header", size=4),
-            Layout(name="body", ratio=1),
+            Layout(name="body", size=max(8, frame_h - 4)),
         )
         layout["body"].split_row(
-            Layout(name="transcript", ratio=3),
-            Layout(name="activity", size=38),
+            Layout(name="transcript", ratio=transcript_ratio),
+            Layout(name="activity", ratio=activity_ratio),
         )
     else:
         sections: List[Layout] = [
             Layout(name="header", size=4),
-            Layout(name="transcript", ratio=1),
+            Layout(name="transcript", size=max(6, frame_h - 4)),
         ]
         if act_tail:
-            sections.append(Layout(name="activity", size=max(8, min(12, len(act_tail) + 2))))
+            sections.append(
+                Layout(name="activity", size=max(8, min(14, len(act_tail) + 2)))
+            )
         layout.split_column(*sections)
 
     dot = Text("●", style="green" if state.connected else "red")
@@ -259,17 +319,23 @@ def _render_layout(state: ReplState) -> Layout:
     if state.busy:
         title.append("  ")
         title.append(f"⏳ {state.busy_label}", style="yellow")
-    hint = Text('Enter to send  •  """ for multi-line  •  /help for commands', style="dim")
-    layout["header"].update(Panel(Group(title, hint), border_style="cyan"))
+    hint = Text(
+        'Type naturally — chat or "build a …"  •  """ for multi-line  •  /help for shortcuts',
+        style="dim",
+    )
+    layout["header"].update(Panel(Group(title, hint), border_style="cyan", padding=(0, 1)))
 
-    # Transcript: cap recent entries so long replies don't swamp the next prompt.
-    tail = state.transcript[-14:]
+    tail = state.transcript[-_transcript_entry_budget():]
     transcript = Group(*tail) if tail else Text("(empty — type a prompt below)", style="dim")
-    layout["transcript"].update(Panel(transcript, title="Chat", border_style="white"))
+    layout["transcript"].update(
+        Panel(transcript, title="Chat", border_style="white", padding=(0, 1))
+    )
 
     if act_tail:
         activity = Group(*act_tail)
-        layout["activity"].update(Panel(activity, title="Agents at work", border_style="magenta"))
+        layout["activity"].update(
+            Panel(activity, title="Agents at work", border_style="magenta", padding=(0, 1))
+        )
 
     return layout
 
@@ -344,7 +410,7 @@ async def _ws_listener(state: ReplState) -> None:
     while not state.stop:
         connected = False
         for path in candidate_paths:
-            url = WS_URL.rstrip("/") + path
+            url = _ws_url().rstrip("/") + path
             try:
                 async with wsmod.connect(url, open_timeout=3, ping_interval=20) as ws:
                     state.connected = True
@@ -583,6 +649,17 @@ async def _cancel_current(state: ReplState) -> None:
 
 
 HELP_TEXT = """\
+**Plain language (no slash required)**
+
+Just type at the `>` prompt:
+
+- **Chat** — ask anything; SkyN3t routes it to `/api/llm/complete` when no agent is selected.
+- **Build** — prompts like `build a habit tracker with streaks` or `create a dashboard for my team`
+  auto-start a Studio run (same as `/project`, when no agent is active).
+- **Multi-line** — type `\"\"\"` on its own line, then close with `\"\"\"` again.
+
+Slash commands are optional power-user shortcuts — `/help` lists them all.
+
 **Slash commands**
 
 - `/help` — show this help
@@ -592,6 +669,9 @@ HELP_TEXT = """\
 - `/tasks` — list currently running tasks
 - `/pipeline NAME [PROMPT...]` — run a pipeline by name
 - `/project BRIEF...` — start a Studio run (defaults to the auto planner)
+- `/approve [SLUG]` — approve a paused Studio gate (uses last project if omitted)
+- `/approve-edits [SLUG]` — edit architecture.md in `$EDITOR`, then approve
+- `/reject FEEDBACK...` — reject the paused gate and re-run with feedback
 - `/project --audience builders --autonomy confirm_first BRIEF...` — steer the run before launch
 - `/project --repo-path ../customer-portal --focus-file src/login.tsx BRIEF...` — target another local git repo or GitHub URL
 - `/project TEMPLATE :: BRIEF...` — force a specific Studio template
@@ -624,8 +704,8 @@ HELP_TEXT = """\
 - `/agent NAME enable` / `/agent NAME disable`
 - `/whoami` — show api_url, active agent/backend/model, connection state
 
-Multi-line input: type `\"\"\"` on its own line to open a block,
-then `\"\"\"` again to send. Ctrl-C cancels an in-flight task.
+**Optional:** `/project`, `/agent`, `/backend`, and `/model` override the defaults above.
+Ctrl-C cancels an in-flight task.
 """
 
 PROJECT_TEMPLATE_KEYS = {
@@ -706,6 +786,12 @@ async def _slash(state: ReplState, raw: str) -> bool:
         return False
     if cmd == "/project":
         await _cmd_project(state, rest)
+        return False
+    if cmd in ("/approve", "/approve-edits"):
+        await _cmd_studio_approve(state, rest, with_edits=cmd == "/approve-edits")
+        return False
+    if cmd == "/reject":
+        await _cmd_studio_reject(state, rest)
         return False
     if cmd == "/rag":
         await _cmd_rag(state, rest)
@@ -820,6 +906,95 @@ async def _cmd_pipeline(state: ReplState, rest: str) -> None:
     )
 
 
+def _resolve_studio_slug(state: ReplState, rest: str) -> Optional[str]:
+    slug = str(rest or "").strip()
+    if slug:
+        return slug
+    return state.studio_slug
+
+
+async def _cmd_studio_approve(
+    state: ReplState,
+    rest: str,
+    *,
+    with_edits: bool,
+) -> None:
+    slug = _resolve_studio_slug(state, rest)
+    if not slug:
+        _add_transcript(
+            state,
+            _info_line(
+                "usage: /approve [slug]  or /approve-edits [slug] — "
+                "start a project first so the slug is remembered",
+                "yellow",
+            ),
+        )
+        return
+    try:
+        with httpx.Client(base_url=state.api_url, timeout=30.0) as client:
+            resp = client.get(f"/api/studio/projects/{slug}")
+            resp.raise_for_status()
+            project = resp.json()
+            if str(project.get("status") or "").lower() != "awaiting_approval":
+                _add_transcript(
+                    state,
+                    _info_line(
+                        f"{slug} is not awaiting approval (status={project.get('status')})",
+                        "yellow",
+                    ),
+                )
+                return
+            original = fetch_approval_document(client, slug)
+            edited: Optional[str] = None
+            if with_edits:
+                edited = edit_markdown_in_editor(original)
+                if edited is None:
+                    _add_transcript(state, _info_line("edit cancelled", "yellow"))
+                    return
+            message = resolve_approval_choice(
+                client,
+                slug,
+                original=original,
+                choice="e" if with_edits else "a",
+                edited=edited,
+            )
+    except Exception as exc:
+        _add_transcript(state, _info_line(f"approve failed: {exc}", "red"))
+        return
+    _add_transcript(state, _info_line(message, "green"))
+
+
+async def _cmd_studio_reject(state: ReplState, rest: str) -> None:
+    parts = rest.split(maxsplit=1)
+    slug = _resolve_studio_slug(state, parts[0] if parts else "")
+    feedback = parts[1].strip() if len(parts) > 1 else ""
+    if not slug:
+        _add_transcript(
+            state,
+            _info_line("usage: /reject [slug] FEEDBACK...", "yellow"),
+        )
+        return
+    if not feedback and len(parts) == 1 and state.studio_slug and parts[0] != state.studio_slug:
+        feedback = parts[0]
+        slug = state.studio_slug
+    if not feedback:
+        _add_transcript(
+            state,
+            _info_line("usage: /reject FEEDBACK...  or  /reject SLUG FEEDBACK...", "yellow"),
+        )
+        return
+    try:
+        with httpx.Client(base_url=state.api_url, timeout=30.0) as client:
+            submit_reject(client, slug, feedback)
+    except Exception as exc:
+        _add_transcript(state, _info_line(f"reject failed: {exc}", "red"))
+        return
+    _add_transcript(
+        state,
+        _info_line(f"rejected {slug} — re-running stage with feedback", "green"),
+    )
+
+
 async def _cmd_project(state: ReplState, rest: str) -> None:
     parsed = await asyncio.to_thread(_parse_project_command, rest)
     if parsed.get("error"):
@@ -831,7 +1006,7 @@ async def _cmd_project(state: ReplState, rest: str) -> None:
     autonomy = str(parsed["autonomy"])
     repo_target = parsed["repo_target"]
     try:
-        async with httpx.AsyncClient(base_url=state.api_url, timeout=30.0) as client:
+        async with httpx.AsyncClient(base_url=state.api_url, timeout=_STUDIO_START_TIMEOUT) as client:
             resp = await client.post(
                 "/api/studio/start",
                 json={
@@ -884,7 +1059,8 @@ def _project_usage() -> str:
     return (
         "usage: /project [--audience auto|general|builders|team|leaders|investors] "
         "[--autonomy balanced|confirm_first|move_fast] [--repo-path PATH_OR_GITHUB_URL] [--focus-file PATH] BRIEF... "
-        "or /project [options] TEMPLATE :: BRIEF..."
+        "or /project [options] TEMPLATE :: BRIEF...\n"
+        "Presets: run `skyn3t project --examples` in a shell to list web-UI showcase briefs."
     )
 
 
@@ -1009,7 +1185,10 @@ def _watch_project_in_repl(
 ) -> None:
     seen_history = 0
     seen_clarification: Optional[tuple[str, ...]] = None
+    seen_approval: Optional[tuple[Any, ...]] = None
+    last_snapshot: Optional[tuple[str, str, str, str]] = None
     terminal_statuses = {"done", "needs_fixes", "failed"}
+    state.studio_slug = slug
     try:
         with httpx.Client(base_url=state.api_url, timeout=30.0) as client:
             while True:
@@ -1017,6 +1196,14 @@ def _watch_project_in_repl(
                 resp = client.get(f"/api/studio/projects/{slug}")
                 resp.raise_for_status()
                 project = resp.json()
+                snapshot = _studio_progress_snapshot(project)
+                if snapshot != last_snapshot:
+                    _add_transcript(
+                        state,
+                        _info_line(_format_studio_progress_line(project), "cyan"),
+                    )
+                    last_snapshot = snapshot
+                    updated = True
                 history = project.get("history") or []
                 if not isinstance(history, list):
                     history = []
@@ -1082,6 +1269,49 @@ def _watch_project_in_repl(
                         seen_clarification = questions
                         paint()
 
+                if status == "awaiting_approval":
+                    gate_key = approval_gate_key(project)
+                    if gate_key != seen_approval:
+                        try:
+                            message = run_interactive_approval(
+                                console=Console(),
+                                client=client,
+                                slug=slug,
+                                project=project,
+                                prompt_choice=lambda: prompt_reader(
+                                    1,
+                                    "Approve? [a/e/r/w]",
+                                ),
+                                prompt_feedback=lambda: prompt_reader(
+                                    1,
+                                    "Feedback for architect",
+                                ),
+                                edit_text=edit_markdown_in_editor,
+                            )
+                        except Exception as exc:
+                            _add_transcript(
+                                state,
+                                _info_line(f"approval failed: {exc}", "red"),
+                            )
+                            paint()
+                            return
+                        if message:
+                            _add_transcript(state, _info_line(message, "green"))
+                            seen_approval = gate_key
+                            seen_history = len(project.get("history") or [])
+                            last_snapshot = None
+                            paint()
+                            continue
+                        _add_transcript(
+                            state,
+                            _info_line(
+                                "approval skipped — still paused "
+                                "(use /approve, /approve-edits, or /reject)",
+                                "yellow",
+                            ),
+                        )
+                        paint()
+
                 if status in terminal_statuses:
                     title = "Project finished" if status != "failed" else "Project failed"
                     border = "green" if status != "failed" else "red"
@@ -1126,7 +1356,7 @@ def _run_project_command(
     _add_transcript(state, _info_line("starting project build…", "cyan"))
     paint()
     try:
-        with httpx.Client(base_url=state.api_url, timeout=30.0) as client:
+        with httpx.Client(base_url=state.api_url, timeout=_STUDIO_START_TIMEOUT) as client:
             resp = client.post(
                 "/api/studio/start",
                 json={
@@ -1158,6 +1388,7 @@ def _run_project_command(
         return
 
     slug = data.get("slug") or "pending"
+    state.studio_slug = str(slug)
     repo_target = normalize_repo_target(data.get("repo_target") or repo_target)
     next_action = data.get("next_action") or "Queued — waiting for a worker slot."
     _add_transcript(
@@ -1846,7 +2077,9 @@ async def _cmd_whoami(state: ReplState) -> None:
 
 _SLASH_COMMANDS = [
     "/help", "/quit", "/exit", "/clear",
-    "/agents", "/tasks", "/agent", "/pipeline", "/project", "/rag", "/ingest",
+    "/agents", "/tasks", "/agent", "/pipeline", "/project",
+    "/approve", "/approve-edits", "/reject",
+    "/rag", "/ingest",
     "/doctor", "/memory", "/resume", "/retry",
     "/model", "/backend", "/whoami",
 ]
@@ -2123,7 +2356,8 @@ def run() -> None:
     _add_transcript(
         state,
         _info_line(
-            f"Connected to {state.api_url}. Type /help for commands. "
+            f"Connected to {state.api_url}. Type naturally to chat or start a build "
+            '(e.g. "build a habit tracker"). /help for optional slash commands. '
             "Use \"\"\" on its own line for multi-line input.",
             "green",
         )
@@ -2159,7 +2393,7 @@ def run() -> None:
     def _paint_snapshot() -> None:
         try:
             console.clear()
-            console.print(_render_layout(state))
+            console.print(_render_layout(state), height=_layout_frame_height())
         except Exception:
             pass
 

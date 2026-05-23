@@ -83,6 +83,56 @@ def test_cli_init_runs_setup_wizard_when_interactive(monkeypatch, tmp_path):
     assert "Setup wizard saved" in result.stdout
 
 
+def test_cli_project_lists_examples():
+    result = runner.invoke(app, ["project", "--examples"])
+
+    assert result.exit_code == 0
+    assert "Studio examples" in result.stdout
+    assert "habit-tracker" in result.stdout
+    assert "skyn3t project --example habit-tracker" in result.stdout
+
+
+def test_cli_project_without_brief_shows_examples():
+    result = runner.invoke(app, ["project"])
+
+    assert result.exit_code == 0
+    assert "habit-tracker" in result.stdout
+    assert "Provide a brief or pick a preset" in result.stdout
+
+
+def test_cli_project_runs_example_preset(monkeypatch):
+    calls = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, path, json=None, **kwargs):
+            calls["json"] = json
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {
+                    "accepted": True,
+                    "slug": "habit-demo",
+                    "title": "Auto-planned",
+                    "next_action": "Queued — waiting for a worker slot.",
+                },
+            )
+
+    monkeypatch.setattr(cli_main, "_client", lambda: FakeClient())
+    monkeypatch.setattr(cli_main, "_interactive_cli_ready", lambda: False)
+
+    result = runner.invoke(app, ["project", "--example", "habit-tracker", "--no-watch"])
+
+    assert result.exit_code == 0
+    assert calls["json"]["template"] == "auto"
+    assert "habit tracker" in calls["json"]["brief"].lower()
+    assert "habit-demo" in result.stdout
+
+
 def test_cli_project_starts_studio_with_auto_template(monkeypatch):
     calls = {}
 
@@ -93,7 +143,7 @@ def test_cli_project_starts_studio_with_auto_template(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-        def post(self, path, json):
+        def post(self, path, json=None, **kwargs):
             calls["path"] = path
             calls["json"] = json
             return SimpleNamespace(
@@ -134,7 +184,7 @@ def test_cli_project_starts_live_watch_in_interactive_terminal(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-        def post(self, path, json):
+        def post(self, path, json=None, **kwargs):
             return SimpleNamespace(
                 raise_for_status=lambda: None,
                 json=lambda: {
@@ -155,6 +205,66 @@ def test_cli_project_starts_live_watch_in_interactive_terminal(monkeypatch):
     assert watched["slug"] == "demo-live"
 
 
+def test_format_studio_progress_line():
+    line = cli_main._format_studio_progress_line(
+        {
+            "status": "running",
+            "current_stage": "code",
+            "current_agent": "CodeAgent",
+            "next_action": "Generating scaffold",
+        }
+    )
+    assert "running" in line
+    assert "code" in line
+    assert "CodeAgent" in line
+    assert "Generating scaffold" in line
+
+
+def test_watch_studio_project_prints_status_updates(monkeypatch):
+    responses = [
+        {
+            "status": "queued",
+            "next_action": "Queued — waiting for a worker slot.",
+            "history": [],
+        },
+        {
+            "status": "running",
+            "current_stage": "brainstorm",
+            "current_agent": "BrainstormAgent",
+            "next_action": "SkyN3t is briefing the swarm.",
+            "history": [],
+        },
+        {
+            "status": "done",
+            "next_action": "Build completed.",
+            "history": [],
+        },
+    ]
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, path):
+            data = responses.pop(0)
+            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: data)
+
+    monkeypatch.setattr(cli_main, "_client", lambda: FakeClient())
+    monkeypatch.setattr(cli_main.time_mod, "sleep", lambda _: None)
+
+    lines: list[str] = []
+    monkeypatch.setattr(cli_main.console, "print", lambda *args, **kwargs: lines.append(str(args[0]) if args else ""))
+
+    cli_main._watch_studio_project("demo-status")
+    text = "\n".join(lines).lower()
+    assert "queued" in text
+    assert "brainstorm" in text
+    assert "done" in text
+
+
 def test_cli_project_sends_custom_mission_setup(monkeypatch):
     calls = {}
 
@@ -165,7 +275,7 @@ def test_cli_project_sends_custom_mission_setup(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-        def post(self, path, json):
+        def post(self, path, json=None, **kwargs):
             calls["path"] = path
             calls["json"] = json
             return SimpleNamespace(
@@ -213,7 +323,7 @@ def test_cli_project_sends_repo_target(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-        def post(self, path, json):
+        def post(self, path, json=None, **kwargs):
             calls["path"] = path
             calls["json"] = json
             return SimpleNamespace(
@@ -294,7 +404,7 @@ def test_cli_agent_add_maps_anthropic_alias_to_claude(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-        def post(self, path, json):
+        def post(self, path, json=None, **kwargs):
             calls["path"] = path
             calls["json"] = json
             return SimpleNamespace(
@@ -422,7 +532,7 @@ def test_cli_proposal_reject_posts_reason(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-        def post(self, path, json):
+        def post(self, path, json=None, **kwargs):
             calls["path"] = path
             calls["json"] = json
             return SimpleNamespace(
@@ -649,7 +759,7 @@ def test_cli_export_penpot_falls_back_to_local_project(monkeypatch, tmp_path):
             return False
 
         def get(self, path, params=None):
-            request = httpx.Request("GET", f"http://localhost:6660{path}")
+            request = httpx.Request("GET", f"{cli_main.API_BASE}{path}")
             response = httpx.Response(404, request=request, text="Not Found")
             raise httpx.HTTPStatusError("Not Found", request=request, response=response)
 
@@ -774,7 +884,7 @@ def test_cli_github_scout_run_posts_and_renders(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-        def post(self, path, json):
+        def post(self, path, json=None, **kwargs):
             calls["path"] = path
             calls["json"] = json
             return SimpleNamespace(
@@ -814,7 +924,7 @@ def test_cli_github_scout_schedule_posts(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-        def post(self, path, json):
+        def post(self, path, json=None, **kwargs):
             calls["path"] = path
             calls["json"] = json
             return SimpleNamespace(
@@ -846,7 +956,7 @@ def test_cli_repo_scout_run_posts_multi_platform(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-        def post(self, path, json):
+        def post(self, path, json=None, **kwargs):
             calls["path"] = path
             calls["json"] = json
             return SimpleNamespace(
@@ -904,7 +1014,7 @@ def test_cli_github_scout_platforms_switches_to_generic_endpoint(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-        def post(self, path, json):
+        def post(self, path, json=None, **kwargs):
             calls["path"] = path
             calls["json"] = json
             return SimpleNamespace(
