@@ -891,6 +891,7 @@ class TestStudioRunner:
         assert manifest["mission_setup"] == {
             "audience": "builders",
             "autonomy": "move_fast",
+            "goal": "",
         }
         assert manifest["repo_target"] == {
             "local_path": repo_root.resolve().as_posix(),
@@ -900,6 +901,7 @@ class TestStudioRunner:
         assert fake_agent.last_task.input_data["mission_setup"] == {
             "audience": "builders",
             "autonomy": "move_fast",
+            "goal": "",
         }
         assert fake_agent.last_task.input_data["audience"] == "Builders / developers"
         assert fake_agent.last_task.input_data["skip_clarification"] is True
@@ -960,14 +962,18 @@ class TestStudioRunner:
         runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
         manifest = await runner.start("demo", "Draft a launch brief", slug="demo-defaults")
 
-        assert manifest["mission_setup"] == {"audience": "", "autonomy": "balanced"}
+        assert manifest["mission_setup"] == {
+            "audience": "",
+            "autonomy": "confirm_first",
+            "goal": "",
+        }
         assert fake_agent.last_task is not None
         assert fake_agent.last_task.input_data["mission_setup"] == {
             "audience": "",
-            "autonomy": "balanced",
+            "autonomy": "confirm_first",
+            "goal": "",
         }
-        assert "skip_clarification" not in fake_agent.last_task.input_data
-        assert "require_clarification" not in fake_agent.last_task.input_data
+        assert fake_agent.last_task.input_data["require_clarification"] is True
 
     async def test_reserve_project_rejects_focus_file_without_repo_path(
         self, event_bus, tmp_path, monkeypatch
@@ -1260,6 +1266,7 @@ class TestStudioRunner:
         assert resumed["mission_setup"] == {
             "audience": "leaders",
             "autonomy": "confirm_first",
+            "goal": "",
         }
         assert resumed["repo_target"] == {
             "local_path": repo_root.resolve().as_posix(),

@@ -533,7 +533,7 @@ class TestBrainstormAgent:
             mode="balanced",
         )
 
-        assert any("real working app/codebase" in question for question in questions)
+        assert any("get at the end" in question.lower() for question in questions)
 
     @pytest.mark.asyncio
     async def test_require_clarification_forces_kickoff_questions(self, tmp_path, monkeypatch):
@@ -575,7 +575,7 @@ class TestBrainstormAgent:
         async def one_question(_brief: str, *, force: bool = False, mode: str = "balanced"):
             assert force is False
             assert mode == "confirm_first"
-            return ["Who is this for?"]
+            return {"specs": [{"id": "audience", "question": "Who is this for?", "options": []}]}
 
         monkeypatch.setattr(agent, "_maybe_ask_clarifications", one_question)
 
@@ -593,8 +593,9 @@ class TestBrainstormAgent:
         assert result.success is True
         assert result.output["needs_clarification"] is True
         assert len(result.output["questions"]) == 4
-        assert result.output["questions"][0] == "Who is this for?"
-        assert any("real working app/codebase" in q for q in result.output["questions"])
+        assert any("Who is this for?" in q for q in result.output["questions"])
+        assert any("get at the end" in q.lower() for q in result.output["questions"])
+        assert result.output.get("question_options")
 
     @pytest.mark.asyncio
     async def test_skip_clarification_bypasses_question_pass(self, tmp_path, monkeypatch):

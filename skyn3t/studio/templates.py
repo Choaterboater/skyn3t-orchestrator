@@ -61,6 +61,7 @@ TEMPLATES: List[Template] = [
                 StageSpec(name="brainstorm", agent="BrainstormAgent", capability="brainstorm"),
                 StageSpec(name="research", agent="ResearchAgent", capability="research"),
                 StageSpec(name="architecture", agent="ArchitectAgent", capability="architecture"),
+                StageSpec(name="designer", agent="DesignerAgent", capability="design"),
                 StageSpec(
                     name="code",
                     agent="CodeAgent",
@@ -73,7 +74,6 @@ TEMPLATES: List[Template] = [
                     capability="writing",
                     input_extra={"kind": "readme"},
                 ),
-                StageSpec(name="designer", agent="DesignerAgent", capability="design"),
                 StageSpec(name="reviewer", agent="ReviewerAgent", capability="review"),
             ]
         ),

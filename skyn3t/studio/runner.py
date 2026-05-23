@@ -27,7 +27,11 @@ from skyn3t.studio.mission_setup import (
     mission_setup_stage_hints,
     normalize_mission_setup,
 )
-from skyn3t.studio.clarification import format_user_intent_brief_block, parse_user_intent
+from skyn3t.studio.clarification import (
+    format_user_intent_brief_block,
+    parse_user_intent,
+    user_keeps_category_defaults,
+)
 from skyn3t.studio.penpot_handoff import materialize_penpot_handoff
 from skyn3t.studio.registry import get_agent
 from skyn3t.studio.repo_target import (
@@ -232,13 +236,22 @@ class StudioRunner:
             enriched_brief = brief
             expanded_brief = brief
             category_defaults = None
+            autonomy_mode = str(setup.get("autonomy") or "balanced").strip().lower()
+            skip_pre_brief_expansion = autonomy_mode == "confirm_first"
             try:
                 from skyn3t.agents.product_categories import (
+                    defaults_for,
+                    detect_category,
                     enrich_brief,
                     expand_sparse_brief,
                 )
-                expanded_brief = expand_sparse_brief(brief)
-                enriched_brief, category_defaults = enrich_brief(expanded_brief)
+                if skip_pre_brief_expansion:
+                    expanded_brief = brief
+                    enriched_brief = brief
+                    category_defaults = defaults_for(detect_category(brief))
+                else:
+                    expanded_brief = expand_sparse_brief(brief)
+                    enriched_brief, category_defaults = enrich_brief(expanded_brief)
                 if category_defaults and category_defaults.slug != "unknown":
                     logger.info(
                         "project %s classified as %s — added %d implicit "
@@ -270,7 +283,7 @@ class StudioRunner:
                 planned = await plan_pipeline(
                     brief=effective_brief,
                     llm_client=llm_client,
-                    user_intent=user_intent or manifest.get("user_intent"),
+                    user_intent=(manifest or {}).get("user_intent") if manifest else None,
                 )
                 # Belt-and-braces guard: if the brief asks for runnable
                 # software but no code-producing agent made it into the
@@ -360,6 +373,12 @@ class StudioRunner:
             manifest["brief"] = brief
             manifest["brief_raw"] = raw_brief
             manifest["brief_expanded"] = bool((expanded_brief or "").strip() != (raw_brief or "").strip())
+            if manifest["brief_expanded"] and expanded_brief.strip() != raw_brief.strip():
+                manifest["brief_expansion_preview"] = expanded_brief.strip()[:1200]
+            if category_defaults and getattr(category_defaults, "implicit_features", None):
+                manifest["brief_category_defaults"] = list(category_defaults.implicit_features)[:12]
+            if skip_pre_brief_expansion and manifest.get("brief_category_defaults"):
+                manifest["brief_assumptions_pending"] = True
             manifest["execution_profile"] = execution_profile
             manifest["mission_setup"] = setup
             manifest["repo_target"] = repo
@@ -380,6 +399,35 @@ class StudioRunner:
                     status="running",
                     message="SkyN3t is briefing the swarm.",
                 )
+                if manifest.get("brief_expanded") and autonomy_mode == "balanced":
+                    preview = str(manifest.get("brief_expansion_preview") or "").strip()
+                    defaults = manifest.get("brief_category_defaults") or []
+                    parts: List[str] = []
+                    if preview:
+                        parts.append(preview[:400])
+                    if defaults:
+                        parts.append(
+                            "Assumed features: "
+                            + ", ".join(str(item) for item in defaults[:6])
+                        )
+                    expansion_msg = "Brief expanded with product defaults."
+                    if parts:
+                        expansion_msg = f"{expansion_msg} {' · '.join(parts)}"
+                    self._append_history(
+                        manifest,
+                        "BRIEF_EXPANDED",
+                        status="running",
+                        message=expansion_msg[:500],
+                    )
+                    self._publish(
+                        "PROJECT_BRIEF_EXPANDED",
+                        {
+                            "slug": slug,
+                            "message": expansion_msg[:500],
+                            "preview": preview[:1200],
+                            "category_defaults": defaults[:12],
+                        },
+                    )
                 self._save_manifest(artifact_dir, manifest)
 
                 self._publish(
@@ -398,6 +446,11 @@ class StudioRunner:
                         **mission_setup_stage_hints(setup),
                         **repo_target_stage_hints(repo),
                         "execution_profile": execution_profile,
+                        **(
+                            {"category_assumption_hints": manifest["brief_category_defaults"]}
+                            if manifest.get("brief_assumptions_pending")
+                            else {}
+                        ),
                         **(extra or {}),
                     },
                 )
@@ -454,7 +507,32 @@ class StudioRunner:
             intent_block = format_user_intent_brief_block(user_intent)
             if intent_block:
                 qa_block += "\n" + intent_block
-            new_brief = (manifest.get("brief") or "") + qa_block
+            base_brief = str(manifest.get("brief_raw") or manifest.get("brief") or "").strip()
+            if manifest.get("brief_assumptions_pending") and user_keeps_category_defaults(
+                questions, answers, question_options
+            ):
+                try:
+                    from skyn3t.agents.product_categories import enrich_brief, expand_sparse_brief
+
+                    expanded_brief = expand_sparse_brief(base_brief)
+                    enriched_base, category_defaults = enrich_brief(expanded_brief)
+                    base_brief = enriched_base
+                    if category_defaults and category_defaults.slug != "unknown":
+                        manifest["product_category"] = category_defaults.slug
+                        manifest["product_category_label"] = category_defaults.label
+                    manifest["brief_expanded"] = expanded_brief.strip() != str(
+                        manifest.get("brief_raw") or ""
+                    ).strip()
+                    if manifest["brief_expanded"]:
+                        manifest["brief_expansion_preview"] = expanded_brief.strip()[:1200]
+                    if category_defaults and getattr(category_defaults, "implicit_features", None):
+                        manifest["brief_category_defaults"] = list(
+                            category_defaults.implicit_features
+                        )[:12]
+                except Exception:
+                    logger.debug("deferred brief enrichment failed", exc_info=True)
+            manifest.pop("brief_assumptions_pending", None)
+            new_brief = base_brief + qa_block
             if user_intent:
                 manifest["user_intent"] = user_intent
             # Reset to running, clear stages so the pipeline reruns from scratch with
@@ -1885,7 +1963,7 @@ class StudioRunner:
                         manifest.get("quality_summary"),
                         quality_candidate,
                     )
-                for generated in self._refresh_penpot_handoff(artifact_dir):
+                for generated in self._refresh_penpot_handoff(artifact_dir, extra=extra):
                     if generated not in manifest["artifacts"]:
                         manifest["artifacts"].append(generated)
                 manifest["next_action"] = (
@@ -4156,6 +4234,104 @@ class StudioRunner:
             scaffold_dir=scaffold_dir,
             brief=brief,
         )
+        profile = str(manifest.get("execution_profile") or "balanced")
+        await self._run_ui_polish_pass(
+            artifact_dir=artifact_dir,
+            brief=brief,
+            execution_profile=profile,
+        )
+
+    async def _run_ui_polish_pass(
+        self,
+        *,
+        artifact_dir: Path,
+        brief: str,
+        execution_profile: str,
+    ) -> None:
+        """Single holistic UI polish pass for balanced/deep code builds."""
+        if execution_profile not in {"balanced", "deep"}:
+            return
+        scaffold_dir = artifact_dir / "scaffold"
+        if not scaffold_dir.is_dir():
+            return
+        app_path = scaffold_dir / "src" / "App.jsx"
+        if not app_path.is_file():
+            app_path = scaffold_dir / "src" / "App.tsx"
+        if not app_path.is_file():
+            return
+        css_candidates = [
+            scaffold_dir / "src" / "index.css",
+            scaffold_dir / "src" / "styles.css",
+        ]
+        css_path = next((p for p in css_candidates if p.is_file()), None)
+        try:
+            app_source = app_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return
+        css_source = ""
+        if css_path is not None:
+            try:
+                css_source = css_path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                css_source = ""
+        design_bits: List[str] = []
+        for name in ("components.md", "tokens.css", "brand.md"):
+            p = artifact_dir / name
+            if p.is_file():
+                try:
+                    body = p.read_text(encoding="utf-8", errors="ignore").strip()
+                except Exception:
+                    continue
+                if body:
+                    design_bits.append(f"### {name}\n{body[:4000]}")
+        if not design_bits and len(app_source) < 400:
+            return
+        from skyn3t.adapters import LLMClient
+        from skyn3t.core.model_router import resolve_model
+
+        backend, model = resolve_model("reviewer")
+        client = LLMClient(
+            default_model=model,
+            backend=backend,
+            event_bus=self.event_bus,
+            caller_name="ui_polish",
+        )
+        prompt = (
+            f"Brief:\n{brief[:2000]}\n\n"
+            f"Design context:\n{chr(10).join(design_bits)[:8000]}\n\n"
+            f"Current App ({app_path.name}):\n```\n{app_source[:12000]}\n```\n\n"
+            f"Current CSS ({css_path.name if css_path else 'none'}):\n```\n{css_source[:8000]}\n```\n\n"
+            "Return JSON only: {\"app\": \"...full file...\", \"css\": \"...full file or empty...\"}. "
+            "Polish hierarchy, spacing, states, and shadcn/ui usage. Keep working React code."
+        )
+        try:
+            out = await client.complete(
+                prompt,
+                system="You are a senior product UI engineer polishing a React scaffold.",
+                max_tokens=8000,
+                temperature=0.2,
+            )
+        except Exception:
+            logger.debug("ui polish pass failed", exc_info=True)
+            return
+        if not out:
+            return
+        import json
+        import re
+
+        match = re.search(r"\{[\s\S]*\}", out)
+        if not match:
+            return
+        try:
+            data = json.loads(match.group(0))
+        except Exception:
+            return
+        new_app = str(data.get("app") or "").strip()
+        new_css = str(data.get("css") or "").strip()
+        if new_app and len(new_app) > 80:
+            app_path.write_text(new_app, encoding="utf-8")
+        if css_path is not None and new_css and len(new_css) > 40:
+            css_path.write_text(new_css, encoding="utf-8")
 
     @staticmethod
     def _unresolved_todo_stub_files(issues: List[Any]) -> List[str]:
@@ -4445,7 +4621,14 @@ class StudioRunner:
                     break
         return entries
 
-    def _refresh_penpot_handoff(self, artifact_dir: Path) -> List[str]:
+    def _refresh_penpot_handoff(
+        self,
+        artifact_dir: Path,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
+        flags = extra or {}
+        if flags.get("penpot_handoff") is not True:
+            return []
         try:
             return materialize_penpot_handoff(artifact_dir)
         except Exception:

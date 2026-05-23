@@ -39,7 +39,8 @@ MISSION_AUTONOMY: Dict[str, Dict[str, str]] = {
 
 DEFAULT_MISSION_SETUP: Dict[str, str] = {
     "audience": "",
-    "autonomy": "balanced",
+    "autonomy": "confirm_first",
+    "goal": "",
 }
 
 
@@ -68,6 +69,7 @@ def normalize_mission_setup(value: Any) -> Dict[str, str]:
     data = value if isinstance(value, dict) else {}
     audience = str(data.get("audience") or "").strip().lower()
     autonomy = str(data.get("autonomy") or DEFAULT_MISSION_SETUP["autonomy"]).strip().lower()
+    goal = str(data.get("goal") or "").strip()
 
     if audience not in MISSION_AUDIENCE_LABELS:
         audience = DEFAULT_MISSION_SETUP["audience"]
@@ -77,6 +79,7 @@ def normalize_mission_setup(value: Any) -> Dict[str, str]:
     return {
         "audience": audience,
         "autonomy": autonomy,
+        "goal": goal,
     }
 
 
@@ -97,6 +100,8 @@ def augment_brief_with_mission_setup(brief: str, value: Any) -> str:
 
     if labels["audience"]:
         lines.append(f"- Primary audience: {labels['audience']}")
+    if setup.get("goal"):
+        lines.append(f"- Success goal: {setup['goal']}")
     if setup["autonomy"] != DEFAULT_MISSION_SETUP["autonomy"]:
         lines.append(
             f"- Operating mode: {MISSION_AUTONOMY[setup['autonomy']]['brief_instruction']}"

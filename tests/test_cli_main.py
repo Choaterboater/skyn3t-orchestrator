@@ -115,7 +115,7 @@ def test_cli_project_starts_studio_with_auto_template(monkeypatch):
     assert calls["json"] == {
         "template": "auto",
         "brief": "build a habit tracker",
-        "mission_setup": {"audience": "", "autonomy": "balanced"},
+        "mission_setup": {"audience": "", "autonomy": "balanced", "goal": ""},
         "repo_target": {"local_path": "", "focus_file": ""},
     }
     assert "demo-123" in result.stdout
@@ -196,6 +196,7 @@ def test_cli_project_sends_custom_mission_setup(monkeypatch):
     assert calls["json"]["mission_setup"] == {
         "audience": "leaders",
         "autonomy": "confirm_first",
+        "goal": "",
     }
     assert calls["json"]["repo_target"] == {"local_path": "", "focus_file": ""}
     assert "Audience: Decision-makers" in result.stdout

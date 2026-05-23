@@ -42,4 +42,22 @@ describe("ActivityPage helpers", () => {
     expect(activityHeadline(event)).toBe("packaging_agent");
     expect(activityDetail(event)).toBe("studio · → PackagingAgent · project stage completed");
   });
+
+  it("summarizes brief expansion project events", () => {
+    const event = {
+      kind: "project",
+      from: "studio",
+      label: "Brief expanded with product defaults",
+      event_type: "PROJECT_BRIEF_EXPANDED",
+      meta: {
+        payload: {
+          preview: "Auth-ready foundations and dark theme defaults.",
+          category_defaults: ["Auth-ready routes", "Dark theme"],
+        },
+      },
+    };
+
+    expect(activityHeadline(event)).toContain("Brief expanded");
+    expect(activityDetail(event)).toContain("Auth-ready routes");
+  });
 });

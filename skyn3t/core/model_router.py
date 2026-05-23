@@ -86,7 +86,7 @@ _DEFAULT_STAGE_POLICY: Dict[str, str] = {
     # common path stays HTTP-based instead of bouncing through CLIs.
     "brainstorm":         "or_cheap",
     "research":           "or_cheap",
-    "designer":           "or_cheap",
+    "designer":           "or_ui",
     "writer":             "or_cheap",
     "marketer":           "or_cheap",
     "business_analyst":   "or_cheap",

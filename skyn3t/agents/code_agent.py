@@ -136,7 +136,7 @@ _ENTRYPOINT_FILES = ("app.jsx", "app.tsx", "main.jsx", "main.tsx")
 # task-aware OpenRouter ladder handles 8K context comfortably. Extra
 # context = fewer truncated brief/architecture sections leaking into
 # stub fallbacks on entrypoint files.
-_ENTRYPOINT_CONTEXT_HARD_CAP = 8000
+_ENTRYPOINT_CONTEXT_HARD_CAP = 12000
 
 # Entry-file paths that should be pinned to USE planned components
 # rather than reinvent them inline. Mirrors _ENTRYPOINT_FILES plus
@@ -914,6 +914,8 @@ class CodeAgent(BaseAgent):
         priority = [
             ("research.md", 6000),
             ("architecture.md", 3000),
+            ("tokens.css", 4000),
+            ("tokens.json", 2000),
             ("brainstorm.md", 2000),
             ("components.md", 2000),
             ("brand.md", 1500),
@@ -930,7 +932,8 @@ class CodeAgent(BaseAgent):
                 if not body:
                     continue
                 body = compress_prompt_context(body, max_chars=max_chars)
-                chunks.append(f"### {name}\n\n{body}")
+                label = name if name.endswith(".md") else name
+                chunks.append(f"### {label}\n\n{body}")
                 seen.add(name)
         # Catch any other .md at top level we didn't enumerate.
         try:
@@ -948,6 +951,23 @@ class CodeAgent(BaseAgent):
         except Exception:
             pass
         return "\n\n---\n\n".join(chunks)
+
+    def _seed_design_tokens_into_scaffold(self, artifact_dir, out_dir) -> None:
+        """Copy Designer token artifacts into the scaffold before codegen."""
+        import shutil
+        from pathlib import Path as _Path
+
+        ad = _Path(artifact_dir)
+        od = _Path(out_dir)
+        tokens_src = ad / "tokens.css"
+        if not tokens_src.is_file():
+            return
+        dest = od / "src" / "tokens.css"
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(tokens_src, dest)
+        except Exception:
+            logger.debug("tokens.css seed into scaffold failed", exc_info=True)
 
     async def _scaffold_from_brief(self, task: TaskRequest) -> TaskResult:
         """Generate new code from a brief into artifact_dir/scaffold/.
@@ -973,6 +993,7 @@ class CodeAgent(BaseAgent):
         artifact_dir = self.resolve_artifact_dir(d.get("artifact_dir"))
         out_dir = artifact_dir / "scaffold"
         out_dir.mkdir(parents=True, exist_ok=True)
+        self._seed_design_tokens_into_scaffold(artifact_dir, out_dir)
         resolved_out_dir = out_dir.resolve()
         files_written: List[str] = []
 

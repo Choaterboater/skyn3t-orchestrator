@@ -17,7 +17,8 @@ from typing import Any, Dict, List, Optional
 
 from skyn3t.studio.clarification import apply_user_intent_plan, skip_force_code_for_intent
 
-logger = logging.getLogger("skyn3t.studio.planner") = re.compile(
+logger = logging.getLogger("skyn3t.studio.planner")
+_TARGET_FILE_PATTERN = re.compile(
     r"\b([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+\.\w+|target_file\s*[:=]\s*\S+)",
     re.IGNORECASE,
 )

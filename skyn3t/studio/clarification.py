@@ -303,6 +303,56 @@ def format_user_intent_brief_block(user_intent: Dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def category_assumption_spec(hints: List[str]) -> Optional[Dict[str, Any]]:
+    """Build a confirm-first question for implicit category features."""
+    cleaned = [str(item).strip() for item in hints if str(item).strip()]
+    if not cleaned:
+        return None
+    preview = "; ".join(cleaned[:4])
+    if len(cleaned) > 4:
+        preview += f"; +{len(cleaned) - 4} more"
+    return {
+        "id": "category_defaults",
+        "question": (
+            "SkyN3t may add typical features for this product type "
+            f"({preview}). Keep them?"
+        ),
+        "options": [
+            {"id": "keep", "label": "Yes, include typical features"},
+            {"id": "skip", "label": "No, keep the scope minimal"},
+        ],
+        "free_text": True,
+        "placeholder": "Or say what to drop or change…",
+    }
+
+
+def user_keeps_category_defaults(
+    questions: List[str],
+    answers: List[str],
+    question_options: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    """Return False when the user opted out of implicit category features."""
+    options_by_question = {
+        str(entry.get("question") or "").strip(): entry
+        for entry in (question_options or [])
+        if isinstance(entry, dict)
+    }
+    for question, raw_answer in zip(questions, answers):
+        answer = str(raw_answer or "").strip().lower()
+        if not answer:
+            continue
+        entry = options_by_question.get(str(question).strip()) or {}
+        if str(entry.get("id") or "") != "category_defaults":
+            continue
+        matched = _match_option_id(entry, str(raw_answer or ""))
+        if matched == "skip":
+            return False
+        if any(token in answer for token in ("no", "minimal", "skip", "simpler", "don't", "do not")):
+            return False
+        return True
+    return True
+
+
 def apply_user_intent_plan(
     user_intent: Optional[Dict[str, Any]],
     chosen_agents: List[str],

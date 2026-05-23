@@ -218,7 +218,7 @@ function ProjectList({
                   </span>
                   {designCount > 0 && (
                     <span className="rounded-full border border-accent-line bg-accent-soft px-2 py-0.5 text-accent">
-                      Penpot ready · {designCount}
+                      Design export ready · {designCount}
                     </span>
                   )}
                 </div>
@@ -289,7 +289,7 @@ function ProjectDetailView({
               </span>
               {penpotReady && (
                 <span className="rounded-full border border-accent-line bg-accent-soft px-2 py-0.5 text-[0.65rem] uppercase tracking-wider text-accent">
-                  Penpot ready · {designArtifacts.length}
+                  Design export ready · {designArtifacts.length}
                 </span>
               )}
             </div>
@@ -344,7 +344,7 @@ function ProjectDetailView({
             </button>
             {penpotReady && (
               <span className="rounded-full border border-accent-line bg-accent-soft px-2 py-1 text-[0.65rem] uppercase tracking-wider text-accent">
-                Optional Penpot export
+                Optional design export
               </span>
             )}
           </div>
@@ -505,7 +505,7 @@ function DesignHandoffCard({
           </div>
           <p className="mt-1 text-xs leading-5 text-text-secondary">
             Use this only if you want to take the generated design assets into
-            Penpot for another design pass.
+            Download design export package for another design pass.
           </p>
         </div>
         {designArtifacts.length > 0 ? (
@@ -828,6 +828,8 @@ function NewProjectForm({
   const [brief, setBrief] = useState("");
   const [slug, setSlug] = useState("");
   const [missionGoal, setMissionGoal] = useState("");
+  const [missionAudience, setMissionAudience] = useState("");
+  const [missionAutonomy, setMissionAutonomy] = useState("confirm_first");
   const [repoTarget, setRepoTarget] = useState("");
 
   const start = useMutation({
@@ -841,7 +843,13 @@ function NewProjectForm({
       } = { template: effectiveTemplate };
       if (brief.trim()) payload.brief = brief.trim();
       if (slug.trim()) payload.slug = slug.trim();
-      if (missionGoal.trim()) payload.mission_setup = { goal: missionGoal.trim() };
+      if (missionGoal.trim() || missionAudience || missionAutonomy) {
+        payload.mission_setup = {
+          ...(missionGoal.trim() ? { goal: missionGoal.trim() } : {}),
+          ...(missionAudience ? { audience: missionAudience } : {}),
+          ...(missionAutonomy ? { autonomy: missionAutonomy } : {}),
+        };
+      }
       if (repoTarget.trim()) payload.repo_target = { remote: repoTarget.trim() };
       return api.startStudio(payload);
     },
@@ -851,6 +859,8 @@ function NewProjectForm({
         setBrief("");
         setSlug("");
         setMissionGoal("");
+        setMissionAudience("");
+        setMissionAutonomy("confirm_first");
         setRepoTarget("");
       }
     },
@@ -946,9 +956,43 @@ function NewProjectForm({
         </div>
       </div>
 
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className="text-xs uppercase tracking-wider text-text-secondary block mb-1">
+            Audience (optional)
+          </label>
+          <select
+            value={missionAudience}
+            onChange={(e) => setMissionAudience(e.target.value)}
+            className="w-full bg-bg-2 border border-border rounded px-3 py-2 text-sm outline-none focus:border-accent"
+          >
+            <option value="">Default</option>
+            <option value="general">General users</option>
+            <option value="builders">Builders / developers</option>
+            <option value="team">Internal team</option>
+            <option value="leaders">Decision-makers</option>
+            <option value="investors">Investors / partners</option>
+          </select>
+        </div>
+        <div>
+          <label className="text-xs uppercase tracking-wider text-text-secondary block mb-1">
+            Build mode
+          </label>
+          <select
+            value={missionAutonomy}
+            onChange={(e) => setMissionAutonomy(e.target.value)}
+            className="w-full bg-bg-2 border border-border rounded px-3 py-2 text-sm outline-none focus:border-accent"
+          >
+            <option value="confirm_first">Confirm first (ask plain questions)</option>
+            <option value="balanced">Balanced</option>
+            <option value="move_fast">Move fast</option>
+          </select>
+        </div>
+      </div>
+
       <div>
         <label className="text-xs uppercase tracking-wider text-text-secondary block mb-1">
-          Mission goal (optional)
+          Success goal (optional)
         </label>
         <input
           value={missionGoal}
@@ -1035,6 +1079,9 @@ function ClarificationCard({ slug, data }: { slug: string; data: any }) {
         .map((q: unknown) => String(q ?? "").trim())
         .filter(Boolean)
     : [];
+  const questionOptions = Array.isArray(data?.clarification?.question_options)
+    ? data.clarification.question_options
+    : [];
   const [answers, setAnswers] = useState<string[]>([]);
 
   useEffect(() => {
@@ -1055,40 +1102,76 @@ function ClarificationCard({ slug, data }: { slug: string; data: any }) {
   const askedBy = String(data?.clarification?.asked_by || "agent");
   const ready = questions.length > 0 && answers.every((answer) => answer.trim().length > 0);
 
+  function setAnswer(index: number, value: string) {
+    const next = [...answers];
+    next[index] = value;
+    setAnswers(next);
+  }
+
   return (
     <section className="border border-status-yellow/40 bg-status-yellow/5 rounded-lg p-4 space-y-4">
       <div className="flex items-baseline justify-between gap-3">
-        <SectionTitle>Clarification required · {askedBy}</SectionTitle>
+        <SectionTitle>Quick questions · {askedBy}</SectionTitle>
         <span className="text-[0.65rem] uppercase tracking-wider text-status-yellow">
           Waiting on answers
         </span>
       </div>
       <p className="text-xs text-text-secondary">
-        The project paused because the swarm needs a few concrete decisions
-        before it can keep building. Answer these here and Studio will resume.
+        Pick an option or type a short answer. Studio will resume the build
+        with your choices — no technical jargon required.
       </p>
       <div className="space-y-3">
-        {questions.map((question: string, index: number) => (
-          <label
-            key={`${index}-${question}`}
-            className="block rounded-lg border border-border bg-bg-2/80 p-3"
-          >
-            <div className="text-xs font-medium text-text-primary">
-              {index + 1}. {question}
+        {questions.map((question: string, index: number) => {
+          const optionEntry = questionOptions.find(
+            (entry: any) => String(entry?.question || "").trim() === question,
+          ) ?? questionOptions[index];
+          const options = Array.isArray(optionEntry?.options)
+            ? optionEntry.options
+            : [];
+          const placeholder =
+            String(optionEntry?.placeholder || "").trim() ||
+            "Type the answer that should guide the build…";
+          return (
+            <div
+              key={`${index}-${question}`}
+              className="block rounded-lg border border-border bg-bg-2/80 p-3 space-y-2"
+            >
+              <div className="text-xs font-medium text-text-primary">
+                {index + 1}. {question}
+              </div>
+              {options.length > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  {options.map((opt: any) => {
+                    const label = String(opt?.label || opt?.id || "").trim();
+                    if (!label) return null;
+                    const selected = answers[index] === label;
+                    return (
+                      <button
+                        key={`${index}-${opt?.id || label}`}
+                        type="button"
+                        onClick={() => setAnswer(index, label)}
+                        className={`rounded-full border px-3 py-1 text-xs transition-colors ${
+                          selected
+                            ? "border-accent bg-accent/15 text-accent"
+                            : "border-border bg-bg-3 text-text-secondary hover:border-accent/50"
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              <textarea
+                value={answers[index] ?? ""}
+                onChange={(e) => setAnswer(index, e.target.value)}
+                rows={options.length > 0 ? 2 : 3}
+                className="w-full rounded border border-border bg-bg-3 px-3 py-2 text-sm text-text-primary outline-none focus:border-accent"
+                placeholder={placeholder}
+              />
             </div>
-            <textarea
-              value={answers[index] ?? ""}
-              onChange={(e) => {
-                const next = [...answers];
-                next[index] = e.target.value;
-                setAnswers(next);
-              }}
-              rows={3}
-              className="mt-2 w-full rounded border border-border bg-bg-3 px-3 py-2 text-sm text-text-primary outline-none focus:border-accent"
-              placeholder="Type the answer that should guide the build…"
-            />
-          </label>
-        ))}
+          );
+        })}
       </div>
       {submit.error && (
         <p className="text-xs text-status-red">

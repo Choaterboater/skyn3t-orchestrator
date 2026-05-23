@@ -102,7 +102,7 @@ def test_detect_stack_from_handoff_honors_react_vite_tailwind_bundle():
         "backend_language": "node",
     }
 
-    assert detect_stack_from_handoff(brief, decisions=decisions) == "react_vite"
+    assert detect_stack_from_handoff(brief, decisions=decisions) == "react_vite_tailwind"
 
 
 def test_detect_stack_from_handoff_honors_vanilla_vite_web_bundle():

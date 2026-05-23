@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResult
 from skyn3t.core.events import EventBus
 from skyn3t.studio.clarification import (
+    category_assumption_spec,
     clarification_payload,
     kickoff_specs,
     merge_clarification_specs,
@@ -133,6 +134,15 @@ class BrainstormAgent(BaseAgent):
                         kickoff_specs(),
                         limit=4,
                     )
+                assumption_hints = input_data.get("category_assumption_hints") or []
+                if isinstance(assumption_hints, list) and assumption_hints:
+                    assumption_spec = category_assumption_spec(assumption_hints)
+                    if assumption_spec:
+                        specs = merge_clarification_specs(
+                            specs,
+                            [assumption_spec],
+                            limit=4,
+                        )
                 if specs:
                     payload = clarification_payload(specs)
                     questions = payload["questions"]

@@ -1646,8 +1646,8 @@ def test_dashboard_html_surfaces_guided_overview():
     assert "New mission" in dashboard_html
     assert "What SkyN3t will do" in dashboard_html
     assert "Current handoff" in dashboard_html
-    assert "Penpot handoff" in dashboard_html
-    assert "Download Penpot" in dashboard_html
+    assert "Design export" in dashboard_html
+    assert "Download export" in dashboard_html
     assert "Latest stage results" in dashboard_html
     assert "Live collaboration" in dashboard_html
     assert "Mission thread" in dashboard_html

@@ -921,7 +921,7 @@ def _parse_project_command(rest: str) -> Dict[str, Any]:
     except ValueError:
         return {"error": usage}
     audience = "auto"
-    autonomy = "move_fast"
+    autonomy = "balanced"
     repo_path = ""
     focus_file = ""
     cleaned: list[str] = []
@@ -965,7 +965,7 @@ def _parse_project_command(rest: str) -> Dict[str, Any]:
 
     audience_map = _project_audience_map()
     audience = str(audience or "auto").strip().lower()
-    autonomy = str(autonomy or "move_fast").strip().lower()
+    autonomy = str(autonomy or "balanced").strip().lower()
     allowed_autonomy = {"balanced", "confirm_first", "move_fast"}
     if audience not in audience_map or autonomy not in allowed_autonomy:
         return {"error": usage}

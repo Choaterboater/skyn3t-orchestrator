@@ -391,6 +391,12 @@ function humanizeEventType(eventType: string | undefined): string {
 export function activityHeadline(e: SwarmEvent): string {
   const label = String(e.label || "").trim();
   if (label && label !== e.from && label !== e.to) return label;
+  const eventType = String(e.event_type || "").toUpperCase();
+  if (eventType === "PROJECT_BRIEF_EXPANDED") {
+    const preview = String(e.meta?.payload?.preview || e.meta?.preview || "").trim();
+    if (preview) return `Brief expanded · ${preview.slice(0, 160)}`;
+    return "Brief expanded with product defaults";
+  }
   return humanizeEventType(e.event_type);
 }
 
@@ -399,6 +405,10 @@ export function activityDetail(e: SwarmEvent): string {
   if (e.from) parts.push(e.from);
   if (e.to && e.to !== e.from) parts.push(`→ ${e.to}`);
   if (e.event_type) parts.push(humanizeEventType(e.event_type));
+  const defaults = e.meta?.payload?.category_defaults;
+  if (Array.isArray(defaults) && defaults.length) {
+    parts.push(`Assumed: ${defaults.slice(0, 3).join(", ")}`);
+  }
   return parts.join(" · ");
 }
 

@@ -98,6 +98,24 @@ STACK_TEMPLATES: Dict[str, FilePlan] = {
         ("vite.config.js", "Standard Vite + React plugin config."),
         ("README.md", "Install + run: `npm install && npm run dev`."),
     ],
+    "react_vite_tailwind": [
+        ("index.html", "Vite entrypoint — root div + module script tag."),
+        ("src/main.jsx", "React mount — imports Tailwind index.css."),
+        ("src/App.jsx", "Top-level page composed from @/components/ui/* shadcn primitives."),
+        ("src/index.css", "Tailwind layers + shadcn CSS variables."),
+        ("tailwind.config.js", "Tailwind content paths + shadcn theme extension."),
+        ("postcss.config.js", "PostCSS with tailwindcss + autoprefixer."),
+        ("components.json", "shadcn/ui config with @ path alias."),
+        ("src/lib/utils.js", "cn() helper for shadcn class merging."),
+        ("src/components/ui/button.jsx", "shadcn Button primitive."),
+        ("src/components/ui/card.jsx", "shadcn Card primitive."),
+        ("src/components/ui/input.jsx", "shadcn Input primitive."),
+        ("src/components/ui/badge.jsx", "shadcn Badge primitive."),
+        ("src/components/ui/separator.jsx", "shadcn Separator primitive."),
+        ("package.json", "react, tailwindcss, shadcn deps; scripts dev/build/preview."),
+        ("vite.config.js", "Vite + React + @ alias for shadcn imports."),
+        ("README.md", "Install + run: `npm install && npm run dev`."),
+    ],
     "next": [
         ("app/page.tsx", "Default route — renders the brief's home view."),
         ("app/layout.tsx", "Root layout with metadata, fonts, global wrappers."),
@@ -134,6 +152,7 @@ _STACK_TRIGGERS: List[Tuple[str, Tuple[str, ...]]] = [
     )),
     ("next", ("next.js", "nextjs", "next 14", "next 13")),
     ("react_vite", ("react", "vite", "spa", "single-page app")),
+    ("react_vite_tailwind", ("tailwind", "shadcn", "react-vite-tailwind")),
     ("fastapi", ("fastapi", "fast-api", "fast api")),
     ("flask", ("flask",)),
     ("node_cli", ("node cli", "node.js cli", "node command-line", "express cli")),
@@ -243,7 +262,7 @@ def _stack_from_decisions(
             return inferred
         return "react_vite"
     if family == "web":
-        if inferred in {"react_vite", "next", "static_site"}:
+        if inferred in {"react_vite", "react_vite_tailwind", "next", "static_site"}:
             return inferred
         return "react_vite"
     if family == "server" and inferred in {"react_vite", "next", "static_site"}:
@@ -261,7 +280,9 @@ def _stack_from_bundle(frontend_bundle: str, backend_bundle: str) -> Optional[st
     """
     if backend_bundle == "next" or frontend_bundle == "next":
         return "next"
-    if frontend_bundle in {"react-vite", "react-vite-tailwind", "vue-vite"}:
+    if frontend_bundle == "react-vite-tailwind":
+        return "react_vite_tailwind"
+    if frontend_bundle in {"react-vite", "vue-vite"}:
         return "react_vite"
     if frontend_bundle == "vanilla-vite":
         return "static_site"
@@ -381,7 +402,7 @@ def template_keys() -> List[str]:
 # keys, the scaffold MUST include a backend proxy or it can't run. The
 # heuristics below detect that case and the named services involved.
 
-_BROWSER_FIRST_STACKS: set = {"react_vite", "next"}
+_BROWSER_FIRST_STACKS: set = {"react_vite", "react_vite_tailwind", "next"}
 
 # Strong "this brief needs a backend tier" signals. Single match is
 # enough — if a brief mentions any of these phrases, the frontend alone
@@ -1095,6 +1116,13 @@ STACK_BUILD_HINTS: Dict[str, str] = {
         "Do NOT use the Next.js App Router. The entry is `index.html` + "
         "`src/main.jsx`, not `app/page.tsx`."
     ),
+    "react_vite_tailwind": (
+        "Idiom: Vite 5+ with React 18+, Tailwind CSS 3+, and shadcn/ui primitives "
+        "under src/components/ui/. Compose pages from Button, Card, Input, Badge — "
+        "never raw unstyled div soup. Import cn from '@/lib/utils'. Use semantic "
+        "Tailwind tokens (bg-background, text-foreground, border-border). "
+        "Entry is index.html + src/main.jsx importing src/index.css."
+    ),
     "next": (
         "Idiom: Next 14+ with the App Router (app/ directory). NEVER use "
         "pages/. Default export functional components from app/*.tsx. "
@@ -1284,6 +1312,7 @@ _README_GENERATORS = {
     "flask": _readme_flask,
     "node_cli": _readme_node_cli,
     "react_vite": _readme_react_vite,
+    "react_vite_tailwind": _readme_react_vite,
     "next": _readme_next,
     "ios_app": _readme_ios_app,
 }
@@ -1369,6 +1398,300 @@ def _manifest_react_vite(brief: str) -> str:
             "vite": "^5.4.0",
         },
     })
+
+
+def _manifest_react_vite_tailwind(brief: str) -> str:
+    return _json_dumps_pretty({
+        "name": "scaffold",
+        "version": "0.1.0",
+        "private": True,
+        "type": "module",
+        "scripts": {
+            "dev": "vite",
+            "build": "vite build",
+            "preview": "vite preview",
+        },
+        "dependencies": {
+            "react": "^18.3.0",
+            "react-dom": "^18.3.0",
+            "class-variance-authority": "^0.7.0",
+            "clsx": "^2.1.1",
+            "tailwind-merge": "^2.5.2",
+        },
+        "devDependencies": {
+            "@vitejs/plugin-react": "^4.3.0",
+            "autoprefixer": "^10.4.20",
+            "postcss": "^8.4.47",
+            "tailwindcss": "^3.4.13",
+            "vite": "^5.4.0",
+        },
+    })
+
+
+def _manifest_tailwind_config(brief: str) -> str:
+    return (
+        "/** @type {import('tailwindcss').Config} */\n"
+        "export default {\n"
+        "  darkMode: ['class'],\n"
+        "  content: ['./index.html', './src/**/*.{js,jsx}'],\n"
+        "  theme: {\n"
+        "    extend: {\n"
+        "      colors: {\n"
+        "        border: 'hsl(var(--border))',\n"
+        "        input: 'hsl(var(--input))',\n"
+        "        ring: 'hsl(var(--ring))',\n"
+        "        background: 'hsl(var(--background))',\n"
+        "        foreground: 'hsl(var(--foreground))',\n"
+        "        primary: { DEFAULT: 'hsl(var(--primary))', foreground: 'hsl(var(--primary-foreground))' },\n"
+        "        secondary: { DEFAULT: 'hsl(var(--secondary))', foreground: 'hsl(var(--secondary-foreground))' },\n"
+        "        muted: { DEFAULT: 'hsl(var(--muted))', foreground: 'hsl(var(--muted-foreground))' },\n"
+        "        accent: { DEFAULT: 'hsl(var(--accent))', foreground: 'hsl(var(--accent-foreground))' },\n"
+        "        card: { DEFAULT: 'hsl(var(--card))', foreground: 'hsl(var(--card-foreground))' },\n"
+        "      },\n"
+        "      borderRadius: {\n"
+        "        lg: 'var(--radius)',\n"
+        "        md: 'calc(var(--radius) - 2px)',\n"
+        "        sm: 'calc(var(--radius) - 4px)',\n"
+        "      },\n"
+        "    },\n"
+        "  },\n"
+        "  plugins: [],\n"
+        "};\n"
+    )
+
+
+def _manifest_postcss_config(brief: str) -> str:
+    return (
+        "export default {\n"
+        "  plugins: {\n"
+        "    tailwindcss: {},\n"
+        "    autoprefixer: {},\n"
+        "  },\n"
+        "};\n"
+    )
+
+
+def _manifest_components_json(brief: str) -> str:
+    return _json_dumps_pretty({
+        "$schema": "https://ui.shadcn.com/schema.json",
+        "style": "default",
+        "rsc": False,
+        "tsx": False,
+        "tailwind": {
+            "config": "tailwind.config.js",
+            "css": "src/index.css",
+            "baseColor": "slate",
+            "cssVariables": True,
+        },
+        "aliases": {
+            "components": "@/components",
+            "utils": "@/lib/utils",
+        },
+    })
+
+
+def _manifest_shadcn_utils(brief: str) -> str:
+    return (
+        "import { clsx } from 'clsx';\n"
+        "import { twMerge } from 'tailwind-merge';\n"
+        "\n"
+        "export function cn(...inputs) {\n"
+        "  return twMerge(clsx(inputs));\n"
+        "}\n"
+    )
+
+
+def _manifest_shadcn_index_css(brief: str, *, palette_hexes: Optional[List[str]] = None) -> str:
+    primary = (palette_hexes or [None])[0] or "222.2 47.4% 11.2%"
+    return (
+        "@tailwind base;\n"
+        "@tailwind components;\n"
+        "@tailwind utilities;\n"
+        "\n"
+        "@layer base {\n"
+        "  :root {\n"
+        "    --background: 0 0% 100%;\n"
+        "    --foreground: 222.2 84% 4.9%;\n"
+        "    --card: 0 0% 100%;\n"
+        "    --card-foreground: 222.2 84% 4.9%;\n"
+        "    --primary: 222.2 47.4% 11.2%;\n"
+        "    --primary-foreground: 210 40% 98%;\n"
+        "    --secondary: 210 40% 96.1%;\n"
+        "    --secondary-foreground: 222.2 47.4% 11.2%;\n"
+        "    --muted: 210 40% 96.1%;\n"
+        "    --muted-foreground: 215.4 16.3% 46.9%;\n"
+        "    --accent: 210 40% 96.1%;\n"
+        "    --accent-foreground: 222.2 47.4% 11.2%;\n"
+        "    --border: 214.3 31.8% 91.4%;\n"
+        "    --input: 214.3 31.8% 91.4%;\n"
+        "    --ring: 222.2 84% 4.9%;\n"
+        "    --radius: 0.5rem;\n"
+        "  }\n"
+        "  .dark {\n"
+        "    --background: 222.2 84% 4.9%;\n"
+        "    --foreground: 210 40% 98%;\n"
+        "    --card: 222.2 84% 4.9%;\n"
+        "    --card-foreground: 210 40% 98%;\n"
+        "    --primary: 210 40% 98%;\n"
+        "    --primary-foreground: 222.2 47.4% 11.2%;\n"
+        "    --secondary: 217.2 32.6% 17.5%;\n"
+        "    --secondary-foreground: 210 40% 98%;\n"
+        "    --muted: 217.2 32.6% 17.5%;\n"
+        "    --muted-foreground: 215 20.2% 65.1%;\n"
+        "    --accent: 217.2 32.6% 17.5%;\n"
+        "    --accent-foreground: 210 40% 98%;\n"
+        "    --border: 217.2 32.6% 17.5%;\n"
+        "    --input: 217.2 32.6% 17.5%;\n"
+        "    --ring: 212.7 26.8% 83.9%;\n"
+        "  }\n"
+        "  * { @apply border-border; }\n"
+        "  body { @apply bg-background text-foreground; }\n"
+        "}\n"
+    )
+
+
+def _manifest_vite_config_tailwind(brief: str) -> str:
+    return (
+        "import path from 'path';\n"
+        "import { defineConfig } from 'vite';\n"
+        "import react from '@vitejs/plugin-react';\n"
+        "\n"
+        "export default defineConfig({\n"
+        "  plugins: [react()],\n"
+        "  resolve: {\n"
+        "    alias: {\n"
+        "      '@': path.resolve(__dirname, './src'),\n"
+        "    },\n"
+        "  },\n"
+        "  server: {\n"
+        "    port: 5180,\n"
+        "    proxy: {\n"
+        "      '/api': {\n"
+        "        target: 'http://localhost:3100',\n"
+        "        changeOrigin: true,\n"
+        "      },\n"
+        "    },\n"
+        "  },\n"
+        "});\n"
+    )
+
+
+def _manifest_main_jsx_tailwind(brief: str) -> str:
+    return (
+        "import React from 'react';\n"
+        "import ReactDOM from 'react-dom/client';\n"
+        "import App from './App.jsx';\n"
+        "import './index.css';\n"
+        "import './tokens.css';\n"
+        "\n"
+        "ReactDOM.createRoot(document.getElementById('root')).render(\n"
+        "  <React.StrictMode>\n"
+        "    <App />\n"
+        "  </React.StrictMode>\n"
+        ");\n"
+    )
+
+
+def _manifest_shadcn_button(brief: str) -> str:
+    return (
+        "import * as React from 'react';\n"
+        "import { cva } from 'class-variance-authority';\n"
+        "import { cn } from '@/lib/utils';\n"
+        "\n"
+        "const buttonVariants = cva(\n"
+        "  'inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50',\n"
+        "  {\n"
+        "    variants: {\n"
+        "      variant: {\n"
+        "        default: 'bg-primary text-primary-foreground hover:bg-primary/90',\n"
+        "        secondary: 'bg-secondary text-secondary-foreground hover:bg-secondary/80',\n"
+        "        outline: 'border border-input bg-background hover:bg-accent hover:text-accent-foreground',\n"
+        "      },\n"
+        "      size: {\n"
+        "        default: 'h-10 px-4 py-2',\n"
+        "        sm: 'h-9 rounded-md px-3',\n"
+        "        lg: 'h-11 rounded-md px-8',\n"
+        "      },\n"
+        "    },\n"
+        "    defaultVariants: { variant: 'default', size: 'default' },\n"
+        "  },\n"
+        ");\n"
+        "\n"
+        "export function Button({ className, variant, size, ...props }) {\n"
+        "  return <button className={cn(buttonVariants({ variant, size, className }))} {...props} />;\n"
+        "}\n"
+    )
+
+
+def _manifest_shadcn_card(brief: str) -> str:
+    return (
+        "import * as React from 'react';\n"
+        "import { cn } from '@/lib/utils';\n"
+        "\n"
+        "export function Card({ className, ...props }) {\n"
+        "  return <div className={cn('rounded-lg border bg-card text-card-foreground shadow-sm', className)} {...props} />;\n"
+        "}\n"
+        "export function CardHeader({ className, ...props }) {\n"
+        "  return <div className={cn('flex flex-col space-y-1.5 p-6', className)} {...props} />;\n"
+        "}\n"
+        "export function CardTitle({ className, ...props }) {\n"
+        "  return <h3 className={cn('text-2xl font-semibold leading-none tracking-tight', className)} {...props} />;\n"
+        "}\n"
+        "export function CardContent({ className, ...props }) {\n"
+        "  return <div className={cn('p-6 pt-0', className)} {...props} />;\n"
+        "}\n"
+    )
+
+
+def _manifest_shadcn_input(brief: str) -> str:
+    return (
+        "import * as React from 'react';\n"
+        "import { cn } from '@/lib/utils';\n"
+        "\n"
+        "export const Input = React.forwardRef(function Input({ className, type, ...props }, ref) {\n"
+        "  return (\n"
+        "    <input\n"
+        "      type={type}\n"
+        "      className={cn(\n"
+        "        'flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',\n"
+        "        className,\n"
+        "      )}\n"
+        "      ref={ref}\n"
+        "      {...props}\n"
+        "    />\n"
+        "  );\n"
+        "});\n"
+    )
+
+
+def _manifest_shadcn_badge(brief: str) -> str:
+    return (
+        "import * as React from 'react';\n"
+        "import { cn } from '@/lib/utils';\n"
+        "\n"
+        "export function Badge({ className, ...props }) {\n"
+        "  return (\n"
+        "    <div\n"
+        "      className={cn(\n"
+        "        'inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold transition-colors',\n"
+        "        className,\n"
+        "      )}\n"
+        "      {...props}\n"
+        "    />\n"
+        "  );\n"
+        "}\n"
+    )
+
+
+def _manifest_shadcn_separator(brief: str) -> str:
+    return (
+        "import * as React from 'react';\n"
+        "import { cn } from '@/lib/utils';\n"
+        "\n"
+        "export function Separator({ className, ...props }) {\n"
+        "  return <div className={cn('shrink-0 bg-border h-[1px] w-full', className)} {...props} />;\n"
+        "}\n"
+    )
 
 
 def _manifest_index_html(brief: str) -> str:
@@ -1495,6 +1818,7 @@ def _manifest_main_jsx(brief: str) -> str:
         "import ReactDOM from 'react-dom/client';\n"
         "import App from './App.jsx';\n"
         "import './styles.css';\n"
+        "import './tokens.css';\n"
         "\n"
         "ReactDOM.createRoot(document.getElementById('root')).render(\n"
         "  <React.StrictMode>\n"
@@ -2001,6 +2325,37 @@ _MANIFEST_GENERATORS = {
     ("react_vite", "src/components/CommandPalette.jsx"): _component_command_palette,
     ("react_vite", "src/components/ServiceDetail.jsx"):  _component_service_detail,
     ("react_vite", "src/components/ActivityFeed.jsx"):   _component_activity_feed,
+    ("react_vite_tailwind", "package.json"): _manifest_react_vite_tailwind,
+    ("react_vite_tailwind", "tailwind.config.js"): _manifest_tailwind_config,
+    ("react_vite_tailwind", "postcss.config.js"): _manifest_postcss_config,
+    ("react_vite_tailwind", "components.json"): _manifest_components_json,
+    ("react_vite_tailwind", "src/lib/utils.js"): _manifest_shadcn_utils,
+    ("react_vite_tailwind", "src/index.css"): _manifest_shadcn_index_css,
+    ("react_vite_tailwind", "vite.config.js"): _manifest_vite_config_tailwind,
+    ("react_vite_tailwind", "src/main.jsx"): _manifest_main_jsx_tailwind,
+    ("react_vite_tailwind", "index.html"): _manifest_index_html,
+    ("react_vite_tailwind", "src/components/ui/button.jsx"): _manifest_shadcn_button,
+    ("react_vite_tailwind", "src/components/ui/card.jsx"): _manifest_shadcn_card,
+    ("react_vite_tailwind", "src/components/ui/input.jsx"): _manifest_shadcn_input,
+    ("react_vite_tailwind", "src/components/ui/badge.jsx"): _manifest_shadcn_badge,
+    ("react_vite_tailwind", "src/components/ui/separator.jsx"): _manifest_shadcn_separator,
+    ("react_vite_tailwind", ".env.example"): _env_example_for_services,
+    ("react_vite_tailwind", "docker-compose.yml"): _docker_compose_for_services,
+    ("react_vite_tailwind", "server/index.js"): _server_index_homelab,
+    ("react_vite_tailwind", "server/package.json"): _server_package_json_for_services,
+    ("react_vite_tailwind", "server/config-store.js"): _server_config_store_homelab,
+    ("react_vite_tailwind", "server/routes/config.js"): _server_config_route_homelab,
+    ("react_vite_tailwind", "src/components/SettingsModal.jsx"): _component_settings_modal_homelab,
+    ("react_vite_tailwind", "src/components/ServiceEditor.jsx"): _component_service_editor_homelab,
+    ("react_vite_tailwind", "src/hooks/useConfig.js"): _hook_use_config_homelab,
+    ("react_vite_tailwind", "src/components/StatusPill.jsx"): _component_status_pill,
+    ("react_vite_tailwind", "src/components/Sparkline.jsx"): _component_sparkline,
+    ("react_vite_tailwind", "src/components/KpiTile.jsx"): _component_kpi_tile,
+    ("react_vite_tailwind", "src/App.jsx"): _component_app_jsx_homelab,
+    ("react_vite_tailwind", "src/hooks/usePolling.js"): _hook_use_polling,
+    ("react_vite_tailwind", "src/components/CommandPalette.jsx"): _component_command_palette,
+    ("react_vite_tailwind", "src/components/ServiceDetail.jsx"): _component_service_detail,
+    ("react_vite_tailwind", "src/components/ActivityFeed.jsx"): _component_activity_feed,
     ("next",       "src/components/StatusPill.jsx"):   _component_status_pill,
     ("next",       "src/components/Sparkline.jsx"):    _component_sparkline,
     ("next",       "src/components/KpiTile.jsx"):      _component_kpi_tile,
