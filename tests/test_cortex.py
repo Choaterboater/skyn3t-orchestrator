@@ -777,7 +777,14 @@ async def test_proposal_store_apply_injects_proposal_id(tmp_path):
             break
         await asyncio.sleep(0)
 
-    assert captured == [{"idea": "demo", "_proposal_id": proposal.id, "_proposal_kind": "feature"}]
+    assert captured == [
+        {
+            "idea": "demo",
+            "_proposal_id": proposal.id,
+            "_proposal_kind": "feature",
+            "_proposal_source": "user_dashboard",
+        }
+    ]
 
 
 def test_review_watcher_parse_filters_placeholder_risks():

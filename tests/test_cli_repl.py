@@ -97,6 +97,14 @@ def test_render_layout_uses_sidebar_for_activity_when_wide(monkeypatch):
     assert [child.name for child in layout["body"].children] == ["transcript", "activity"]
 
 
+def test_render_layout_shows_studio_sidebar_before_timeline_arrives(monkeypatch):
+    state = repl.ReplState(studio_slug="demo-build")
+    monkeypatch.setattr(repl, "_terminal_width", lambda: 140)
+    layout = repl._render_layout(state)
+
+    assert "activity" in [child.name for child in layout["body"].children]
+
+
 def test_render_layout_stacks_activity_when_narrow(monkeypatch):
     state = repl.ReplState()
     state.activity.append(Text("• task"))
@@ -153,6 +161,191 @@ def test_format_event_uses_compact_swarm_payload():
     assert "writer" in line.plain
     assert "started" in line.plain
     assert "Draft README" in line.plain
+
+
+def test_format_event_formats_studio_project_payload():
+    line = repl._format_event(
+        {
+            "kind": "project",
+            "event_type": "SYSTEM_ALERT",
+            "from": "studio",
+            "ts": "2026-05-23T13:02:32+00:00",
+            "meta": {
+                "payload": {
+                    "kind": "PROJECT_STAGE_STARTED",
+                    "status": "running",
+                    "stage": "brainstorm",
+                    "message": "BrainstormAgent is working on brainstorm.md.",
+                }
+            },
+        }
+    )
+
+    assert line is not None
+    assert "PROJECT_STAGE_STARTED" in line.plain
+    assert "running" in line.plain
+    assert "brainstorm" in line.plain
+    assert "BrainstormAgent is working on brainstorm.md." in line.plain
+
+
+def test_format_event_filters_agent_thought_noise_during_studio_watch():
+    state = repl.ReplState(studio_slug="demo")
+    line = repl._format_event(
+        {
+            "kind": "thought",
+            "event_type": "AGENT_THOUGHT",
+            "from": "code_agent",
+            "label": "building file 3/20: src/App.jsx",
+        },
+        state,
+    )
+
+    assert line is None
+
+
+def test_format_event_filters_codegen_progress_even_without_studio_slug():
+    state = repl.ReplState()
+    assert repl._maybe_update_live_activity(
+        state,
+        {
+            "kind": "thought",
+            "event_type": "AGENT_THOUGHT",
+            "from": "code_agent",
+            "label": "building file 17/28: src/components/HabitList.jsx",
+        },
+    )
+    assert state.live_activity_line is not None
+    assert "17/28" in state.live_activity_line.plain
+    assert "HabitList.jsx" in state.live_activity_line.plain
+    assert (
+        repl._format_event(
+            {
+                "kind": "thought",
+                "event_type": "AGENT_THOUGHT",
+                "from": "code_agent",
+                "label": "building file 17/28: src/components/HabitList.jsx",
+            },
+            state,
+        )
+        is None
+    )
+
+
+def test_activity_lines_for_display_includes_live_progress():
+    state = repl.ReplState(studio_slug="demo")
+    repl._maybe_update_live_activity(
+        state,
+        {
+            "kind": "thought",
+            "event_type": "AGENT_THOUGHT",
+            "from": "code_agent",
+            "label": "building file 2/28: src/main.jsx",
+        },
+    )
+
+    lines = repl._activity_lines_for_display(state)
+
+    assert any("Syncing studio timeline" in line.plain for line in lines)
+    assert any("2/28" in line.plain for line in lines)
+
+
+def test_resolve_status_query_slug_from_explicit_slug():
+    state = repl.ReplState()
+    slug = "build-a-habit-tracker-with-streaks-and-a-dark-theme-1539a8"
+    resolved = repl._resolve_status_query_slug(state, f"status of {slug}")
+
+    assert resolved == slug
+
+
+def test_resolve_status_query_slug_uses_active_build():
+    state = repl.ReplState(studio_slug="demo-build")
+    assert repl._resolve_status_query_slug(state, "what is the status of my build") == "demo-build"
+
+
+def test_show_project_status_in_repl_attaches_sidebar(monkeypatch):
+    state = repl.ReplState()
+    paints = []
+
+    class FakeResponse:
+        def __init__(self, payload, status_code=200):
+            self._payload = payload
+            self.status_code = status_code
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError("bad status")
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, path):
+            assert path.endswith("/demo")
+            return FakeResponse(
+                {
+                    "slug": "demo",
+                    "title": "Habit tracker",
+                    "status": "running",
+                    "current_stage": "code",
+                    "current_agent": "CodeAgent",
+                    "next_action": "Generating source files",
+                    "history": [
+                        {
+                            "event": "PROJECT_STAGE_STARTED",
+                            "stage": "code",
+                            "message": "CodeAgent is working on (source files).",
+                        }
+                    ],
+                }
+            )
+
+    monkeypatch.setattr(repl.httpx, "Client", FakeClient)
+    monkeypatch.setattr(repl, "_request_repaint", lambda _state: paints.append("paint"))
+
+    repl._show_project_status_in_repl(state, "demo")
+
+    assert state.studio_slug == "demo"
+    assert len(state.transcript) == 1
+    assert getattr(state.transcript[-1], "title", "").startswith("Studio ·")
+    assert len(state.activity) >= 1
+    assert paints == ["paint"]
+
+
+def test_pick_active_studio_project_prefers_latest_running():
+    projects = [
+        {"slug": "old", "status": "done", "updated_at": 300.0},
+        {"slug": "live", "status": "running", "updated_at": 100.0},
+        {"slug": "newer", "status": "running", "updated_at": 200.0},
+    ]
+
+    picked = repl._pick_active_studio_project(projects)
+
+    assert picked is not None
+    assert picked["slug"] == "newer"
+
+
+def test_format_studio_history_entry_includes_timestamp_and_event():
+    line = repl._format_studio_history_entry(
+        {
+            "event": "PROJECT_QUEUED",
+            "status": "queued",
+            "message": "Queued — waiting for a worker slot.",
+            "ts": 1716468089.0,
+        }
+    )
+
+    assert "PROJECT_QUEUED" in line.plain
+    assert "queued" in line.plain
+    assert "Queued — waiting for a worker slot." in line.plain
 
 
 def test_looks_like_project_request_detects_builder_prompt():

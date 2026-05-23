@@ -105,6 +105,42 @@ _LOW_SIGNAL_ACTIVITY_TYPES = {
     "LLM_EXCHANGE",
 }
 
+_STUDIO_BUILD_NOISE_MARKERS = (
+    "building file",
+    "deterministic manifest",
+    " wrote ",
+    "solo + ",
+    "cluster(s)",
+    "file(s):",
+)
+
+_STUDIO_SNIPPET_LIMIT = 240
+
+_STUDIO_SLUG_RE = re.compile(
+    r"\b([a-z0-9][a-z0-9-]{8,}-[a-f0-9]{6,8})\b",
+    re.IGNORECASE,
+)
+
+_STATUS_QUERY_CUES = (
+    "status",
+    "progress",
+    "going",
+    "update",
+    "how is",
+    "where is",
+    "what is the status",
+    "what's the status",
+    "how's the build",
+    "how is the build",
+    "what stage",
+    "current stage",
+    "state of",
+)
+
+_ACTIVE_STUDIO_STATUSES = frozenset(
+    {"queued", "running", "awaiting_clarification", "awaiting_approval"}
+)
+
 
 @dataclass
 class ReplState:
@@ -131,6 +167,13 @@ class ReplState:
     known_agents: List[str] = field(default_factory=list)
     render_version: int = 0
     studio_slug: Optional[str] = None
+    studio_watching: bool = False
+    studio_history_seen: int = 0
+    studio_last_snapshot: Optional[tuple[str, str, str, str]] = None
+    last_studio_activity_key: Optional[str] = None
+    live_activity_key: Optional[str] = None
+    live_activity_line: Optional[Text] = None
+    paint_callback: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -160,10 +203,30 @@ def _layout_frame_height() -> int:
     return max(12, _terminal_height() - _prompt_reserve_lines())
 
 
-def _activity_line_budget() -> int:
+def _render_height(state: ReplState) -> int:
+    """Paint height — use the full band while a studio build is active."""
+    frame_h = _layout_frame_height()
+    if state.studio_slug:
+        return frame_h
+    transcript_items = min(_transcript_entry_budget(), len(state.transcript))
+    transcript_rows = max(5, transcript_items * 4 + 3)
+    activity_rows = max(5, min(_activity_line_budget(state), len(state.activity)) + 3)
+    act_tail = _activity_lines_for_display(state)
+    if _activity_sidebar_enabled(state, act_tail):
+        body_rows = max(transcript_rows, activity_rows)
+    elif act_tail:
+        body_rows = transcript_rows + activity_rows
+    else:
+        body_rows = transcript_rows
+    return min(frame_h, 4 + body_rows + 1)
+
+
+def _activity_line_budget(state: ReplState) -> int:
     """Activity rows to show — scales with layout body height."""
     body_rows = _layout_frame_height() - 4  # header
-    return max(6, min(18, body_rows - 3))
+    floor = 8 if state.studio_slug else 6
+    cap = 24 if state.studio_slug else 18
+    return max(floor, min(cap, body_rows - 3))
 
 
 def _transcript_entry_budget() -> int:
@@ -172,9 +235,14 @@ def _transcript_entry_budget() -> int:
     return max(4, min(10, body_rows // 5))
 
 
-def _body_column_ratios() -> tuple[int, int]:
+def _body_column_ratios(state: ReplState) -> tuple[int, int]:
     """Transcript (left) vs activity sidebar (right) width ratios."""
     width = _terminal_width()
+    if state.studio_slug:
+        if width >= 160:
+            return (3, 2)
+        if width >= 120:
+            return (2, 1)
     if width >= 180:
         return (7, 3)
     if width >= 140:
@@ -184,30 +252,389 @@ def _body_column_ratios() -> tuple[int, int]:
     return (2, 1)
 
 
-def _activity_sidebar_enabled(items: List[Text]) -> bool:
-    return bool(items) and _terminal_width() >= 100
+def _activity_sidebar_enabled(state: ReplState, items: List[Text]) -> bool:
+    if _terminal_width() < 100:
+        return False
+    return bool(items) or bool(state.studio_slug)
 
 
-def _format_event(evt: dict) -> Optional[Text]:
+def _activity_lines_for_display(state: ReplState) -> List[Text]:
+    """Timeline + optional rolling live-progress line for the right panel."""
+    budget = _activity_line_budget(state)
+    reserve = 1 if state.live_activity_line is not None else 0
+    lines = list(state.activity)[-(budget - reserve) :]
+    if not lines and state.studio_slug:
+        lines = [Text("Syncing studio timeline…", style="dim")]
+    if state.live_activity_line is not None:
+        lines.append(state.live_activity_line)
+    return lines
+
+
+def _activity_panel_title(state: ReplState) -> str:
+    if state.studio_slug:
+        return f"Studio build · {state.studio_slug}"
+    return "Agents at work"
+
+
+def _format_activity_ts(ts: Any) -> str:
+    if ts is None:
+        return ""
+    if isinstance(ts, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(ts)).strftime("%H:%M:%S")
+        except (OSError, OverflowError, ValueError):
+            return ""
+    raw = str(ts).strip()
+    if not raw:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return parsed.strftime("%H:%M:%S")
+    except ValueError:
+        return raw[:8]
+
+
+def _truncate_studio_text(text: str, limit: int = _STUDIO_SNIPPET_LIMIT) -> str:
+    cleaned = str(text or "").replace("\n", " ").strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 3] + "..."
+
+
+def _studio_history_label(event_name: str) -> str:
+    labels = {
+        "PROJECT_QUEUED": "Queued",
+        "PROJECT_STARTED": "Started",
+        "BRIEF_EXPANDED": "Brief expanded",
+        "PROJECT_BRIEF_EXPANDED": "Brief expanded",
+        "PROJECT_STAGE_STARTED": "Stage started",
+        "PROJECT_STAGE_COMPLETED": "Stage completed",
+        "PROJECT_STAGE_FAILED": "Stage failed",
+        "PROJECT_AWAITING_CLARIFICATION": "Waiting for clarification",
+        "PROJECT_AWAITING_APPROVAL": "Awaiting approval",
+        "PROJECT_RESUMED": "Resumed",
+        "PROJECT_RESUMED_AFTER_APPROVAL": "Resumed after approval",
+        "PROJECT_COMPLETED": "Project finished",
+        "PROJECT_FAILED": "Runner failed",
+        "PROJECT_REAPED": "Recovered",
+        "CRITIQUE_ISSUES_FOUND": "Critique issues",
+        "STUDIO_STATUS": "Status",
+    }
+    key = str(event_name or "").upper()
+    return labels.get(key, key.replace("_", " ").title())
+
+
+def _studio_event_name_from_swarm(evt: dict) -> str:
+    et = str(evt.get("event_type") or evt.get("type") or "").upper()
+    kind = str(evt.get("kind") or "").lower()
+    payload: dict = {}
+    meta = evt.get("meta")
+    if isinstance(meta, dict):
+        nested = meta.get("payload")
+        if isinstance(nested, dict):
+            payload = nested
+    if kind == "project":
+        payload_kind = str(payload.get("kind") or "").upper()
+        if payload_kind:
+            return payload_kind
+    if et == "SYSTEM_ALERT":
+        payload_kind = str(payload.get("kind") or "").upper()
+        if payload_kind:
+            return payload_kind
+    return et
+
+
+def _format_studio_timeline_line(
+    *,
+    event_name: str,
+    message: str = "",
+    status: str = "",
+    stage: str = "",
+    agent: str = "",
+    ts: Any = None,
+) -> Text:
+    """Rich single-line studio timeline entry — mirrors the web activity feed."""
+    event_upper = str(event_name or "").upper()
+    label = _studio_history_label(event_upper)
+    detail_parts: List[str] = []
+    if stage:
+        detail_parts.append(stage)
+    if agent:
+        detail_parts.append(agent)
+    if message:
+        detail_parts.append(_truncate_studio_text(message))
+    detail = " · ".join(detail_parts)
+
+    style = "cyan"
+    if event_upper.endswith("_FAILED") or event_upper == "PROJECT_FAILED":
+        style = "red"
+    elif event_upper.endswith("_COMPLETED") or event_upper == "PROJECT_COMPLETED":
+        style = "green"
+    elif "AWAITING" in event_upper or event_upper == "CRITIQUE_ISSUES_FOUND":
+        style = "yellow"
+
+    line = Text()
+    stamp = _format_activity_ts(ts)
+    if stamp:
+        line.append(stamp, style="dim")
+        line.append("  ")
+    line.append(event_upper or "EVENT", style=f"bold {style}")
+    if status:
+        line.append(f"  {status}", style=style)
+    line.append(f"  {label}", style=f"bold {style}")
+    if detail:
+        line.append(f"  {detail}", style="white")
+    return line
+
+
+def _format_studio_history_entry(item: dict) -> Text:
+    return _format_studio_timeline_line(
+        event_name=str(item.get("event") or ""),
+        message=str(item.get("message") or ""),
+        status=str(item.get("status") or ""),
+        stage=str(item.get("stage") or ""),
+        agent=str(item.get("agent") or ""),
+        ts=item.get("ts"),
+    )
+
+
+def _format_studio_swarm_event(evt: dict) -> Text:
+    event_name = _studio_event_name_from_swarm(evt)
+    payload: dict = {}
+    meta = evt.get("meta")
+    if isinstance(meta, dict) and isinstance(meta.get("payload"), dict):
+        payload = meta["payload"]
+    message = str(
+        evt.get("label")
+        or payload.get("message")
+        or payload.get("summary")
+        or payload.get("preview")
+        or ""
+    ).strip()
+    if event_name in {"BRIEF_EXPANDED", "PROJECT_BRIEF_EXPANDED"}:
+        preview = str(payload.get("preview") or message).strip()
+        defaults = payload.get("category_defaults")
+        if isinstance(defaults, list) and defaults:
+            assumed = ", ".join(str(item) for item in defaults[:6])
+            message = f"{preview} · Assumed: {assumed}" if preview else f"Assumed: {assumed}"
+        else:
+            message = preview or message
+    return _format_studio_timeline_line(
+        event_name=event_name,
+        message=message,
+        status=str(payload.get("status") or "").strip(),
+        stage=str(payload.get("stage") or payload.get("current_stage") or "").strip(),
+        agent=str(payload.get("agent") or payload.get("current_agent") or evt.get("from") or "").strip(),
+        ts=evt.get("ts"),
+    )
+
+
+def _studio_activity_key(*, event_name: str, status: str = "", stage: str = "", message: str = "") -> str:
+    return "|".join(
+        [
+            str(event_name or "").upper(),
+            str(status or "").strip(),
+            str(stage or "").strip(),
+            _truncate_studio_text(message, 120),
+        ]
+    )
+
+
+def _is_studio_build_noise(evt: dict, state: ReplState) -> bool:
+    kind = str(evt.get("kind") or "").lower()
+    et = str(evt.get("event_type") or evt.get("type") or "").upper()
+    if kind in {"project", "task", "stage", "message"}:
+        return False
+    if kind == "project" or _studio_event_name_from_swarm(evt).startswith(
+        ("PROJECT_", "BRIEF_", "CRITIQUE_")
+    ):
+        return False
+    if kind in {"convo"} or et in _LOW_SIGNAL_ACTIVITY_TYPES:
+        return True
+
+    snippet = _event_snippet(evt).lower()
+    if "entrypoint fast-path" in snippet:
+        return True
+    if "fast-path success" in snippet:
+        return True
+    if "deterministic manifest" in snippet and " wrote " in snippet:
+        return True
+    if _compress_swarm_to_live_line(evt) is not None:
+        return True
+    return False
+
+
+def _compress_swarm_to_live_line(evt: dict) -> Optional[tuple[str, Text]]:
+    """Collapse high-frequency build chatter into one rolling sidebar line."""
+    source = str(evt.get("from") or evt.get("source") or "agent").strip()
+    snippet = _event_snippet(evt)
+    if not snippet:
+        return None
+
+    match = re.search(r"building file (\d+)/(\d+):\s*(.+)", snippet, re.IGNORECASE)
+    if match:
+        idx, total, path = match.groups()
+        line = Text("⚡ ", style="yellow")
+        line.append(source, style="bold yellow")
+        line.append(f"  file {idx}/{total}", style="yellow")
+        line.append(f"  {_truncate_studio_text(path, 72)}", style="white")
+        return (f"{source}:file-progress", line)
+
+    lower = snippet.lower()
+    if "building" in lower and "file" in lower:
+        line = Text("⚡ ", style="yellow")
+        line.append(source, style="bold yellow")
+        line.append(f"  {_truncate_studio_text(snippet, 96)}", style="white")
+        return (f"{source}:build", line)
+
+    if "solo +" in lower or "cluster(s)" in lower or "file(s):" in lower:
+        line = Text("⚡ ", style="cyan")
+        line.append(source, style="bold cyan")
+        line.append(f"  {_truncate_studio_text(snippet, 96)}", style="white")
+        return (f"{source}:batch", line)
+
+    kind = str(evt.get("kind") or "").lower()
+    et = str(evt.get("event_type") or evt.get("type") or "").upper()
+    if kind == "thought" or et.startswith("AGENT_THOUGHT"):
+        if any(marker in lower for marker in _STUDIO_BUILD_NOISE_MARKERS):
+            return None
+        line = Text("✦ ", style="magenta")
+        line.append(source, style="bold magenta")
+        line.append(f"  {_truncate_studio_text(snippet, 96)}", style="dim")
+        return (f"{source}:thought", line)
+
+    return None
+
+
+def _maybe_update_live_activity(state: ReplState, evt: dict) -> bool:
+    compressed = _compress_swarm_to_live_line(evt)
+    if compressed is None:
+        return False
+    key, line = compressed
+    if state.live_activity_key == key and state.live_activity_line is not None:
+        if state.live_activity_line.plain == line.plain:
+            return True
+    state.live_activity_key = key
+    state.live_activity_line = line
+    _touch_state(state)
+    return True
+
+
+def _pick_active_studio_project(projects: List[dict]) -> Optional[dict]:
+    active: List[dict] = []
+    for project in projects:
+        if not isinstance(project, dict):
+            continue
+        status = str(project.get("status") or "").strip().lower()
+        slug = str(project.get("slug") or "").strip()
+        if not slug or status not in _ACTIVE_STUDIO_STATUSES:
+            continue
+        active.append(project)
+    if not active:
+        return None
+    return max(active, key=lambda item: float(item.get("updated_at") or item.get("created_at") or 0))
+
+
+def _apply_studio_project_activity(state: ReplState, project: dict) -> bool:
+    """Merge manifest history + status into the activity sidebar."""
+    updated = False
+    snapshot = _studio_progress_snapshot(project)
+    if snapshot != state.studio_last_snapshot:
+        status, stage, agent, next_action = snapshot
+        _add_studio_activity(
+            state,
+            _format_studio_timeline_line(
+                event_name="STUDIO_STATUS",
+                status=status,
+                stage=stage,
+                agent=agent,
+                message=next_action,
+            ),
+            event_name="STUDIO_STATUS",
+            status=status,
+            stage=stage,
+            message=next_action,
+        )
+        state.studio_last_snapshot = snapshot
+        updated = True
+
+    history = project.get("history") or []
+    if not isinstance(history, list):
+        history = []
+    for item in history[state.studio_history_seen :]:
+        if not isinstance(item, dict):
+            continue
+        _add_studio_activity(
+            state,
+            _format_studio_history_entry(item),
+            event_name=str(item.get("event") or ""),
+            status=str(item.get("status") or ""),
+            stage=str(item.get("stage") or ""),
+            message=str(item.get("message") or ""),
+        )
+        updated = True
+    state.studio_history_seen = len(history)
+    return updated
+
+
+def _request_repaint(state: ReplState) -> None:
+    callback = state.paint_callback
+    if callable(callback):
+        try:
+            callback()
+        except Exception:
+            pass
+
+
+def _event_snippet(evt: dict) -> str:
+    data = evt.get("data") or {}
+    if isinstance(data, dict) and "data" in data and "event_type" in data:
+        evt = data
+        data = evt.get("data") or {}
+    snippet = str(evt.get("label") or "").strip()
+    if isinstance(data, dict):
+        if not snippet:
+            for key in ("message", "thought", "title", "query", "summary", "stage", "repo", "name", "line"):
+                value = data.get(key)
+                if value:
+                    snippet = str(value)
+                    break
+        if not snippet:
+            snippet = ", ".join(f"{k}={v}" for k, v in list(data.items())[:2])
+    elif data:
+        snippet = str(data)
+    return snippet.replace("\n", " ").strip()
+
+
+def _format_event(evt: dict, state: Optional[ReplState] = None) -> Optional[Text]:
+    if state is not None:
+        if _maybe_update_live_activity(state, evt):
+            return None
+        if _is_studio_build_noise(evt, state):
+            return None
+
     et = str(evt.get("event_type") or evt.get("type") or "").upper()
     kind = str(evt.get("kind") or "").lower()
     if et in _LOW_SIGNAL_ACTIVITY_TYPES or kind == "convo":
         return None
 
-    if kind == "project" and not et.startswith("PROJECT_"):
-        payload = evt.get("meta", {}).get("payload") if isinstance(evt.get("meta"), dict) else {}
-        payload_kind = str((payload or {}).get("kind") or "").upper()
-        if payload_kind.startswith("PROJECT_"):
-            et = payload_kind
+    studio_event = _studio_event_name_from_swarm(evt)
+    if kind == "project" or studio_event.startswith(("PROJECT_", "BRIEF_", "CRITIQUE_")):
+        return _format_studio_swarm_event(evt)
 
     data = evt.get("data") or {}
     if isinstance(data, dict) and "data" in data and "event_type" in data:
-        # nested {"type": "event", "data": {...}}
         evt = data
         et = str(evt.get("event_type", et) or "").upper()
         data = evt.get("data") or {}
         if et in _LOW_SIGNAL_ACTIVITY_TYPES:
             return None
+        if et.startswith("PROJECT_") or et.startswith("CRITIQUE_"):
+            return _format_studio_swarm_event(evt)
+
+    snippet = _event_snippet(evt)
+    if len(snippet) > 96:
+        snippet = snippet[:93] + "..."
 
     glyph = _glyph(et)
     source = (
@@ -216,21 +643,6 @@ def _format_event(evt: dict) -> Optional[Text]:
         or (data.get("agent") if isinstance(data, dict) else None)
         or ""
     )
-    snippet = str(evt.get("label") or "").strip()
-    if isinstance(data, dict):
-        if not snippet:
-            for k in ("message", "thought", "title", "query", "summary", "stage", "repo", "name"):
-                v = data.get(k)
-                if v:
-                    snippet = str(v)
-                    break
-        if not snippet:
-            snippet = ", ".join(f"{k}={v}" for k, v in list(data.items())[:2])
-    elif data:
-        snippet = str(data)
-    snippet = snippet.replace("\n", " ").strip()
-    if len(snippet) > 96:
-        snippet = snippet[:93] + "..."
 
     style = "white"
     if et.startswith("TASK_FAIL"):
@@ -262,7 +674,7 @@ def _format_event(evt: dict) -> Optional[Text]:
     elif et == "PIPELINE_STAGE_FAILED":
         verb = "stage failed"
     elif et.startswith("PROJECT_"):
-        verb = _studio_history_label(et)
+        return _format_studio_swarm_event(evt)
     elif et == "AGENT_THOUGHT":
         verb = "thinking"
     elif et.startswith("AGENT_MESSAGE"):
@@ -284,13 +696,14 @@ def _format_event(evt: dict) -> Optional[Text]:
 
 def _render_layout(state: ReplState) -> Layout:
     layout = Layout()
-    frame_h = _layout_frame_height()
-    act_tail = list(state.activity)[-_activity_line_budget():]
-    if _activity_sidebar_enabled(act_tail):
-        transcript_ratio, activity_ratio = _body_column_ratios()
+    frame_h = _render_height(state)
+    act_tail = _activity_lines_for_display(state)
+    body_rows = max(6, frame_h - 4)
+    if _activity_sidebar_enabled(state, act_tail):
+        transcript_ratio, activity_ratio = _body_column_ratios(state)
         layout.split_column(
             Layout(name="header", size=4),
-            Layout(name="body", size=max(8, frame_h - 4)),
+            Layout(name="body", size=body_rows),
         )
         layout["body"].split_row(
             Layout(name="transcript", ratio=transcript_ratio),
@@ -299,11 +712,11 @@ def _render_layout(state: ReplState) -> Layout:
     else:
         sections: List[Layout] = [
             Layout(name="header", size=4),
-            Layout(name="transcript", size=max(6, frame_h - 4)),
+            Layout(name="transcript", size=max(5, body_rows)),
         ]
         if act_tail:
             sections.append(
-                Layout(name="activity", size=max(8, min(14, len(act_tail) + 2)))
+                Layout(name="activity", size=max(6, min(14, len(act_tail) + 2)))
             )
         layout.split_column(*sections)
 
@@ -334,7 +747,12 @@ def _render_layout(state: ReplState) -> Layout:
     if act_tail:
         activity = Group(*act_tail)
         layout["activity"].update(
-            Panel(activity, title="Agents at work", border_style="magenta", padding=(0, 1))
+            Panel(
+                activity,
+                title=_activity_panel_title(state),
+                border_style="magenta",
+                padding=(0, 1),
+            )
         )
 
     return layout
@@ -356,6 +774,28 @@ def _add_activity(state: ReplState, renderable: Text) -> None:
     _touch_state(state)
 
 
+def _add_studio_activity(
+    state: ReplState,
+    renderable: Text,
+    *,
+    event_name: str,
+    status: str = "",
+    stage: str = "",
+    message: str = "",
+) -> None:
+    key = _studio_activity_key(
+        event_name=event_name,
+        status=status,
+        stage=stage,
+        message=message,
+    )
+    if state.last_studio_activity_key == key:
+        return
+    state.last_studio_activity_key = key
+    state.activity.append(renderable)
+    _touch_state(state)
+
+
 def _user_line(text: str) -> Text:
     t = Text("You  ", style="bold cyan")
     t.append(text, style="white")
@@ -373,23 +813,9 @@ def _info_line(text: str, style: str = "yellow") -> Text:
     return Text(text, style=style)
 
 
-def _studio_history_label(event_name: str) -> str:
-    labels = {
-        "PROJECT_QUEUED": "Queued",
-        "PROJECT_STARTED": "Started",
-        "PROJECT_STAGE_STARTED": "Stage started",
-        "PROJECT_STAGE_COMPLETED": "Stage completed",
-        "PROJECT_STAGE_FAILED": "Stage failed",
-        "PROJECT_AWAITING_CLARIFICATION": "Waiting for clarification",
-        "PROJECT_RESUMED": "Resumed",
-        "PROJECT_COMPLETED": "Project finished",
-        "PROJECT_FAILED": "Runner failed",
-        "PROJECT_REAPED": "Recovered",
-    }
-    return labels.get(
-        str(event_name or "").upper(),
-        str(event_name or "update").replace("_", " ").title(),
-    )
+def _is_studio_swarm_event(evt: dict) -> bool:
+    name = _studio_event_name_from_swarm(evt)
+    return name.startswith(("PROJECT_", "BRIEF_", "CRITIQUE_"))
 
 
 # ---------------------------------------------------------------------------
@@ -399,10 +825,6 @@ def _studio_history_label(event_name: str) -> str:
 
 async def _ws_listener(state: ReplState) -> None:
     """Listen for swarm events; reconnect every 3s on disconnect."""
-    if not _HAS_WS:
-        await _poll_listener(state)
-        return
-
     import websockets as wsmod
     from websockets.exceptions import ConnectionClosed
 
@@ -422,9 +844,17 @@ async def _ws_listener(state: ReplState) -> None:
                             continue
                         # Possible shapes: {"type":"event","data":{event_type:...}}
                         payload = msg.get("data", msg) if isinstance(msg, dict) else {}
-                        line = _format_event(payload)
+                        if state.studio_slug and isinstance(payload, dict) and _is_studio_swarm_event(payload):
+                            continue
+                        if isinstance(payload, dict) and _maybe_update_live_activity(state, payload):
+                            _request_repaint(state)
+                            continue
+                        if isinstance(payload, dict) and _is_studio_build_noise(payload, state):
+                            continue
+                        line = _format_event(payload, state)
                         if line is not None:
                             _add_activity(state, line)
+                            _request_repaint(state)
                     break  # ws closed cleanly
             except ConnectionClosed:
                 pass
@@ -447,14 +877,68 @@ async def _poll_listener(state: ReplState) -> None:
                     state.connected = True
                     items = resp.json().get("events", [])
                     for evt in items[-20:]:
-                        line = _format_event(evt)
+                        if state.studio_slug and isinstance(evt, dict) and _is_studio_swarm_event(evt):
+                            continue
+                        if isinstance(evt, dict) and _maybe_update_live_activity(state, evt):
+                            _request_repaint(state)
+                            continue
+                        if isinstance(evt, dict) and _is_studio_build_noise(evt, state):
+                            continue
+                        line = _format_event(evt, state)
                         if line is not None:
                             _add_activity(state, line)
+                            _request_repaint(state)
                 else:
                     state.connected = False
             except Exception:
                 state.connected = False
             await asyncio.sleep(1)
+
+
+async def _studio_sync_listener(state: ReplState) -> None:
+    """Track active Studio builds started elsewhere (web UI, another terminal)."""
+    async with httpx.AsyncClient(base_url=state.api_url, timeout=10.0) as client:
+        while not state.stop:
+            if state.studio_watching:
+                await asyncio.sleep(1)
+                continue
+            try:
+                resp = await client.get("/api/studio/projects")
+                if resp.status_code != 200:
+                    await asyncio.sleep(3)
+                    continue
+                projects = resp.json().get("projects") or []
+                active = _pick_active_studio_project(projects)
+                if active is None:
+                    if state.studio_slug and not state.studio_watching:
+                        state.studio_slug = None
+                        state.studio_history_seen = 0
+                        state.studio_last_snapshot = None
+                        state.last_studio_activity_key = None
+                    await asyncio.sleep(3)
+                    continue
+
+                slug = str(active.get("slug") or "").strip()
+                if slug and slug != state.studio_slug:
+                    state.studio_slug = slug
+                    state.studio_history_seen = 0
+                    state.studio_last_snapshot = None
+                    state.last_studio_activity_key = None
+
+                detail = await client.get(f"/api/studio/projects/{slug}")
+                if detail.status_code != 200:
+                    await asyncio.sleep(3)
+                    continue
+                if _apply_studio_project_activity(state, detail.json()):
+                    _request_repaint(state)
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+
+
+async def _background_listeners(state: ReplState) -> None:
+    swarm_task = _ws_listener(state) if _HAS_WS else _poll_listener(state)
+    await asyncio.gather(swarm_task, _studio_sync_listener(state))
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +1140,9 @@ Just type at the `>` prompt:
 - **Chat** — ask anything; SkyN3t routes it to `/api/llm/complete` when no agent is selected.
 - **Build** — prompts like `build a habit tracker with streaks` or `create a dashboard for my team`
   auto-start a Studio run (same as `/project`, when no agent is active).
+- **Status** — ask `status of my build`, `what's the progress?`, or
+  `status of build-a-habit-tracker-…-1539a8` to read the live Studio manifest
+  (not the chat model).
 - **Multi-line** — type `\"\"\"` on its own line, then close with `\"\"\"` again.
 
 Slash commands are optional power-user shortcuts — `/help` lists them all.
@@ -669,6 +1156,7 @@ Slash commands are optional power-user shortcuts — `/help` lists them all.
 - `/tasks` — list currently running tasks
 - `/pipeline NAME [PROMPT...]` — run a pipeline by name
 - `/project BRIEF...` — start a Studio run (defaults to the auto planner)
+- `/status [SLUG]` — show live Studio build status (defaults to active/last project)
 - `/approve [SLUG]` — approve a paused Studio gate (uses last project if omitted)
 - `/approve-edits [SLUG]` — edit architecture.md in `$EDITOR`, then approve
 - `/reject FEEDBACK...` — reject the paused gate and re-run with feedback
@@ -786,6 +1274,9 @@ async def _slash(state: ReplState, raw: str) -> bool:
         return False
     if cmd == "/project":
         await _cmd_project(state, rest)
+        return False
+    if cmd == "/status":
+        await _cmd_status(state, rest)
         return False
     if cmd in ("/approve", "/approve-edits"):
         await _cmd_studio_approve(state, rest, with_edits=cmd == "/approve-edits")
@@ -1088,6 +1579,117 @@ def _should_route_prompt_to_project(state: ReplState, prompt: str) -> bool:
     return state.active_agent is None and _looks_like_project_request(prompt)
 
 
+def _extract_studio_slug(text: str) -> Optional[str]:
+    match = _STUDIO_SLUG_RE.search(str(text or ""))
+    return match.group(1).lower() if match else None
+
+
+def _resolve_status_query_slug(state: ReplState, prompt: str) -> Optional[str]:
+    normalized = re.sub(r"\s+", " ", str(prompt or "").strip().lower())
+    if not normalized or normalized.startswith("/"):
+        return None
+    slug = _extract_studio_slug(normalized)
+    if slug and any(cue in normalized for cue in _STATUS_QUERY_CUES):
+        return slug
+    build_words = ("build", "project", "studio", "run", "habit", "tracker", "mvp")
+    if state.studio_slug and any(cue in normalized for cue in _STATUS_QUERY_CUES):
+        if any(word in normalized for word in build_words) or len(normalized.split()) <= 6:
+            return state.studio_slug
+    if normalized.rstrip("?") in {"status", "progress"} and state.studio_slug:
+        return state.studio_slug
+    return None
+
+
+def _attach_studio_project(state: ReplState, slug: str) -> None:
+    if slug != state.studio_slug:
+        state.studio_slug = slug
+        state.studio_history_seen = 0
+        state.studio_last_snapshot = None
+        state.last_studio_activity_key = None
+
+
+def _format_studio_status_panel(project: dict) -> Panel:
+    slug = str(project.get("slug") or "")
+    title = str(project.get("title") or slug)
+    status = str(project.get("status") or "unknown")
+    stage = str(project.get("current_stage") or "—")
+    agent = str(project.get("current_agent") or "—")
+    next_action = str(project.get("next_action") or "").strip()
+    lines = [
+        f"[bold]Slug[/bold]    {slug}",
+        f"[bold]Status[/bold]  {status}",
+        f"[bold]Stage[/bold]   {stage}",
+        f"[bold]Agent[/bold]   {agent}",
+    ]
+    if next_action:
+        lines.append(f"[bold]Next[/bold]     {next_action}")
+    history = project.get("history") or []
+    if isinstance(history, list) and history:
+        lines.append("")
+        lines.append("[bold]Recent[/bold]")
+        for item in history[-5:]:
+            if not isinstance(item, dict):
+                continue
+            event = str(item.get("event") or "")
+            message = str(item.get("message") or "").strip()
+            stage_name = str(item.get("stage") or "").strip()
+            row = _studio_history_label(event)
+            if stage_name:
+                row += f" · {stage_name}"
+            if message:
+                row += f" · {_truncate_studio_text(message, 120)}"
+            lines.append(f"  • {row}")
+    return Panel("\n".join(lines), title=f"Studio · {title}", border_style="cyan", padding=(0, 1))
+
+
+def _show_project_status_in_repl(state: ReplState, slug: str) -> None:
+    try:
+        with httpx.Client(base_url=state.api_url, timeout=30.0) as client:
+            resp = client.get(f"/api/studio/projects/{slug}")
+            if resp.status_code == 404:
+                _add_transcript(state, _info_line(f"project not found: {slug}", "red"))
+                return
+            resp.raise_for_status()
+            project = resp.json()
+    except Exception as exc:
+        _add_transcript(state, _info_line(f"status lookup failed: {exc}", "red"))
+        return
+
+    _attach_studio_project(state, slug)
+    _apply_studio_project_activity(state, project)
+    _add_transcript(state, _format_studio_status_panel(project))
+    _request_repaint(state)
+
+
+async def _cmd_status(state: ReplState, rest: str) -> None:
+    slug = rest.strip() or state.studio_slug
+    if not slug:
+        try:
+            with httpx.Client(base_url=state.api_url, timeout=30.0) as client:
+                resp = client.get("/api/studio/projects")
+                resp.raise_for_status()
+                projects = resp.json().get("projects") or []
+                active = _pick_active_studio_project(projects)
+                if active:
+                    slug = str(active.get("slug") or "").strip()
+                elif projects:
+                    latest = max(
+                        projects,
+                        key=lambda item: float(item.get("updated_at") or item.get("created_at") or 0),
+                    )
+                    slug = str(latest.get("slug") or "").strip()
+        except Exception as exc:
+            _add_transcript(state, _info_line(f"status lookup failed: {exc}", "red"))
+            return
+    if not slug:
+        _add_transcript(
+            state,
+            _info_line("usage: /status [SLUG] — or ask: status of my build", "yellow"),
+        )
+        return
+    _show_project_status_in_repl(state, slug)
+
+
 def _parse_project_command(rest: str) -> Dict[str, Any]:
     usage = _project_usage()
     if not rest:
@@ -1183,12 +1785,14 @@ def _watch_project_in_repl(
     paint: Any,
     prompt_reader: Any,
 ) -> None:
-    seen_history = 0
     seen_clarification: Optional[tuple[str, ...]] = None
     seen_approval: Optional[tuple[Any, ...]] = None
-    last_snapshot: Optional[tuple[str, str, str, str]] = None
     terminal_statuses = {"done", "needs_fixes", "failed"}
     state.studio_slug = slug
+    state.studio_watching = True
+    state.studio_history_seen = 0
+    state.studio_last_snapshot = None
+    state.last_studio_activity_key = None
     try:
         with httpx.Client(base_url=state.api_url, timeout=30.0) as client:
             while True:
@@ -1196,30 +1800,8 @@ def _watch_project_in_repl(
                 resp = client.get(f"/api/studio/projects/{slug}")
                 resp.raise_for_status()
                 project = resp.json()
-                snapshot = _studio_progress_snapshot(project)
-                if snapshot != last_snapshot:
-                    _add_transcript(
-                        state,
-                        _info_line(_format_studio_progress_line(project), "cyan"),
-                    )
-                    last_snapshot = snapshot
+                if _apply_studio_project_activity(state, project):
                     updated = True
-                history = project.get("history") or []
-                if not isinstance(history, list):
-                    history = []
-                for item in history[seen_history:]:
-                    event_name = str(item.get("event") or "")
-                    label = _studio_history_label(event_name)
-                    stage = str(item.get("stage") or "").strip()
-                    message = str(item.get("message") or "").strip()
-                    line = f"{label}"
-                    if stage:
-                        line += f" · {stage}"
-                    if message:
-                        line += f" · {message}"
-                    _add_transcript(state, _info_line(line, "cyan"))
-                    updated = True
-                seen_history = len(history)
                 if updated:
                     paint()
 
@@ -1298,8 +1880,9 @@ def _watch_project_in_repl(
                         if message:
                             _add_transcript(state, _info_line(message, "green"))
                             seen_approval = gate_key
-                            seen_history = len(project.get("history") or [])
-                            last_snapshot = None
+                            state.studio_history_seen = len(project.get("history") or [])
+                            state.studio_last_snapshot = None
+                            state.last_studio_activity_key = None
                             paint()
                             continue
                         _add_transcript(
@@ -1333,6 +1916,8 @@ def _watch_project_in_repl(
     except Exception as exc:
         _add_transcript(state, _info_line(f"project watch failed: {exc}", "red"))
         paint()
+    finally:
+        state.studio_watching = False
 
 
 def _run_project_command(
@@ -2300,6 +2885,12 @@ def _run_plain_prompt(
 
     _add_transcript(state, _user_line(line))
 
+    status_slug = _resolve_status_query_slug(state, line)
+    if status_slug:
+        _show_project_status_in_repl(state, status_slug)
+        paint()
+        return
+
     if _should_route_prompt_to_project(state, line):
         _add_transcript(state, _info_line("routing this into a project build…", "cyan"))
         paint()
@@ -2369,7 +2960,7 @@ def run() -> None:
 
     def _bg() -> None:
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(_ws_listener(state))
+        loop.run_until_complete(_background_listeners(state))
 
     bg_thread = threading.Thread(target=_bg, daemon=True)
     bg_thread.start()
@@ -2393,9 +2984,11 @@ def run() -> None:
     def _paint_snapshot() -> None:
         try:
             console.clear()
-            console.print(_render_layout(state), height=_layout_frame_height())
+            console.print(_render_layout(state), height=_render_height(state))
         except Exception:
             pass
+
+    state.paint_callback = _paint_snapshot
 
     def _prompt_reader(index: int, question: str) -> str:
         del question
