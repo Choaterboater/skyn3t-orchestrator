@@ -3662,6 +3662,29 @@ async def studio_project_clarify(slug: str, payload: dict):
         return _safe_error_response(e)
 
 
+@app.post("/api/studio/projects/{slug}/resume-interrupted")
+async def studio_project_resume_interrupted(slug: str):
+    """Resume a pipeline that was marked interrupted when the server restarted."""
+    runner = _get_studio_runner(app)
+    project = runner.get_project(slug)
+    if project is None:
+        return JSONResponse({"error": "project not found"}, status_code=404)
+    if str(project.get("status") or "").lower() != "interrupted":
+        return JSONResponse(
+            {
+                "error": "project is not interrupted",
+                "status": project.get("status"),
+            },
+            status_code=400,
+        )
+    try:
+        task = asyncio.create_task(runner.resume_interrupted(slug))
+        _track_studio_task(task, runner=runner, slug=slug, action="resuming after interrupt")
+        return {"ok": True, "resuming": slug}
+    except Exception as e:
+        return _safe_error_response(e)
+
+
 @app.post("/api/studio/projects/{slug}/approve")
 async def studio_project_approve(slug: str):
     runner = _get_studio_runner(app)

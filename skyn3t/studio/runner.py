@@ -641,6 +641,57 @@ class StudioRunner:
                     logger.exception("failure thread update failed during resume")
             raise
 
+    async def resume_interrupted(self, slug: str) -> dict:
+        """Resume a project marked ``interrupted`` after a server restart.
+
+        Picks up at the first stage that is not ``done`` in the manifest.
+        """
+        artifact_dir = self.projects_root / slug
+        mf_path = artifact_dir / "project.json"
+        if not mf_path.exists():
+            raise FileNotFoundError(slug)
+        manifest = self._normalize_manifest(json.loads(mf_path.read_text(encoding="utf-8")))
+        status = str(manifest.get("status") or "").strip().lower()
+        if status != "interrupted":
+            raise ValueError(f"project status is {status!r}, not interrupted")
+
+        start_index = 0
+        for idx, stage in enumerate(manifest.get("stages") or []):
+            if isinstance(stage, dict) and str(stage.get("status") or "").lower() != "done":
+                start_index = idx
+                break
+        else:
+            start_index = len(manifest.get("stages") or [])
+
+        stage_name = None
+        stages = manifest.get("stages") or []
+        if start_index < len(stages) and isinstance(stages[start_index], dict):
+            stage_name = str(stages[start_index].get("name") or "")
+
+        manifest["status"] = "running"
+        manifest["error"] = None
+        manifest["completed_at"] = None
+        manifest["next_action"] = (
+            f"Resuming from {stage_name} after server restart."
+            if stage_name
+            else "Resuming after server restart."
+        )
+        if stage_name:
+            manifest["current_stage"] = stage_name
+        self._append_history(
+            manifest,
+            "PROJECT_RESUMED",
+            status="running",
+            stage=stage_name,
+            message=manifest["next_action"],
+        )
+        self._save_manifest(artifact_dir, manifest)
+        self._publish(
+            "PROJECT_RESUMED",
+            {"slug": slug, "stage": stage_name, "reason": "interrupted"},
+        )
+        return await self._resume_pipeline_from(slug, start_index)
+
     async def resume_after_approval(
         self,
         slug: str,
