@@ -70,7 +70,7 @@ def should_spawn_feature(
         return False
 
     lane = str(payload.get("lane") or "").strip().lower()
-    if lane and lane not in {"fit", "activity"}:
+    if lane and lane not in {"fit", "activity", "popularity"}:
         return False
     reuse_risk = str(payload.get("reuse_risk") or "").lower()
     if reuse_risk == "high":

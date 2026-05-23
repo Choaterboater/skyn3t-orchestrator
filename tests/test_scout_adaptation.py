@@ -22,6 +22,15 @@ def test_should_spawn_feature_only_for_scout_github():
     assert should_spawn_feature(payload, source="repo_scout:gitlab", ingested_count=2) is False
 
 
+def test_should_spawn_feature_allows_popularity_lane():
+    payload = {
+        "repo": "octo/trending-tool",
+        "lane": "popularity",
+        "reuse_risk": "low",
+    }
+    assert should_spawn_feature(payload, source="repo_scout:github", ingested_count=1) is True
+
+
 def test_should_spawn_feature_respects_high_reuse_risk(monkeypatch):
     monkeypatch.setattr(
         "skyn3t.config.settings.get_settings",

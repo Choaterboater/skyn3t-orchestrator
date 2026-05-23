@@ -919,19 +919,47 @@ async def test_reject_skill_draft_updates_memory(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_run_github_scout_returns_component_result(monkeypatch):
     class FakeScout:
-        async def run_once(self, config):
+        is_running = False
+
+        def start_background(self, config):
             assert config == {"cadence": "weekly", "limit": 2, "platforms": ["github"]}
-            return {"ok": True, "filed": 1}
+            return {"ok": True, "started": True, "state": "running"}
 
     async def fake_ensure():
         return FakeScout()
 
-    monkeypatch.setattr(web_app, "orchestrator", SimpleNamespace())
+    monkeypatch.setattr(web_app, "orchestrator", SimpleNamespace(running_tasks={}))
     monkeypatch.setattr(web_app, "_ensure_repo_scout", fake_ensure)
+    monkeypatch.setattr(web_app, "_count_active_studio_projects", lambda _app: 0)
 
-    result = await web_app.run_github_scout({"cadence": "weekly", "limit": 2})
+    response = await web_app.run_github_scout({"cadence": "weekly", "limit": 2})
 
-    assert result == {"ok": True, "filed": 1}
+    assert response.status_code == 202
+    body = json.loads(response.body)
+    assert body["started"] is True
+    assert body["state"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_run_github_scout_skips_when_studio_busy(monkeypatch):
+    class FakeScout:
+        is_running = False
+
+        def start_background(self, config):
+            raise AssertionError("should not start when studio busy")
+
+    async def fake_ensure():
+        return FakeScout()
+
+    monkeypatch.setattr(web_app, "orchestrator", SimpleNamespace(running_tasks={}))
+    monkeypatch.setattr(web_app, "_ensure_repo_scout", fake_ensure)
+    monkeypatch.setattr(web_app, "_count_active_studio_projects", lambda _app: 2)
+
+    response = await web_app.run_github_scout({"limit": 1})
+
+    assert response.status_code == 409
+    body = json.loads(response.body)
+    assert body["reason"] == "system_busy"
 
 
 @pytest.mark.asyncio
@@ -969,20 +997,25 @@ async def test_schedule_github_scout_persists_job(monkeypatch):
 @pytest.mark.asyncio
 async def test_run_repo_scout_defaults_to_multi_platform(monkeypatch):
     class FakeScout:
-        async def run_once(self, config):
+        is_running = False
+
+        def start_background(self, config):
             assert config["platforms"] == ["github", "gitlab", "bitbucket"]
             assert config["cadence"] == "weekly"
-            return {"ok": True, "filed": 2}
+            return {"ok": True, "started": True, "state": "running"}
 
     async def fake_ensure():
         return FakeScout()
 
-    monkeypatch.setattr(web_app, "orchestrator", SimpleNamespace())
+    monkeypatch.setattr(web_app, "orchestrator", SimpleNamespace(running_tasks={}))
     monkeypatch.setattr(web_app, "_ensure_repo_scout", fake_ensure)
+    monkeypatch.setattr(web_app, "_count_active_studio_projects", lambda _app: 0)
 
-    result = await web_app.run_repo_scout({"cadence": "weekly"})
+    response = await web_app.run_repo_scout({"cadence": "weekly"})
 
-    assert result == {"ok": True, "filed": 2}
+    assert response.status_code == 202
+    body = json.loads(response.body)
+    assert body["started"] is True
 
 
 @pytest.mark.asyncio

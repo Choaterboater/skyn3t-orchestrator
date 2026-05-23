@@ -133,6 +133,12 @@ class Settings(BaseSettings):
     cortex_scout_spawn_min_ingested: int = Field(
         default=1, alias="SKYN3T_CORTEX_SCOUT_SPAWN_MIN_INGESTED"
     )
+    cortex_scout_skip_when_busy: bool = Field(
+        default=True, alias="SKYN3T_CORTEX_SCOUT_SKIP_WHEN_BUSY"
+    )
+    cortex_scout_run_timeout_seconds: int = Field(
+        default=300, alias="SKYN3T_CORTEX_SCOUT_RUN_TIMEOUT_SECONDS"
+    )
 
     # Execution backend for code agent: inline (fast, no isolation),
     # docker (real sandbox), or auto (probe docker, fall back to inline).

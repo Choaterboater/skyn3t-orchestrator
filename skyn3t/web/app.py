@@ -2676,17 +2676,87 @@ def _normalize_repo_scout_config(
     return payload
 
 
-async def _run_repo_scout(data: Dict[str, Any] | None = None, *, default_platforms: List[str]):
+def _count_active_studio_projects(app) -> int:
+    try:
+        runner = _get_studio_runner(app)
+        projects = runner.list_projects()
+    except Exception:
+        return 0
+    active = {"running", "queued"}
+    return sum(1 for project in projects if str(project.get("status") or "") in active)
+
+
+def _repo_scout_busy_reason(app) -> Optional[str]:
+    if not orchestrator:
+        return None
+    from skyn3t.cortex.repo_scout import MultiSourceRepoScout
+
+    return MultiSourceRepoScout.busy_reason(
+        orchestrator,
+        studio_active=_count_active_studio_projects(app),
+    )
+
+
+async def _repo_scout_status_payload(app) -> Dict[str, Any]:
+    scout = await _ensure_repo_scout()
+    if scout is None:
+        return {"available": False, "state": "unavailable"}
+    status = scout.get_run_status()
+    busy = _repo_scout_busy_reason(app)
+    return {
+        "available": True,
+        "busy_reason": busy,
+        "state": status.get("state"),
+        "last_result": status.get("last_result") or {},
+    }
+
+
+async def _start_repo_scout_background(
+    app,
+    data: Dict[str, Any] | None,
+    *,
+    default_platforms: List[str],
+):
     if not orchestrator:
         return JSONResponse({"error": "orchestrator not initialized"}, status_code=503)
+    busy = _repo_scout_busy_reason(app)
+    if busy:
+        return JSONResponse(
+            {"ok": False, "started": False, "error": busy, "reason": "system_busy"},
+            status_code=409,
+        )
     scout = await _ensure_repo_scout()
     if scout is None:
         return JSONResponse({"error": "repo scout not available"}, status_code=503)
-    result = await scout.run_once(_normalize_repo_scout_config(data, default_platforms=default_platforms))
-    status_code = 200 if result.get("ok") else 400
-    if status_code != 200:
-        return JSONResponse(result, status_code=status_code)
-    return result
+    config = _normalize_repo_scout_config(data, default_platforms=default_platforms)
+    if scout.is_running:
+        return JSONResponse(
+            {
+                "ok": False,
+                "started": False,
+                "error": "repo scout already running",
+                "state": scout.get_run_status(),
+            },
+            status_code=409,
+        )
+    started = scout.start_background(config)
+    return JSONResponse(
+        {
+            **started,
+            "message": "repo scout started in background; poll /api/repo-scout/status",
+            "status_url": "/api/repo-scout/status",
+        },
+        status_code=202,
+    )
+
+
+async def _run_repo_scout(data: Dict[str, Any] | None = None, *, default_platforms: List[str]):
+    """Non-blocking: returns 202 immediately; poll status endpoint for results."""
+    return await _start_repo_scout_background(
+        app,
+        data,
+        default_platforms=default_platforms,
+    )
 
 
 async def _schedule_repo_scout(
@@ -2723,6 +2793,18 @@ async def _schedule_repo_scout(
         run_count=0,
     )
     return {"job_id": job_id, "name": name, "created": True, "config": config}
+
+
+@app.get("/api/repo-scout/status")
+async def repo_scout_status():
+    """Poll background repo scout progress without blocking the server."""
+    return await _repo_scout_status_payload(app)
+
+
+@app.get("/api/github/scout/status")
+async def github_scout_status():
+    """Poll background GitHub scout progress."""
+    return await _repo_scout_status_payload(app)
 
 
 @app.post("/api/repo-scout/run")

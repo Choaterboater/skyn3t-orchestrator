@@ -47,6 +47,72 @@ class MultiSourceRepoScout:
         self.max_per_run = max_per_run
         self._wired = False
         self._last_result: Dict[str, Any] = {}
+        self._run_task: Optional[asyncio.Task] = None
+        self._run_state: str = "idle"
+
+    @property
+    def is_running(self) -> bool:
+        task = self._run_task
+        return task is not None and not task.done()
+
+    def get_run_status(self) -> Dict[str, Any]:
+        return {
+            "state": "running" if self.is_running else self._run_state,
+            "last_result": dict(self._last_result or {}),
+        }
+
+    def start_background(self, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Schedule ``run_once`` without blocking the caller."""
+        if self.is_running:
+            return {
+                "ok": False,
+                "started": False,
+                "error": "repo scout already running",
+                "status": self.get_run_status(),
+            }
+        cfg = dict(config or {})
+        self._run_state = "running"
+        self._run_task = asyncio.create_task(self._run_once_guarded(cfg))
+        self._run_task.add_done_callback(self._clear_run_task)
+        return {"ok": True, "started": True, "state": "running"}
+
+    def _clear_run_task(self, task: asyncio.Task) -> None:
+        self._run_task = None
+        if self._run_state == "running":
+            self._run_state = "completed" if not task.cancelled() else "cancelled"
+
+    async def _run_once_guarded(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        timeout = 300
+        try:
+            from skyn3t.config.settings import get_settings
+
+            timeout = max(
+                30,
+                int(getattr(get_settings(), "cortex_scout_run_timeout_seconds", 300)),
+            )
+        except Exception:
+            pass
+        try:
+            result = await asyncio.wait_for(self.run_once(config), timeout=timeout)
+            self._run_state = "completed" if result.get("ok") else "failed"
+            return result
+        except asyncio.TimeoutError:
+            logger.warning("repo scout run timed out after %ss", timeout)
+            result = {
+                "ok": False,
+                "error": f"repo scout timed out after {timeout}s",
+                "filed": 0,
+                "proposals": [],
+            }
+            self._last_result = result
+            self._run_state = "failed"
+            return result
+        except Exception as exc:
+            logger.exception("repo scout background run failed")
+            result = {"ok": False, "error": str(exc), "filed": 0, "proposals": []}
+            self._last_result = result
+            self._run_state = "failed"
+            return result
 
     def start(self) -> None:
         if self._wired:
@@ -74,6 +140,8 @@ class MultiSourceRepoScout:
         return {
             "wired": self._wired,
             "last_result": self._last_result,
+            "running": self.is_running,
+            "state": "running" if self.is_running else self._run_state,
         }
 
     def _on_event(self, event) -> None:
@@ -83,16 +151,38 @@ class MultiSourceRepoScout:
         scheduled = payload.get("payload") or {}
         if scheduled.get("agent_name") not in {"github_repo_scout", "repo_scout"}:
             return
+        if self.is_running:
+            logger.info("repo scout skipped scheduled run — already running")
+            return
+        if self._system_too_busy_for_orchestrator(self.orchestrator):
+            logger.info("repo scout skipped scheduled run — system busy")
+            return
         prompt = str(scheduled.get("prompt") or "").strip()
         config = self._parse_prompt_config(prompt)
-        task = asyncio.create_task(self.run_once(config))
-        task.add_done_callback(self._log_done)
+        self.start_background(config)
 
     @staticmethod
-    def _log_done(fut: "asyncio.Future[Any]") -> None:
-        exc = fut.exception()
-        if exc is not None:
-            logger.error("repo scout background task failed", exc_info=exc)
+    def _system_too_busy_for_orchestrator(orchestrator) -> bool:
+        return (
+            MultiSourceRepoScout.busy_reason(orchestrator, studio_active=0) is not None
+        )
+
+    @classmethod
+    def busy_reason(cls, orchestrator, *, studio_active: int = 0) -> Optional[str]:
+        """Return a human-readable reason when scout should not start."""
+        try:
+            from skyn3t.config.settings import get_settings
+
+            if not getattr(get_settings(), "cortex_scout_skip_when_busy", True):
+                return None
+        except Exception:
+            return None
+        if studio_active > 0:
+            return f"{studio_active} studio project(s) running or queued"
+        running = len(getattr(orchestrator, "running_tasks", {}) or {})
+        if running > 0:
+            return f"{running} orchestrator task(s) in flight"
+        return None
 
     @staticmethod
     def _parse_prompt_config(prompt: str) -> Dict[str, Any]:

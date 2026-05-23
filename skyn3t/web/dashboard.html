@@ -1926,6 +1926,18 @@
         .proposal-review-head { display: flex; justify-content: space-between; gap: .75rem; align-items: flex-start; }        .proposal-review-summary { color: var(--text-secondary); font-size: .75rem; line-height: 1.45; }
         .proposal-review-meta { display: flex; gap: .5rem; flex-wrap: wrap; color: var(--text-dim); font-size: .7rem; }
         .proposal-review-actions { display: flex; gap: .45rem; flex-wrap: wrap; margin-top: .15rem; }
+        .scout-status-panel {
+            font-size: .75rem;
+            line-height: 1.45;
+            padding: .65rem .75rem;
+            border-radius: var(--radius-md, .65rem);
+            border: 1px solid var(--border);
+            background: rgba(0, 0, 0, .12);
+        }
+        .scout-status-panel.running { border-color: rgba(201, 169, 110, .35); color: var(--text-secondary); }
+        .scout-status-panel.ok { border-color: rgba(74, 222, 128, .25); }
+        .scout-status-panel.warn { border-color: rgba(250, 204, 21, .35); }
+        .scout-status-panel.err { border-color: rgba(248, 113, 113, .35); }
 
         .capabilities-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: .65rem; }
         .cap-row { background: var(--bg-2); border-left: 2px solid var(--cyan); padding: .55rem .85rem; border-radius: .35rem; }
@@ -2936,6 +2948,9 @@
                         <i class="fa-solid fa-bell"></i>
                         <span id="tbPendingCount">0</span>
                     </button>
+                    <button class="btn btn-xs" type="button" onclick="runGithubScoutFromUI(true)" title="Discover repos and ingest into RAG">
+                        <i class="fa-brands fa-github"></i> Scout
+                    </button>
                     <button class="btn btn-xs" type="button" onclick="openSuggestModal()" title="Suggest improvement">
                         <i class="fa-solid fa-lightbulb"></i> Suggest
                     </button>
@@ -3034,6 +3049,7 @@
                                 <h3><i class="fa-solid fa-wand-magic-sparkles"></i> Self-update inbox</h3>
                                 <span class="right" style="display:flex;align-items:center;gap:.5rem;">
                                     <span id="overviewProposalBadge" class="badge hidden">0 pending</span>
+                                    <button class="btn btn-ghost btn-xs" type="button" onclick="runGithubScoutFromUI(true)"><i class="fa-brands fa-github"></i> Run scout</button>
                                     <button class="btn btn-ghost btn-xs" onclick="showPage('cortex')"><i class="fa-solid fa-up-right-from-square"></i> Open Cortex</button>
                                 </span>
                             </div>
@@ -3440,11 +3456,33 @@
                         </div>
                         <div class="page-actions">
                             <span id="cortexHeaderBadge" class="badge hidden" style="margin:0">0 pending</span>
+                            <button class="btn btn-primary" id="scoutRunHeaderBtn" type="button" onclick="runGithubScoutFromUI()"><i class="fa-brands fa-github"></i> Run GitHub Scout</button>
                             <button class="btn" onclick="loadProposals()"><i class="fa-solid fa-rotate"></i> Refresh</button>
                             <button class="btn" id="cortexResetServicesBtn" onclick="resetServices(this)"><i class="fa-solid fa-power-off"></i> Reset services</button>
                         </div>
                     </div>
                     <div class="page-body grid-12">
+                        <div class="ui-card col-12" id="cortexScoutCard">
+                            <div class="card-h">
+                                <h3><i class="fa-brands fa-github"></i> GitHub Scout</h3>
+                                <span class="right"><span id="scoutStatePill" class="pill">idle</span></span>
+                            </div>
+                            <div class="card-b">
+                                <p class="muted" style="font-size:.75rem;margin:0 0 .75rem;line-height:1.45">Discover public repos, auto-ingest docs into RAG, and file adapt-to-SkyN3t proposals for your review — no curl required.</p>
+                                <div style="display:flex;gap:.65rem;flex-wrap:wrap;align-items:flex-end;margin-bottom:.65rem">
+                                    <div class="form-group" style="flex:1;min-width:220px;margin:0">
+                                        <label for="scoutQueryInput">Search focus</label>
+                                        <input id="scoutQueryInput" type="text" value="multi agent orchestrator rag cortex" placeholder="GitHub search query">
+                                    </div>
+                                    <div class="form-group" style="width:88px;margin:0">
+                                        <label for="scoutLimitInput">Limit</label>
+                                        <input id="scoutLimitInput" type="number" min="1" max="10" value="2">
+                                    </div>
+                                    <button class="btn btn-primary" id="scoutRunBtn" type="button" onclick="runGithubScoutFromUI()"><i class="fa-solid fa-radar"></i> Run scout</button>
+                                </div>
+                                <div id="scoutStatusPanel" class="scout-status-panel muted">Idle — scout runs in the background and skips automatically while Studio builds are active.</div>
+                            </div>
+                        </div>
                         <div class="ui-card col-3"><div class="card-b"><div class="cortex-card-label">Pending</div><div class="cortex-card-value" id="cortexPending">0</div></div></div>
                         <div class="ui-card col-3"><div class="card-b"><div class="cortex-card-label">Approved (24h)</div><div class="cortex-card-value" id="cortexApproved">0</div></div></div>
                         <div class="ui-card col-3"><div class="card-b"><div class="cortex-card-label">Rejected (24h)</div><div class="cortex-card-value" id="cortexRejected">0</div></div></div>
@@ -3741,6 +3779,9 @@
             }
             if (normalizedPage === 'rag') {
                 loadRAGOverview();
+            }
+            if (normalizedPage === 'cortex') {
+                refreshScoutStatusPanel();
             }
         }
 
@@ -9418,6 +9459,143 @@
             return { update: (newRows) => { state.rows = newRows.slice(); render(); } };
         }
 
+        // ─── GitHub Scout (Cortex) ───
+        let _scoutPollTimer = null;
+
+        function _setScoutUiRunning(running) {
+            ['scoutRunBtn', 'scoutRunHeaderBtn'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.disabled = !!running;
+            });
+            const pill = document.getElementById('scoutStatePill');
+            if (pill) {
+                pill.textContent = running ? 'running' : (pill.dataset.last || 'idle');
+            }
+        }
+
+        function _renderScoutStatus(st) {
+            const panel = document.getElementById('scoutStatusPanel');
+            const pill = document.getElementById('scoutStatePill');
+            if (!panel) return;
+            const state = String(st.state || 'idle');
+            const busy = st.busy_reason ? String(st.busy_reason) : '';
+            const lr = st.last_result || {};
+            panel.classList.remove('running', 'ok', 'warn', 'err');
+
+            if (busy && state === 'running') {
+                panel.classList.add('warn');
+                panel.textContent = `Waiting — ${busy}`;
+            } else if (state === 'running') {
+                panel.classList.add('running');
+                panel.textContent = 'Scout running… discovering repos, ingesting docs, and filing proposals.';
+            } else if (lr.ok) {
+                panel.classList.add('ok');
+                const filed = lr.filed || 0;
+                const repos = (lr.proposals || []).map(p => p.repo || p.full_name).filter(Boolean);
+                const repoLine = repos.length ? repos.join(', ') : 'none';
+                const warns = (lr.warnings || []).slice(0, 2).join(' · ');
+                panel.textContent = `Done — filed ${filed} proposal(s): ${repoLine}${warns ? ' · ' + warns : ''}`;
+            } else if (lr.error || state === 'failed') {
+                panel.classList.add('err');
+                panel.textContent = lr.error || busy || 'Scout finished with errors.';
+            } else if (busy) {
+                panel.classList.add('warn');
+                panel.textContent = `Skipped — ${busy}`;
+            } else {
+                panel.textContent = 'Idle — scout runs in the background and skips automatically while Studio builds are active.';
+            }
+
+            if (pill) {
+                pill.textContent = state;
+                pill.dataset.last = state;
+            }
+            _setScoutUiRunning(state === 'running');
+        }
+
+        async function refreshScoutStatusPanel() {
+            try {
+                const st = await fetchJSON('/api/github/scout/status');
+                _renderScoutStatus(st);
+                if (st.state === 'running') _pollScoutUntilDone();
+            } catch (e) {
+                const panel = document.getElementById('scoutStatusPanel');
+                if (panel) panel.textContent = 'Could not load scout status.';
+            }
+        }
+
+        function _pollScoutUntilDone() {
+            if (_scoutPollTimer) return;
+            _scoutPollTimer = setInterval(async () => {
+                try {
+                    const st = await fetchJSON('/api/github/scout/status');
+                    _renderScoutStatus(st);
+                    if (st.state !== 'running') {
+                        clearInterval(_scoutPollTimer);
+                        _scoutPollTimer = null;
+                        const lr = st.last_result || {};
+                        if (lr.ok) {
+                            const filed = lr.filed || 0;
+                            showToast({
+                                kind: 'success',
+                                title: 'GitHub scout finished',
+                                body: filed
+                                    ? `Filed ${filed} proposal(s). Review pending items below and approve to apply.`
+                                    : 'Scout finished — check warnings in the scout panel.',
+                            });
+                        } else if (st.busy_reason) {
+                            showToast({ kind: 'warning', title: 'Scout skipped', body: st.busy_reason });
+                        } else if (lr.error) {
+                            showToast({ kind: 'error', title: 'Scout failed', body: lr.error });
+                        }
+                        if (typeof loadProposals === 'function') await loadProposals();
+                    }
+                } catch (e) {
+                    // keep polling through transient errors
+                }
+            }, 2500);
+        }
+
+        async function runGithubScoutFromUI(navigateToCortex) {
+            if (navigateToCortex) showPage('cortex');
+            const queryEl = document.getElementById('scoutQueryInput');
+            const limitEl = document.getElementById('scoutLimitInput');
+            const query = queryEl ? queryEl.value.trim() : '';
+            const limit = limitEl ? Math.max(1, Math.min(10, parseInt(limitEl.value, 10) || 2)) : 2;
+            _setScoutUiRunning(true);
+            const panel = document.getElementById('scoutStatusPanel');
+            if (panel) {
+                panel.classList.remove('ok', 'warn', 'err');
+                panel.classList.add('running');
+                panel.textContent = 'Starting scout…';
+            }
+            try {
+                const resp = await fetch('/api/github/scout/run', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ limit, queries: query ? [query] : [] }),
+                });
+                const data = await resp.json().catch(() => ({}));
+                if (resp.status === 409) {
+                    const reason = data.error || data.reason || 'system busy';
+                    _renderScoutStatus({ state: 'idle', busy_reason: reason, last_result: {} });
+                    showToast({ kind: 'warning', title: 'Scout skipped', body: reason });
+                    return;
+                }
+                if (!resp.ok && resp.status !== 202) {
+                    throw new Error(data.error || data.detail || `HTTP ${resp.status}`);
+                }
+                _renderScoutStatus({ state: 'running', last_result: {} });
+                _pollScoutUntilDone();
+            } catch (e) {
+                _setScoutUiRunning(false);
+                if (panel) {
+                    panel.classList.add('err');
+                    panel.textContent = 'Scout failed to start.';
+                }
+                notifyDashboardError('scout-run', 'Scout failed', e.message || 'unknown error');
+            }
+        }
+
         // ─── Suggest Improvement ───
         function openSuggestModal() {
           document.getElementById('suggestText').value = '';
@@ -10182,6 +10360,13 @@
                 });
             });
             // Actions
+            items.push({
+                group: 'Actions',
+                label: 'Run GitHub Scout',
+                sub: 'discover repos · ingest docs · file proposals',
+                icon: 'fa-brands fa-github',
+                run: () => { try { runGithubScoutFromUI(true); } catch (_) {} },
+            });
             items.push({
                 group: 'Actions',
                 label: 'Suggest improvement',
