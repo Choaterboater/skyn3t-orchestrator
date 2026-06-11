@@ -371,9 +371,17 @@ async def lifespan(app: FastAPI):
     orchestrator.enable_memory()
     orchestrator.enable_consciousness()
     orchestrator.enable_experience_ingestion()
+    orchestrator.enable_reflection()
     orchestrator.enable_self_tuning()
     orchestrator.enable_meta_agent()
+    orchestrator.set_studio_runner_getter(lambda: _get_studio_runner(app))
     await orchestrator.start()
+    try:
+        from skyn3t.core.openrouter_catalog import schedule_background_sync
+
+        schedule_background_sync()
+    except Exception:
+        logger.exception("openrouter catalog sync schedule failed")
     try:
         app.state.proposal_recovery = await _resume_cortex_proposals()
     except Exception:
@@ -1288,11 +1296,25 @@ def _invalidate_policy_llm_cache(stage_names: List[str]) -> None:
 
 @app.get("/api/routing/policy")
 async def routing_policy_get():
-    from skyn3t.core.model_router import available_tiers, list_stage_routes
+    from skyn3t.core.model_router import (
+        available_tiers,
+        list_stage_routes,
+        studio_quality_policies,
+    )
 
     return {
         "tiers": available_tiers(),
         "routes": list_stage_routes(),
+        "presets": {
+            "studio_quality": {
+                "label": "Studio Quality (OpenRouter)",
+                "description": (
+                    "Strong code + review tiers, UI designer tier, cheap fan-out "
+                    "for brainstorm/research. Matches skyn3t wizard."
+                ),
+                "policies": studio_quality_policies(),
+            },
+        },
     }
 
 
@@ -1368,6 +1390,111 @@ async def routing_policy_delete(stage_name: str):
         "stage": stage_name.strip().lower(),
         "tiers": available_tiers(),
         "routes": list_stage_routes(),
+    }
+
+
+@app.post("/api/routing/presets/studio-quality")
+async def routing_preset_studio_quality():
+    """Apply the Studio Quality OpenRouter routing preset (wizard default)."""
+    from skyn3t.config.model_routing import get_model_routing_store
+    from skyn3t.core.model_router import (
+        available_tiers,
+        list_stage_routes,
+        studio_quality_policies,
+    )
+
+    policies = studio_quality_policies()
+    updates = {
+        stage: {"tier": tier, "applied_via": "manual"}
+        for stage, tier in policies.items()
+    }
+    get_model_routing_store().set_entries(updates)
+    _invalidate_policy_llm_cache(list(updates))
+    return {
+        "ok": True,
+        "preset": "studio_quality",
+        "updated": sorted(updates),
+        "tiers": available_tiers(),
+        "routes": list_stage_routes(),
+    }
+
+
+_VALID_EXECUTION_BACKENDS = frozenset({"auto", "inline", "docker", "docker-pool"})
+
+
+@app.get("/api/execution/backend")
+async def execution_backend_get():
+    """Configured CodeAgent sandbox backend and Docker availability."""
+    import os
+
+    from skyn3t.config.settings import get_settings
+    from skyn3t.security.sandbox import DockerPoolBackend, get_backend
+
+    settings = get_settings()
+    configured = str(settings.execution_backend or "auto").strip().lower()
+    docker_available = await DockerPoolBackend().available()
+    resolved = "inline"
+    resolved_class = "InlineBackend"
+    try:
+        backend = await get_backend(configured)
+        resolved_class = backend.__class__.__name__
+        if resolved_class == "DockerPoolBackend":
+            resolved = "docker-pool"
+        elif resolved_class == "DockerBackend":
+            resolved = "docker"
+        else:
+            resolved = "inline"
+    except Exception as exc:
+        logger.debug("execution backend probe failed: %s", exc)
+
+    return {
+        "configured": configured,
+        "resolved": resolved,
+        "resolved_class": resolved_class,
+        "docker_available": docker_available,
+        "valid_backends": sorted(_VALID_EXECUTION_BACKENDS),
+        "auto_retry": os.environ.get("SKYN3T_AUTO_RETRY", "0").strip() == "1",
+    }
+
+
+@app.patch("/api/execution/backend")
+async def execution_backend_patch(payload: Dict[str, Any]):
+    """Persist SKYN3T_EXECUTION_BACKEND to .env and reload settings."""
+    import os
+
+    from skyn3t.config.env_file import env_file_path, upsert_env_setting
+    from skyn3t.config.settings import get_settings
+    from skyn3t.security.sandbox import DockerPoolBackend, get_backend
+
+    backend = str(payload.get("backend") or "").strip().lower()
+    if backend not in _VALID_EXECUTION_BACKENDS:
+        return JSONResponse(
+            {
+                "error": f"unknown backend '{backend}'",
+                "valid_backends": sorted(_VALID_EXECUTION_BACKENDS),
+            },
+            status_code=400,
+        )
+    if backend in {"docker", "docker-pool"} and not await DockerPoolBackend().available():
+        return JSONResponse(
+            {
+                "error": "Docker is not available on this host",
+                "hint": "Install Docker or use backend=auto for inline fallback",
+            },
+            status_code=400,
+        )
+
+    env_path = env_file_path()
+    upsert_env_setting(env_path, "SKYN3T_EXECUTION_BACKEND", backend)
+    os.environ["SKYN3T_EXECUTION_BACKEND"] = backend
+    get_settings.cache_clear()
+
+    resolved_class = (await get_backend(backend)).__class__.__name__
+    return {
+        "ok": True,
+        "configured": backend,
+        "resolved_class": resolved_class,
+        "env_path": str(env_path),
     }
 
 
@@ -1590,6 +1717,25 @@ async def llm_backends():
 async def llm_models(backend: str = "auto"):
     from skyn3t.adapters.model_catalog import list_models
     return {"backend": backend, "models": await list_models(backend)}
+
+
+@app.get("/api/models/openrouter")
+async def openrouter_models(refresh: bool = False):
+    """OpenRouter catalog for the dashboard (cached, 24h TTL)."""
+    from skyn3t.core.openrouter_catalog import (
+        get_catalog_async,
+        is_sync_enabled,
+        sync_catalog,
+        validate_tier_models,
+    )
+
+    if refresh and is_sync_enabled():
+        await sync_catalog(force=True)
+    snap = await get_catalog_async()
+    payload = snap.to_dict()
+    payload["sync_enabled"] = is_sync_enabled()
+    payload["tier_validation"] = validate_tier_models()
+    return payload
 
 
 def _resolve_repl_chat_defaults(
@@ -2404,6 +2550,25 @@ async def install_skill(request: Request):
     return JSONResponse({"error": f"source not found: {source}"}, status_code=400)
 
 
+@app.get("/api/skills/hub")
+async def skills_hub_catalog():
+    """List installable skills from the local Skills Hub seed directories."""
+    from skyn3t.intelligence.skills_hub import list_hub_entries
+
+    return list_hub_entries()
+
+
+@app.post("/api/skills/hub/install")
+async def skills_hub_install(request: Request):
+    """Install all safe skills from the local Skills Hub."""
+    from skyn3t.intelligence.skills_hub import install_from_hub
+
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    only_missing = bool(body.get("only_missing", True))
+    result = install_from_hub(only_missing=only_missing, reject_unsafe=True)
+    return result
+
+
 @app.delete("/api/skills/{name}")
 async def delete_skill(name: str):
     """Remove a skill by name."""
@@ -2676,17 +2841,87 @@ def _normalize_repo_scout_config(
     return payload
 
 
-async def _run_repo_scout(data: Dict[str, Any] | None = None, *, default_platforms: List[str]):
+def _count_active_studio_projects(app) -> int:
+    try:
+        runner = _get_studio_runner(app)
+        projects = runner.list_projects()
+    except Exception:
+        return 0
+    active = {"running", "queued"}
+    return sum(1 for project in projects if str(project.get("status") or "") in active)
+
+
+def _repo_scout_busy_reason(app) -> Optional[str]:
+    if not orchestrator:
+        return None
+    from skyn3t.cortex.repo_scout import MultiSourceRepoScout
+
+    return MultiSourceRepoScout.busy_reason(
+        orchestrator,
+        studio_active=_count_active_studio_projects(app),
+    )
+
+
+async def _repo_scout_status_payload(app) -> Dict[str, Any]:
+    scout = await _ensure_repo_scout()
+    if scout is None:
+        return {"available": False, "state": "unavailable"}
+    status = scout.get_run_status()
+    busy = _repo_scout_busy_reason(app)
+    return {
+        "available": True,
+        "busy_reason": busy,
+        "state": status.get("state"),
+        "last_result": status.get("last_result") or {},
+    }
+
+
+async def _start_repo_scout_background(
+    app,
+    data: Dict[str, Any] | None,
+    *,
+    default_platforms: List[str],
+):
     if not orchestrator:
         return JSONResponse({"error": "orchestrator not initialized"}, status_code=503)
+    busy = _repo_scout_busy_reason(app)
+    if busy:
+        return JSONResponse(
+            {"ok": False, "started": False, "error": busy, "reason": "system_busy"},
+            status_code=409,
+        )
     scout = await _ensure_repo_scout()
     if scout is None:
         return JSONResponse({"error": "repo scout not available"}, status_code=503)
-    result = await scout.run_once(_normalize_repo_scout_config(data, default_platforms=default_platforms))
-    status_code = 200 if result.get("ok") else 400
-    if status_code != 200:
-        return JSONResponse(result, status_code=status_code)
-    return result
+    config = _normalize_repo_scout_config(data, default_platforms=default_platforms)
+    if scout.is_running:
+        return JSONResponse(
+            {
+                "ok": False,
+                "started": False,
+                "error": "repo scout already running",
+                "state": scout.get_run_status(),
+            },
+            status_code=409,
+        )
+    started = scout.start_background(config)
+    return JSONResponse(
+        {
+            **started,
+            "message": "repo scout started in background; poll /api/repo-scout/status",
+            "status_url": "/api/repo-scout/status",
+        },
+        status_code=202,
+    )
+
+
+async def _run_repo_scout(data: Dict[str, Any] | None = None, *, default_platforms: List[str]):
+    """Non-blocking: returns 202 immediately; poll status endpoint for results."""
+    return await _start_repo_scout_background(
+        app,
+        data,
+        default_platforms=default_platforms,
+    )
 
 
 async def _schedule_repo_scout(
@@ -2723,6 +2958,36 @@ async def _schedule_repo_scout(
         run_count=0,
     )
     return {"job_id": job_id, "name": name, "created": True, "config": config}
+
+
+@app.get("/api/github/scout/config")
+async def github_scout_config():
+    """Scout UI config — auto mode ranks trending + relevance; no manual search required."""
+    from skyn3t.config.settings import get_settings
+
+    settings = get_settings()
+    return {
+        "mode": "auto",
+        "default_limit": max(1, min(int(settings.cortex_scout_default_limit), 10)),
+        "discovery_lanes": ["trending", "fit", "activity"],
+        "summary": (
+            "Scout discovers candidates from GitHub trending and internal relevance "
+            "signals, then files the top matches by score (fit lane, license safety, "
+            "and SkyN3t-related metadata — not a fixed search string)."
+        ),
+    }
+
+
+@app.get("/api/repo-scout/status")
+async def repo_scout_status():
+    """Poll background repo scout progress without blocking the server."""
+    return await _repo_scout_status_payload(app)
+
+
+@app.get("/api/github/scout/status")
+async def github_scout_status():
+    """Poll background GitHub scout progress."""
+    return await _repo_scout_status_payload(app)
 
 
 @app.post("/api/repo-scout/run")
@@ -3155,6 +3420,14 @@ async def swarm_snapshot():
 
 
 # ─── Proposals (Cortex) ───
+@app.get("/api/autonomous/status")
+async def autonomous_status():
+    """Autonomous learning + build queue visibility for the dashboard."""
+    if not orchestrator:
+        return JSONResponse({"error": "orchestrator not initialized"}, status_code=503)
+    return orchestrator.get_autonomous_status()
+
+
 @app.get("/api/cortex/status")
 async def cortex_status():
     if orchestrator and hasattr(orchestrator, "get_cortex_status"):
@@ -3450,6 +3723,8 @@ async def studio_start(payload: dict):
         return JSONResponse({"error": "missing template"}, status_code=400)
     runner = _get_studio_runner(app)
     extra = payload.get("extra") or {}
+    if not extra.get("autonomous"):
+        logger.info("studio start (manual) template=%s brief=%s", template_key, brief[:80])
     try:
         # reserve_project performs a sync `git rev-parse` subprocess (timeout=10s)
         # via repo_target.resolve_repo_target; run it off the event loop so the
