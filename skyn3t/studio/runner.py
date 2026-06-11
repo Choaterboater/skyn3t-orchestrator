@@ -76,6 +76,14 @@ class StudioRunner:
     MAX_CONCURRENT_PROJECTS = 3
 
     @classmethod
+    def configure_max_concurrent(cls, n: int) -> None:
+        """Raise or lower the shared Studio concurrency limit (e.g. agent fleet)."""
+        n = max(1, min(int(n), 64))
+        cls.MAX_CONCURRENT_PROJECTS = n
+        cls._concurrency_sem = asyncio.Semaphore(n)
+        logger.info("StudioRunner max concurrent projects set to %d", n)
+
+    @classmethod
     def _get_sem(cls) -> asyncio.Semaphore:
         if cls._concurrency_sem is None:
             cls._concurrency_sem = asyncio.Semaphore(cls.MAX_CONCURRENT_PROJECTS)
@@ -1059,6 +1067,19 @@ class StudioRunner:
             )
 
         try:
+            from skyn3t.intelligence.cheap_smart import (
+                auto_apply_cheaper_routing,
+                cheap_smart_enabled,
+                clear_project_context,
+                set_project_context,
+            )
+
+            set_project_context(slug)
+            manifest["cheap_smart"] = cheap_smart_enabled()
+            if cheap_smart_enabled():
+                applied = auto_apply_cheaper_routing()
+                if applied:
+                    manifest["cheap_smart_routing_applied"] = applied
             self._init_benchmark(manifest)
             # Auto-detect target_file from the brief (e.g. "target_file: skyn3t/web/dashboard.html").
             # Also infer from common phrasings so users don't have to type the keyword.
@@ -1201,6 +1222,23 @@ class StudioRunner:
                 # router mount in past runs, tell the CodeAgent to
                 # double-check the mount lines before handoff.
                 if stage.name == "code":
+                    try:
+                        from skyn3t.worktree import ensure_worktree, worktree_enabled_for_extra
+
+                        if worktree_enabled_for_extra(extra if isinstance(extra, dict) else None):
+                            track = "default"
+                            if isinstance(extra, dict) and extra.get("fleet_slot") is not None:
+                                track = f"slot-{extra.get('fleet_slot')}"
+                            wt = ensure_worktree(artifact_dir / "scaffold", track_id=track)
+                            input_data["code_scaffold_dir"] = str(wt.worktree_path)
+                            manifest["worktree"] = {
+                                "track": track,
+                                "branch": wt.branch,
+                                "path": str(wt.worktree_path),
+                            }
+                            self._save_manifest(artifact_dir, manifest)
+                    except Exception:
+                        logger.debug("worktree setup skipped", exc_info=True)
                     pre_warnings = self._scoreboard_prewarnings(brief)
                     if pre_warnings:
                         input_data["scoreboard_prewarnings"] = pre_warnings
@@ -1349,13 +1387,11 @@ class StudioRunner:
                         error=stage_error,
                     )
                     self._save_manifest(artifact_dir, manifest)
-                    # Record stage timeout as a 'no' verdict for the
-                    # scoreboard so self-learning sees the failure. The
-                    # scoreboard otherwise only learns from verifier
-                    # outcomes — but stage timeouts that never reach the
-                    # verifier ARE failures, and the meta-agent should
-                    # see them. Whatever partial scaffold exists is the
-                    # shape that failed.
+                    self._maybe_escalate_cheap_smart(
+                        slug=slug,
+                        stage_name=stage.name,
+                        reason="stage timeout",
+                    )
                     if stage.name == "code":
                         try:
                             from skyn3t.intelligence.build_patterns import (
@@ -1432,6 +1468,11 @@ class StudioRunner:
                         error=stage_error,
                     )
                     self._save_manifest(artifact_dir, manifest)
+                    self._maybe_escalate_cheap_smart(
+                        slug=slug,
+                        stage_name=stage.name,
+                        reason=f"stage failed: {stage_error[:120]}",
+                    )
                     # Same scoreboard hook as the timeout path — record
                     # a code-stage exception as 'no' verdict so the
                     # learner sees it.
@@ -1621,6 +1662,11 @@ class StudioRunner:
                                 "CONTRACT_VERIFIER_BLOCKERS",
                                 status="running",
                                 message=f"{blockers} blocker(s) found by contract verifier.",
+                            )
+                            self._maybe_escalate_cheap_smart(
+                                slug=slug,
+                                stage_name="code",
+                                reason="contract verifier blockers",
                             )
                             try:
                                 import json as _json
@@ -2734,6 +2780,7 @@ class StudioRunner:
                     ),
                     "status": manifest["status"],
                     "verdict": (manifest.get("quality_summary") or {}).get("verdict") or "",
+                    "reviewer_score": (manifest.get("quality_summary") or {}).get("score"),
                     "stack": manifest.get("stack") or "",
                     "feature_tags": _feature_tags,
                     "message": completion_message,
@@ -2861,6 +2908,30 @@ class StudioRunner:
             except Exception:
                 logger.exception("failure thread update failed")
             raise
+        finally:
+            try:
+                from skyn3t.intelligence.cheap_smart import clear_project_context
+
+                clear_project_context(slug)
+            except Exception:
+                logger.debug("cheap_smart context cleanup failed", exc_info=True)
+
+    def _maybe_escalate_cheap_smart(
+        self,
+        *,
+        slug: str,
+        stage_name: str,
+        reason: str,
+    ) -> None:
+        """Escalate a stage to strong tier when cheap-first underperforms."""
+        try:
+            from skyn3t.intelligence.cheap_smart import cheap_smart_enabled, escalate_stage
+
+            if not cheap_smart_enabled():
+                return
+            escalate_stage(stage_name, project_slug=slug, reason=reason)
+        except Exception:
+            logger.debug("cheap_smart escalation failed", exc_info=True)
 
     def list_projects(self) -> List[dict]:
         """Return every project manifest under ``projects_root``."""
@@ -4162,6 +4233,12 @@ class StudioRunner:
                         "resolved": False,
                     },
                 )
+                if stage.name == "code":
+                    self._maybe_escalate_cheap_smart(
+                        slug=artifact_dir.name,
+                        stage_name="code",
+                        reason="critique unresolved after max rounds",
+                    )
                 return current_result
 
         # Defensive fallback
@@ -4174,6 +4251,12 @@ class StudioRunner:
                 "resolved": False,
             },
         )
+        if stage.name == "code":
+            self._maybe_escalate_cheap_smart(
+                slug=artifact_dir.name,
+                stage_name="code",
+                reason="critique unresolved",
+            )
         return current_result
 
     def _collect_stage_artifacts(

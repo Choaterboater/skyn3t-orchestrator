@@ -377,8 +377,10 @@ async def lifespan(app: FastAPI):
     orchestrator.set_studio_runner_getter(lambda: _get_studio_runner(app))
     await orchestrator.start()
     try:
+        from skyn3t.core.model_evolution import set_evolution_event_bus
         from skyn3t.core.openrouter_catalog import schedule_background_sync
 
+        set_evolution_event_bus(orchestrator.event_bus)
         schedule_background_sync()
     except Exception:
         logger.exception("openrouter catalog sync schedule failed")
@@ -1721,8 +1723,10 @@ async def llm_models(backend: str = "auto"):
 
 @app.get("/api/models/openrouter")
 async def openrouter_models(refresh: bool = False):
-    """OpenRouter catalog for the dashboard (cached, 24h TTL)."""
+    """OpenRouter catalog for the dashboard (cached; 6h TTL when evolution on)."""
+    from skyn3t.core.model_evolution import evolution_status, run_evolution
     from skyn3t.core.openrouter_catalog import (
+        catalog_ttl_seconds,
         get_catalog_async,
         is_sync_enabled,
         sync_catalog,
@@ -1731,10 +1735,13 @@ async def openrouter_models(refresh: bool = False):
 
     if refresh and is_sync_enabled():
         await sync_catalog(force=True)
+        run_evolution()
     snap = await get_catalog_async()
     payload = snap.to_dict()
     payload["sync_enabled"] = is_sync_enabled()
+    payload["ttl_seconds"] = catalog_ttl_seconds()
     payload["tier_validation"] = validate_tier_models()
+    payload["evolution"] = evolution_status()
     return payload
 
 
@@ -3426,6 +3433,23 @@ async def autonomous_status():
     if not orchestrator:
         return JSONResponse({"error": "orchestrator not initialized"}, status_code=503)
     return orchestrator.get_autonomous_status()
+
+
+@app.get("/api/fleet/status")
+async def fleet_status():
+    """Parallel agent fleet slot visibility for the dashboard."""
+    if not orchestrator:
+        return JSONResponse({"error": "orchestrator not initialized"}, status_code=503)
+    # Return cached snapshot immediately — never block on slow fleet/Studio work.
+    return await asyncio.to_thread(orchestrator.get_fleet_status)
+
+
+@app.get("/api/improvement/status")
+async def improvement_status():
+    """Never-stop improvement flywheel health for the dashboard."""
+    if not orchestrator:
+        return JSONResponse({"error": "orchestrator not initialized"}, status_code=503)
+    return orchestrator.get_improvement_status()
 
 
 @app.get("/api/cortex/status")

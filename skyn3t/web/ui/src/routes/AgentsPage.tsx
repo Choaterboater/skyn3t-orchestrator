@@ -8,6 +8,8 @@ import {
   RoutingRoute,
   RoutingTier,
 } from "../api/client";
+import StatusPill from "../components/StatusPill";
+import { PageHeader, PanelCard, PanelHeader } from "../components/Panel";
 
 // Agent registry. Click a row to open the edit drawer — change backend,
 // model, system prompt, temperature, max_tokens. Enable/disable inline.
@@ -67,31 +69,23 @@ export default function AgentsPage() {
 
   return (
     <div className="space-y-6">
-      <header className="flex items-baseline justify-between gap-4">
-        <div>
-          <h1 className="display text-4xl">
-            <span className="text-accent">Agents</span>
-          </h1>
-          <p className="text-text-secondary text-sm mt-1">
-            Every registered agent. Click a row to edit backend, model, prompt,
-            and limits.
-          </p>
-        </div>
-        {totals.data && (
-          <div className="text-right text-xs space-y-0.5">
-            <div className="text-text-secondary uppercase tracking-wider">
-              Total tokens (this session)
+      <PageHeader
+        title="Agents"
+        subtitle="Every registered agent. Click a row to edit backend, model, prompt, and limits."
+        aside={
+          totals.data ? (
+            <div className="panel-card px-4 py-3 text-right">
+              <div className="section-label">Session tokens</div>
+              <div className="text-2xl font-mono text-accent">
+                {fmtTokens(totals.data.total_tokens ?? 0)}
+              </div>
+              <div className="text-text-dim font-mono text-xs">
+                {totals.data.total_calls ?? 0} calls · {totals.data.agents_tracked ?? 0} agents
+              </div>
             </div>
-            <div className="text-2xl font-mono text-accent">
-              {fmtTokens(totals.data.total_tokens ?? 0)}
-            </div>
-            <div className="text-text-dim font-mono">
-              {totals.data.total_calls ?? 0} LLM calls ·{" "}
-              {totals.data.agents_tracked ?? 0} agents
-            </div>
-          </div>
-        )}
-      </header>
+          ) : undefined
+        }
+      />
 
       {isLoading && <p className="text-text-secondary">Loading…</p>}
       {error && (
@@ -127,7 +121,13 @@ export default function AgentsPage() {
         ].join(" ")}
       >
         {data && data.length > 0 && (
-          <div className="rounded-lg border border-border bg-bg-2 overflow-hidden min-w-0">
+          <PanelCard className="min-w-0">
+            <PanelHeader
+              title="Registry"
+              icon="fa-solid fa-table-list"
+              description="Click a row to edit. Token counts refresh every 10s."
+            />
+            <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="bg-bg-3 text-text-secondary text-xs uppercase tracking-wider">
                 <tr>
@@ -155,7 +155,8 @@ export default function AgentsPage() {
                 ))}
               </tbody>
             </table>
-          </div>
+            </div>
+          </PanelCard>
         )}
 
         {editing && (
@@ -192,29 +193,29 @@ function ExecutionBackendCard({
     : "Docker not detected — auto falls back to inline execution.";
 
   return (
-    <section className="rounded-lg border border-border bg-bg-2 overflow-hidden">
-      <header className="px-4 py-3 border-b border-border flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h2 className="font-mono text-accent">Code execution sandbox</h2>
-          <p className="text-text-secondary text-sm mt-1">
+    <PanelCard>
+      <PanelHeader
+        title="Code execution sandbox"
+        icon="fa-solid fa-box"
+        description={
+          <>
             Isolates CodeAgent Python runs. Studio Quality wizard sets{" "}
-            <code className="font-mono text-xs bg-bg-3 px-1 rounded">auto</code>{" "}
-            (Docker pool when available).
-          </p>
-          <p className="text-text-dim text-xs mt-1">{dockerHint}</p>
-        </div>
-        <div className="text-right text-xs font-mono text-text-dim">
-          resolved: {view.resolved_class}
-          {view.auto_retry && (
-            <div className="text-accent mt-1">SKYN3T_AUTO_RETRY=1</div>
-          )}
-        </div>
-      </header>
+            <code className="font-mono text-xs bg-bg-3 px-1 rounded">auto</code> (Docker pool when
+            available). {dockerHint}
+          </>
+        }
+        actions={
+          <div className="text-right text-xs font-mono text-text-dim">
+            <div>{view.resolved_class}</div>
+            {view.auto_retry && <div className="text-accent mt-1">SKYN3T_AUTO_RETRY=1</div>}
+          </div>
+        }
+      />
       <div className="px-4 py-3 flex flex-wrap items-center gap-3">
         <select
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          className="min-w-[180px] bg-bg-3 border border-border rounded px-2 py-1.5 text-sm font-mono outline-none focus:border-accent"
+          className="min-w-[180px] data-input font-mono"
         >
           {view.valid_backends.map((name) => (
             <option key={name} value={name}>
@@ -226,7 +227,7 @@ function ExecutionBackendCard({
           type="button"
           disabled={save.isPending || draft === view.configured}
           onClick={() => save.mutate(draft)}
-          className="text-sm px-3 py-1.5 rounded border border-accent-line text-accent hover:bg-accent-soft disabled:opacity-50"
+          className="btn-ghost"
         >
           save to .env
         </button>
@@ -236,7 +237,7 @@ function ExecutionBackendCard({
           </span>
         )}
       </div>
-    </section>
+    </PanelCard>
   );
 }
 
@@ -273,29 +274,25 @@ function RoutingPolicyCard({
   });
 
   return (
-    <section className="rounded-lg border border-border bg-bg-2 overflow-hidden">
-      <header className="px-4 py-3 border-b border-border flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h2 className="font-mono text-accent">Model routing</h2>
-          <p className="text-text-secondary text-sm mt-1">
-            Per-stage tier map for Project Studio. Saved policy beats env, then built-in defaults.
-          </p>
-          <p className="text-text-dim text-xs mt-1">
-            {preset?.description ??
-              "Use Studio Quality to match the skyn3t wizard OpenRouter preset."}
-          </p>
-        </div>
-        <button
-          type="button"
-          disabled={applyPreset.isPending}
-          onClick={() => applyPreset.mutate()}
-          className="text-sm px-3 py-1.5 rounded border border-accent-line text-accent hover:bg-accent-soft disabled:opacity-50 whitespace-nowrap"
-        >
-          {applyPreset.isPending
-            ? "applying…"
-            : preset?.label ?? "Apply Studio Quality"}
-        </button>
-      </header>
+    <PanelCard>
+      <PanelHeader
+        title="Model routing"
+        icon="fa-solid fa-route"
+        description={
+          preset?.description ??
+          "Per-stage tier map for Project Studio. Saved policy beats env, then built-in defaults."
+        }
+        actions={
+          <button
+            type="button"
+            disabled={applyPreset.isPending}
+            onClick={() => applyPreset.mutate()}
+            className="btn-ghost whitespace-nowrap"
+          >
+            {applyPreset.isPending ? "applying…" : preset?.label ?? "Apply Studio Quality"}
+          </button>
+        }
+      />
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
           <thead className="bg-bg-3 text-text-secondary text-xs uppercase tracking-wider">
@@ -425,7 +422,7 @@ function RoutingPolicyCard({
           </tbody>
         </table>
       </div>
-    </section>
+    </PanelCard>
   );
 }
 
@@ -670,9 +667,9 @@ function AgentEditDrawer({
   }
 
   return (
-    <aside className="rounded-lg border border-border bg-bg-2 p-4 space-y-3 max-h-[80vh] overflow-y-auto">
+    <aside className="panel-card p-4 space-y-3 max-h-[80vh] overflow-y-auto">
       <header className="flex items-baseline justify-between gap-2 min-w-0">
-        <h2 className="font-mono text-accent truncate" title={name}>
+        <h2 className="display text-lg text-accent truncate" title={name}>
           {name}
         </h2>
         <button
@@ -792,11 +789,7 @@ function AgentEditDrawer({
           )}
 
           <div className="flex items-center gap-2 pt-2 border-t border-border">
-            <button
-              type="submit"
-              disabled={save.isPending}
-              className="rounded bg-accent text-bg-0 text-sm font-medium px-3 py-1.5 disabled:opacity-60"
-            >
+            <button type="submit" disabled={save.isPending} className="btn-primary disabled:opacity-60">
               {save.isPending ? "Saving…" : "Save"}
             </button>
             <button
@@ -1034,26 +1027,6 @@ function Td({
     >
       {children}
     </td>
-  );
-}
-
-function StatusPill({ status }: { status: string }) {
-  const color =
-    status === "idle"
-      ? "bg-status-green/20 text-status-green border-status-green/30"
-      : status === "busy"
-        ? "bg-accent-soft text-accent border-accent-line"
-        : status === "error"
-          ? "bg-status-red/20 text-status-red border-status-red/30"
-          : status === "disabled"
-            ? "bg-bg-3 text-text-dim border-border"
-            : "bg-bg-3 text-text-dim border-border";
-  return (
-    <span
-      className={`inline-block px-2 py-0.5 rounded text-xs uppercase tracking-wider border ${color}`}
-    >
-      {status}
-    </span>
   );
 }
 

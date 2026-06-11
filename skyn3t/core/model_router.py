@@ -167,6 +167,16 @@ _CODE_STAGE_NAMES: frozenset[str] = frozenset(
     {"code", "code_agent", "code_improver"},
 )
 
+# Escalation map: when cheap-first fails, bump to the next tier up.
+_TIER_ESCALATION: Dict[str, str] = {
+    "or_cheap": "or_strong",
+    "or_ui": "or_strong",
+    "or_backend": "or_strong",
+    "or_docs": "or_cheap",
+    "cheap": "strong",
+    "balanced": "strong",
+}
+
 
 def _load_code_tier_override() -> Optional[str]:
     """Optional operator knob for cheaper code generation.
@@ -219,14 +229,55 @@ def _load_persisted_overrides() -> Dict[str, Dict[str, Optional[str]]]:
     return out
 
 
-def _tier_backend_model(tier_name: str) -> Tuple[str, Optional[str]]:
+def _task_kind_for_path(rel_path: str) -> str:
+    rl = (rel_path or "").lower().replace("\\", "/")
+    if any(h in rl for h in _FRONTEND_PATH_HINTS) or rl.endswith(_FRONTEND_EXTS):
+        return "ui"
+    if any(h in rl for h in _BACKEND_PATH_HINTS):
+        return "backend"
+    if rl.endswith((".md", ".rst", ".txt")) or "/docs/" in rl:
+        return "docs"
+    return "general"
+
+
+def _tier_backend_model(
+    tier_name: str,
+    *,
+    task_kind: Optional[str] = None,
+) -> Tuple[str, Optional[str]]:
     """Return (backend, model) for a tier, validating OpenRouter ids."""
     backend, model = _TIERS.get(tier_name, _TIERS["cheap"])
     if backend == "openrouter" and model:
         try:
-            from skyn3t.core.openrouter_catalog import resolve_openrouter_model
+            from skyn3t.core.model_evolution import (
+                is_evolution_enabled,
+                pick_evolved_model_for_task,
+                tier_override_model,
+            )
+            from skyn3t.core.openrouter_catalog import (
+                pick_best_model_for_task,
+                resolve_openrouter_model,
+            )
 
+            evolved = tier_override_model(tier_name)
+            if evolved:
+                model = evolved
             model = resolve_openrouter_model(tier_name, model)
+            if task_kind:
+                if is_evolution_enabled():
+                    picked = pick_evolved_model_for_task(
+                        tier_name,
+                        task_kind,
+                        base_model=model,
+                    )
+                else:
+                    picked = pick_best_model_for_task(
+                        tier_name,
+                        task_kind,
+                        base_model=model,
+                    )
+                if picked:
+                    model = picked
         except Exception:
             logger.debug("openrouter tier validation skipped", exc_info=True)
     return backend, model
@@ -268,6 +319,32 @@ def tier_for_backend_model(backend: str, model: Optional[str]) -> Optional[str]:
     return None
 
 
+def escalate_tier(tier_name: str) -> str:
+    """Return the next-stronger tier for failure-driven escalation."""
+    tier = str(tier_name or "").strip().lower()
+    return _TIER_ESCALATION.get(tier, "or_strong")
+
+
+def _cheap_smart_tier(stage: str) -> Optional[str]:
+    try:
+        from skyn3t.intelligence.cheap_smart import cheap_smart_stage_tier
+
+        return cheap_smart_stage_tier(stage)
+    except Exception:
+        logger.debug("cheap_smart tier lookup failed", exc_info=True)
+        return None
+
+
+def _runtime_escalated_tier(stage: str) -> Optional[str]:
+    try:
+        from skyn3t.intelligence.cheap_smart import escalated_tier_for_stage
+
+        return escalated_tier_for_stage(stage)
+    except Exception:
+        logger.debug("cheap_smart escalation lookup failed", exc_info=True)
+        return None
+
+
 def _route_for_stage(stage_name: Optional[str]) -> Dict[str, Optional[str]]:
     if not stage_name:
         backend, model = _TIERS["cheap"]
@@ -304,6 +381,17 @@ def _route_for_stage(stage_name: Optional[str]) -> Dict[str, Optional[str]]:
             "source": "env",
             "persisted_via": None,
         }
+    escalated = _runtime_escalated_tier(stage)
+    if escalated and escalated in _TIERS:
+        backend, model = _tier_backend_model(escalated)
+        return {
+            "stage": stage,
+            "tier": escalated,
+            "backend": backend,
+            "model": model,
+            "source": "escalation",
+            "persisted_via": None,
+        }
     code_tier = _load_code_tier_override()
     if code_tier and stage in _CODE_STAGE_NAMES:
         backend, model = _tier_backend_model(code_tier)
@@ -313,6 +401,17 @@ def _route_for_stage(stage_name: Optional[str]) -> Dict[str, Optional[str]]:
             "backend": backend,
             "model": model,
             "source": "env_code_tier",
+            "persisted_via": None,
+        }
+    cheap_tier = _cheap_smart_tier(stage)
+    if cheap_tier and cheap_tier in _TIERS:
+        backend, model = _tier_backend_model(cheap_tier)
+        return {
+            "stage": stage,
+            "tier": cheap_tier,
+            "backend": backend,
+            "model": model,
+            "source": "cheap_smart",
             "persisted_via": None,
         }
     if stage in _DEFAULT_STAGE_POLICY:
@@ -367,7 +466,7 @@ def has_stage_policy(stage_name: Optional[str]) -> bool:
     if not stage_name:
         return False
     source = _route_for_stage(stage_name).get("source")
-    return source in {"persisted", "env", "default"}
+    return source in {"persisted", "env", "default", "cheap_smart", "escalation", "env_code_tier"}
 
 
 def resolve_model(
@@ -722,6 +821,7 @@ def resolve_model_for_file(
     stack: Optional[str] = None,
     scoreboard: Any = None,
     event_bus: Any = None,
+    escalate: bool = False,
 ) -> Tuple[str, Optional[str]]:
     """Pick (backend, model) for a SPECIFIC file inside the code stage.
 
@@ -744,7 +844,7 @@ def resolve_model_for_file(
     published as ``CORTEX_DECISION`` events so the Activity timeline
     can render them alongside other autonomous-system decisions.
     """
-    backend, model = _resolve_static(rel_path, stage_name)
+    backend, model = _resolve_static(rel_path, stage_name, escalate=escalate)
     if (
         stack and scoreboard is not None and _adaptive_enabled()
         and hasattr(scoreboard, "backend_rate")
@@ -773,15 +873,27 @@ def resolve_model_for_file(
 def _resolve_static(
     rel_path: str,
     stage_name: Optional[str] = "code",
+    *,
+    escalate: bool = False,
 ) -> Tuple[str, Optional[str]]:
     """The pure-static decision (split out so it's unit-testable and
     so the adaptive path can call it without recursion)."""
+    task_kind = _task_kind_for_path(rel_path)
     code_tier = _load_code_tier_override()
     if code_tier:
-        return _tier_backend_model(code_tier)
+        tier = escalate_tier(code_tier) if escalate else code_tier
+        return _tier_backend_model(tier, task_kind=task_kind)
     if not rel_path:
-        return resolve_model(stage_name)
+        route = _route_for_stage(stage_name)
+        tier = str(route.get("tier") or "cheap")
+        if escalate:
+            tier = escalate_tier(tier)
+        return _tier_backend_model(tier, task_kind=task_kind)
     rl = rel_path.lower().replace("\\", "/")
+
+    def _pick(tier_name: str) -> Tuple[str, Optional[str]]:
+        tier = escalate_tier(tier_name) if escalate else tier_name
+        return _tier_backend_model(tier, task_kind=task_kind)
 
     # Critical entrypoint files → OpenRouter UI specialist
     # (xiaomi/mimo-v2-flash). Same files that empirically broke
@@ -789,21 +901,25 @@ def _resolve_static(
     # server/index.js) — now routed to an HTTP backend with a
     # 120s timeout instead of the 240s CLI idle.
     if rl.endswith(("app.jsx", "app.tsx", "main.jsx", "main.tsx")):
-        return _tier_backend_model("or_ui")
+        return _pick("or_ui")
 
     # Frontend by path hint OR extension → OpenRouter UI specialist.
     if any(h in rl for h in _FRONTEND_PATH_HINTS):
-        return _tier_backend_model("or_ui")
+        return _pick("or_ui")
     if rl.endswith(_FRONTEND_EXTS):
-        return _tier_backend_model("or_ui")
+        return _pick("or_ui")
     if rl.endswith(".css") and "/server/" not in rl:
-        return _tier_backend_model("or_ui")
+        return _pick("or_ui")
     if rl.endswith(".html"):
-        return _tier_backend_model("or_ui")
+        return _pick("or_ui")
 
     # Backend by path hint → OpenRouter code specialist (qwen3-coder).
     if any(h in rl for h in _BACKEND_PATH_HINTS):
-        return _tier_backend_model("or_backend")
+        return _pick("or_backend")
 
     # Default to the stage-level tier.
-    return resolve_model(stage_name)
+    route = _route_for_stage(stage_name)
+    tier = str(route.get("tier") or "cheap")
+    if escalate:
+        tier = escalate_tier(tier)
+    return _tier_backend_model(tier, task_kind=task_kind)

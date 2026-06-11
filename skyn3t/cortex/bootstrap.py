@@ -311,6 +311,44 @@ class CortexBootstrap:
                 (),
                 (),
             ),
+            (
+                "continuous_improvement",
+                "_continuous_improvement",
+                lambda: _import_and_build(
+                    "skyn3t.cortex.continuous_improvement",
+                    "ContinuousImprovementEngine",
+                    self.orchestrator,
+                    self.event_bus,
+                ),
+                (),
+                (),
+                ("SYSTEM_ALERT:IMPROVEMENT_TICK",),
+            ),
+            (
+                "agent_fleet",
+                "_agent_fleet_coordinator",
+                lambda: _import_and_build(
+                    "skyn3t.cortex.agent_fleet", "AgentFleetCoordinator",
+                    self.orchestrator,
+                    self.event_bus,
+                ),
+                (),
+                (),
+                ("SYSTEM_ALERT:FLEET_SLOT_STARTED", "SYSTEM_ALERT:FLEET_SLOT_COMPLETED"),
+            ),
+            (
+                "never_stop",
+                "_never_stop_watchdog",
+                lambda: _import_and_build(
+                    "skyn3t.cortex.never_stop",
+                    "NeverStopWatchdog",
+                    self.orchestrator,
+                    self.event_bus,
+                ),
+                (),
+                (),
+                ("SYSTEM_ALERT:NEVER_STOP_RECOVERED",),
+            ),
         ]
 
         for name, orch_attr, factory, creates, handles, subs in specs:

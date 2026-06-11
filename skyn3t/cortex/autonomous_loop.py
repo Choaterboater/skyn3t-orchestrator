@@ -182,6 +182,8 @@ class AutonomousCoordinator:
         self._task: Optional[asyncio.Task] = None
         self._wired = False
         self._scout_boot: Dict[str, Any] = {}
+        self._fleet_delegates_builds = False
+        self._queue_empty_since: Optional[float] = None
 
     async def start(self) -> None:
         from skyn3t.config.settings import get_settings
@@ -238,8 +240,55 @@ class AutonomousCoordinator:
                 pass
             self._task = None
 
+    def set_fleet_delegates_builds(self, enabled: bool) -> None:
+        """When True, the single-build loop only proposes briefs; fleet starts builds."""
+        self._fleet_delegates_builds = bool(enabled)
+
+    def pop_highest_priority_brief(self) -> Optional[AutonomousBrief]:
+        """Dequeue the highest-priority brief for the agent fleet."""
+        items: List[AutonomousBrief] = []
+        while not self._pending.empty():
+            try:
+                items.append(self._pending.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        if not items:
+            return None
+        items.sort(key=lambda b: (-b.priority, b.created_at))
+        chosen = items[0]
+        for rest in items[1:]:
+            self._pending.put_nowait(rest)
+        self._persist_queue_snapshot()
+        return chosen
+
+    def reenqueue_brief(self, brief: AutonomousBrief) -> None:
+        """Put a brief back on the queue after a failed fleet start."""
+        try:
+            self._pending.put_nowait(brief)
+            self._persist_queue_snapshot()
+        except Exception:
+            logger.debug("reenqueue brief failed", exc_info=True)
+
+    async def start_build_for_brief(
+        self,
+        brief: AutonomousBrief,
+        *,
+        slot_id: int = 0,
+    ) -> Dict[str, Any]:
+        """Start a Studio build for *brief* (used by AgentFleetCoordinator)."""
+        skip = self._check_build_gates()
+        if skip:
+            return {"ok": False, "reason": skip}
+        try:
+            slug, est_tokens = await self._execute_build(brief, slot_id=slot_id)
+            return {"ok": True, "slug": slug, "est_tokens": est_tokens}
+        except Exception as exc:
+            logger.exception("fleet build start failed slot=%s", slot_id)
+            return {"ok": False, "reason": str(exc)}
+
     def get_status(self) -> Dict[str, Any]:
         from skyn3t.config.settings import get_settings
+        from skyn3t.cortex.agent_fleet import effective_build_daily_cap
 
         settings = get_settings()
         return {
@@ -249,7 +298,8 @@ class AutonomousCoordinator:
             "scout_schedule": self._scout_boot,
             "daily_builds": self.state.daily_builds,
             "daily_spend_usd": self.state.daily_spend_usd,
-            "daily_cap": int(getattr(settings, "autonomous_build_daily_cap", 3)),
+            "daily_cap": effective_build_daily_cap(settings),
+            "fleet_delegates_builds": self._fleet_delegates_builds,
             "daily_budget_usd": float(getattr(settings, "autonomous_build_daily_budget_usd", 5.0)),
             "queue_depth": self._pending.qsize(),
             "last_build_slug": self.state.last_build_slug,
@@ -364,6 +414,36 @@ class AutonomousCoordinator:
             )
         )
 
+    async def enqueue_brief(self, item: AutonomousBrief) -> bool:
+        """Public entry for other flywheel components (e.g. continuous improvement)."""
+        return await self._offer_brief(item)
+
+    async def seed_startup_briefs(self, *, min_depth: int = 3) -> int:
+        """Seed competitive practice briefs when the queue is shallow on boot."""
+        from skyn3t.cortex.competitive_intel import competitive_practice_brief
+
+        added = 0
+        attempts = 0
+        max_attempts = max(min_depth * 4, 8)
+        while self._pending.qsize() < min_depth and attempts < max_attempts:
+            attempts += 1
+            text = competitive_practice_brief()
+            if not text:
+                break
+            ok = await self._offer_brief(
+                AutonomousBrief(
+                    brief=text,
+                    source="competitive_intel",
+                    trigger="startup_seed",
+                    priority=45,
+                )
+            )
+            if ok:
+                added += 1
+        if added:
+            logger.info("seeded %d startup brief(s); queue_depth=%d", added, self._pending.qsize())
+        return added
+
     async def _offer_brief(self, item: AutonomousBrief) -> bool:
         if not item.brief.strip():
             return False
@@ -416,18 +496,23 @@ class AutonomousCoordinator:
 
     async def _loop(self) -> None:
         from skyn3t.config.settings import get_settings
+        from skyn3t.cortex.never_stop import effective_loop_interval
 
         settings = get_settings()
-        interval = max(60, int(getattr(settings, "autonomous_build_interval_seconds", 900)))
-        await asyncio.sleep(30)  # warmup after orchestrator boot
+        interval = effective_loop_interval(
+            settings,
+            "autonomous_build_interval_seconds",
+            900,
+        )
         while self._running:
             try:
                 _reset_daily_counters(self.state)
                 self.state.last_tick_at = time.time()
                 await self._maybe_propose_briefs()
-                skip = await self._maybe_start_build()
-                if skip:
-                    self.state.last_skip_reason = skip
+                if not self._fleet_delegates_builds:
+                    skip = await self._maybe_start_build()
+                    if skip:
+                        self.state.last_skip_reason = skip
                 _save_state(self.state)
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
@@ -436,7 +521,56 @@ class AutonomousCoordinator:
                 logger.exception("autonomous build loop tick failed")
                 await asyncio.sleep(interval)
 
+    def _track_queue_depth(self) -> None:
+        if self._pending.qsize() > 0:
+            self._queue_empty_since = None
+        elif self._queue_empty_since is None:
+            self._queue_empty_since = time.time()
+
+    async def replenish_queue_if_stale(
+        self,
+        settings: Any,
+        *,
+        empty_seconds: int = 300,
+    ) -> int:
+        """Inject synthetic practice briefs when the queue has been empty too long."""
+        from skyn3t.cortex.agent_fleet import effective_build_daily_cap
+
+        self._track_queue_depth()
+        if self._queue_empty_since is None:
+            return 0
+        if time.time() - self._queue_empty_since < empty_seconds:
+            return 0
+
+        daily_cap = effective_build_daily_cap(settings)
+        if daily_cap > 0 and self.state.daily_builds >= daily_cap:
+            return 0
+
+        injected = 0
+        for fn in (
+            self._propose_from_build_patterns,
+            self._propose_from_competitive,
+            self._propose_from_scout,
+        ):
+            if self._pending.qsize() >= 3:
+                break
+            try:
+                item = await fn()
+                if item is not None and await self._offer_brief(item):
+                    injected += 1
+                    self._queue_empty_since = None
+            except Exception:
+                logger.debug("replenish brief %s failed", fn.__name__, exc_info=True)
+        if injected:
+            self._publish_alert(
+                "NEVER_STOP_QUEUE_REPLENISHED",
+                injected=injected,
+                queue_depth=self._pending.qsize(),
+            )
+        return injected
+
     async def _maybe_propose_briefs(self) -> None:
+        self._track_queue_depth()
         if self._pending.qsize() >= 3:
             return
         for fn in (
@@ -525,13 +659,13 @@ class AutonomousCoordinator:
             priority=40,
         )
 
-    async def _maybe_start_build(self) -> Optional[str]:
+    def _check_build_gates(self) -> Optional[str]:
         from skyn3t.config.settings import get_settings
+        from skyn3t.cortex.agent_fleet import effective_build_daily_cap
 
         settings = get_settings()
-        daily_cap = max(0, int(getattr(settings, "autonomous_build_daily_cap", 3)))
+        daily_cap = effective_build_daily_cap(settings)
         daily_budget = float(getattr(settings, "autonomous_build_daily_budget_usd", 5.0))
-        per_build_cap = float(getattr(settings, "max_build_cost_usd", 1.0))
 
         if self.state.daily_builds >= daily_cap:
             return f"daily cap reached ({daily_cap})"
@@ -555,55 +689,84 @@ class AutonomousCoordinator:
         )
         if busy:
             return busy
+        return None
 
-        if self._pending.empty():
-            return "queue empty"
+    async def _execute_build(
+        self,
+        chosen: AutonomousBrief,
+        *,
+        slot_id: int = 0,
+    ) -> tuple[str, int]:
+        from skyn3t.config.settings import get_settings
+        from skyn3t.intelligence.cheap_smart import auto_apply_cheaper_routing
 
-        # Pick highest priority brief
-        items: List[AutonomousBrief] = []
-        while not self._pending.empty():
-            items.append(await self._pending.get())
-        if not items:
-            return "queue empty"
-        items.sort(key=lambda b: (-b.priority, b.created_at))
-        chosen = items[0]
-        for rest in items[1:]:
-            await self._pending.put(rest)
+        settings = get_settings()
+        daily_budget = float(getattr(settings, "autonomous_build_daily_budget_usd", 5.0))
+        per_build_cap = float(getattr(settings, "max_build_cost_usd", 1.0))
 
-        slug_base = f"auto-{chosen.source}-{int(time.time())}"
+        runner = self._get_runner()
+        if runner is None:
+            raise RuntimeError("studio runner not available")
+
+        auto_apply_cheaper_routing()
+
+        slug_base = f"auto-{chosen.source}-s{slot_id}-{int(time.time())}"
+        max_cost = (
+            min(per_build_cap, daily_budget - self.state.daily_spend_usd)
+            if daily_budget > 0
+            else per_build_cap
+        )
         extra = {
             "autonomous": True,
             "source": "autonomous",
             "trigger_source": chosen.source,
             "execution_profile": "balanced",
-            "max_cost_usd": min(per_build_cap, daily_budget - self.state.daily_spend_usd)
-            if daily_budget > 0
-            else per_build_cap,
+            "max_cost_usd": max_cost,
+            "fleet_slot": slot_id,
+            "worktree": True,
         }
         self._publish_alert(
             "AUTONOMOUS_BUILD_STARTED",
             brief=chosen.brief[:200],
             source=chosen.source,
             trigger=chosen.trigger[:120],
+            fleet_slot=slot_id,
         )
+        manifest = await runner.start(
+            chosen.template,
+            chosen.brief,
+            slug=slug_base[:48],
+            extra=extra,
+            mission_setup={"autonomy": "balanced"},
+        )
+        slug = str(manifest.get("slug") or slug_base)
+        self.state.daily_builds += 1
+        self.state.daily_spend_usd += float(max_cost)
+        self.state.last_build_slug = slug
+        self.state.last_skip_reason = None
+        _save_state(self.state)
+        est_tokens = int(max_cost * 250_000) if max_cost else 50_000
+        logger.info(
+            "autonomous build started slug=%s source=%s slot=%s",
+            slug,
+            chosen.source,
+            slot_id,
+        )
+        return slug, est_tokens
+
+    async def _maybe_start_build(self) -> Optional[str]:
+        gate = self._check_build_gates()
+        if gate:
+            return gate
+        if self._pending.empty():
+            return "queue empty"
+
+        chosen = self.pop_highest_priority_brief()
+        if chosen is None:
+            return "queue empty"
+
         try:
-            manifest = await runner.start(
-                chosen.template,
-                chosen.brief,
-                slug=slug_base[:48],
-                extra=extra,
-                mission_setup={"autonomy": "balanced"},
-            )
-            slug = str(manifest.get("slug") or slug_base)
-            self.state.daily_builds += 1
-            self.state.daily_spend_usd += float(extra.get("max_cost_usd") or per_build_cap)
-            self.state.last_build_slug = slug
-            self.state.last_skip_reason = None
-            logger.info(
-                "autonomous build started slug=%s source=%s",
-                slug,
-                chosen.source,
-            )
+            await self._execute_build(chosen)
             return None
         except Exception as exc:
             logger.exception("autonomous build start failed")

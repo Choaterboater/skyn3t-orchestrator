@@ -1,54 +1,72 @@
 /** @type {import('tailwindcss').Config} */
-// Tailwind config aligned with the SkyN3t / ChoateLabs brand:
-// cyan-on-black with brushed silver chrome and a cyan glow halo.
-// Fonts: Orbitron (display headings), Rajdhani (body), JetBrains Mono (data).
-// The aesthetic is "autonomous machine / circuit luxe" — taken from the
-// canonical logo at data/design_references/canonical_brand.png.
+// Command-center atelier: Instrument Serif display, Space Grotesk UI,
+// cyan live-data accent + amber warmth on deep charcoal.
 export default {
   content: ["./index.html", "./src/**/*.{ts,tsx,js,jsx}"],
   theme: {
     extend: {
       colors: {
         bg: {
-          0: "#000000",   // pure black — matches logo
-          1: "#070A0E",   // near-black slab
-          2: "#0E141B",   // chrome shadow
-          3: "#16202B",   // raised panel
+          0: "#0c0e12",
+          1: "#111520",
+          2: "#171d28",
+          3: "#1f2735",
         },
         border: {
-          DEFAULT: "#1E2A38",
-          strong: "#2B3D52",
+          DEFAULT: "#2a3344",
+          strong: "#3a4558",
         },
         text: {
-          primary: "#E6F6FA",
-          secondary: "#8FA8B5",
-          dim: "#56717F",
+          primary: "#e4eaf0",
+          secondary: "#8a9bb0",
+          dim: "#566577",
         },
         accent: {
-          DEFAULT: "#0FF0FC",        // cyan glow — primary accent
-          strong: "#26F5FF",         // hover/active state, slightly brighter
-          soft: "rgba(15, 240, 252, 0.08)",
-          line: "rgba(15, 240, 252, 0.24)",
+          DEFAULT: "#38d4f0",
+          strong: "#5ee4ff",
+          soft: "rgba(56, 212, 240, 0.08)",
+          line: "rgba(56, 212, 240, 0.24)",
+        },
+        amber: {
+          DEFAULT: "#e5a045",
+          strong: "#f0b45c",
+          soft: "rgba(229, 160, 69, 0.10)",
+          line: "rgba(229, 160, 69, 0.28)",
         },
         chrome: {
-          DEFAULT: "#A8B0B8",        // brushed silver — bezel highlights
-          dim: "#6F7A85",
-          bright: "#D7DCE2",
+          DEFAULT: "#9aa8b8",
+          dim: "#6b7a8c",
+          bright: "#d0d8e2",
         },
         status: {
-          green: "#3DDC97",
-          yellow: "#FFCB47",
-          red: "#FF5C5C",
+          green: "#4ecf9a",
+          yellow: "#e5b84a",
+          red: "#f07171",
         },
       },
       fontFamily: {
-        display: ['"Orbitron"', "system-ui", "sans-serif"],
-        sans: ['"Rajdhani"', "system-ui", "sans-serif"],
+        display: ['"Instrument Serif"', "Georgia", "serif"],
+        sans: ['"Space Grotesk"', "system-ui", "sans-serif"],
         mono: ['"JetBrains Mono"', "ui-monospace", "monospace"],
       },
       boxShadow: {
-        glow: "0 0 24px rgba(15, 240, 252, 0.35)",
-        "glow-sm": "0 0 12px rgba(15, 240, 252, 0.25)",
+        glow: "0 0 24px rgba(56, 212, 240, 0.30)",
+        "glow-sm": "0 0 12px rgba(56, 212, 240, 0.22)",
+        panel: "0 20px 50px -24px rgba(0, 0, 0, 0.65)",
+      },
+      animation: {
+        "live-pulse": "live-pulse 1.4s ease-in-out infinite",
+        "atelier-rise": "atelier-rise 480ms cubic-bezier(0.2, 0.7, 0.2, 1) both",
+      },
+      keyframes: {
+        "live-pulse": {
+          "0%, 100%": { opacity: "1", boxShadow: "0 0 8px rgba(56, 212, 240, 0.6)" },
+          "50%": { opacity: "0.35", boxShadow: "0 0 4px rgba(56, 212, 240, 0.2)" },
+        },
+        "atelier-rise": {
+          from: { opacity: "0", transform: "translateY(8px)" },
+          to: { opacity: "1", transform: "translateY(0)" },
+        },
       },
     },
   },

@@ -1233,8 +1233,15 @@ def init(
 @models_app.command("sync")
 def models_sync(
     force: bool = typer.Option(False, "--force", "-f", help="Ignore cache TTL and refetch"),
+    evolve: bool = typer.Option(
+        False,
+        "--evolve",
+        "-e",
+        help="Run model evolution after sync (default when SKYN3T_MODEL_EVOLUTION=1)",
+    ),
 ) -> None:
     """🔄 Fetch the latest OpenRouter model catalog into data/openrouter_models.json."""
+    from skyn3t.core.model_evolution import is_evolution_enabled, run_evolution
     from skyn3t.core.openrouter_catalog import sync_catalog, validate_tier_models
 
     async def _run() -> Dict[str, Any]:
@@ -1253,6 +1260,10 @@ def models_sync(
         _error(str(result.get("error") or "sync failed"))
         raise typer.Exit(1)
 
+    evolution_result: Dict[str, Any] = {}
+    if evolve or is_evolution_enabled():
+        evolution_result = run_evolution()
+
     lines = [
         f"Status: [cyan]{status}[/cyan]",
         f"Models: [bold]{count}[/bold]",
@@ -1270,7 +1281,21 @@ def models_sync(
         lines.append("[yellow]Tier models missing from catalog:[/yellow]")
         for row in missing:
             fb = row.get("fallback") or "(none)"
-            lines.append(f"  • {row['tier']}: {row['model']} → fallback {fb}")
+            evolved = " [dim](evolved)[/dim]" if row.get("evolved") else ""
+            lines.append(f"  • {row['tier']}: {row['model']}{evolved} → fallback {fb}")
+
+    upgrades = evolution_result.get("upgrades") if isinstance(evolution_result, dict) else None
+    if upgrades:
+        lines.append("")
+        lines.append("[green]Model evolution upgrades:[/green]")
+        for row in upgrades:
+            lines.append(
+                f"  • {row['tier']}: {row.get('from')} → {row.get('to')} "
+                f"(score {row.get('from_score')} → {row.get('to_score')})"
+            )
+    elif evolution_result.get("enabled"):
+        lines.append("")
+        lines.append("[dim]Model evolution: no tier upgrades this run[/dim]")
 
     console.print(Panel.fit("\n".join(lines), title="OpenRouter catalog", border_style="cyan"))
 

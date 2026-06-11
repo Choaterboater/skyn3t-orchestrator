@@ -3,18 +3,31 @@
 @tailwind utilities;
 
 /* ============================================================
-   SkyN3t — Global Styles
-   Brand: cyan-on-black with brushed silver chrome + cyan glow.
-   Source: canonical logo at data/design_references/canonical_brand.png.
-   Fonts: Orbitron (display), Rajdhani (body), JetBrains Mono (data).
+   SkyN3t — Command Center Atelier
+   Display: Instrument Serif (italic) · UI: Space Grotesk · Data: JetBrains Mono
+   Palette: cyan live-data + amber warmth on deep charcoal
    ============================================================ */
 
-/* ---------- Display headings (Orbitron, engineered) ---------- */
+@layer base {
+  html {
+    @apply font-sans antialiased;
+  }
+
+  body {
+    @apply bg-bg-0 text-text-primary;
+    line-height: 1.55;
+    letter-spacing: -0.003em;
+    text-rendering: optimizeLegibility;
+  }
+}
+
+/* ---------- Display headings (editorial serif italic) ---------- */
 .display {
-  font-family: var(--font-display, "Orbitron", system-ui, sans-serif);
-  font-weight: 500;
-  letter-spacing: 0.04em;
-  line-height: 1.1;
+  font-family: "Instrument Serif", Georgia, serif;
+  font-style: italic;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  line-height: 1.05;
 }
 
 /* ---------- Tabular numerals on all data ---------- */
@@ -25,10 +38,10 @@ pre,
   font-variant-numeric: tabular-nums;
 }
 
-/* ---------- Atelier background: cyan bloom + circuit grid ---------- */
+/* ---------- Atelier background: cyan + amber blooms, dot grid ---------- */
 .bg-atelier {
   position: relative;
-  background-color: #000000;
+  background-color: #0c0e12;
 }
 
 .bg-atelier::before {
@@ -36,12 +49,9 @@ pre,
   position: fixed;
   inset: 0;
   background:
-    /* top-left cyan glow halo */
-    radial-gradient(ellipse 1400px 900px at 8% -10%,
-      rgba(15, 240, 252, 0.10), transparent 62%),
-    /* bottom-right chrome shadow */
-    radial-gradient(ellipse 900px 700px at 100% 110%,
-      rgba(20, 32, 44, 0.55), transparent 70%);
+    radial-gradient(ellipse 1200px 800px at 6% -8%, rgba(56, 212, 240, 0.09), transparent 58%),
+    radial-gradient(ellipse 900px 600px at 92% 108%, rgba(229, 160, 69, 0.06), transparent 62%),
+    radial-gradient(ellipse 700px 500px at 50% 120%, rgba(17, 21, 32, 0.8), transparent 70%);
   pointer-events: none;
   z-index: 0;
 }
@@ -50,46 +60,158 @@ pre,
   content: "";
   position: fixed;
   inset: 0;
-  /* faint circuit-board dot grid in cyan */
-  background-image:
-    radial-gradient(circle at 1px 1px, rgba(15, 240, 252, 0.045) 1px, transparent 0);
+  background-image: radial-gradient(
+    circle at 1px 1px,
+    rgba(56, 212, 240, 0.035) 1px,
+    transparent 0
+  );
   background-size: 22px 22px;
-  opacity: 0.55;
+  opacity: 0.5;
   mix-blend-mode: screen;
   pointer-events: none;
   z-index: 0;
 }
 
-/* ---------- Glow utility for active / focused states ---------- */
-.glow-accent {
-  box-shadow: 0 0 12px rgba(15, 240, 252, 0.35),
-              0 0 24px rgba(15, 240, 252, 0.18);
+/* ---------- Page load reveal (staggered) ---------- */
+.page-enter {
+  animation: atelier-rise 480ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
 }
 
-/* Wordmark with cyan glow halo (matches the logo) */
-.wordmark-glow {
-  text-shadow: 0 0 6px rgba(15, 240, 252, 0.5),
-               0 0 18px rgba(15, 240, 252, 0.25);
+.page-enter > * {
+  animation: atelier-rise 480ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
 }
 
-/* ---------- Scrollbar styling (WebKit) ---------- */
+.page-enter > *:nth-child(1) {
+  animation-delay: 40ms;
+}
+.page-enter > *:nth-child(2) {
+  animation-delay: 90ms;
+}
+.page-enter > *:nth-child(3) {
+  animation-delay: 140ms;
+}
+.page-enter > *:nth-child(4) {
+  animation-delay: 190ms;
+}
+.page-enter > *:nth-child(5) {
+  animation-delay: 240ms;
+}
+.page-enter > *:nth-child(6) {
+  animation-delay: 290ms;
+}
+
+@keyframes atelier-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .page-enter,
+  .page-enter > * {
+    animation: none;
+  }
+  .live-dot {
+    animation: none !important;
+  }
+}
+
+/* ---------- Component utilities ---------- */
+@layer components {
+  .panel-card {
+    @apply rounded-lg border border-border bg-bg-2 shadow-panel overflow-hidden;
+    background: linear-gradient(165deg, rgba(31, 39, 53, 0.55) 0%, rgba(23, 29, 40, 0.95) 100%);
+  }
+
+  .panel-card::before {
+    content: "";
+    display: block;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(56, 212, 240, 0.35), transparent);
+    opacity: 0.6;
+  }
+
+  .panel-header {
+    @apply px-4 py-3 border-b border-border flex flex-wrap items-start justify-between gap-3;
+    background: linear-gradient(180deg, rgba(56, 212, 240, 0.04), transparent);
+  }
+
+  .section-label {
+    @apply text-[0.65rem] uppercase tracking-[0.14em] text-text-secondary font-medium;
+  }
+
+  .data-input {
+    @apply bg-bg-3 border border-border rounded px-2 py-1.5 text-sm outline-none focus:border-accent transition-colors;
+  }
+
+  .btn-primary {
+    @apply rounded bg-accent text-bg-0 text-sm font-medium px-3 py-1.5 hover:bg-accent-strong transition-colors disabled:opacity-50;
+  }
+
+  .btn-ghost {
+    @apply text-sm px-3 py-1.5 rounded border border-accent-line text-accent hover:bg-accent-soft transition-colors disabled:opacity-50;
+  }
+
+  .hero-strip {
+    @apply panel-card p-0;
+  }
+
+  .hero-metric {
+    @apply flex flex-col gap-0.5 min-w-0 px-4 py-3 border-r border-border last:border-r-0;
+  }
+
+  .wordmark-glow {
+    text-shadow:
+      0 0 6px rgba(56, 212, 240, 0.45),
+      0 0 18px rgba(56, 212, 240, 0.18);
+  }
+
+  .glow-accent {
+    box-shadow:
+      0 0 12px rgba(56, 212, 240, 0.3),
+      0 0 24px rgba(56, 212, 240, 0.14);
+  }
+
+  .live-dot {
+    @apply inline-block w-1.5 h-1.5 rounded-full bg-accent;
+    animation: live-pulse 1.4s ease-in-out infinite;
+  }
+
+  @keyframes live-pulse {
+    0%,
+    100% {
+      opacity: 1;
+      box-shadow: 0 0 8px rgba(56, 212, 240, 0.6);
+    }
+    50% {
+      opacity: 0.35;
+      box-shadow: 0 0 4px rgba(56, 212, 240, 0.15);
+    }
+  }
+}
+
+/* ---------- Scrollbar (WebKit) ---------- */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 ::-webkit-scrollbar-track {
-  background: #000000;
+  background: #0c0e12;
 }
 ::-webkit-scrollbar-thumb {
-  background: #1E2A38;
+  background: #2a3344;
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #2B3D52;
+  background: #3a4558;
 }
 
-/* ---------- Selection ---------- */
 ::selection {
-  background: rgba(15, 240, 252, 0.25);
-  color: #E6F6FA;
+  background: rgba(56, 212, 240, 0.22);
+  color: #e4eaf0;
 }

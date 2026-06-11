@@ -179,6 +179,42 @@ class Settings(BaseSettings):
     autonomous_proof_run: bool = Field(
         default=True, alias="SKYN3T_AUTONOMOUS_PROOF_RUN"
     )
+    # Parallel agent fleet — concurrent autonomous learn + build workers
+    agent_fleet_size: int = Field(default=0, alias="SKYN3T_AGENT_FLEET_SIZE")
+    agent_fleet_learning: int = Field(default=1, alias="SKYN3T_AGENT_FLEET_LEARNING")
+    agent_fleet_tick_seconds: int = Field(
+        default=30, alias="SKYN3T_AGENT_FLEET_TICK_SECONDS"
+    )
+    agent_fleet_max_concurrent_builds: int = Field(
+        default=5, alias="SKYN3T_AGENT_FLEET_MAX_CONCURRENT_BUILDS"
+    )
+    cortex_scout_defer_boot_seconds: int = Field(
+        default=120, alias="SKYN3T_CORTEX_SCOUT_DEFER_BOOT_SECONDS"
+    )
+    # Never-stop improvement flywheel (default on)
+    continuous_improvement: bool = Field(
+        default=True, alias="SKYN3T_CONTINUOUS_IMPROVEMENT"
+    )
+    improvement_tick_seconds: int = Field(
+        default=600, alias="SKYN3T_IMPROVEMENT_TICK_SECONDS"
+    )
+    improvement_score_regression_threshold: float = Field(
+        default=70.0, alias="SKYN3T_IMPROVEMENT_SCORE_REGRESSION"
+    )
+    improvement_stack_score_window: int = Field(
+        default=8, alias="SKYN3T_IMPROVEMENT_SCORE_WINDOW"
+    )
+    improvement_competitive_practice_daily_cap: int = Field(
+        default=1, alias="SKYN3T_IMPROVEMENT_COMPETITIVE_PRACTICE_DAILY_CAP"
+    )
+    improvement_proof_retry_daily_cap: int = Field(
+        default=2, alias="SKYN3T_IMPROVEMENT_PROOF_RETRY_DAILY_CAP"
+    )
+    # Never-stop watchdog — auto-restart dead autonomy tasks (default on with improvement)
+    never_stop: bool = Field(default=True, alias="SKYN3T_NEVER_STOP")
+    never_stop_queue_empty_seconds: int = Field(
+        default=300, alias="SKYN3T_NEVER_STOP_QUEUE_EMPTY_SECONDS"
+    )
     skills_hub_auto_install: bool = Field(
         default=True, alias="SKYN3T_SKILLS_HUB_AUTO_INSTALL"
     )

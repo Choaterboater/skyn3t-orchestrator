@@ -1,0 +1,54 @@
+---
+description: SkyN3t continuous improvement — Cursor improves the repo; fleet improves generated projects
+alwaysApply: true
+---
+
+# SkyN3t continuous improvement (Cursor + Fleet)
+
+## Session start
+
+1. Read `docs/CONTINUE.md` — especially **Next priorities** and **Cursor + Fleet dual loop**.
+2. If `data/cursor_tasks.json` exists, check the highest-priority task before other work.
+3. Run `./scripts/cursor_improve.sh` for a quick smoke (fleet API + queued task hint).
+
+## Two loops (do not confuse them)
+
+| Loop | Scope | Mechanism |
+|------|-------|-----------|
+| **Fleet** | `PROJECTS_DIR` scaffolds | `AgentFleetCoordinator`, `AutonomousCoordinator`, Studio pipeline |
+| **Cursor** | This repo (`skyn3t/`) | You — small shippable diffs, tests, UI polish |
+
+Fleet must **not** self-edit SkyN3t without approval. Cursor **should** steadily improve SkyN3t: UI bugs, fleet wiring, Hermes gaps, docs drift.
+
+## Working style
+
+- Prefer **small, shippable diffs** (one concern per change).
+- Pick the next item from `docs/CONTINUE.md` or `data/cursor_tasks.json`.
+- Run tests before claiming done:
+  ```bash
+  source .venv/bin/activate
+  ruff check skyn3t tests
+  pytest tests/ -q --ignore=tests/test_observability.py
+  ```
+- Focused smoke after cortex/web changes:
+  ```bash
+  pytest tests/test_agent_fleet.py tests/test_continuous_improvement.py tests/test_autonomous_loop.py -q
+  curl -sf http://127.0.0.1:6660/api/fleet/status | head -c 400
+  curl -sf http://127.0.0.1:6660/api/improvement/status | head -c 400
+  ```
+
+## Never stop improving
+
+Keep chipping at: dashboard UX, fleet idle/backpressure bugs, messaging channel parity vs Hermes, worktree isolation, gateway/cron stubs, model routing UI, flaky tests.
+
+When the improvement flywheel queues a task (`source: continuous_improvement:regression` or `competitive_intel`), implement or refine it in the same session when possible.
+
+## PR / commit discipline
+
+- Do not open a PR unless tests pass.
+- Only commit when the user asks.
+- Never commit secrets (`.env`, API keys).
+
+## Process cursor_tasks.json
+
+User can say: **"Process cursor_tasks.json"** — dequeue the highest-priority task, implement it, remove or mark it done in the queue file, run `./scripts/cursor_improve.sh`, update `docs/CONTINUE.md` if priorities shift.

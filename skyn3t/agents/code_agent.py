@@ -991,7 +991,11 @@ class CodeAgent(BaseAgent):
         d = task.input_data or {}
         brief = (d.get("brief") or "").strip()
         artifact_dir = self.resolve_artifact_dir(d.get("artifact_dir"))
-        out_dir = artifact_dir / "scaffold"
+        scaffold_override = str(d.get("code_scaffold_dir") or "").strip()
+        if scaffold_override:
+            out_dir = _Path(scaffold_override)
+        else:
+            out_dir = artifact_dir / "scaffold"
         out_dir.mkdir(parents=True, exist_ok=True)
         self._seed_design_tokens_into_scaffold(artifact_dir, out_dir)
         resolved_out_dir = out_dir.resolve()
@@ -1424,6 +1428,24 @@ class CodeAgent(BaseAgent):
                     )
             except Exception:
                 logger.debug("skill injection failed", exc_info=True)
+
+            try:
+                from skyn3t.core.model_router import tier_for_stage
+                from skyn3t.intelligence.cheap_smart import (
+                    build_cheap_context_boost,
+                    cheap_smart_enabled,
+                )
+
+                if cheap_smart_enabled() and "cheap" in tier_for_stage("code"):
+                    boost = build_cheap_context_boost(
+                        brief=brief,
+                        stack=stack,
+                        stage_name="code",
+                    )
+                    if boost:
+                        build_system = build_system + "\n\n" + boost
+            except Exception:
+                logger.debug("cheap_smart context boost failed", exc_info=True)
 
             # RAG recall: query past experiences for this stack + brief
             # to inject "I tried this before and it failed because..."
@@ -2015,10 +2037,27 @@ class CodeAgent(BaseAgent):
                                 f"retry {rel} on fallback backend ({reason})"
                             )
                             from skyn3t.adapters import LLMClient as _LLMClient
+                            from skyn3t.core.model_router import resolve_model_for_file
+                            try:
+                                from skyn3t.intelligence.build_patterns import (
+                                    get_default_scoreboard,
+                                )
+                                _sb_retry = get_default_scoreboard()
+                            except Exception:
+                                _sb_retry = None
+                            esc_backend, esc_model = resolve_model_for_file(
+                                rel,
+                                stack=stack,
+                                scoreboard=_sb_retry,
+                                event_bus=self.event_bus,
+                                escalate=True,
+                            )
                             retry_client = _LLMClient(
-                                default_model=None,
-                                backend=None,  # "auto" picks next available
-                                skip_backends=[primary] if primary else [],
+                                default_model=esc_model,
+                                backend=esc_backend or None,
+                                event_bus=self.event_bus,
+                                caller_name=self.name,
+                                backend_is_policy=bool(esc_backend),
                             )
                             retry_body = await retry_client.complete(
                                 file_prompt,
@@ -2028,6 +2067,25 @@ class CodeAgent(BaseAgent):
                                 timeout=_FILE_RETRY_TIMEOUT_SECONDS,
                                 _allow_backend_failover=False,
                             )
+                            if (
+                                (not retry_body or "[deterministic-stub]" in retry_body)
+                                and primary
+                            ):
+                                retry_client = _LLMClient(
+                                    default_model=None,
+                                    backend=None,
+                                    skip_backends=[primary],
+                                    event_bus=self.event_bus,
+                                    caller_name=self.name,
+                                )
+                                retry_body = await retry_client.complete(
+                                    file_prompt,
+                                    system=build_system,
+                                    max_tokens=8000,
+                                    temperature=0.3,
+                                    timeout=_FILE_RETRY_TIMEOUT_SECONDS,
+                                    _allow_backend_failover=False,
+                                )
                             marked_retry = _extract_marked_files(retry_body or "")
                             if marked_retry:
                                 retry_match = (

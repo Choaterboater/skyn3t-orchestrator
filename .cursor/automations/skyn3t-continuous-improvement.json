@@ -1,0 +1,28 @@
+{
+  "name": "SkyN3t continuous improvement",
+  "description": "Periodic health check and small shippable improvements to the SkyN3t orchestrator repo (fleet improves PROJECTS_DIR scaffolds separately).",
+  "workflow": {
+    "triggers": [
+      {
+        "cron": {
+          "cron": "0 9 * * 1-5"
+        }
+      }
+    ],
+    "actions": [],
+    "prompts": [
+      {
+        "prompt": "You are improving the SkyN3t orchestrator repo (Choaterboater/skyn3t-orchestrator).\n\n## Session start\n1. Read docs/CONTINUE.md — focus on Next priorities and Cursor + Fleet dual loop.\n2. If data/cursor_tasks.json exists, take the highest-priority task (or run: Process cursor_tasks.json).\n3. Run ./scripts/cursor_improve.sh for smoke (fleet API + pytest subset).\n\n## Scope\n- Improve THIS repo (skyn3t/, web UI, tests, docs) — NOT PROJECTS_DIR scaffolds.\n- The autonomous fleet handles generated projects; you handle orchestrator quality.\n\n## Quality bar\n- Prefer one small shippable diff per run.\n- Before claiming done:\n  source .venv/bin/activate\n  ruff check skyn3t tests\n  pytest tests/ -q --ignore=tests/test_observability.py\n- After cortex/web changes also run:\n  pytest tests/test_agent_fleet.py tests/test_continuous_improvement.py -q\n\n## Priorities (when queue empty)\nPick from docs/CONTINUE.md: messaging channel parity, worktree helper, dashboard UX, fleet idle bugs, Hermes gaps.\n\n## PR rule\nOpen a PR only if all tests pass. Never commit secrets.\n\n## Finish\nUpdate docs/CONTINUE.md if you completed a priority. Remove or dequeue the cursor task you finished."
+      }
+    ],
+    "model": "",
+    "agentOptions": {
+      "skipInstall": false
+    },
+    "memoryEnabled": true,
+    "gitConfig": {
+      "repo": "Choaterboater/skyn3t-orchestrator",
+      "branch": "main"
+    }
+  }
+}

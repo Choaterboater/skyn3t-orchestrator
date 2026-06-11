@@ -12,13 +12,24 @@ from skyn3t.studio.templates import TEMPLATES
 @pytest.fixture(autouse=True)
 def _isolated_routing_policy(monkeypatch, tmp_path):
     import skyn3t.config.model_routing as routing_config
+    from skyn3t.core import openrouter_catalog as catalog
 
     store = ModelRoutingStore(tmp_path / "model_routing.json")
     monkeypatch.setattr(routing_config, "_store", store)
     monkeypatch.delenv("SKYN3T_MODEL_ROUTING", raising=False)
     monkeypatch.delenv("SKYN3T_CODE_TIER", raising=False)
+    monkeypatch.setenv("SKYN3T_CHEAP_SMART", "0")
+    catalog._catalog_index = None
+    catalog._catalog_loaded_at = 0.0
+    monkeypatch.setattr(
+        catalog,
+        "resolve_openrouter_model",
+        lambda _tier, model: model,
+    )
     yield store
     monkeypatch.setattr(routing_config, "_store", None)
+    catalog._catalog_index = None
+    catalog._catalog_loaded_at = 0.0
 
 
 def test_persisted_policy_overrides_env_file(monkeypatch, tmp_path, _isolated_routing_policy):

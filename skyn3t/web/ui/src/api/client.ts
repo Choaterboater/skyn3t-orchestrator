@@ -349,6 +349,31 @@ export type SystemStatus = {
   completed_tasks?: number;
 };
 
+export type FleetSlotStatus = {
+  slot_id: number;
+  state: string;
+  current_slug?: string | null;
+  current_brief?: string | null;
+  learning_kind?: string | null;
+  tokens_today?: number;
+  last_error?: string | null;
+};
+
+export type FleetStatus = {
+  available?: boolean;
+  running?: boolean;
+  fleet_size?: number;
+  configured_size?: number;
+  active_builds?: number;
+  active_learning?: number;
+  daily_builds?: number;
+  daily_cap?: number;
+  queue_depth?: number;
+  backpressure?: string | null;
+  slots?: FleetSlotStatus[];
+  error?: string;
+};
+
 export type AutonomousStatus = {
   available?: boolean;
   autonomous_learning?: boolean;
@@ -378,6 +403,32 @@ export type OpenRouterCatalog = {
   stale?: boolean;
   models?: Array<{ id?: string; name?: string; pricing?: Record<string, unknown> }>;
   tier_validation?: Record<string, unknown>;
+  evolution?: {
+    enabled?: boolean;
+    last_run_at?: number;
+    runs_total?: number;
+    models_promoted?: number;
+    models_demoted?: number;
+    [key: string]: unknown;
+  };
+};
+
+export type ImprovementStatus = {
+  available?: boolean;
+  enabled?: boolean;
+  running?: boolean;
+  last_tick_at?: number;
+  ticks_total?: number;
+  builds_today?: number;
+  competitive_practice_today?: number;
+  model_evolutions_total?: number;
+  last_model_evolution_at?: number;
+  last_model_sync_at?: number;
+  cheaper_routing_applied?: number;
+  autonomous_queue_depth?: number;
+  autonomous_builds_enabled?: boolean;
+  model_evolution?: Record<string, unknown>;
+  error?: string;
 };
 
 export const api = {
@@ -386,6 +437,20 @@ export const api = {
     fetchJson<AutonomousStatus>("/api/autonomous/status").catch((err) => {
       if (err instanceof HttpError && err.status === 503) {
         return { available: false } as AutonomousStatus;
+      }
+      throw err;
+    }),
+  fleetStatus: () =>
+    fetchJson<FleetStatus>("/api/fleet/status").catch((err) => {
+      if (err instanceof HttpError && err.status === 503) {
+        return { available: false } as FleetStatus;
+      }
+      throw err;
+    }),
+  improvementStatus: () =>
+    fetchJson<ImprovementStatus>("/api/improvement/status").catch((err) => {
+      if (err instanceof HttpError && err.status === 503) {
+        return { available: false } as ImprovementStatus;
       }
       throw err;
     }),

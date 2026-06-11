@@ -20,6 +20,7 @@ logger = logging.getLogger("skyn3t.core.openrouter_catalog")
 
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 DEFAULT_TTL_SECONDS = 86_400  # 24h
+EVOLUTION_TTL_SECONDS = 21_600  # 6h when model evolution is enabled
 CACHE_FILENAME = "openrouter_models.json"
 
 # Keywords used to pick a replacement when a tier model disappears.
@@ -68,6 +69,21 @@ def _env_truthy(name: str) -> bool:
 
 def _env_falsy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"0", "false", "no", "off"}
+
+
+def catalog_ttl_seconds(settings: Any | None = None) -> int:
+    """Catalog cache TTL — 6h when model evolution is on, else 24h."""
+    try:
+        from skyn3t.core.model_evolution import (
+            EVOLUTION_TTL_SECONDS,
+            is_evolution_enabled,
+        )
+
+        if is_evolution_enabled(settings):
+            return EVOLUTION_TTL_SECONDS
+    except Exception:
+        logger.debug("catalog TTL evolution check failed", exc_info=True)
+    return DEFAULT_TTL_SECONDS
 
 
 def is_sync_enabled(settings: Any | None = None) -> bool:
@@ -124,9 +140,10 @@ def _read_cache_file(path: Path) -> Optional[CatalogSnapshot]:
         if not isinstance(models_raw, list):
             return None
         models = [m for m in (_parse_model(x) for x in models_raw if isinstance(x, dict)) if m]
+        ttl = int(raw.get("ttl_seconds") or catalog_ttl_seconds())
         return CatalogSnapshot(
             synced_at=float(raw.get("synced_at") or 0.0),
-            ttl_seconds=int(raw.get("ttl_seconds") or DEFAULT_TTL_SECONDS),
+            ttl_seconds=ttl,
             models=models,
             source="cache",
         )
@@ -157,7 +174,7 @@ def load_catalog(*, settings: Any | None = None) -> CatalogSnapshot:
     if snap is None:
         return CatalogSnapshot(
             synced_at=0.0,
-            ttl_seconds=DEFAULT_TTL_SECONDS,
+            ttl_seconds=catalog_ttl_seconds(settings),
             models=[],
             source="empty",
         )
@@ -219,19 +236,21 @@ async def sync_catalog(*, force: bool = False, settings: Any | None = None) -> D
         )
         snapshot = CatalogSnapshot(
             synced_at=time.time(),
-            ttl_seconds=DEFAULT_TTL_SECONDS,
+            ttl_seconds=catalog_ttl_seconds(settings),
             models=models,
             source="network",
         )
         _write_cache_file(path, snapshot)
         _refresh_index(snapshot)
         logger.info("openrouter catalog synced: %d models", len(models))
-        return {
+        result = {
             "status": "synced",
             "source": "network",
             "count": len(models),
             "synced_at": snapshot.synced_at,
         }
+        _maybe_run_evolution(settings=settings)
+        return result
     except Exception as exc:
         logger.warning("openrouter catalog sync failed: %s", exc)
         if cached:
@@ -295,6 +314,81 @@ def find_best_fallback(tier_name: str, original_model: str) -> Optional[str]:
     return best_id if best_score > 0 else None
 
 
+_TASK_KIND_KEYWORDS: Dict[str, List[str]] = {
+    "ui": ["flash", "mimo", "ui", "vision", "frontend"],
+    "backend": ["coder", "code", "qwen", "dev", "backend"],
+    "docs": ["oss", "120b", "instruct", "doc"],
+    "general": ["owl", "free", "mini", "fast"],
+}
+
+
+def pick_best_model_for_task(
+    tier_name: str,
+    task_kind: str,
+    *,
+    base_model: Optional[str] = None,
+    prefer_evolution: bool = False,
+) -> Optional[str]:
+    """Pick the best catalog model for ``tier_name`` + ``task_kind``.
+
+    Used by cheap-smart routing to avoid a static owl-alpha for every file
+    type when the OpenRouter catalog has a better specialist available.
+    When ``base_model`` is set (from model evolution), only returns a
+    different id when the specialist scores meaningfully higher.
+    """
+    if _catalog_index is None or not _catalog_index:
+        load_catalog()
+    if not _catalog_index:
+        return None
+
+    tier_keywords = list(_TIER_FALLBACK_KEYWORDS.get(tier_name, []))
+    kind_keywords = list(_TASK_KIND_KEYWORDS.get(task_kind, []))
+    if not tier_keywords and not kind_keywords:
+        return None
+
+    try:
+        from skyn3t.core.model_evolution import score_model_for_tier
+    except Exception:
+        score_model_for_tier = None  # type: ignore[assignment,misc]
+
+    def _score(mid: str, meta: Dict[str, Any]) -> float:
+        if prefer_evolution and score_model_for_tier is not None:
+            base = score_model_for_tier(tier_name, mid, meta)
+        else:
+            base = 0.0
+        hay = f"{mid} {meta.get('name', '')} {meta.get('description', '')}".lower()
+        base += sum(2.0 for kw in kind_keywords if kw and kw in hay)
+        base += sum(1.0 for kw in tier_keywords if kw and kw in hay)
+        pricing = meta.get("pricing") if isinstance(meta.get("pricing"), dict) else {}
+        prompt_cost = float(pricing.get("prompt") or pricing.get("input") or 0.0)
+        if prompt_cost == 0.0:
+            base += 1.0
+        ctx = meta.get("context_length") or 0
+        if isinstance(ctx, int) and ctx >= 32_000:
+            base += 1.0
+        return base
+
+    base_score = 0.0
+    if base_model and base_model in _catalog_index:
+        base_score = _score(base_model, _catalog_index[base_model])
+
+    best_id: Optional[str] = None
+    best_score = base_score if base_model else -1.0
+    min_delta = 0.5 if base_model else 0.0
+
+    for mid, meta in _catalog_index.items():
+        if base_model and mid == base_model:
+            continue
+        score = _score(mid, meta)
+        if score > best_score + min_delta:
+            best_score = score
+            best_id = mid
+
+    if best_id:
+        return best_id
+    return None if not base_model else None
+
+
 def resolve_openrouter_model(tier_name: str, model_id: Optional[str]) -> Optional[str]:
     """Validate a tier model against the catalog; fall back when missing."""
     if not model_id:
@@ -318,6 +412,18 @@ def resolve_openrouter_model(tier_name: str, model_id: Optional[str]) -> Optiona
     return model_id
 
 
+def _effective_tier_model_id(tier_name: str, default_model: str) -> str:
+    try:
+        from skyn3t.core.model_evolution import tier_override_model
+
+        evolved = tier_override_model(tier_name)
+        if evolved:
+            return evolved
+    except Exception:
+        logger.debug("evolution tier lookup failed", exc_info=True)
+    return default_model
+
+
 def validate_tier_models() -> List[Dict[str, Any]]:
     """Return validation rows for OpenRouter tiers in ``model_router._TIERS``."""
     from skyn3t.core.model_router import _TIERS
@@ -327,17 +433,29 @@ def validate_tier_models() -> List[Dict[str, Any]]:
     for tier_name, (backend, model) in _TIERS.items():
         if backend != "openrouter" or not model:
             continue
-        exists = model_exists(model)
-        fallback = None if exists else find_best_fallback(tier_name, model)
+        effective = _effective_tier_model_id(tier_name, model)
+        exists = model_exists(effective)
+        fallback = None if exists else find_best_fallback(tier_name, effective)
         rows.append(
             {
                 "tier": tier_name,
-                "model": model,
+                "model": effective,
+                "default_model": model,
+                "evolved": effective != model,
                 "exists": exists,
                 "fallback": fallback,
             }
         )
     return rows
+
+
+def _maybe_run_evolution(*, settings: Any | None = None) -> None:
+    try:
+        from skyn3t.core.model_evolution import run_evolution
+
+        run_evolution(settings=settings)
+    except Exception:
+        logger.debug("model evolution after sync failed", exc_info=True)
 
 
 def schedule_background_sync() -> None:
@@ -367,7 +485,10 @@ async def _background_sync_loop() -> None:
         logger.debug("openrouter initial background sync failed", exc_info=True)
     while True:
         try:
-            await asyncio.sleep(DEFAULT_TTL_SECONDS)
+            from skyn3t.config.settings import get_settings
+
+            sleep_seconds = catalog_ttl_seconds(get_settings())
+            await asyncio.sleep(sleep_seconds)
             if not is_sync_enabled():
                 continue
             result = await sync_catalog(force=True)

@@ -99,6 +99,9 @@ class Orchestrator:
         self._cortex_tasks: List[asyncio.Task] = []
         self._studio_runner_getter: Optional[Callable[[], Any]] = None
         self._autonomous_coordinator: Optional[Any] = None
+        self._agent_fleet_coordinator: Optional[Any] = None
+        self._continuous_improvement: Optional[Any] = None
+        self._never_stop_watchdog: Optional[Any] = None
 
         # Subscribe to system events
         self.event_bus.subscribe(self._on_task_completed, EventType.TASK_COMPLETED)
@@ -227,6 +230,34 @@ class Orchestrator:
         except Exception as exc:
             return {"available": False, "error": str(exc)}
 
+    def get_fleet_status(self) -> Dict[str, Any]:
+        fleet = getattr(self, "_agent_fleet_coordinator", None)
+        if fleet is None:
+            return {"available": False}
+        try:
+            status = fleet.get_status()
+            status["available"] = True
+            return status
+        except Exception as exc:
+            return {"available": False, "error": str(exc)}
+
+    def get_improvement_status(self) -> Dict[str, Any]:
+        engine = getattr(self, "_continuous_improvement", None)
+        if engine is None:
+            return {"available": False, "enabled": False}
+        try:
+            status = engine.get_status()
+            status["available"] = True
+            watchdog = getattr(self, "_never_stop_watchdog", None)
+            if watchdog is not None:
+                try:
+                    status.update(watchdog.get_status())
+                except Exception:
+                    logger.debug("never-stop status merge failed", exc_info=True)
+            return status
+        except Exception as exc:
+            return {"available": False, "error": str(exc)}
+
     def get_cortex_status(self) -> Dict[str, Any]:
         """Return runtime status for the Cortex proposal loop."""
         if self._cortex_bootstrap is None:
@@ -271,8 +302,10 @@ class Orchestrator:
         await self._boot_cortex()
 
         try:
+            from skyn3t.core.model_evolution import set_evolution_event_bus
             from skyn3t.core.openrouter_catalog import schedule_background_sync
 
+            set_evolution_event_bus(self.event_bus)
             schedule_background_sync()
         except Exception:
             logger.debug("openrouter catalog background sync schedule failed", exc_info=True)
@@ -286,6 +319,9 @@ class Orchestrator:
         except Exception:
             logger.exception("default roster registration failed")
 
+        import time as _time
+
+        self._booted_at = _time.time()
         self.event_bus.publish(
             Event(
                 event_type=EventType.SYSTEM_ALERT,

@@ -50,11 +50,27 @@ Work across this thread focused on **fixing CI-quality issues** and **raising St
 | Item | Detail |
 |------|--------|
 | Module | `skyn3t/core/openrouter_catalog.py` |
-| Cache | `data/openrouter_models.json` (24h TTL) |
-| Auto-sync | Orchestrator/web start + daily background loop when `OPENROUTER_API_KEY` set (`SKYN3T_OPENROUTER_SYNC=1`, default on) |
-| API | `GET /api/models/openrouter` (`?refresh=1` to force) |
-| CLI | `skyn3t models sync` (`--force`) |
+| Cache | `data/openrouter_models.json` (24h TTL; **6h** when model evolution enabled) |
+| Auto-sync | Orchestrator/web start + background loop when `OPENROUTER_API_KEY` set (`SKYN3T_OPENROUTER_SYNC=1`, default on) |
+| API | `GET /api/models/openrouter` (`?refresh=1` to force; includes `evolution` block) |
+| CLI | `skyn3t models sync` (`--force`, `--evolve`) |
 | Routing | `model_router._tier_backend_model()` validates tier ids; missing → keyword fallback + warning |
+
+### Model Evolution Engine (2026-06-11)
+
+| Item | Detail |
+|------|--------|
+| Module | `skyn3t/core/model_evolution.py` |
+| Overrides | `data/model_tier_overrides.json` — persisted tier→model upgrades (no downgrade by default) |
+| Enable | `SKYN3T_MODEL_EVOLUTION=1` (default on with `OPENROUTER_API_KEY`) |
+| Scoring | Context length, pricing, tool support, recency hints in model id, tier keywords |
+| Alerts | `SYSTEM_ALERT` with `alert_type=MODEL_TIER_EVOLVED` on upgrades |
+| Integration | `model_router` reads overrides before `_TIERS`; `pick_best_model_for_task` refines per file type |
+| TTL | 6h catalog sync when evolution on (proactive discovery, not just missing-model fallback) |
+
+Env: `SKYN3T_MODEL_EVOLUTION=1`, `SKYN3T_MODEL_EVOLUTION_DOWNGRADE=0`, `SKYN3T_MODEL_EVOLUTION_MIN_GAIN=0.25`
+
+Tests: `tests/test_model_evolution.py`
 
 ---
 
@@ -139,9 +155,16 @@ Last known good: **1862+ tests passed** (1 skipped) before doc/approval-gate edi
 | `SKYN3T_VERIFY_OFFLINE` | unset | Set `1` to accept syntax-only pass when `npm install` has no network |
 | `SKYN3T_VERIFY_NPM_INSTALL` | `1` | Set `0` to skip npm install/build in BuildVerifier |
 | `SKYN3T_AUTONOMOUS_PROOF_RUN` | `1` | Post-build npm/py_compile proof for autonomous builds |
+| `SKYN3T_AGENT_FLEET_SIZE` | `0` | `20` — parallel autonomous learn + build worker slots |
+| `SKYN3T_AGENT_FLEET_MAX_CONCURRENT_BUILDS` | `5` | Studio semaphore cap when fleet builds on (keeps API responsive) |
+| `SKYN3T_AGENT_FLEET_LEARNING` | `1` | Parallel learning ticks per idle slot (scout/RAG/routing/evolution) |
+| `SKYN3T_CORTEX_SCOUT_DEFER_BOOT_SECONDS` | `120` | Defer fleet scout GitHub searches after orchestrator boot |
+| `SKYN3T_STUDIO_WORKTREE` | `1` | Git worktree per fleet slot for CodeAgent isolation |
+| `SKYN3T_CONTINUOUS_IMPROVEMENT` | `1` | Never-stop flywheel; boots 3-slot fleet when `FLEET_SIZE` unset |
 | `SKYN3T_SKILLS_HUB_AUTO_INSTALL` | `1` | Seed hub skills on orchestrator start when no-approval |
 | `SKYN3T_SKILLS_HUB_PATHS` | `examples/skills_seed,skills` | Comma-separated hub roots |
 | `SKYN3T_CODE_TIER` | unset | Override code stage tier (`or_backend`, `or_cheap`, …); beats default `or_strong` |
+| `SKYN3T_CHEAP_SMART` | `1` | Cheap-first code gen + context boost + escalation; set `0` for always-strong code |
 | `execution_profile` | `balanced` | Pass `deep` on CLI/API for max critique rounds + fix budget |
 
 Example max-quality build:
@@ -216,6 +239,32 @@ Set `SKYN3T_NO_APPROVAL=1` (synonyms: `SKYN3T_AUTO_APPROVE=1`, `SKYN3T_AUTO_APPR
 
 Env: see `.env.example` autonomous section. SkyN3t repo changes still approval-gated; builds land in `PROJECTS_DIR` only.
 
+### Done in agent fleet pass (2026-06-11)
+
+| Feature | File(s) | Notes |
+|---------|---------|-------|
+| **AgentFleetCoordinator** | `skyn3t/cortex/agent_fleet.py` | N slots (`idle` / `learning` / `building`); fleet semaphore; composes with `AutonomousCoordinator` queue |
+| **Fleet learning ticks** | `skyn3t/cortex/continuous_improvement.py` | `run_fleet_learning_tick` — scout, RAG, routing apply, model evolution |
+| **Studio concurrency** | `skyn3t/studio/runner.py` | `configure_max_concurrent(N)` when fleet + autonomous builds on |
+| **Operator API** | `GET /api/fleet/status` | 20 slots with state, brief/slug, tokens today, backpressure |
+| **Events** | `SYSTEM_ALERT` | `FLEET_SLOT_STARTED`, `FLEET_SLOT_COMPLETED` |
+| **Dashboard** | `OverviewPage.tsx` | Agent fleet tile (busy/building/learning counts) |
+| **Safety** | `agent_fleet.py`, `autonomous_loop.py` | Daily cap scales with fleet size; orchestrator backpressure at 75% task load |
+
+**Enable 20-agent fleet:**
+
+```bash
+SKYN3T_AGENT_FLEET_SIZE=20
+SKYN3T_AGENT_FLEET_LEARNING=1
+SKYN3T_AUTONOMOUS_BUILDS=1
+SKYN3T_AUTONOMOUS_LEARNING=1
+SKYN3T_AUTONOMOUS_BUILD_DAILY_CAP=20
+SKYN3T_AUTONOMOUS_BUILD_INTERVAL_SECONDS=60
+SKYN3T_NO_APPROVAL=1   # or implicit via AUTONOMOUS_BUILDS
+```
+
+Tests: `tests/test_agent_fleet.py`
+
 ### Done in quality-fix pass (2026-06-11)
 
 | Feature | File(s) | Notes |
@@ -231,6 +280,24 @@ Env: see `.env.example` autonomous section. SkyN3t repo changes still approval-g
 | **Docker sandbox default** | wizard, `GET/PATCH /api/execution/backend`, Agents UI | `SKYN3T_EXECUTION_BACKEND=auto` (Docker pool when available) |
 | **Routing wizard UI** | `AgentsPage.tsx`, routing preset API | One-click Studio Quality + per-stage tier editor |
 
+### Done in cheap-smart pass (2026-06-11)
+
+| Feature | File(s) | Notes |
+|---------|---------|-------|
+| **SKYN3T_CHEAP_SMART** | `skyn3t/intelligence/cheap_smart.py`, `model_router.py` | Default ON — code stages start `or_cheap`; runtime escalation → `or_strong` on failure |
+| **Context boost** | `cheap_smart.py`, `code_agent.py` | Checklist + winning scaffold shape + competitive/UI/backend hints injected for cheap tiers |
+| **Capability-aware picker** | `openrouter_catalog.py`, `model_router.py` | `pick_best_model_for_task()` selects catalog specialist per file type |
+| **Model evolution** | `model_evolution.py`, `openrouter_catalog.py` | Proactive tier upgrades after sync; overrides in `data/model_tier_overrides.json` |
+| **Cross-model lift** | existing `runner._critique_and_revise` | Cheap producer + strong reviewer unchanged; escalation bumps code tier when critique/verifier fails |
+| **Routing auto-apply** | `cheap_smart.auto_apply_cheaper_routing`, `runner.py` | High-confidence cheaper recommendations applied at pipeline start |
+| **Per-file escalation retry** | `code_agent.py` | Failed cheap file gen retries on `resolve_model_for_file(..., escalate=True)` before CLI failover |
+
+Env: `SKYN3T_CHEAP_SMART=1` (default), `SKYN3T_CHEAP_SMART=0` to restore quality-first `or_strong` code routing.
+
+Tests: `tests/test_cheap_smart.py`
+
+---
+
 ### Done in proof-run + skills hub pass (2026-06-11)
 
 | Feature | File(s) | Notes |
@@ -241,6 +308,28 @@ Env: see `.env.example` autonomous section. SkyN3t repo changes still approval-g
 | **Dashboard tiles** | `OverviewPage.tsx`, `api/client.ts` | Autonomous loop status + OpenRouter catalog on Overview |
 
 Tests: `tests/test_proof_run_and_skills_hub.py`
+
+### Never-stop improvement flywheel (2026-06-11)
+
+| Feature | File(s) | Notes |
+|---------|---------|-------|
+| **ContinuousImprovementEngine** | `skyn3t/cortex/continuous_improvement.py` | Single asyncio coordinator; `SKYN3T_CONTINUOUS_IMPROVEMENT=1` (default on) |
+| **Loop A — outcome learning** | `continuous_improvement.py`, `runner.py` | Every `PROJECT_COMPLETED`/`PROJECT_FAILED`: scoreboard flush, routing check, `reviewer_score` in payload |
+| **Loop B — model freshness** | `model_evolution.py`, `openrouter_catalog.py` | 6h catalog sync + tier evolution; per-tick `cheap_smart.auto_apply_cheaper_routing` |
+| **Loop C — competitive drills** | `continuous_improvement.py`, `autonomous_loop.py` | Scout competitor ingest → micro practice brief via `enqueue_brief` (1/day cap) |
+| **Loop D — regression guard** | `continuous_improvement.py` | Rolling reviewer avg per stack in `data/improvement_metrics.json`; auto tier bump + cortex proposal |
+| **Loop E — visibility** | `GET /api/improvement/status`, `IMPROVEMENT_TICK` events | Flywheel health: last tick, builds today, score trend, model evolutions |
+| **NeverStopWatchdog** | `skyn3t/cortex/never_stop.py` | Every 30s: restart dead improvement/autonomous/fleet tasks; `NEVER_STOP_RECOVERED` alerts |
+| **Queue replenishment** | `autonomous_loop.replenish_queue_if_stale`, watchdog | After 5m empty queue → synthetic briefs from build-pattern gaps + competitive intel |
+| **Process wrapper** | `scripts/never_stop.sh` | Optional shell loop restarts web server if port 6660 dies |
+
+**Flywheel prose (how it runs forever):**
+
+On orchestrator boot, `CortexBootstrap` starts `continuous_improvement` alongside `autonomous_loop` and the `never_stop` watchdog last. Loops tick immediately on boot (no warmup sleep) with a 30s minimum interval when `SKYN3T_NEVER_STOP=1`. The improvement engine publishes `IMPROVEMENT_TICK` on the event bus each tick (`SKYN3T_IMPROVEMENT_TICK_SECONDS`, default 600). Each Studio build completion feeds Loop A: the build scoreboard flushes, reviewer scores roll into per-stack windows, and adaptive routing health is checked. Every six hours Loop B syncs OpenRouter and runs `model_evolution` tier upgrades; on every tick high-confidence “use cheaper” routing recommendations apply when trajectory proves strong-tier overkill. Loop C watches applied scout ingest proposals for known competitors and queues one internalizing practice build per day into the autonomous queue (requires `SKYN3T_AUTONOMOUS_BUILDS=1`). Loop D compares rolling reviewer averages against `SKYN3T_IMPROVEMENT_SCORE_REGRESSION` and auto-bumps code tier plus files a cortex proposal when quality regresses. Spend stays bounded by reusing autonomous daily caps for competitive drills and proof retries.
+
+The watchdog monitors background asyncio tasks; if any die, it stops/restarts the component within 30s and logs `NEVER_STOP_RECOVERED`. When the brief queue stays empty for `SKYN3T_NEVER_STOP_QUEUE_EMPTY_SECONDS` (default 300), synthetic practice briefs refill slots without bypassing daily build caps. `GET /api/improvement/status` includes `never_stop`, `last_recovery_at`, and `uptime_seconds`.
+
+Env: see `.env.example` improvement section. Tests: `tests/test_continuous_improvement.py`, `tests/test_never_stop.py`.
 
 ### Competitive intel pass (2026-06-11)
 
@@ -256,14 +345,28 @@ Repos analyzed: Hermes, MetaSwarm, Forge, Railyard, Ark, ATC, Ruah, Karajan, Ope
 **Top 3 remaining gaps vs Hermes + field:**
 
 1. **Messaging channel parity** (~13 vs ~22) + unified cron→gateway delivery
-2. **Git worktree parallel isolation** (Railyard/ATC/Maestro) for multi-agent same-repo edits
-3. **Gateway + serverless backends** — Modal/Daytona + cron→gateway delivery for VPS ops story
+2. **Gateway + serverless backends** — Modal/Daytona + cron→gateway delivery for VPS ops story
+3. **Homelab proof brief** — run autonomous build + `./scripts/studio_smoke.sh` on a real dashboard brief end-to-end
 
 **Next priorities (ordered):**
 
-1. **Git worktree helper** — `skyn3t/worktree` util + Studio option for parallel CodeAgent edits
-2. **Messaging channel parity** — add 1–2 high-value channels or unified cron→gateway stub
-3. **Homelab proof brief** — run autonomous build + `./scripts/studio_smoke.sh` on a real dashboard brief end-to-end
+1. **Messaging channel parity** — add 1–2 high-value channels or unified cron→gateway stub
+2. **Homelab proof brief** — run autonomous build + `./scripts/studio_smoke.sh` on a real dashboard brief end-to-end
+3. **Studio/Cortex route UI polish** — match new Overview design on Agents/Cortex pages
+
+### Done in fleet-backpressure + worktree pass (2026-06-11)
+
+| Feature | File(s) | Notes |
+|---------|---------|-------|
+| **Studio concurrency cap** | `agent_fleet.py`, `settings.py` | `SKYN3T_AGENT_FLEET_MAX_CONCURRENT_BUILDS=5` (default) decouples fleet slots from Studio semaphore |
+| **Non-blocking fleet status** | `agent_fleet.py`, `web/app.py` | 2s cached snapshot + `asyncio.to_thread` on `/api/fleet/status` |
+| **Scout off boot path** | `continuous_improvement.py` | Fleet scout uses `start_background`; `SKYN3T_CORTEX_SCOUT_DEFER_BOOT_SECONDS=120` |
+| **Git worktree helper** | `skyn3t/worktree.py`, `scripts/worktree.sh` | Per-slot worktree under `.worktrees/`; autonomous builds pass `worktree=True` |
+| **CodeAgent worktree dir** | `runner.py`, `code_agent.py` | `code_scaffold_dir` override when worktree enabled |
+
+Env: `SKYN3T_AGENT_FLEET_MAX_CONCURRENT_BUILDS=5`, `SKYN3T_CORTEX_SCOUT_DEFER_BOOT_SECONDS=120`, `SKYN3T_STUDIO_WORKTREE=1`
+
+Tests: `tests/test_agent_fleet.py`, `tests/test_continuous_improvement.py`, `tests/test_worktree.py`
 
 ---
 
@@ -283,9 +386,45 @@ Recent SkyN3t quality work was **not** validated against live Hermes at build ti
 
 **Top 3 gaps to close next (updated from live Hermes):**
 
-1. **Git worktree parallel isolation** — Railyard/ATC pattern for multi-agent same-repo edits
-2. **Gateway + cron + serverless** — unified messaging delivery + Modal/Daytona backends
-3. **Homelab proof brief** — validate autonomous loop + proof runs on a real homelab dashboard build
+1. **Gateway + cron + serverless** — unified messaging delivery + Modal/Daytona backends
+2. **Homelab proof brief** — validate autonomous loop + proof runs on a real homelab dashboard build
+3. **Messaging channel parity** — ~13 vs Hermes ~22 channels
+
+---
+
+## Cursor + Fleet dual loop (2026-06-11)
+
+Two never-stop improvement paths run in parallel:
+
+| Loop | Improves | Mechanism |
+|------|----------|-----------|
+| **Fleet** | `PROJECTS_DIR` scaffolds | `AgentFleetCoordinator` + `AutonomousCoordinator` + Studio pipeline |
+| **Cursor** | This repo (`skyn3t/`) | Cursor IDE agents + optional Cursor Automation |
+
+### Fleet (autonomous Studio)
+
+- Env: `SKYN3T_AGENT_FLEET_SIZE=20`, `SKYN3T_AUTONOMOUS_BUILDS=1`, `SKYN3T_CONTINUOUS_IMPROVEMENT=1`
+- APIs: `GET /api/fleet/status`, `GET /api/improvement/status`
+- Boot seeds competitive practice briefs via `seed_startup_briefs()`; dispatcher uses `SKYN3T_AGENT_FLEET_TICK_SECONDS` (default 30s)
+
+### Cursor (orchestrator repo)
+
+| Artifact | Purpose |
+|----------|---------|
+| `.cursor/rules/continuous-improvement.mdc` | Agent rule: read CONTINUE.md, small diffs, run tests |
+| `.cursor/automations/skyn3t-continuous-improvement.json` | Automation prefill (weekday 09:00 cron) |
+| `.cursor/automations/README.md` | Enable steps in Cursor Automations UI |
+| `data/cursor_tasks.json` | Queue written by improvement flywheel |
+| `skyn3t/cortex/cursor_improvement.py` | Enqueue on regression / competitive scout |
+| `scripts/cursor_improve.sh` | Print next task + fleet/improvement smoke + pytest subset |
+
+**Enable Cursor Automation:** Cursor → Automations → New → prefill from `.cursor/automations/skyn3t-continuous-improvement.json` → set repo `Choaterboater/skyn3t-orchestrator` → save.
+
+**Manual chat:** `Process cursor_tasks.json` or `./scripts/cursor_improve.sh`
+
+**Regression / scout → Cursor:** `ContinuousImprovementEngine` calls `enqueue_regression_task()` and `maybe_enqueue_from_competitive_adaptation()` so IDE agents can fix SkyN3t itself while fleet drills stay in `PROJECTS_DIR`.
+
+Tests: `tests/test_cursor_improvement.py`
 
 ---
 
@@ -293,6 +432,7 @@ Recent SkyN3t quality work was **not** validated against live Hermes at build ti
 
 ```
 Read docs/CONTINUE.md and continue the Hermes-beating quality work from the next priorities list.
+Process data/cursor_tasks.json if the queue has items.
 ```
 
 ---
