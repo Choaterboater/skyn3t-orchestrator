@@ -20,7 +20,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 logger = logging.getLogger("skyn3t.cortex.autonomous_loop")
@@ -177,7 +177,7 @@ class AutonomousCoordinator:
         self.orchestrator = orchestrator
         self.event_bus = event_bus
         self.state = _load_state()
-        self._pending: Deque[AutonomousBrief] = asyncio.Queue()
+        self._pending: asyncio.Queue[AutonomousBrief] = asyncio.Queue()  # type: ignore
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._wired = False
@@ -295,6 +295,9 @@ class AutonomousCoordinator:
             "autonomous_learning": bool(getattr(settings, "autonomous_learning", True)),
             "autonomous_builds": bool(getattr(settings, "autonomous_builds", False)),
             "autonomous_proof_run": bool(getattr(settings, "autonomous_proof_run", True)),
+            "autonomous_min_reviewer_score": int(
+                getattr(settings, "autonomous_min_reviewer_score", 85)
+            ),
             "scout_schedule": self._scout_boot,
             "daily_builds": self.state.daily_builds,
             "daily_spend_usd": self.state.daily_spend_usd,
@@ -340,12 +343,10 @@ class AutonomousCoordinator:
                 logger.debug("autonomous proof-run hook failed", exc_info=True)
 
     async def _on_project_completed(self, payload: Dict[str, Any]) -> None:
-        """Fail-closed proof run after autonomous Studio builds finish."""
+        """Fail-closed quality/proof checks after autonomous Studio builds finish."""
         from skyn3t.config.settings import get_settings
 
         settings = get_settings()
-        if not getattr(settings, "autonomous_proof_run", True):
-            return
         if not getattr(settings, "autonomous_builds", False):
             return
 
@@ -354,7 +355,22 @@ class AutonomousCoordinator:
             return
         if not payload.get("autonomous") and not slug.startswith("auto-"):
             return
-        if str(payload.get("status") or "") == "failed":
+
+        quality_failure = self._autonomous_quality_failure(payload, settings)
+        if quality_failure:
+            self._publish_alert(
+                "AUTONOMOUS_QUALITY_REJECTED",
+                slug=slug,
+                stack=payload.get("stack"),
+                status=payload.get("status"),
+                verdict=payload.get("verdict"),
+                reviewer_score=self._payload_reviewer_score(payload),
+                summary=quality_failure,
+            )
+            await self._enqueue_quality_retry_brief(payload, quality_failure, settings)
+            return
+
+        if not getattr(settings, "autonomous_proof_run", True):
             return
 
         from skyn3t.studio.proof_run import run_proof_for_slug
@@ -394,6 +410,76 @@ class AutonomousCoordinator:
                 "stack": proof.get("stack") or payload.get("stack") or "web",
                 "source": "proof_run",
             }
+        )
+
+    @staticmethod
+    def _payload_reviewer_score(payload: Dict[str, Any]) -> Optional[float]:
+        for key in ("reviewer_score", "score"):
+            raw = payload.get(key)
+            if isinstance(raw, (int, float)):
+                return float(raw)
+        quality = payload.get("quality_summary")
+        if isinstance(quality, dict):
+            raw = quality.get("score")
+            if isinstance(raw, (int, float)):
+                return float(raw)
+        return None
+
+    def _autonomous_quality_failure(
+        self,
+        payload: Dict[str, Any],
+        settings: Any,
+    ) -> Optional[str]:
+        threshold = int(getattr(settings, "autonomous_min_reviewer_score", 85))
+        status = str(payload.get("status") or "").strip().lower()
+        verdict = str(payload.get("verdict") or "").strip().lower()
+        if not verdict:
+            quality = payload.get("quality_summary")
+            if isinstance(quality, dict):
+                verdict = str(quality.get("verdict") or "").strip().lower()
+
+        score = self._payload_reviewer_score(payload)
+        if status == "failed":
+            return str(payload.get("message") or payload.get("error") or "project status is failed")
+        if status != "done":
+            return f"project status is {status or 'unknown'}, not done"
+        if verdict != "go":
+            return f"reviewer verdict is {verdict or 'missing'}, not go"
+        if score is None:
+            return "reviewer score is missing"
+        if score < threshold:
+            return f"reviewer score {score:.0f}/100 is below autonomous floor {threshold}/100"
+        return None
+
+    async def _enqueue_quality_retry_brief(
+        self,
+        payload: Dict[str, Any],
+        reason: str,
+        settings: Any,
+    ) -> None:
+        if not getattr(settings, "autonomous_quality_retry", True):
+            return
+        stack = str(payload.get("stack") or "web").strip() or "web"
+        slug = str(payload.get("slug") or payload.get("project_slug") or "previous run").strip()
+        original = str(payload.get("brief") or payload.get("title") or "").strip()
+        if not original:
+            original = "the previous autonomous project brief"
+        threshold = int(getattr(settings, "autonomous_min_reviewer_score", 85))
+        brief = (
+            f"Autonomous quality recovery drill: rebuild {original[:180]} as a polished, "
+            f"runnable {stack} product. Previous run {slug} was rejected because {reason}. "
+            f"Ship a clean reviewer 'go' result at or above {threshold}/100: implement the core "
+            "workflow end-to-end, include runnable packaging/configuration, use real integrations "
+            "where the brief asks for them, and do not ship TODOs, placeholders, mock-only demos, "
+            "or weak visual states."
+        )
+        await self._offer_brief(
+            AutonomousBrief(
+                brief=brief,
+                source="quality_gate",
+                trigger=reason[:200],
+                priority=90,
+            )
         )
 
     async def _enqueue_failure_brief(self, payload: Dict[str, Any]) -> None:
@@ -478,15 +564,15 @@ class AutonomousCoordinator:
                         "created_at": b.created_at,
                     }
                 )
-            for b in items:
+            for b_dict in items:
                 self._pending.put_nowait(
                     AutonomousBrief(
-                        brief=b["brief"],
-                        template=b["template"],
-                        source=b["source"],
-                        trigger=b["trigger"],
-                        priority=b["priority"],
-                        created_at=b["created_at"],
+                        brief=b_dict["brief"],
+                        template=b_dict["template"],
+                        source=b_dict["source"],
+                        trigger=b_dict["trigger"],
+                        priority=b_dict["priority"],
+                        created_at=b_dict["created_at"],
                     )
                 )
             self.state.queue = items
@@ -724,6 +810,8 @@ class AutonomousCoordinator:
             "max_cost_usd": max_cost,
             "fleet_slot": slot_id,
             "worktree": True,
+            "quality_floor_score": int(getattr(settings, "autonomous_min_reviewer_score", 85)),
+            "fail_on_needs_fixes": True,
         }
         self._publish_alert(
             "AUTONOMOUS_BUILD_STARTED",
@@ -737,22 +825,63 @@ class AutonomousCoordinator:
             chosen.brief,
             slug=slug_base[:48],
             extra=extra,
-            mission_setup={"autonomy": "balanced"},
+            mission_setup={
+                "autonomy": "balanced",
+                "quality_floor_score": int(
+                    getattr(settings, "autonomous_min_reviewer_score", 85)
+                ),
+            },
         )
         slug = str(manifest.get("slug") or slug_base)
+        actual_tokens = self._project_token_total(runner, slug)
+        actual_spend = self._estimate_spend_from_tokens(
+            actual_tokens,
+            reserved_max_cost=max_cost,
+        )
         self.state.daily_builds += 1
-        self.state.daily_spend_usd += float(max_cost)
+        self.state.daily_spend_usd += actual_spend
         self.state.last_build_slug = slug
         self.state.last_skip_reason = None
         _save_state(self.state)
-        est_tokens = int(max_cost * 250_000) if max_cost else 50_000
+        est_tokens = actual_tokens or (int(actual_spend * 250_000) if actual_spend else 50_000)
         logger.info(
-            "autonomous build started slug=%s source=%s slot=%s",
+            "autonomous build finished slug=%s source=%s slot=%s spend=%.4f tokens=%d",
             slug,
             chosen.source,
             slot_id,
+            actual_spend,
+            est_tokens,
         )
         return slug, est_tokens
+
+    @staticmethod
+    def _project_token_total(runner: Any, slug: str) -> int:
+        reader = getattr(runner, "_project_token_total", None)
+        if callable(reader):
+            try:
+                return max(0, int(reader(slug) or 0))
+            except Exception:
+                logger.debug("runner project token lookup failed", exc_info=True)
+        try:
+            from skyn3t.observability.token_tracker import get_default_tracker
+
+            row = get_default_tracker().project_summary(slug)
+            return max(0, int(row.get("total_tokens") or 0))
+        except Exception:
+            logger.debug("token tracker project lookup failed", exc_info=True)
+            return 0
+
+    @staticmethod
+    def _estimate_spend_from_tokens(
+        tokens: int,
+        *,
+        reserved_max_cost: float,
+    ) -> float:
+        if reserved_max_cost <= 0:
+            return 0.0
+        if tokens > 0:
+            return min(float(reserved_max_cost), max(0.001, tokens / 250_000.0))
+        return min(float(reserved_max_cost), 0.01)
 
     async def _maybe_start_build(self) -> Optional[str]:
         gate = self._check_build_gates()

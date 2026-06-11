@@ -1,7 +1,6 @@
 """Studio token budget and pipeline checkpoint behavior."""
 
 import json
-from pathlib import Path
 
 import pytest
 
@@ -61,9 +60,10 @@ def test_record_pipeline_checkpoint(runner):
 
 def test_studio_token_budget_exceeded(monkeypatch, runner):
     monkeypatch.setenv("SKYN3T_STUDIO_TOKEN_BUDGET", "1000")
+    from types import SimpleNamespace
+
     from skyn3t.config.settings import get_settings
     from skyn3t.observability.token_tracker import get_default_tracker
-    from types import SimpleNamespace
 
     get_settings.cache_clear()
     tracker = get_default_tracker()

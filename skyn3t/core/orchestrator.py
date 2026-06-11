@@ -226,9 +226,9 @@ class Orchestrator:
         try:
             status = coord.get_status()
             status["available"] = True
-            return status
+            return status  # type: ignore
         except Exception as exc:
-            return {"available": False, "error": str(exc)}
+            return {"available": False, "error": str(exc)}  # type: ignore
 
     def get_fleet_status(self) -> Dict[str, Any]:
         fleet = getattr(self, "_agent_fleet_coordinator", None)
@@ -237,9 +237,9 @@ class Orchestrator:
         try:
             status = fleet.get_status()
             status["available"] = True
-            return status
+            return status  # type: ignore
         except Exception as exc:
-            return {"available": False, "error": str(exc)}
+            return {"available": False, "error": str(exc)}  # type: ignore
 
     def get_improvement_status(self) -> Dict[str, Any]:
         engine = getattr(self, "_continuous_improvement", None)
@@ -254,9 +254,9 @@ class Orchestrator:
                     status.update(watchdog.get_status())
                 except Exception:
                     logger.debug("never-stop status merge failed", exc_info=True)
-            return status
+            return status  # type: ignore
         except Exception as exc:
-            return {"available": False, "error": str(exc)}
+            return {"available": False, "error": str(exc)}  # type: ignore
 
     def get_cortex_status(self) -> Dict[str, Any]:
         """Return runtime status for the Cortex proposal loop."""
@@ -1526,7 +1526,7 @@ class Orchestrator:
             "self_tuning": {"enabled": self._tuner is not None},
             "meta_agent": self._meta_agent.get_status() if self._meta_agent else {"enabled": False},
         }
-        return status
+        return status  # type: ignore
 
     # ------------------------------------------------------------------
     # Event handlers

@@ -381,7 +381,7 @@ class AgentFleetCoordinator:
             return None
         pop = getattr(auto, "pop_highest_priority_brief", None)
         if callable(pop):
-            return pop()
+            return pop()  # type: ignore
         return None
 
     async def _run_build_slot(self, slot: FleetSlot, brief: AutonomousBrief) -> None:

@@ -39,6 +39,9 @@ def isolate_runtime_state(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "")
     # Force inline execution backend so tests don't pull Docker images.
     monkeypatch.setenv("SKYN3T_EXECUTION_BACKEND", "inline")
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILDS", "0")
+    monkeypatch.setenv("SKYN3T_AUTO_APPROVE", "0")
+    monkeypatch.setenv("SKYN3T_NO_APPROVAL", "0")
 
     import skyn3t.memory.database as memory_database
     from skyn3t.config.settings import get_settings

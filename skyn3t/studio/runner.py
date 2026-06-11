@@ -2781,9 +2781,16 @@ class StudioRunner:
                     "status": manifest["status"],
                     "verdict": (manifest.get("quality_summary") or {}).get("verdict") or "",
                     "reviewer_score": (manifest.get("quality_summary") or {}).get("score"),
+                    "quality_summary": manifest.get("quality_summary") or {},
+                    "build_verification": manifest.get("build_verification") or {},
+                    "boot_verification": manifest.get("boot_verification") or {},
+                    "integration_verification": manifest.get("integration_verification") or {},
+                    "consistency_check": manifest.get("consistency_check") or {},
                     "stack": manifest.get("stack") or "",
                     "feature_tags": _feature_tags,
                     "message": completion_message,
+                    "error": manifest.get("error") or "",
+                    "brief": str(manifest.get("brief_raw") or manifest.get("brief") or "")[:800],
                 },
             )
             # Post final outcome into the Discord thread (if one exists).
@@ -2799,14 +2806,13 @@ class StudioRunner:
                 )
             except Exception:
                 logger.exception("discord completion post failed")
-            # Retry-success skill capture: when a `-retry` project finishes
-            # well (status done / needs_fixes), the original failure that
-            # triggered the retry is now a solved problem. Persist the
-            # lesson so the next similar brief gets it injected at code-gen
-            # time instead of repeating the same break → retry cycle.
+            # Retry-success skill capture: when a `-retry` project fully
+            # finishes, the original failure that triggered the retry is a
+            # solved problem. Persist only clean wins; needs_fixes/no-go
+            # retries are failure lessons, not reusable success skills.
             if (
                 slug.endswith("-retry")
-                and manifest.get("status") in {"done", "needs_fixes"}
+                and self._retry_manifest_is_skillworthy(manifest)
             ):
                 try:
                     self._persist_retry_as_skill(retry_slug=slug, retry_manifest=manifest)
@@ -3579,6 +3585,20 @@ class StudioRunner:
             )
         except Exception:
             logger.exception("skill upsert failed for retry-recovery skill %s", name)
+
+    def _retry_manifest_is_skillworthy(self, manifest: Dict[str, Any]) -> bool:
+        if manifest.get("status") != "done":
+            return False
+        quality = self._normalize_quality_summary(manifest.get("quality_summary"))
+        if quality is None:
+            return False
+        if str(quality.get("verdict") or "").lower() != "go":
+            return False
+        try:
+            score = int(quality.get("score"))
+        except (TypeError, ValueError):
+            return False
+        return score >= self._reviewer_score_threshold(manifest)
 
     async def _run_build_verifier(
         self,
@@ -5347,6 +5367,32 @@ class StudioRunner:
     # reviewer >= REVIEWER_SCORE_THRESHOLD before declaring done.
     REVIEWER_SCORE_THRESHOLD = 80
 
+    def _needs_fixes_outcome(
+        self,
+        message: str,
+        error: Optional[str],
+        *,
+        manifest: Optional[Dict[str, Any]],
+    ) -> tuple[str, str, Optional[str]]:
+        if manifest is not None and manifest.get("autonomous"):
+            next_action = f"Autonomous quality gate rejected this output: {message}"
+            return "failed", next_action, error or message
+        return "needs_fixes", message, error
+
+    def _reviewer_score_threshold(self, manifest: Optional[Dict[str, Any]]) -> int:
+        threshold = self.REVIEWER_SCORE_THRESHOLD
+        if manifest is not None and manifest.get("autonomous"):
+            try:
+                from skyn3t.config.settings import get_settings
+
+                threshold = max(
+                    threshold,
+                    int(getattr(get_settings(), "autonomous_min_reviewer_score", threshold)),
+                )
+            except Exception:
+                logger.debug("autonomous reviewer threshold lookup failed", exc_info=True)
+        return threshold
+
     def _finalize_project_outcome(
         self,
         quality_summary: Any,
@@ -5387,25 +5433,25 @@ class StudioRunner:
         # 1. Hard failures from verifiers — these can't be reviewer-
         # overridden. A program that doesn't boot isn't "done".
         if build_verdict == "no":
-            return (
-                "needs_fixes",
+            return self._needs_fixes_outcome(
                 "Build verifier rejected the scaffold — see "
                 "build_verification.failure_hint for the cross-file issue.",
                 "build verifier said no",
+                manifest=manifest,
             )
         if boot_verdict == "no":
-            return (
-                "needs_fixes",
+            return self._needs_fixes_outcome(
                 "Server failed to boot — see boot_verification.failure_hint "
                 "for the diagnosed cross-file issue.",
                 "boot verifier said no",
+                manifest=manifest,
             )
         if integration_verdict == "no":
-            return (
-                "needs_fixes",
+            return self._needs_fixes_outcome(
                 "Frontend/backend integration failed — see "
                 "integration_verification.failure_hint for the contract issue.",
                 "integration verifier said no",
+                manifest=manifest,
             )
 
         # 2. Reviewer-driven outcome, with the score threshold layered on.
@@ -5414,11 +5460,17 @@ class StudioRunner:
             # ran mechanical verifiers but have no quality signal, don't
             # silently mark the run as shippable.
             if manifest is not None and manifest.get("build_verification") is not None:
-                return (
-                    "needs_fixes",
+                return self._needs_fixes_outcome(
                     "Build verification ran but no reviewer score was recorded — "
                     "inspect the scaffold before shipping.",
                     None,
+                    manifest=manifest,
+                )
+            if manifest is not None and manifest.get("autonomous"):
+                return self._needs_fixes_outcome(
+                    "No reviewer score was recorded for an autonomous build.",
+                    None,
+                    manifest=manifest,
                 )
             return "done", "Project finished — open an artifact or download the zip.", None
 
@@ -5429,27 +5481,28 @@ class StudioRunner:
         except (TypeError, ValueError):
             score = None
         summary = self._truncate_stage_text(quality.get("summary"), limit=240)
+        reviewer_threshold = self._reviewer_score_threshold(manifest)
 
         # Reviewer says go but score is below threshold → needs fixes.
         # This catches the "100/100 marketing reviewer score on a
         # half-baked scaffold" case AND the inverse (low score even
         # though verdict said go).
         if verdict == "go":
-            if score is not None and score < self.REVIEWER_SCORE_THRESHOLD:
-                return (
-                    "needs_fixes",
+            if score is not None and score < reviewer_threshold:
+                return self._needs_fixes_outcome(
                     f"Reviewer said go but score {score}/100 is below "
-                    f"the {self.REVIEWER_SCORE_THRESHOLD} threshold for "
+                    f"the {reviewer_threshold} threshold for "
                     f"shipping. Review the findings before merging.",
                     None,
+                    manifest=manifest,
                 )
             return "done", "Project finished — open an artifact or download the zip.", None
 
         if verdict == "go-with-fixes":
-            return (
-                "needs_fixes",
+            return self._needs_fixes_outcome(
                 summary or "Project finished with follow-up fixes still needed.",
                 None,
+                manifest=manifest,
             )
         return (
             "failed",

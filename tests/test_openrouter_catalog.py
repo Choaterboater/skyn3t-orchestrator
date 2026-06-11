@@ -154,6 +154,21 @@ def test_resolve_openrouter_model_keeps_existing_id(tmp_path):
     assert catalog.resolve_openrouter_model("or_cheap", "openrouter/owl-alpha") == "openrouter/owl-alpha"
 
 
+def test_project_type_ladder_uses_catalog_fallback_for_missing_models(tmp_path):
+    from skyn3t.core.project_type_router import ladder_for_file_and_brief
+
+    _write_cache(
+        tmp_path,
+        [m for m in _sample_models() if m["id"] != "openrouter/owl-alpha"],
+    )
+    catalog.load_catalog()
+
+    ladder = ladder_for_file_and_brief("server/index.js", "Build an Express API server")
+
+    assert ladder[0] == "qwen/qwen3-coder"
+    assert "openrouter/owl-alpha" not in ladder
+
+
 def test_validate_tier_models_reports_missing(tmp_path):
     _write_cache(
         tmp_path,

@@ -179,6 +179,12 @@ class Settings(BaseSettings):
     autonomous_proof_run: bool = Field(
         default=True, alias="SKYN3T_AUTONOMOUS_PROOF_RUN"
     )
+    autonomous_min_reviewer_score: int = Field(
+        default=85, alias="SKYN3T_AUTONOMOUS_MIN_REVIEWER_SCORE"
+    )
+    autonomous_quality_retry: bool = Field(
+        default=True, alias="SKYN3T_AUTONOMOUS_QUALITY_RETRY"
+    )
     # Parallel agent fleet — concurrent autonomous learn + build workers
     agent_fleet_size: int = Field(default=0, alias="SKYN3T_AGENT_FLEET_SIZE")
     agent_fleet_learning: int = Field(default=1, alias="SKYN3T_AGENT_FLEET_LEARNING")

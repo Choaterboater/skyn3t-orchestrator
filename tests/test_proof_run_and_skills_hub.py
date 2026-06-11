@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -17,6 +16,10 @@ from skyn3t.studio.proof_run import resolve_scaffold_dir, run_scaffold_proof
 @pytest.fixture(autouse=True)
 def _clear_settings(monkeypatch, tmp_path):
     monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(
+        "skyn3t.cortex.autonomous_loop.STATE_PATH",
+        tmp_path / "data" / "autonomous_loop_state.json",
+    )
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
@@ -66,6 +69,10 @@ def test_list_hub_entries_includes_seed():
 
 
 def test_install_from_hub_imports_seed_skills(tmp_path, monkeypatch):
+    from skyn3t.intelligence.skill_library import get_default_library
+    lib = get_default_library()
+    for skill in lib.all():
+        lib.delete(skill.slug)
     monkeypatch.setenv("SKYN3T_SKILLS_HUB_PATHS", str(tmp_path / "hub"))
     get_settings.cache_clear()
     hub = tmp_path / "hub"
@@ -114,6 +121,8 @@ async def test_autonomous_proof_failed_enqueues_brief(monkeypatch):
                 "slug": "auto-test-123",
                 "autonomous": True,
                 "status": "done",
+                "verdict": "go",
+                "reviewer_score": 92,
                 "stack": "node",
             }
         )
@@ -148,7 +157,13 @@ async def test_autonomous_proof_passed_skips_enqueue(monkeypatch):
         ),
     ):
         await coord._on_project_completed(
-            {"slug": "auto-ok", "autonomous": True, "status": "done"}
+            {
+                "slug": "auto-ok",
+                "autonomous": True,
+                "status": "done",
+                "verdict": "go",
+                "reviewer_score": 92,
+            }
         )
 
     assert coord.state.last_proof_ok is True

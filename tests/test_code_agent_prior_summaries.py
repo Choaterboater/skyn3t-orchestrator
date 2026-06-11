@@ -40,25 +40,28 @@ class TestRelevantContextKeepsEssentials:
     )
 
     BRAND = "### brand.md\n\nPrimary terracotta on cream."
+    DESIGN = "### design.md\n\nUse an operator dashboard, not raw JSON dumps."
 
     def _ctx(self, *blocks: str) -> str:
         return "\n\n---\n\n".join(blocks)
 
     def test_essentials_kept_for_frontend_file(self):
-        ctx = self._ctx(self.ESSENTIALS, self.BRAND, self.ARCHITECTURE)
+        ctx = self._ctx(self.ESSENTIALS, self.DESIGN, self.BRAND, self.ARCHITECTURE)
         out = _relevant_context(ctx, "src/App.jsx")
         assert "Upstream essentials" in out
-        # Frontend wants brand and architecture too.
+        # Frontend wants design, brand, and architecture too.
+        assert "design.md" in out
         assert "brand.md" in out
         assert "architecture.md" in out
 
     def test_essentials_kept_for_config_file(self):
         # vite.config.js normally only gets architecture.md — brand is
         # noise for a config file. Essentials must still be present.
-        ctx = self._ctx(self.ESSENTIALS, self.BRAND, self.ARCHITECTURE)
+        ctx = self._ctx(self.ESSENTIALS, self.DESIGN, self.BRAND, self.ARCHITECTURE)
         out = _relevant_context(ctx, "vite.config.js")
         assert "Upstream essentials" in out
         assert "architecture.md" in out
+        assert "design.md" not in out
         assert "brand.md" not in out
 
     def test_essentials_kept_for_server_file(self):

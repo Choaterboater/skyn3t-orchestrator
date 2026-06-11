@@ -75,7 +75,8 @@ def test_fleet_should_run_with_size(monkeypatch):
 
 def test_effective_build_daily_cap_scales_with_fleet(monkeypatch):
     monkeypatch.setenv("SKYN3T_AGENT_FLEET_SIZE", "20")
-    monkeypatch.delenv("SKYN3T_AUTONOMOUS_BUILD_DAILY_CAP", raising=False)
+    monkeypatch.setenv("SKYN3T_AGENT_FLEET_MAX_CONCURRENT_BUILDS", "5")
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILD_DAILY_CAP", "3")
     get_settings.cache_clear()
     assert effective_build_daily_cap() == 20
 
@@ -207,6 +208,7 @@ async def test_pop_highest_priority_brief_order(fake_autonomous):
 @pytest.mark.asyncio
 async def test_fleet_start_configures_studio_concurrency(monkeypatch, fake_autonomous):
     monkeypatch.setenv("SKYN3T_AGENT_FLEET_SIZE", "20")
+    monkeypatch.setenv("SKYN3T_AGENT_FLEET_MAX_CONCURRENT_BUILDS", "5")
     monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILDS", "1")
     get_settings.cache_clear()
 

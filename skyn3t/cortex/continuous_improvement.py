@@ -257,7 +257,7 @@ class ContinuousImprovementEngine:
 
         stack = str(payload.get("stack") or "unknown").strip() or "unknown"
         status = str(payload.get("status") or "")
-        success = kind == "PROJECT_COMPLETED" and status not in {"failed"}
+        success = kind == "PROJECT_COMPLETED" and status == "done"
 
         try:
             from skyn3t.intelligence.build_patterns import get_default_scoreboard

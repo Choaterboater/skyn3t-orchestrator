@@ -321,8 +321,60 @@ def install_handlers(orchestrator) -> None:
             logger.exception("studio_debug_handler failed")
             return {"ok": False, "error": str(e)}
 
+    async def project_improvement_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Approved project_improvement → mark a verified local candidate as accepted.
+
+        This handler intentionally does *not* push to GitHub or mutate the
+        original project. It records an approval marker in the candidate
+        workspace so a human/operator can decide whether to open a PR or copy
+        the result later.
+        """
+        import json
+        import time
+
+        source_uri = str(payload.get("source_uri") or "").strip()
+        candidate_dir_raw = str(payload.get("candidate_dir") or "").strip()
+        comparison = payload.get("comparison") if isinstance(payload.get("comparison"), dict) else {}
+        if not candidate_dir_raw:
+            return {"ok": False, "error": "candidate_dir missing"}
+        candidate_dir = Path(candidate_dir_raw).expanduser().resolve()
+        if not candidate_dir.is_dir():
+            return {"ok": False, "error": f"candidate_dir not found: {candidate_dir}"}
+        if payload.get("git_push_allowed") is True:
+            return {"ok": False, "error": "refusing project improvement with git_push_allowed=true"}
+        if payload.get("read_only_original") is False:
+            return {"ok": False, "error": "refusing project improvement without read_only_original=true"}
+        if comparison and comparison.get("improved") is not True:
+            return {"ok": False, "error": "candidate comparison did not prove improvement"}
+
+        marker = {
+            "status": "approved_candidate",
+            "source_uri": source_uri,
+            "candidate_dir": str(candidate_dir),
+            "read_only_original": True,
+            "git_push_allowed": False,
+            "comparison": comparison,
+            "approved_at": time.time(),
+            "next_step": (
+                "Review the candidate workspace and manually create a PR/patch if desired. "
+                "Original repositories were not modified by SkyN3t."
+            ),
+        }
+        marker_path = candidate_dir / ".skyn3t_project_improvement_approved.json"
+        marker_path.write_text(json.dumps(marker, indent=2), encoding="utf-8")
+        return {
+            "ok": True,
+            "status": "candidate-approved",
+            "candidate_dir": str(candidate_dir),
+            "marker": str(marker_path),
+            "details": "Verified candidate approved locally; original source remains untouched.",
+        }
+
     store.register_handler("feature", feature_handler)
     store.register_handler("ingest", ingest_handler)
     store.register_handler("external_learning", external_learning_handler)
     store.register_handler("studio_debug", studio_debug_handler)
-    logger.info("cortex handlers registered: feature, ingest, external_learning, studio_debug")
+    store.register_handler("project_improvement", project_improvement_handler)
+    logger.info(
+        "cortex handlers registered: feature, ingest, external_learning, studio_debug, project_improvement"
+    )

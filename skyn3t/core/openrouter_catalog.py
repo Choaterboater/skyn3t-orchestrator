@@ -360,7 +360,7 @@ def pick_best_model_for_task(
         base += sum(2.0 for kw in kind_keywords if kw and kw in hay)
         base += sum(1.0 for kw in tier_keywords if kw and kw in hay)
         pricing = meta.get("pricing") if isinstance(meta.get("pricing"), dict) else {}
-        prompt_cost = float(pricing.get("prompt") or pricing.get("input") or 0.0)
+        prompt_cost = float((pricing.get("prompt") if isinstance(pricing, dict) else None) or (pricing.get("input") if isinstance(pricing, dict) else None) or 0.0)
         if prompt_cost == 0.0:
             base += 1.0
         ctx = meta.get("context_length") or 0

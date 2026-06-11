@@ -58,6 +58,20 @@ Where SkyN3t tries to stand apart is in its emphasis on:
 
 The mission docs also call out **inter-agent conversation**, **multi-LLM debate**, **brutal verification**, and **real autonomy** as key differentiators. Some of those areas are still actively being completed, so the clearest current difference is the architecture: SkyN3t is designed as a persistent, memory-bearing agent swarm with orchestration, feedback loops, and system-level learning built in.
 
+## Domain learning for networking tools
+
+SkyN3t can build a redacted golden corpus from approved local or GitHub projects, starting with Aruba, Juniper, field troubleshooting, inventory/config validation, and automation-script tools. Original local projects and original GitHub repositories are treated as read-only: improvements are prepared in local candidate workspaces, benchmarked against the baseline, and surfaced as approval-gated proposals only when the candidate wins.
+
+Useful commands:
+
+```bash
+skyn3t domain queries
+skyn3t domain ingest-local /path/to/golden-tool --vendor aruba --domain field_troubleshooting
+skyn3t domain candidate https://github.com/org/repo --label experiment
+```
+
+The loop optimizes for quality per dollar: cheap/current OpenRouter models can compete on domain benchmark tasks, but verifier/reviewer results decide what gets learned or proposed.
+
 ## Diagrams
 
 ### 1. High-level architecture

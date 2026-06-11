@@ -66,6 +66,7 @@ def _print_getting_started(*, server_up: bool = False) -> None:
             "In another, run [bold]skyn3t[/bold] again — that opens the chat REPL."
         )
         console.print()
+
     quickstart = Table(show_header=False, box=box.SIMPLE, pad_edge=False)
     quickstart.add_row(
         "[bold cyan]skyn3t[/bold cyan]",
@@ -421,6 +422,7 @@ schedule_app = typer.Typer(help="Schedule recurring tasks", no_args_is_help=True
 memory_app = typer.Typer(help="Memory inspection commands", no_args_is_help=True)
 skills_app = typer.Typer(help="Skill registry commands", no_args_is_help=True)
 models_app = typer.Typer(help="LLM model catalog commands", no_args_is_help=True)
+domain_app = typer.Typer(help="Domain corpus and safe evolution commands", no_args_is_help=True)
 
 app.add_typer(studio_app, name="studio")
 app.add_typer(agent_app, name="agent")
@@ -436,6 +438,82 @@ app.add_typer(schedule_app, name="schedule")
 app.add_typer(memory_app, name="memory")
 app.add_typer(skills_app, name="skills")
 app.add_typer(models_app, name="models")
+app.add_typer(domain_app, name="domain")
+
+
+@domain_app.command("queries")
+def domain_queries() -> None:
+    """Show GitHub search queries for networking golden-corpus discovery."""
+    from skyn3t.intelligence.golden_project_ingestor import networking_github_queries
+
+    table = Table(title="Networking GitHub discovery queries", box=box.SIMPLE)
+    table.add_column("#", style="cyan", justify="right")
+    table.add_column("Query")
+    for idx, query in enumerate(networking_github_queries(), start=1):
+        table.add_row(str(idx), query)
+    console.print(table)
+
+
+@domain_app.command("ingest-local")
+def domain_ingest_local(
+    path: str = typer.Argument(..., help="Approved local golden project folder"),
+    title: str = typer.Option("", "--title", help="Human-readable corpus title"),
+    vendor: List[str] = typer.Option([], "--vendor", help="Vendor tag, e.g. aruba or juniper"),
+    domain: List[str] = typer.Option([], "--domain", help="Domain tag, e.g. field_troubleshooting"),
+    stack: str = typer.Option("", "--stack", help="Project stack label"),
+) -> None:
+    """Ingest a local golden project with redaction and reusable skill output."""
+    from skyn3t.intelligence.golden_project_ingestor import ingest_golden_project
+    from skyn3t.rag.rag_engine import RAGEngine
+
+    source_path = Path(path).expanduser()
+    if not source_path.is_dir():
+        _error(f"Project folder not found: {source_path}")
+        raise typer.Exit(1)
+
+    async def _run() -> Dict[str, Any]:
+        rag = RAGEngine()
+        await rag.initialize()
+        result = await ingest_golden_project(
+            source_uri=str(source_path),
+            title=title or source_path.name,
+            vendor_tags=vendor,
+            domain_tags=domain,
+            stack=stack,
+            rag_engine=rag,
+        )
+        return result.to_dict()
+
+    result = asyncio.run(_run())
+    record = result["record"]
+    _success(
+        "Golden project ingested\n"
+        f"• Corpus ID: [bold]{record['corpus_id']}[/bold]\n"
+        f"• Source: {record['source']['uri']}\n"
+        f"• Read-only original: {record['source']['read_only_original']}\n"
+        f"• Knowledge ID: {result.get('knowledge_id') or 'none'}\n"
+        f"• Skills: {', '.join(result.get('skill_names') or [])}"
+    )
+
+
+@domain_app.command("candidate")
+def domain_candidate(
+    source_uri: str = typer.Argument(..., help="Original local path or GitHub repo URL"),
+    label: str = typer.Option("", "--label", help="Candidate label"),
+) -> None:
+    """Prepare a safe local candidate workspace without mutating the original."""
+    from skyn3t.intelligence.project_evolution import prepare_candidate_workspace
+
+    workspace = prepare_candidate_workspace(source_uri, label=label)
+    data = workspace.to_dict()
+    _success(
+        "Candidate workspace prepared\n"
+        f"• Source: {data['source_uri']}\n"
+        f"• Type: {data['source_type']}\n"
+        f"• Candidate: {data['candidate_dir']}\n"
+        f"• Original read-only: {data['read_only_original']}\n"
+        f"• Direct Git push allowed: {data['git_push_allowed']}"
+    )
 
 # ---------------------------------------------------------------------------
 # Helpers

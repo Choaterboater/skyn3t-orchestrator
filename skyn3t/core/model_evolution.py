@@ -73,6 +73,23 @@ def allow_downgrade() -> bool:
     return _env_truthy("SKYN3T_MODEL_EVOLUTION_DOWNGRADE")
 
 
+def allow_premium_models() -> bool:
+    return _env_truthy("SKYN3T_MODEL_EVOLUTION_ALLOW_PREMIUM")
+
+
+def _is_premium_model(model_id: str) -> bool:
+    text = (model_id or "").lower()
+    premium_markers = (
+        "opus",
+        "claude-opus",
+        "gpt-5",
+        "gpt-4.5",
+        "o3-pro",
+        "o1-pro",
+    )
+    return any(marker in text for marker in premium_markers)
+
+
 def set_evolution_event_bus(event_bus: Any) -> None:
     """Optional hook so background evolution can publish SYSTEM_ALERT events."""
     global _event_bus
@@ -152,7 +169,7 @@ def tier_override_model(tier_name: str, *, settings: Any | None = None) -> Optio
 def _prompt_cost(meta: Dict[str, Any]) -> float:
     pricing = meta.get("pricing") if isinstance(meta.get("pricing"), dict) else {}
     for key in ("prompt", "input"):
-        raw = pricing.get(key)
+        raw = pricing.get(key) if isinstance(pricing, dict) else None
         if raw is None:
             continue
         try:
@@ -230,8 +247,11 @@ def find_best_for_tier(
 ) -> Tuple[Optional[str], float]:
     best_id: Optional[str] = None
     best_score = -1.0
+    premium_ok = allow_premium_models()
     for mid, meta in catalog_index.items():
         if not mid or not isinstance(meta, dict):
+            continue
+        if not premium_ok and _is_premium_model(mid):
             continue
         s = score_model_for_tier(tier_name, mid, meta)
         if s > best_score:
@@ -436,7 +456,7 @@ def pick_evolved_model_for_task(
     base_model: Optional[str] = None,
 ) -> Optional[str]:
     """Task-kind refinement on top of evolution tier base (cheap-smart integration)."""
-    from skyn3t.core.openrouter_catalog import load_catalog, pick_best_model_for_task
+    from skyn3t.core.openrouter_catalog import pick_best_model_for_task
 
     base = base_model or tier_override_model(tier_name)
     picked = pick_best_model_for_task(

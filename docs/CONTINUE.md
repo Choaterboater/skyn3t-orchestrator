@@ -1,13 +1,101 @@
 # SkyN3t — Session Continuation Handoff
 
 Use this file when a chat runs out of tokens or you start a fresh agent session.
-Branch: `cursor/github-scout-dashboard-ui` (dirty working tree as of 2026-06-11).
+
+## Current state (2026-06-11)
+
+- **Branch:** `main` @ `7cb27d0` before this commit; push this handoff commit to `origin/main`.
+- **Working tree:** tracked changes are the autonomy/domain-learning implementation; untracked only local editor noise (`.obsidian/`, `*.canvas`, `2026-05-27.md`, `FETCH_HEAD`) plus generated project artifacts outside the repo root.
+- **Server:** SkyN3t web/API runs on `http://127.0.0.1:6660/` when started. It can become sluggish during large Studio builds; restart safely after projects are `done` or `failed`.
+- **Autonomy budget:** lowered to safer settings in `.env`: `SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD=10.0`, `SKYN3T_AUTONOMOUS_BUILD_DAILY_CAP=10`, `SKYN3T_AGENT_FLEET_MAX_CONCURRENT_BUILDS=3`.
+- **Model routing note:** Opus appeared because model evolution promoted `or_strong`; local data overrides removed that Opus override and routed some stages cheaper, but the committed default policy still has `or_strong` for architect/reviewer unless changed in code or via persisted routing.
+- **Golden corpus:** 7 GitHub repos were ingested as read-only golden networking references.
+- **Generated candidates:** three networking apps repaired to `done` 92/100; CentralMCP challenger v2 scored 100/100 vs centralmcp baseline 96; PyConsole 2030 scored 100/100 vs ConsolePi baseline 92.
+- **Running app:** PyConsole 2030 is launched at frontend `http://127.0.0.1:5182/` and backend `http://127.0.0.1:3102/`.
+
+### Git (verified 2026-06-11)
+
+| Item | Value |
+|------|--------|
+| `HEAD` | `7cb27d0d8184e5166ea01f1486476dd1d4c89229` before commit |
+| `origin/main` | same as pre-commit `HEAD` |
+| Status | On `main`; commit and push pending |
+
+Recent commits on `main`:
+
+| SHA | Subject |
+|-----|---------|
+| `7cb27d0` | feat(cortex): fleet coordination, continuous improvement, and dashboard UX |
+| `519091b` | wip: split-source snapshot for PR extraction |
+| `30490ec` | Fix Studio clarification intent and improve REPL scout UX. |
+
+### Open pull requests
+
+| # | Title | Branch |
+|---|-------|--------|
+| 53 | feat(web): scout REST API for Cortex dashboard | `feat/cortex-scout-rest-api` |
+| 52 | docs: CONTINUE handoff and mission updates | `docs/handoff-continue-mission` |
+| 51 | feat(web): routing, autonomy, and OpenRouter dashboard APIs | `feat/web-dashboard-routing-autonomy` |
+| 50 | feat(routing): OpenRouter sync, multi-LLM wizard, CLI skills | `feat/openrouter-sync-and-cli-wizard` |
+| 49 | feat(autonomy): autonomous builds, proof runs, no-approval | `feat/autonomous-build-loop-no-approval` |
+| 48 | feat(core): autonomy learning and self-healing | `feat/autonomy-learning-self-healing` |
+| 47 | feat(studio): quality verification and critique stack | `feat/studio-quality-verification-stack` |
+| 46 | feat(cortex): GitHub scout dashboard and competitive intel | `feat/cortex-github-scout-competitive-intel` |
+| 45 | fix(deps): pin starlette for FastAPI compatibility | `fix/deps-starlette-pin` |
+
+## Resume prompt
+
+```
+Read docs/CONTINUE.md. Continue from domain-autonomy implementation on main. Verify commit pushed.
+Next: decide whether to commit generated candidate apps into an examples/projects repo, harden live connector credentials, and update default routing if Opus/strong-tier should be opt-in only.
+```
+
+## Next priorities (ordered)
+
+1. Commit and push this implementation to `main`.
+2. Decide whether generated candidate apps should be copied into a tracked examples repo or left under `/Users/stephenchoate/Documents/Skyn3t/Projects`.
+3. Make strong/Opus routing explicitly opt-in if desired; currently data overrides were used locally, not a default code-policy change.
+4. Add real live-read credential flows for selected candidates only after explicit approval.
+5. Continue feeding `GOLD:` / `WEAK:` repos to expand the corpus beyond networking.
+6. Close/reconcile stale PRs #45–#53 if they are superseded by main.
 
 ---
 
 ## Session summary
 
 Work across this thread focused on **fixing CI-quality issues** and **raising Studio build quality to beat Hermes**.
+
+### Domain-autonomy expansion (this session)
+
+| Area | Change |
+|------|--------|
+| **Golden corpus** | Added redacted domain corpus schema and ingestor for local/GitHub networking projects. Originals remain read-only. |
+| **Networking rubric** | Added domain quality scoring for vendor API realism, dry-run safety, config validation, inventory, troubleshooting, sample mode, and operator docs. |
+| **Benchmarking** | Added domain benchmark harness, model tournament store, and safe project-evolution candidate/proposal flow. |
+| **CLI controls** | Added `skyn3t domain queries`, `skyn3t domain ingest-local`, and `skyn3t domain candidate`. |
+| **GitHub seeds** | Ingested `secure-ssid/aos8-migration-tool`, `secure-ssid/New-Central-Portal`, `secure-ssid/centralmcp`, `Choaterboater/GreenCli`, `Choaterboater/securessid`, `aruba/pycentral`, and `Pack3tL0ss/ConsolePi` as read-only golden corpus skills/RAG docs. |
+| **Baseline reports** | Saved comparison reports under session files: `baseline-comparison.json`, `centralmcp-challenger-v2-comparison.json`, `pyconsole-2030-consolepi-comparison.json`. |
+
+### Generated candidate apps (outside repo root)
+
+| Candidate | Path | Result |
+|-----------|------|--------|
+| Aruba Central field triage | `/Users/stephenchoate/Documents/Skyn3t/Projects/aruba-central-field-triage` | Repaired to `done`, score 92; build/test/domain benchmark pass. |
+| AOS8 migration readiness | `/Users/stephenchoate/Documents/Skyn3t/Projects/aos8-migration-readiness-tool` | Repaired to `done`, score 92; build/test/domain benchmark pass. |
+| Network config drift inventory | `/Users/stephenchoate/Documents/Skyn3t/Projects/network-config-drift-inventory` | Repaired to `done`, score 92; build/test/domain benchmark pass. |
+| CentralMCP FieldOps challenger v2 | `/Users/stephenchoate/Documents/Skyn3t/Projects/centralmcp-fieldops-challenger-v2` | Local candidate scored 100 vs centralmcp baseline 96; proposal `b6054ff046a3`. |
+| PyConsole 2030 | `/Users/stephenchoate/Documents/Skyn3t/Projects/pyconsole-2030-field-console-v1` | Local candidate scored 100 vs ConsolePi baseline 92; proposal `521b0da3a578`; launched on ports 5182/3102. |
+
+### PyConsole 2030 current runtime
+
+```bash
+open http://127.0.0.1:5182/
+curl http://127.0.0.1:3102/api/health
+curl http://127.0.0.1:3102/api/config/status
+curl http://127.0.0.1:3102/api/mcp/tools
+```
+
+The app now has env-driven credential status, live read-only Aruba Central request path, serial/SSH planning, Junos RPC planning, config validation, backup diff, diagnostic bundle preview, and MCP stdio server (`npm run mcp`). It remains dry-run by default.
 
 ### Fixes & tooling
 
@@ -76,40 +164,23 @@ Tests: `tests/test_model_evolution.py`
 
 ## Modified files (git status snapshot)
 
-**Tracked modifications:**
+**Current (2026-06-11, post–`7cb27d0`):** no tracked modifications; handoff work is on `main` @ `origin/main`. Untracked noise only — see **Current state** above.
+
+<details>
+<summary>Pre-merge snapshot (historical — merged into main)</summary>
+
+Tracked modifications before direct push:
 
 ```
-.env.example
-README.md
-docs/MISSION.md
-pyproject.toml
-requirements.txt
-skyn3t/agents/build_verifier.py
-skyn3t/agents/code_agent.py
-skyn3t/agents/contract_engine.py
-skyn3t/agents/contract_verifier.py
-skyn3t/agents/reviewer.py
-skyn3t/agents/reviewer_fixes.py
-skyn3t/cli/main.py
-skyn3t/cli/repl.py
-skyn3t/core/orchestrator.py
-skyn3t/cortex/build_pattern_bias.py
-skyn3t/studio/runner.py
-tests/test_build_pattern_bias_apply.py
-tests/test_generation_optimization.py
-tests/test_scout_adaptation.py
-tests/test_studio_approval_cli.py
+.env.example, README.md, docs/MISSION.md, pyproject.toml, requirements.txt,
+skyn3t/agents/* (build_verifier, code_agent, contract_*, reviewer*),
+skyn3t/cli/main.py, skyn3t/cli/repl.py, skyn3t/core/orchestrator.py,
+skyn3t/cortex/build_pattern_bias.py, skyn3t/studio/runner.py, tests/*
 ```
 
-**New untracked (should be committed with this work):**
+Also landed: `docs/CONTINUE.md`, `docs/REBUILD_PLAN.md`, `tests/test_contract_entrypoint_wiring.py`.
 
-```
-docs/CONTINUE.md          ← this file
-docs/REBUILD_PLAN.md      ← updated matrix (in progress)
-tests/test_contract_entrypoint_wiring.py
-```
-
-**Untracked noise (do not commit):** `.obsidian/`, `*.canvas`, `2026-05-27.md`, `FETCH_HEAD`
+</details>
 
 ---
 
@@ -177,7 +248,9 @@ Documented in `.env.example`.
 
 ---
 
-## Next priorities (ordered)
+## Next priorities (historical — superseded)
+
+> **Canonical queue:** see **Next priorities (ordered)** at the top of this document.
 
 1. ~~**Install wizard for multi-LLM backends**~~ — `skyn3t wizard` / `skyn3t init --wizard` (Studio Quality OpenRouter preset + local CLI)
 2. **Messaging channel parity** — Hermes ~18 channels; SkyN3t has ~13
@@ -348,7 +421,7 @@ Repos analyzed: Hermes, MetaSwarm, Forge, Railyard, Ark, ATC, Ruah, Karajan, Ope
 2. **Gateway + serverless backends** — Modal/Daytona + cron→gateway delivery for VPS ops story
 3. **Homelab proof brief** — run autonomous build + `./scripts/studio_smoke.sh` on a real dashboard brief end-to-end
 
-**Next priorities (ordered):**
+**Next priorities (historical — see top of doc):**
 
 1. **Messaging channel parity** — add 1–2 high-value channels or unified cron→gateway stub
 2. **Homelab proof brief** — run autonomous build + `./scripts/studio_smoke.sh` on a real dashboard brief end-to-end
@@ -430,10 +503,7 @@ Tests: `tests/test_cursor_improvement.py`
 
 ## Resume prompt (copy-paste to next agent)
 
-```
-Read docs/CONTINUE.md and continue the Hermes-beating quality work from the next priorities list.
-Process data/cursor_tasks.json if the queue has items.
-```
+Use the **Resume prompt** block at the top of this document (canonical). Also process `data/cursor_tasks.json` if the queue has items.
 
 ---
 

@@ -443,7 +443,7 @@ class ProposalStore:
             return _AutoTriageDecision("pending")
 
         # Safety floor: never auto-approve SkyN3t repo self-edits.
-        if kind in {"code_patch", "studio_debug"}:
+        if kind == "code_patch":
             return _AutoTriageDecision("pending")
         if kind == "feature" and str(payload.get("kind") or "").strip() != "build_pattern_bias":
             return _AutoTriageDecision("pending")

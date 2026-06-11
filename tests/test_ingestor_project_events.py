@@ -194,6 +194,11 @@ def test_ingestor_routes_project_completed_with_failure_verdict(tmp_path) -> Non
                 "stack": "node",
                 "feature_tags": ["glassmorphism", "dark"],
                 "message": "Review complete: go-with-fixes (60/100).",
+                "build_verification": {
+                    "verdict": "no",
+                    "summary": "vite build failed",
+                    "failure_hint": "src/App.jsx imports a missing component",
+                },
             },
         )
         ingestor._on_system_alert(evt)
@@ -209,7 +214,10 @@ def test_ingestor_routes_project_completed_with_failure_verdict(tmp_path) -> Non
     assert doc["doc_type"] == "experience"
     assert "Verdict: go-with-fixes" in doc["content"]
     assert "60/100" in doc["content"]
+    assert "Build Verification: verdict=no" in doc["content"]
+    assert "vite build failed" in doc["content"]
     assert doc["metadata"]["feature_tags"] == "glassmorphism, dark"
+    assert doc["metadata"]["success"] is False
 
 
 def test_ingestor_stages_lessons_as_drafts_until_approved(tmp_path) -> None:

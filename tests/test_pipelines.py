@@ -1769,6 +1769,36 @@ class TestStudioRunner:
         assert "integration" in next_action.lower()
         assert error == "integration verifier said no"
 
+    async def test_finalize_project_outcome_fails_autonomous_below_quality_floor(
+        self, event_bus, tmp_path, monkeypatch
+    ):
+        from skyn3t.config.settings import get_settings
+        from skyn3t.studio.runner import StudioRunner
+
+        monkeypatch.setenv("SKYN3T_AUTONOMOUS_MIN_REVIEWER_SCORE", "85")
+        get_settings.cache_clear()
+        runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
+
+        status, next_action, error = runner._finalize_project_outcome(
+            {
+                "source": "reviewer",
+                "verdict": "go-with-fixes",
+                "score": 82,
+                "summary": "Good but still has product gaps.",
+            },
+            manifest={
+                "autonomous": True,
+                "build_verification": {"verdict": "yes"},
+                "boot_verification": {"verdict": "yes"},
+                "integration_verification": {"verdict": "yes"},
+            },
+        )
+
+        assert status == "failed"
+        assert "Autonomous quality gate rejected" in next_action
+        assert error == "Good but still has product gaps."
+        get_settings.cache_clear()
+
     async def test_unresolved_stub_failure_uses_stub_retry_hint(
         self, event_bus, tmp_path, monkeypatch
     ):

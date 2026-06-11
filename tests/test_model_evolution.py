@@ -17,6 +17,7 @@ def _isolated_evolution(monkeypatch, tmp_path):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.delenv("SKYN3T_MODEL_EVOLUTION", raising=False)
     monkeypatch.delenv("SKYN3T_MODEL_EVOLUTION_DOWNGRADE", raising=False)
+    monkeypatch.delenv("SKYN3T_MODEL_EVOLUTION_ALLOW_PREMIUM", raising=False)
     monkeypatch.delenv("SKYN3T_CHEAP_SMART", raising=False)
     monkeypatch.setenv("SKYN3T_CHEAP_SMART", "0")
     catalog._catalog_index = None
@@ -172,6 +173,57 @@ def test_run_evolution_publishes_alert(tmp_path, monkeypatch):
     alert = captured[0]
     assert alert.payload.get("alert_type") == "MODEL_TIER_EVOLVED"
     assert alert.payload.get("count") >= 1
+
+
+def test_run_evolution_skips_premium_opus_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    models = _sample_models() + [
+        {
+            "id": "anthropic/claude-opus-4.1",
+            "name": "Claude Opus 4.1",
+            "description": "premium reasoning opus model",
+            "context_length": 200000,
+            "pricing": {"prompt": "0.0001", "completion": "0.0001"},
+            "supported_parameters": ["temperature", "tools"],
+            "architecture": {"modality": "text"},
+        }
+    ]
+    _write_catalog(tmp_path, models)
+
+    result = evolution.run_evolution()
+
+    assert result["tiers"]["or_strong"]["best"] != "anthropic/claude-opus-4.1"
+    assert evolution.tier_override_model("or_strong") != "anthropic/claude-opus-4.1"
+
+
+def test_run_evolution_can_opt_into_premium_models(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setenv("SKYN3T_MODEL_EVOLUTION_ALLOW_PREMIUM", "1")
+    models = [
+        {
+            "id": "openrouter/owl-alpha",
+            "name": "Owl Alpha",
+            "description": "cheap coding model",
+            "context_length": 8192,
+            "pricing": {"prompt": "0", "completion": "0"},
+            "supported_parameters": ["temperature", "max_tokens"],
+            "architecture": {"modality": "text"},
+        },
+        {
+            "id": "anthropic/claude-opus-4.1",
+            "name": "Claude Opus 4.1",
+            "description": "premium reasoning opus model",
+            "context_length": 200000,
+            "pricing": {"prompt": "0", "completion": "0"},
+            "supported_parameters": ["temperature", "tools"],
+            "architecture": {"modality": "text"},
+        }
+    ]
+    _write_catalog(tmp_path, models)
+
+    result = evolution.run_evolution()
+
+    assert result["tiers"]["or_strong"]["best"] == "anthropic/claude-opus-4.1"
 
 
 def test_model_router_uses_evolved_tier(tmp_path, monkeypatch):

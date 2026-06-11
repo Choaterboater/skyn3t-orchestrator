@@ -113,6 +113,24 @@ _PROFILES_BY_TYPE = {
     p.project_type: p for p in (UI_HEAVY, BACKEND, DATA_VIZ, GAME, DOCS, GENERIC)
 }
 
+_PROFILE_TIER = {
+    "ui_heavy": "or_ui",
+    "data_viz": "or_ui",
+    "backend": "or_backend",
+    "docs": "or_docs",
+    "game": "or_cheap",
+    "generic": "or_cheap",
+}
+
+_PROFILE_TASK_KIND = {
+    "ui_heavy": "ui",
+    "data_viz": "ui",
+    "backend": "backend",
+    "docs": "docs",
+    "game": "general",
+    "generic": "general",
+}
+
 
 _TYPE_PATTERNS: Sequence[Tuple[str, str]] = (
     ("game",      r"\b(?:game|puzzle|arcade|platformer|sudoku|chess|tic[-\s]?tac[-\s]?toe|"
@@ -169,7 +187,8 @@ def classify_project(brief: str) -> str:
 def ladder_for_brief(brief: str) -> Tuple[str, ...]:
     """Convenience: classify and return the matching ladder in one call."""
     project_type = classify_project(brief)
-    return _PROFILES_BY_TYPE.get(project_type, GENERIC).ladder
+    profile = _PROFILES_BY_TYPE.get(project_type, GENERIC)
+    return _catalog_aware_ladder(profile.project_type, profile.ladder)
 
 
 def ladder_for_file_and_brief(rel_path: str, brief: str) -> Tuple[str, ...]:
@@ -187,11 +206,11 @@ def ladder_for_file_and_brief(rel_path: str, brief: str) -> Tuple[str, ...]:
     if not rl:
         return ladder_for_brief(brief)
     if rl.startswith(("server/", "api/")) or "/server/" in rl or "/api/" in rl:
-        return BACKEND.ladder
+        return _catalog_aware_ladder(BACKEND.project_type, BACKEND.ladder)
     if rl.endswith((".py", ".sh")):
-        return BACKEND.ladder
+        return _catalog_aware_ladder(BACKEND.project_type, BACKEND.ladder)
     if rl.endswith((".md", ".markdown")):
-        return DOCS.ladder
+        return _catalog_aware_ladder(DOCS.project_type, DOCS.ladder)
     return ladder_for_brief(brief)
 
 
@@ -199,3 +218,40 @@ def profile_for_brief(brief: str) -> RoutingProfile:
     """Public lookup used by anything that wants the full profile (notes,
     type, ladder), not just the ladder tuple."""
     return _PROFILES_BY_TYPE.get(classify_project(brief), GENERIC)
+
+
+def _catalog_aware_ladder(project_type: str, ladder: Tuple[str, ...]) -> Tuple[str, ...]:
+    """Resolve a static ladder through the live OpenRouter catalog.
+
+    OpenRouter's model list changes frequently. Keep the hand-curated
+    ladder as a stable fallback, but prepend the current catalog/evolution
+    winner for this project type and replace missing model ids when the
+    local catalog knows a better fit.
+    """
+    resolved: list[str] = []
+    tier = _PROFILE_TIER.get(project_type, "or_cheap")
+    task_kind = _PROFILE_TASK_KIND.get(project_type, "general")
+    try:
+        from skyn3t.core.openrouter_catalog import (
+            pick_best_model_for_task,
+            resolve_openrouter_model,
+        )
+
+        best = pick_best_model_for_task(
+            tier,
+            task_kind,
+            prefer_evolution=True,
+        )
+        if best:
+            resolved.append(best)
+        for model in ladder:
+            candidate = resolve_openrouter_model(tier, model) or model
+            resolved.append(candidate)
+    except Exception:
+        resolved.extend(ladder)
+
+    deduped: list[str] = []
+    for model in resolved:
+        if model and model not in deduped:
+            deduped.append(model)
+    return tuple(deduped) or ladder

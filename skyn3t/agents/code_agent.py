@@ -214,8 +214,8 @@ def _entrypoint_import_instructions(
 def _relevant_context(prior_context: str, rel_path: str) -> str:
     """Filter prior_context down to just the sections this file needs.
 
-    The full prior_context is ~14KB of brief/research/architecture/brand/
-    components — sending ALL of it on every per-file LLM call means the
+    The full prior_context is ~14KB of brief/research/architecture/design/
+    brand/components — sending ALL of it on every per-file LLM call means the
     CLI streams ~14KB of prompt overhead before the model can think.
     For a tiny file like vite.config.js, 95%+ of that context is dead
     weight that doubles the per-call wall time on CLI backends.
@@ -236,7 +236,7 @@ def _relevant_context(prior_context: str, rel_path: str) -> str:
     rl = rel_path.lower()
     # Map file path → which artifact sections to include.
     # Tags: "research" (API specs), "architecture" (system design),
-    # "brand" / "components" (visual/UI), "brainstorm" (alternatives).
+    # "design" / "brand" / "components" (visual/UI), "brainstorm" (alternatives).
     is_server = rl.startswith("server/") or "server/" in rl
     is_adapter = "/adapters/" in rl
     is_frontend = (
@@ -250,7 +250,7 @@ def _relevant_context(prior_context: str, rel_path: str) -> str:
     )
     if is_top_config:
         # Config files need architecture (port choices, stack hints).
-        # Research isn't useful here. Brand/components aren't either.
+        # Research isn't useful here. Design/brand/components aren't either.
         wanted = {"architecture.md"}
     elif is_adapter or is_server:
         # Backend files: research's API specs are the most useful
@@ -258,11 +258,11 @@ def _relevant_context(prior_context: str, rel_path: str) -> str:
         # Brand/components are noise.
         wanted = {"research.md", "architecture.md"}
     elif is_frontend:
-        # Frontend files: brand + components dictate look/feel,
+        # Frontend files: design + brand + components dictate look/feel,
         # architecture defines the API shapes the UI consumes.
         # Research alone is rarely needed unless the file talks to a
         # service directly (rare in a proxied architecture).
-        wanted = {"brand.md", "components.md", "architecture.md"}
+        wanted = {"design.md", "brand.md", "components.md", "architecture.md"}
     else:
         # Unknown shape (top-level scripts, etc.) — include
         # architecture only. Skip the bulky research/brand sections.
@@ -916,6 +916,7 @@ class CodeAgent(BaseAgent):
             ("architecture.md", 3000),
             ("tokens.css", 4000),
             ("tokens.json", 2000),
+            ("design.md", 3500),
             ("brainstorm.md", 2000),
             ("components.md", 2000),
             ("brand.md", 1500),
@@ -1356,6 +1357,21 @@ class CodeAgent(BaseAgent):
                 "workflow end-to-end in this file pass — wiring, handlers, "
                 "and edge cases — not a skeleton that 'looks like' the app."
             )
+            if d.get("autonomous"):
+                try:
+                    quality_floor = int(d.get("quality_floor_score") or 85)
+                except (TypeError, ValueError):
+                    quality_floor = 85
+                build_system = (
+                    build_system
+                    + "\n\nAUTONOMOUS QUALITY CONTRACT:\n"
+                    + f"- This build must earn reviewer verdict `go` with score >= {quality_floor}/100.\n"
+                    + "- If the brief is broad, simplify the product scope but keep one complete, "
+                    + "runnable end-to-end workflow instead of many shallow placeholders.\n"
+                    + "- Do not leave TODOs, placeholder copy, inert buttons, mock-only dashboards, "
+                    + "or disconnected components. Autonomous outputs below this bar are rejected "
+                    + "and retried as failures."
+                )
             if stack_hint:
                 build_system = build_system + "\n\n" + stack_hint
             # Scoreboard pre-warnings: the runner injects strings derived

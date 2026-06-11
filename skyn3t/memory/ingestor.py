@@ -406,7 +406,7 @@ class ExperienceIngestor:
         error = payload.get("error") or ""
         verdict = payload.get("verdict") or ""
         status = str(payload.get("status") or "").strip().lower()
-        success = kind == "PROJECT_COMPLETED" and status in {"done", "needs_fixes"}
+        success = kind == "PROJECT_COMPLETED" and status == "done"
 
         # Build a structured lesson body. Keep it terse — RAG hits return
         # the content directly into a prompt; we want < 600 chars after
@@ -416,12 +416,47 @@ class ExperienceIngestor:
             f"Slug: {slug}",
             f"Stage: {stage}",
         ]
+        if status:
+            lines.append(f"Status: {status}")
         if verdict:
             lines.append(f"Verdict: {verdict}")
+        score = payload.get("reviewer_score")
+        if score is None:
+            score = payload.get("score")
+        if isinstance(score, (int, float)):
+            lines.append(f"Reviewer Score: {score}/100")
         if message:
             lines.append(f"Message: {message[:300]}")
         if error:
             lines.append(f"Error: {error[:300]}")
+        for label, key in (
+            ("Build Verification", "build_verification"),
+            ("Boot Verification", "boot_verification"),
+            ("Integration Verification", "integration_verification"),
+        ):
+            details = payload.get(key)
+            if not isinstance(details, dict):
+                continue
+            verdict_value = str(details.get("verdict") or "").strip()
+            summary_value = str(details.get("summary") or "").strip()
+            hint_value = str(details.get("failure_hint") or "").strip()
+            if verdict_value or summary_value or hint_value:
+                lines.append(
+                    f"{label}: verdict={verdict_value or '?'}; "
+                    f"summary={(summary_value or hint_value)[:220]}"
+                )
+        consistency = payload.get("consistency_check")
+        if isinstance(consistency, dict) and consistency:
+            issue_count = consistency.get("issue_count")
+            missing = consistency.get("missing_planned_files") or []
+            stubs = consistency.get("unresolved_todo_stubs") or []
+            if issue_count is not None or missing or stubs:
+                lines.append(
+                    "Consistency Check: "
+                    f"issues={issue_count if issue_count is not None else '?'}; "
+                    f"missing={', '.join(str(x) for x in missing[:5])}; "
+                    f"stubs={', '.join(str(x) for x in stubs[:5])}"
+                )
 
         # Pull contract-verifier blockers out if present — these are the
         # most actionable signal we can record.

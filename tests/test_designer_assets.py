@@ -261,10 +261,12 @@ async def test_execute_does_not_hang_on_post_write_side_effects(monkeypatch, tmp
         "README.md",
         "brand.md",
         "components.md",
+        "design.md",
         "logo.svg",
         "palette.json",
         "tokens.css",
         "tokens.json",
     ]
     assert (tmp_path / "brand.md").exists()
+    assert (tmp_path / "design.md").exists()
     assert (tmp_path / "tokens.css").exists()

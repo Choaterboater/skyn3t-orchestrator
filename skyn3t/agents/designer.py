@@ -2,7 +2,7 @@
 
 LLM-first. The agent reads the brief, asks an LLM to infer the aesthetic intent
 (cyberpunk HUD, minimal SaaS, luxury, warm/organic, etc.), and emits
-``brand.md``, ``palette.json`` and ``components.md`` that match that intent.
+``brand.md``, ``design.md``, ``palette.json`` and ``components.md`` that match that intent.
 
 If the LLM is offline or returns garbage, the agent falls back to a curated
 hash-keyed palette table per mood so output remains deterministic.
@@ -300,6 +300,18 @@ class DesignerAgent(BaseAgent):
         components_path.write_text(components_md, encoding="utf-8")
         await self.think(f"wrote {components_path.name}")
 
+        design_md = self._render_design_md(
+            brief=brief,
+            mood=mood,
+            palette=palette_json,
+            fonts=fonts,
+            brand_md=brand_md,
+            components_md=components_md,
+        )
+        design_path = artifact_dir / "design.md"
+        design_path.write_text(design_md, encoding="utf-8")
+        await self.think(f"wrote {design_path.name}")
+
         # Structured component file plan — gives CodeAgent a list of
         # small component files to generate ONE AT A TIME instead of
         # cramming the whole app into App.jsx. Best-effort: a failure
@@ -351,7 +363,7 @@ class DesignerAgent(BaseAgent):
         await self.think(f"wrote {readme_path.name}")
 
         files = [
-            str(brand_path), str(palette_path), str(components_path),
+            str(brand_path), str(design_path), str(palette_path), str(components_path),
             str(tokens_css_path), str(tokens_json_path),
             str(logo_svg_path), str(readme_path),
         ]
@@ -913,6 +925,66 @@ class DesignerAgent(BaseAgent):
         out = ArchitectAgent._drop_empty_sections(out)
         out = ArchitectAgent._renumber_lists(out)
         return out
+
+    @staticmethod
+    def _render_design_md(
+        *,
+        brief: str,
+        mood: str,
+        palette: Dict[str, str],
+        fonts: Dict[str, str],
+        brand_md: str,
+        components_md: str,
+    ) -> str:
+        """Concise UI implementation guide for CodeAgent.
+
+        ``brand.md`` can be narrative and ``components.md`` can be long.
+        ``design.md`` is intentionally action-oriented so generated UIs
+        follow concrete layout/state rules rather than dumping raw data.
+        """
+        colors = "\n".join(
+            f"- `{name}`: `{value}`"
+            for name, value in palette.items()
+            if isinstance(value, str)
+        )
+        return "\n".join(
+            [
+                "# UI Design Brief",
+                "",
+                "## Product brief",
+                "",
+                (brief or "").strip()[:1200],
+                "",
+                "## Design intent",
+                "",
+                f"- Mood: `{mood}`",
+                f"- Heading font: `{fonts.get('heading', 'Inter')}`",
+                f"- Body font: `{fonts.get('body', 'Inter')}`",
+                f"- Mono font: `{fonts.get('mono', 'JetBrains Mono')}`",
+                "",
+                "## Palette tokens",
+                "",
+                colors or "- Use palette.json tokens.",
+                "",
+                "## Implementation rules",
+                "",
+                "- Build a real operator dashboard, not a JSON dump.",
+                "- Use visible navigation and task-oriented sections.",
+                "- Include loading, empty, error, and success states.",
+                "- Make primary actions obvious and label destructive actions as gated.",
+                "- Use responsive card/table layouts with clear hierarchy.",
+                "- Prefer charts, status pills, diff views, timelines, and runbook cards over raw pre blocks.",
+                "- Keep controls keyboard-accessible and include focus-visible states.",
+                "",
+                "## Brand source excerpt",
+                "",
+                brand_md.strip()[:1600],
+                "",
+                "## Component source excerpt",
+                "",
+                components_md.strip()[:1600],
+            ]
+        ).rstrip() + "\n"
 
     def _render_brand_md_fallback(
         self,

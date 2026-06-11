@@ -21,6 +21,10 @@ from skyn3t.cortex.autonomous_loop import (
 @pytest.fixture(autouse=True)
 def _clear_settings_cache(monkeypatch, tmp_path):
     monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(
+        "skyn3t.cortex.autonomous_loop.STATE_PATH",
+        tmp_path / "data" / "autonomous_loop_state.json",
+    )
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
@@ -42,9 +46,13 @@ class _FakeRunner:
 
     def __init__(self):
         self.started: list[dict] = []
+        self.token_total = 0
 
     def list_projects(self):
         return []
+
+    def _project_token_total(self, slug: str):
+        return self.token_total
 
     async def start(self, template, brief, **kwargs):
         self.started.append({"template": template, "brief": brief, **kwargs})
@@ -102,8 +110,10 @@ async def test_autonomous_build_respects_daily_cap(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_autonomous_build_starts_when_enabled(monkeypatch):
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD", "100.0")
     monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILDS", "1")
     monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILD_DAILY_CAP", "3")
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_MIN_REVIEWER_SCORE", "88")
     get_settings.cache_clear()
 
     runner = _FakeRunner()
@@ -123,6 +133,80 @@ async def test_autonomous_build_starts_when_enabled(monkeypatch):
     assert skip is None
     assert len(runner.started) == 1
     assert runner.started[0]["extra"].get("autonomous") is True
+    assert runner.started[0]["extra"].get("quality_floor_score") == 88
+    assert runner.started[0]["extra"].get("fail_on_needs_fixes") is True
+
+
+@pytest.mark.asyncio
+async def test_autonomous_quality_rejection_enqueues_recovery(monkeypatch, tmp_path):
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILDS", "1")
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_PROOF_RUN", "0")
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_MIN_REVIEWER_SCORE", "85")
+    monkeypatch.setattr(
+        "skyn3t.cortex.autonomous_loop.STATE_PATH",
+        tmp_path / "data" / "autonomous_loop_state.json",
+    )
+    get_settings.cache_clear()
+
+    orch = SimpleNamespace(
+        memory_store=_FakeMemory(),
+        running_tasks={},
+        get_studio_runner=lambda: _FakeRunner(),
+        _repo_scout=None,
+    )
+    bus = MagicMock()
+    coord = AutonomousCoordinator(orch, bus)
+
+    await coord._on_project_completed(
+        {
+            "slug": "auto-low-quality",
+            "autonomous": True,
+            "status": "needs_fixes",
+            "verdict": "go-with-fixes",
+            "reviewer_score": 72,
+            "stack": "react_vite",
+            "brief": "Build a habit tracker with streaks.",
+            "message": "Review complete: go-with-fixes (72/100).",
+        }
+    )
+
+    assert coord._pending.qsize() == 1
+    queued = coord.pop_highest_priority_brief()
+    assert queued is not None
+    assert queued.source == "quality_gate"
+    assert queued.priority == 90
+    assert "reviewer 'go'" in queued.brief
+
+
+@pytest.mark.asyncio
+async def test_autonomous_build_charges_actual_token_usage(monkeypatch, tmp_path):
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILDS", "1")
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILD_DAILY_CAP", "3")
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD", "10.0")
+    monkeypatch.setattr(
+        "skyn3t.cortex.autonomous_loop.STATE_PATH",
+        tmp_path / "data" / "autonomous_loop_state.json",
+    )
+    get_settings.cache_clear()
+
+    runner = _FakeRunner()
+    runner.token_total = 125_000
+    orch = SimpleNamespace(
+        memory_store=_FakeMemory(),
+        running_tasks={},
+        get_studio_runner=lambda: runner,
+        _repo_scout=None,
+    )
+    coord = AutonomousCoordinator(orch, MagicMock())
+    await coord._pending.put(
+        AutonomousBrief(brief="Build a polished notes app.", source="test")
+    )
+
+    skip = await coord._maybe_start_build()
+
+    assert skip is None
+    assert coord.state.daily_builds == 1
+    assert coord.state.daily_spend_usd == pytest.approx(0.5)
 
 
 def test_brief_hash_dedup():

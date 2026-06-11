@@ -41,6 +41,34 @@ def test_cli_no_args_launches_repl_when_interactive_server_is_up(monkeypatch):
     assert called["repl"] is True
 
 
+def test_domain_queries_command_lists_networking_queries():
+    result = runner.invoke(app, ["domain", "queries"])
+
+    assert result.exit_code == 0
+    assert "aos-cx aruba" in result.stdout
+    assert "junos juniper" in result.stdout
+
+
+def test_domain_candidate_command_creates_safe_workspace(tmp_path, monkeypatch):
+    from skyn3t.config.settings import get_settings
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "README.md").write_text("Aruba tool", encoding="utf-8")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    get_settings.cache_clear()
+
+    result = runner.invoke(app, ["domain", "candidate", str(source), "--label", "test"])
+
+    assert result.exit_code == 0
+    assert "Original read-only: True" in result.stdout
+    assert "Direct Git push allowed: False" in result.stdout
+    candidates = list((tmp_path / "data" / "project_candidates").glob("*test"))
+    assert candidates
+    assert (candidates[0] / "README.md").is_file()
+    get_settings.cache_clear()
+
+
 def test_apply_install_wizard_choice_writes_env_and_routing(tmp_path, monkeypatch):
     env_path = tmp_path / ".env"
     store = ModelRoutingStore(tmp_path / "model_routing.json")

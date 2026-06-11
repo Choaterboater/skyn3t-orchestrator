@@ -13,6 +13,10 @@ from skyn3t.studio import approval_gate
 
 
 def _reset_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILDS", "0")
+    monkeypatch.setenv("SKYN3T_AUTO_APPROVE", "0")
+    from skyn3t.config.settings import get_settings
+    get_settings.cache_clear()
     monkeypatch.setattr(
         approval_gate, "_CONFIG_PATH", tmp_path / "approval_gates.json"
     )

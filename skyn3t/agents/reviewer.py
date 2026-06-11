@@ -195,6 +195,18 @@ class ReviewerAgent(BaseAgent):
         else:
             packaging_score, packaging_gaps, packaging_family = None, [], None
 
+        networking_report = None
+        try:
+            from skyn3t.intelligence.networking_quality import evaluate_networking_quality
+
+            networking_report = evaluate_networking_quality(
+                brief=brief,
+                contents=contents,
+                artifact_dir=artifact_dir,
+            )
+        except Exception:
+            logger.debug("networking quality rubric failed", exc_info=True)
+
         # Blend scores. When packaging is enabled, weight LLM/heuristic/
         # packaging at 54/36/10 (or 90/10 heuristic+packaging if no LLM).
         # When disabled, drop the packaging axis entirely and rescale
@@ -234,6 +246,11 @@ class ReviewerAgent(BaseAgent):
         if packaging_enabled and packaging_gaps:
             for gap in packaging_gaps:
                 risks.append(f"Packaging: {gap}")
+        if networking_report is not None and networking_report.applicable:
+            for gap in networking_report.gaps:
+                risks.append(gap)
+            blended = min(blended, int(networking_report.score))
+            verdict_score = min(verdict_score, int(networking_report.score))
 
         # Hard guard: if the brief explicitly asks for runnable code
         # ("build a … app/dashboard/site/api/script/cli with React/FastAPI/etc.")
@@ -273,6 +290,9 @@ class ReviewerAgent(BaseAgent):
             packaging_score=packaging_score,
             packaging_gaps=packaging_gaps,
             packaging_family=packaging_family,
+            networking_report=networking_report.to_dict()
+            if networking_report is not None and networking_report.applicable
+            else None,
         )
         review_path = artifact_dir / "review.md"
         review_path.write_text(review_md, encoding="utf-8")
@@ -1105,6 +1125,7 @@ class ReviewerAgent(BaseAgent):
         packaging_score: Optional[int] = None,
         packaging_gaps: Optional[List[str]] = None,
         packaging_family: Optional[str] = None,
+        networking_report: Optional[Dict[str, Any]] = None,
     ) -> str:
         out: List[str] = []
         out.append(f"# Review - {artifact_dir.name}")
@@ -1148,6 +1169,19 @@ class ReviewerAgent(BaseAgent):
                     out.append(f"- ⚠️ {gap}")
             else:
                 out.append("- ✓ All packaging artifacts present.")
+        if networking_report:
+            out.append("")
+            out.append(
+                "### Networking domain quality: "
+                f"{networking_report.get('score')}/"
+                f"{networking_report.get('max_score', 100)}"
+            )
+            gaps = networking_report.get("gaps") or []
+            if gaps:
+                for gap in gaps:
+                    out.append(f"- ⚠️ {gap}")
+            else:
+                out.append("- ✓ Networking operator workflows covered.")
         out.append("")
         if llm_review_md:
             out.append("## LLM review")
