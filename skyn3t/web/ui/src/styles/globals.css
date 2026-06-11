@@ -8,6 +8,36 @@
    Palette: cyan live-data + amber warmth on deep charcoal
    ============================================================ */
 
+/* ---------- Design tokens as CSS custom properties ----------
+   Mirrors tailwind.config.js so chart primitives can default to
+   var(--accent)/var(--spark) while still honoring currentColor.
+   Keep these in sync with tailwind.config.js colors.        */
+:root {
+  /* core palette */
+  --accent: #38d4f0;
+  --accent-strong: #5ee4ff;
+  --amber: #e5a045;
+  --amber-strong: #f0b45c;
+  --spark: #38d4f0; /* default chart stroke (Sparkline contract) */
+
+  /* rgba channels for translucent layering (use rgb(var(--accent-rgb) / a)) */
+  --accent-rgb: 56 212 240;
+  --amber-rgb: 229 160 69;
+
+  /* surfaces */
+  --bg-0: #0c0e12;
+  --bg-2: #171d28;
+
+  /* live-data glow tints (precomputed for animations) */
+  --accent-glow-soft: rgba(56, 212, 240, 0.18);
+  --accent-glow: rgba(56, 212, 240, 0.45);
+  --amber-glow: rgba(229, 160, 69, 0.4);
+
+  /* MemoryCore brightness driver — consumers set --glow: 0..1 inline
+     to scale the brain-glow / memory-bright intensity from live data. */
+  --glow: 0;
+}
+
 @layer base {
   html {
     @apply font-sans antialiased;
@@ -192,6 +222,164 @@ pre,
       opacity: 0.35;
       box-shadow: 0 0 4px rgba(56, 212, 240, 0.15);
     }
+  }
+}
+
+/* ============================================================
+   Live-data motion system (additive)
+   ekg-line · edge-pulse · brain-glow/memory-bright · event-flash
+   convo-collapse. All neutralized in the reduced-motion guard
+   below, each with a visible static fallback.
+
+   IMPORTANT: kept at TOP LEVEL (NOT inside @layer components). Tailwind
+   tree-shakes @layer rules whose class names don't appear in scanned source;
+   several of these are applied dynamically (string class names / inline CSS
+   vars), so wrapping them in @layer would PURGE them from the production
+   build. Plain top-level CSS is emitted verbatim. */
+  /* ---------- EKG heartbeat sweep ----------
+     For an inline <svg> <path>/<polyline> heartbeat trace. Animates a
+     dash gap travelling left->right across the stroke. The element must
+     set its own stroke (e.g. text-accent + stroke:currentColor).
+     Optional --ekg-duration tunes cadence from live event rate. */
+  .ekg-line {
+    stroke-dasharray: 4 220;
+    stroke-dashoffset: 226;
+    animation: ekg-sweep var(--ekg-duration, 2.2s) linear infinite;
+  }
+
+  @keyframes ekg-sweep {
+    from {
+      stroke-dashoffset: 226;
+    }
+    to {
+      stroke-dashoffset: 0;
+    }
+  }
+
+  /* ---------- AgentGraph edge pulse ----------
+     A travelling packet of light along a graph edge <path>/<line>.
+     Apply to the moving overlay stroke; the base edge stays static.
+     --edge-duration scales with traffic; --edge-len sizes the packet. */
+  .edge-pulse {
+    stroke-dasharray: var(--edge-len, 8) var(--edge-gap, 160);
+    stroke-dashoffset: 168;
+    animation: edge-travel var(--edge-duration, 1.6s) linear infinite;
+    filter: drop-shadow(0 0 3px var(--accent-glow));
+  }
+
+  @keyframes edge-travel {
+    from {
+      stroke-dashoffset: 168;
+    }
+    to {
+      stroke-dashoffset: 0;
+    }
+  }
+
+  /* ---------- MemoryCore brain glow ----------
+     Variable-intensity glow driven by inline --glow (0..1). At rest it
+     is calm; brighten by raising --glow as insights/skills accumulate.
+     Pairs a steady scaled glow with a slow breathing pulse on top. */
+  .brain-glow {
+    --glow-i: clamp(0, var(--glow, 0), 1);
+    filter: drop-shadow(0 0 calc(4px + 20px * var(--glow-i)) var(--accent-glow))
+      drop-shadow(0 0 calc(2px + 8px * var(--glow-i)) var(--amber-glow));
+    animation: brain-breathe calc(4.5s - 1.8s * var(--glow-i)) ease-in-out infinite;
+    will-change: filter, opacity;
+  }
+
+  @keyframes brain-breathe {
+    0%,
+    100% {
+      opacity: calc(0.72 + 0.18 * var(--glow-i, 0));
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+
+  /* ---------- MemoryCore brightness halo ----------
+     A box-shadow companion to brain-glow for rounded core containers;
+     scales the same --glow var. No animation by default. */
+  .memory-bright {
+    --glow-i: clamp(0, var(--glow, 0), 1);
+    box-shadow:
+      0 0 calc(8px + 28px * var(--glow-i)) var(--accent-glow-soft),
+      inset 0 0 calc(6px + 16px * var(--glow-i)) rgb(var(--accent-rgb) / calc(0.06 + 0.14 * var(--glow-i)));
+    transition: box-shadow 600ms cubic-bezier(0.2, 0.7, 0.2, 1);
+  }
+
+  /* ---------- Event flash ----------
+     Brief background flash on hero/fleet cells when a fresh event lands.
+     Add the class (e.g. via a key remount or toggled class) to fire once. */
+  .event-flash {
+    animation: event-flash 720ms cubic-bezier(0.2, 0.7, 0.2, 1) 1;
+  }
+
+  .event-flash-amber {
+    animation: event-flash-amber 720ms cubic-bezier(0.2, 0.7, 0.2, 1) 1;
+  }
+
+  @keyframes event-flash {
+    0% {
+      background-color: rgb(var(--accent-rgb) / 0.22);
+      box-shadow: inset 0 0 0 1px rgb(var(--accent-rgb) / 0.4);
+    }
+    100% {
+      background-color: transparent;
+      box-shadow: inset 0 0 0 1px transparent;
+    }
+  }
+
+  @keyframes event-flash-amber {
+    0% {
+      background-color: rgb(var(--amber-rgb) / 0.2);
+      box-shadow: inset 0 0 0 1px rgb(var(--amber-rgb) / 0.38);
+    }
+    100% {
+      background-color: transparent;
+      box-shadow: inset 0 0 0 1px transparent;
+    }
+  }
+
+  /* ---------- Convo collapse ----------
+     Smooth expand/collapse for LLM exchange detail rows. Pair with a
+     max-height utility toggle (e.g. max-h-0 <-> max-h-[N]) on the row;
+     this supplies the eased transition + fade. */
+  .convo-collapse {
+    overflow: hidden;
+    transition:
+      max-height 320ms cubic-bezier(0.2, 0.7, 0.2, 1),
+      opacity 240ms ease,
+      margin 320ms cubic-bezier(0.2, 0.7, 0.2, 1);
+  }
+
+/* ---------- Reduced-motion: neutralize ALL new motion ----------
+   Static fallbacks stay visible (glow held at a calm mid intensity,
+   flashes resolve instantly, collapse becomes an instant toggle). */
+@media (prefers-reduced-motion: reduce) {
+  .ekg-line {
+    animation: none !important;
+    stroke-dasharray: none;
+    stroke-dashoffset: 0;
+  }
+  .edge-pulse {
+    animation: none !important;
+    stroke-dasharray: none;
+    stroke-dashoffset: 0;
+    opacity: 0.5;
+  }
+  .brain-glow {
+    animation: none !important;
+    opacity: 1;
+    /* keep a static glow proportional to --glow, no breathing */
+  }
+  .event-flash,
+  .event-flash-amber {
+    animation: none !important;
+  }
+  .convo-collapse {
+    transition: none !important;
   }
 }
 

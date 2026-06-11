@@ -18,7 +18,7 @@ export default function BuildPatternsPage() {
     enabled: !!stack,
   });
 
-  const per = summary?.per_stack ?? {};
+  const per: Record<string, any> = summary?.per_stack ?? {};
   const stacks = Object.keys(per);
 
   return (

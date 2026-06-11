@@ -3,10 +3,13 @@ import { useQuery } from "@tanstack/react-query";
 import { NavLink, Route, Routes } from "react-router-dom";
 
 import { api, clearAuthToken, getAuthToken, HttpError } from "./api/client";
+import { SwarmProvider, useSwarm } from "./context/SwarmProvider";
 import OverviewPage from "./routes/OverviewPage";
 import AgentsPage from "./routes/AgentsPage";
 import StudioPage from "./routes/StudioPage";
 import CortexPage from "./routes/CortexPage";
+import CortexBrainPage from "./routes/CortexBrainPage";
+import SettingsPage from "./routes/SettingsPage";
 import ActivityPage from "./routes/ActivityPage";
 import ChatPage from "./routes/ChatPage";
 import SkillsPage from "./routes/SkillsPage";
@@ -18,40 +21,44 @@ export default function App() {
   const [navOpen, setNavOpen] = useState(false);
 
   return (
-    <div className="relative z-10 min-h-screen bg-atelier">
-      {/* Mobile overlay */}
-      {navOpen && (
-        <button
-          type="button"
-          aria-label="Close navigation"
-          className="fixed inset-0 z-40 bg-bg-0/70 backdrop-blur-sm lg:hidden"
-          onClick={() => setNavOpen(false)}
-        />
-      )}
+    <SwarmProvider>
+      <div className="relative z-10 min-h-screen bg-atelier">
+        {/* Mobile overlay */}
+        {navOpen && (
+          <button
+            type="button"
+            aria-label="Close navigation"
+            className="fixed inset-0 z-40 bg-bg-0/70 backdrop-blur-sm lg:hidden"
+            onClick={() => setNavOpen(false)}
+          />
+        )}
 
-      <div className="grid lg:grid-cols-[260px_minmax(0,1fr)] min-h-screen">
-        <Sidebar open={navOpen} onClose={() => setNavOpen(false)} />
+        <div className="grid lg:grid-cols-[260px_minmax(0,1fr)] min-h-screen">
+          <Sidebar open={navOpen} onClose={() => setNavOpen(false)} />
 
-        <div className="flex flex-col min-w-0 min-h-screen">
-          <MobileTopBar onMenu={() => setNavOpen(true)} />
-          <main className="flex-1 min-w-0 p-4 sm:p-6 space-y-4 page-enter">
-            <BackendStatusBanner />
-            <Routes>
-              <Route path="/" element={<OverviewPage />} />
-              <Route path="/agents" element={<AgentsPage />} />
-              <Route path="/studio" element={<StudioPage />} />
-              <Route path="/cortex" element={<CortexPage />} />
-              <Route path="/activity" element={<ActivityPage />} />
-              <Route path="/chat" element={<ChatPage />} />
-              <Route path="/skills" element={<SkillsPage />} />
-              <Route path="/knowledge" element={<KnowledgePage />} />
-              <Route path="/build-patterns" element={<BuildPatternsPage />} />
-              <Route path="/traces" element={<TracesPage />} />
-            </Routes>
-          </main>
+          <div className="flex flex-col min-w-0 min-h-screen">
+            <MobileTopBar onMenu={() => setNavOpen(true)} />
+            <main className="flex-1 min-w-0 p-4 sm:p-6 space-y-4 page-enter">
+              <BackendStatusBanner />
+              <Routes>
+                <Route path="/" element={<OverviewPage />} />
+                <Route path="/agents" element={<AgentsPage />} />
+                <Route path="/studio" element={<StudioPage />} />
+                <Route path="/brain" element={<CortexBrainPage />} />
+                <Route path="/cortex" element={<CortexPage />} />
+                <Route path="/activity" element={<ActivityPage />} />
+                <Route path="/chat" element={<ChatPage />} />
+                <Route path="/skills" element={<SkillsPage />} />
+                <Route path="/knowledge" element={<KnowledgePage />} />
+                <Route path="/build-patterns" element={<BuildPatternsPage />} />
+                <Route path="/traces" element={<TracesPage />} />
+                <Route path="/settings" element={<SettingsPage />} />
+              </Routes>
+            </main>
+          </div>
         </div>
       </div>
-    </div>
+    </SwarmProvider>
   );
 }
 
@@ -183,13 +190,15 @@ function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
     { to: "/", label: "Overview", icon: "fa-solid fa-gauge-high" },
     { to: "/agents", label: "Agents", icon: "fa-solid fa-robot" },
     { to: "/studio", label: "Studio", icon: "fa-solid fa-hammer" },
-    { to: "/cortex", label: "Cortex", icon: "fa-solid fa-brain" },
+    { to: "/brain", label: "Brain", icon: "fa-solid fa-brain" },
+    { to: "/cortex", label: "Cortex", icon: "fa-solid fa-inbox" },
     { to: "/activity", label: "Activity", icon: "fa-solid fa-circle-nodes" },
     { to: "/chat", label: "Chat", icon: "fa-solid fa-comments" },
     { to: "/skills", label: "Skills", icon: "fa-solid fa-graduation-cap" },
     { to: "/knowledge", label: "Knowledge", icon: "fa-solid fa-book" },
     { to: "/build-patterns", label: "Build Patterns", icon: "fa-solid fa-route" },
     { to: "/traces", label: "Traces", icon: "fa-solid fa-stethoscope" },
+    { to: "/settings", label: "Settings", icon: "fa-solid fa-sliders" },
   ];
 
   return (
@@ -247,10 +256,44 @@ function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
         ))}
       </nav>
 
-      <div className="text-[0.6rem] text-text-dim font-mono border-t border-border pt-4">
-        <span className="live-dot mr-1.5 align-middle" />
-        polling · 127.0.0.1:6660
+      <div className="border-t border-border pt-4">
+        <ConnIndicator />
       </div>
     </aside>
+  );
+}
+
+// Live swarm-socket state, surfaced globally so the shared /ws/swarm
+// connection is always visible. Driven by the one app-wide SwarmProvider.
+function ConnIndicator() {
+  const { status } = useSwarm();
+  // Deterministic dot color via inline style so class-order can't override it.
+  const cfg =
+    status === "open"
+      ? { label: "live", color: "var(--accent, #38d4f0)", text: "text-accent", pulse: true }
+      : status === "connecting"
+        ? { label: "connecting", color: "var(--amber, #e5a045)", text: "text-status-yellow", pulse: true }
+        : { label: "offline", color: "#f0584f", text: "text-status-red", pulse: false };
+  return (
+    <div
+      className="flex items-center gap-2 text-[0.6rem] font-mono"
+      role="status"
+      aria-live="polite"
+      aria-label={`Swarm connection ${cfg.label}`}
+      title={`Swarm socket: ${cfg.label} · 127.0.0.1:6660`}
+    >
+      <span
+        className={[
+          "inline-block w-1.5 h-1.5 rounded-full align-middle",
+          cfg.pulse ? "live-dot" : "",
+        ].join(" ")}
+        style={{ backgroundColor: cfg.color }}
+        aria-hidden="true"
+      />
+      <span className={["uppercase tracking-[0.16em]", cfg.text].join(" ")}>
+        {cfg.label}
+      </span>
+      <span className="text-text-dim ml-auto">/ws/swarm</span>
+    </div>
   );
 }

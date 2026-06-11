@@ -431,6 +431,134 @@ export type ImprovementStatus = {
   error?: string;
 };
 
+// ---------------------------------------------------------------------------
+// Phase 4 command-center additions (ADDITIVE — appended, existing wrappers
+// untouched). consciousness/memory/meta/llm/agents/skills typed surfaces for
+// the operator dashboard. consciousness + meta follow the fleetStatus 503 ->
+// graceful {enabled:false} pattern.
+// ---------------------------------------------------------------------------
+
+export type ConsciousnessStatus = {
+  enabled: boolean;
+  working_memory_keys?: number;
+  active_sessions?: number;
+  total_insights?: number;
+  agents_with_insights?: string[];
+};
+
+export type MemoryLayers = {
+  enabled: boolean;
+  layers: {
+    session: { active_sessions: number; sessions: string[] };
+    operator: {
+      insight_count: number;
+      recent_insights: Array<{
+        agent?: string;
+        capability?: string;
+        insight?: string;
+        timestamp?: number;
+      }>;
+      skill_summary: Record<string, any>;
+      top_skills: Array<{
+        name: string;
+        score: number;
+        tags: string[];
+        source: string;
+      }>;
+    };
+    project: {
+      tasks: number;
+      messages: number;
+      knowledge_documents: number;
+      success_rate: number;
+      recent_documents: Array<{
+        title?: string;
+        source?: string;
+        doc_type?: string;
+        created_at?: number;
+      }>;
+    };
+  };
+};
+
+export type MemoryInsight = {
+  agent?: string;
+  capability?: string;
+  insight?: string;
+  timestamp?: number;
+  [k: string]: any;
+};
+
+export type MetaStatus = {
+  enabled: boolean;
+  running?: boolean;
+  interval_seconds?: number;
+  observations_collected?: number;
+  actions_taken?: number;
+  recent_actions?: Array<Record<string, any>>;
+};
+
+export type LlmBackends = { backends: string[] };
+
+export type AgentTypes = { types: string[] };
+
+export type SkillHubCatalog = {
+  roots: string[];
+  markdown_skills: string[];
+  agent_skill_dirs: string[];
+  total: number;
+};
+
+export type SkillInstallResult = {
+  installed?: string;
+  warnings?: string[];
+  error?: string;
+  flagged?: string[];
+  [k: string]: any;
+};
+
+export type HubInstallResult = {
+  installed?: string[];
+  skipped?: string[];
+  flagged?: string[];
+  [k: string]: any;
+};
+
+export type UsageAgentRow = {
+  agent: string;
+  prompt_tokens: number;
+  response_tokens: number;
+  total_tokens: number;
+  calls: number;
+  last_used_at: number;
+  backend?: string;
+  model?: string;
+};
+
+// Alias so consumers can name the existing GithubScoutConfig surface
+// uniformly without re-declaring it.
+export type GithubScoutConfigFull = GithubScoutConfig;
+
+// New skills surface (GET /api/skills) — distinct from the existing
+// /api/memory/skills wrapped by api.skills.
+export type SkillCatalogEntry = {
+  name: string;
+  slug: string;
+  description?: string;
+  tags: string[];
+  score: number;
+  success_count: number;
+  failure_count: number;
+  source: string;
+  last_used_at?: number;
+  created_at?: number;
+};
+
+export type SkillCatalog = {
+  skills: SkillCatalogEntry[];
+  summary: Record<string, any>;
+};
+
 export const api = {
   status: () => fetchJson<SystemStatus>("/api/status"),
   autonomousStatus: () =>
@@ -731,4 +859,111 @@ export const api = {
       throw err;
     });
   },
+
+  // --- Phase 4 command-center methods (additive) -------------------------
+
+  // Consciousness + meta follow fleetStatus's 503 -> graceful pattern: a
+  // disabled subsystem must not surface as a hard error in the UI.
+  consciousnessStatus: () =>
+    fetchJson<ConsciousnessStatus>("/api/consciousness/status").catch((err) => {
+      if (err instanceof HttpError && err.status === 503) {
+        return { enabled: false } as ConsciousnessStatus;
+      }
+      throw err;
+    }),
+  memoryLayers: (limit?: number) => {
+    const q = typeof limit === "number" ? `?limit=${limit}` : "";
+    return fetchJson<MemoryLayers>(`/api/memory/layers${q}`).catch((err) => {
+      if (err instanceof HttpError && err.status === 503) {
+        return {
+          enabled: false,
+          layers: {
+            session: { active_sessions: 0, sessions: [] },
+            operator: {
+              insight_count: 0,
+              recent_insights: [],
+              skill_summary: {},
+              top_skills: [],
+            },
+            project: {
+              tasks: 0,
+              messages: 0,
+              knowledge_documents: 0,
+              success_rate: 0,
+              recent_documents: [],
+            },
+          },
+        } as MemoryLayers;
+      }
+      throw err;
+    });
+  },
+  memoryInsights: (opts?: {
+    agent?: string;
+    capability?: string;
+    limit?: number;
+  }) => {
+    const qs = new URLSearchParams();
+    if (opts?.agent) qs.set("agent", opts.agent);
+    if (opts?.capability) qs.set("capability", opts.capability);
+    if (typeof opts?.limit === "number") qs.set("limit", String(opts.limit));
+    const q = qs.toString();
+    return fetchJson<{ insights: MemoryInsight[] }>(
+      `/api/memory/insights${q ? `?${q}` : ""}`,
+    ).then((d) => d.insights ?? []);
+  },
+  metaStatus: () =>
+    fetchJson<MetaStatus>("/api/meta/status").catch((err) => {
+      if (err instanceof HttpError && err.status === 503) {
+        return { enabled: false } as MetaStatus;
+      }
+      throw err;
+    }),
+  pauseMeta: () =>
+    fetchJson<{ status?: string; error?: string }>("/api/meta/pause", {
+      method: "POST",
+      body: "{}",
+    }),
+  resumeMeta: () =>
+    fetchJson<{ status?: string; error?: string }>("/api/meta/resume", {
+      method: "POST",
+      body: "{}",
+    }),
+  llmBackends: () =>
+    fetchJson<LlmBackends>("/api/llm/backends").then((d) => d.backends ?? []),
+  agentTypes: () =>
+    fetchJson<AgentTypes>("/api/agents/types").then((d) => d.types ?? []),
+  createAgent: (payload: {
+    name: string;
+    base_type?: string;
+    [k: string]: unknown;
+  }) =>
+    fetchJson<{ ok?: boolean; name?: string; error?: string }>(
+      "/api/agents/create",
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+  skillsList: (tag?: string) => {
+    const q = tag ? `?tag=${encodeURIComponent(tag)}` : "";
+    return fetchJson<SkillCatalog>(`/api/skills${q}`);
+  },
+  skillsHub: () => fetchJson<SkillHubCatalog>("/api/skills/hub"),
+  installSkill: (source: string) =>
+    fetchJson<SkillInstallResult>("/api/skills/install", {
+      method: "POST",
+      body: JSON.stringify({ source }),
+    }),
+  installFromHub: (onlyMissing?: boolean) =>
+    fetchJson<HubInstallResult>("/api/skills/hub/install", {
+      method: "POST",
+      body: JSON.stringify({ only_missing: onlyMissing ?? false }),
+    }),
+  deleteSkill: (name: string) =>
+    fetchJson<{ ok?: boolean; error?: string }>(
+      `/api/skills/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    ),
+  usageAgents: () =>
+    fetchJson<{ agents: UsageAgentRow[] }>("/api/usage/agents").then(
+      (d) => d.agents ?? [],
+    ),
 };

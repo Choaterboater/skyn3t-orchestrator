@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, ProjectDetail, ProjectRow, Template } from "../api/client";
+import { BuildConsole } from "../components/studio/BuildConsole";
 import {
   buildClarificationAnswers,
   clarificationOptionEntry,
@@ -164,7 +165,7 @@ function ProjectList({
       {isLoading && (
         <p className="text-text-secondary text-sm p-4">Loading…</p>
       )}
-      {error && (
+      {error != null && (
         <p className="text-status-red text-sm p-4">
           {error instanceof Error ? error.message : "load failed"}
         </p>
@@ -411,6 +412,11 @@ function ProjectDetailView({
             </div>
           </div>
         </div>
+      </section>
+
+      <section>
+        <SectionTitle>Live build console</SectionTitle>
+        <BuildConsole slug={slug} sessionId={data.session_id} />
       </section>
 
       {data.status === "awaiting_clarification" && (
@@ -1097,7 +1103,7 @@ function ClarificationCard({ slug, data }: { slug: string; data: any }) {
       if (prev.length === questions.length) {
         return prev;
       }
-      return questions.map((_, index) => prev[index] ?? "");
+      return questions.map((_: unknown, index: number) => prev[index] ?? "");
     });
     setSent(false);
   }, [questions.join("\n"), questions.length]);
