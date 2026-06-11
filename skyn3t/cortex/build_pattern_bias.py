@@ -61,7 +61,11 @@ def persist_build_pattern_skill(
         source="cortex:build_pattern_bias",
         body="\n".join(body_lines),
     )
-    get_default_library().upsert(skill)
+    # The counts above are cumulative-derived from the scoreboard and this
+    # writes to a STABLE slug ({stack}-winning-shape) that re-fires on every
+    # approval/graduation. Use "set" so repeated graduations are idempotent and
+    # never inflate the skill's success/failure counts.
+    get_default_library().upsert(skill, count_mode="set")
     return name
 
 
@@ -88,8 +92,14 @@ def write_stack_preference(stack: str, payload: Dict[str, Any]) -> None:
     _write_stack_preference(stack, payload)
 
 
-async def apply_build_pattern_bias(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Activate a build-pattern bias proposal (no LLM diff)."""
+def _apply_build_pattern_bias_core(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Synchronous activation core (no awaits).
+
+    This is the single place that actually persists the winning-shape skill
+    and records the stack preference. The async ``apply_build_pattern_bias``
+    (cortex approval handler) and the sync ``apply_build_pattern_bias_sync``
+    (MetaAgent graduation) both delegate here so behavior is identical.
+    """
     stack = str(payload.get("stack") or "").strip()
     winner_shape = [str(p).strip() for p in (payload.get("winner_shape") or []) if str(p).strip()]
     if not stack:
@@ -126,3 +136,23 @@ async def apply_build_pattern_bias(payload: Dict[str, Any]) -> Dict[str, Any]:
             f"skill `{skill_name}` and data/build_pattern_preferences.json."
         ),
     }
+
+
+def apply_build_pattern_bias_sync(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Sync-friendly entry for callers without an await point.
+
+    MetaAgent's threshold scan (``_check_build_pattern_biases``) runs as a
+    synchronous method inside the observe loop and needs to auto-promote a
+    graduated pattern without scheduling a coroutine. Since the activation
+    body never awaits, this calls the shared sync core directly.
+    """
+    return _apply_build_pattern_bias_core(payload)
+
+
+async def apply_build_pattern_bias(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Activate a build-pattern bias proposal (no LLM diff).
+
+    Async signature is preserved for the cortex ``feature`` approval handler
+    (handlers.py awaits this). The work itself is synchronous.
+    """
+    return _apply_build_pattern_bias_core(payload)

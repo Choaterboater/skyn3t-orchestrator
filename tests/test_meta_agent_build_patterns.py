@@ -121,19 +121,26 @@ def test_distinguishing_files_lists_extras_in_winner(fresh_meta):
     assert "tsconfig.json" in store.proposals[0]["payload"]["distinguishing_files"]
 
 
-def test_winning_shape_persists_as_skill_file(fresh_meta, monkeypatch, tmp_path):
-    """End-to-end: MetaAgent's pattern scan should persist the winning
-    shape as a first-class Skill file the next scaffold can read."""
+def _isolate_skill_library(monkeypatch, tmp_path):
+    """Point the default skill library + graduation prefs at tmp_path so the
+    live data/ directory is never touched."""
+    import skyn3t.cortex.build_pattern_bias as bpb
     import skyn3t.intelligence.skill_library as sl
     skill_root = tmp_path / "skills"
     monkeypatch.setattr(sl, "_default_library", None)
-    monkeypatch.setattr(
-        sl, "get_default_library",
-        lambda: sl.SkillLibrary(root=skill_root),
-    )
+    monkeypatch.setattr(sl, "get_default_library",
+                        lambda: sl.SkillLibrary(root=skill_root))
+    monkeypatch.setattr(bpb, "PREFS_PATH", tmp_path / "build_pattern_preferences.json")
+    return sl
 
+
+def test_below_graduation_files_proposal_not_skill(fresh_meta, monkeypatch, tmp_path):
+    """Below the graduation bar (high rate but few samples), the scan files an
+    approval-gated proposal and must NOT write to the live skill library."""
+    sl = _isolate_skill_library(monkeypatch, tmp_path)
     meta, sb, store = fresh_meta
-    # Same fastapi setup as the headline pass-fail test.
+    # Winner 86% over 7 samples — clears the 75% contrast bar but NOT the
+    # graduation bar (needs >=90% over >=20 samples).
     for _ in range(6):
         sb.record("fastapi", ["src/main.py", "tests/test_health.py", "requirements.txt"], "yes")
     sb.record("fastapi", ["src/main.py", "tests/test_health.py", "requirements.txt"], "no")
@@ -142,11 +149,35 @@ def test_winning_shape_persists_as_skill_file(fresh_meta, monkeypatch, tmp_path)
         sb.record("fastapi", ["src/main.py", "requirements.txt"], "no")
     meta._check_build_pattern_biases()
 
-    lib = sl.get_default_library()
-    skills = lib.find(tag="fastapi", min_score=-1.0, limit=5)
+    # A contrast proposal is filed for operator approval...
+    assert len(store.proposals) == 1
+    assert store.proposals[0]["payload"]["kind"] == "build_pattern_bias"
+    # ...but nothing is written to the live library yet.
+    assert sl.get_default_library().find(tag="fastapi", min_score=-1.0, limit=5) == []
+
+
+def test_graduation_auto_promotes_skill(fresh_meta, monkeypatch, tmp_path):
+    """At/above the graduation bar (>=90% over >=20 samples vs a clear loser),
+    the winning shape is auto-promoted into the skill library without waiting
+    for approval, and the contrast proposal is suppressed for that stack."""
+    sl = _isolate_skill_library(monkeypatch, tmp_path)
+    meta, sb, store = fresh_meta
+    # Winner: 19 wins, 1 loss → 95% over 20 samples (clears graduation).
+    for _ in range(19):
+        sb.record("fastapi", ["src/main.py", "tests/test_health.py", "requirements.txt"], "yes")
+    sb.record("fastapi", ["src/main.py", "tests/test_health.py", "requirements.txt"], "no")
+    # Loser: 1 win, 7 losses → 12.5% over 8 samples.
+    sb.record("fastapi", ["src/main.py", "requirements.txt"], "yes")
+    for _ in range(7):
+        sb.record("fastapi", ["src/main.py", "requirements.txt"], "no")
+    meta._check_build_pattern_biases()
+
+    skills = sl.get_default_library().find(tag="fastapi", min_score=-1.0, limit=5)
     names = [s.name for s in skills]
     assert "fastapi-winning-shape" in names
     target = next(s for s in skills if s.name == "fastapi-winning-shape")
     assert "tests/test_health.py" in target.body
     assert "scaffold-shape" in target.tags
     assert "build-success" in target.tags
+    # Graduation supersedes the approval-gated contrast proposal for this stack.
+    assert len(store.proposals) == 0

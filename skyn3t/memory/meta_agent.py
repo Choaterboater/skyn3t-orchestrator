@@ -44,6 +44,18 @@ PROJECT_RETRY_THRESHOLD = 2
 REVIEW_SCORE_WINDOW = 5
 REVIEW_SCORE_FLOOR = 50.0
 
+# ── Item 8: build-pattern graduation thresholds ──────────────────────
+# A winning shape that clears BOTH of these bars is high-confidence enough
+# to AUTO-PROMOTE (activate the skill + write the stack preference) without
+# operator approval. Everything below this bar stays approval-gated via the
+# 75%/40% contrast proposal. These are deliberately strict: auto-promotion
+# is self-modifying, so it only fires on overwhelming, well-sampled evidence.
+GRADUATION_MIN_RATE = 0.90
+GRADUATION_MIN_SAMPLES = 20
+# Graduation gets its own cooldown so a re-graduation can't thrash the live
+# library even if the 4h proposal dedup has expired.
+GRADUATION_DEDUP_SECONDS = 24 * 3600
+
 
 class MetaAgent:
     """Autonomous meta-agent for system self-improvement.
@@ -90,6 +102,10 @@ class MetaAgent:
         self._review_scores: Deque[float] = deque(maxlen=REVIEW_SCORE_WINDOW)
         # Per-signature dedup map for proposal filing (sig → last-fired ts).
         self._proposal_last_filed: Dict[str, float] = {}
+        # Per-stack dedup map for build-pattern graduation (auto-promote).
+        # Separate from _proposal_last_filed so auto-promotion has its own,
+        # longer cooldown and never collides with the approval-gated path.
+        self._graduation_last_fired: Dict[str, float] = {}
 
         # Subscribe to the events that drive threshold detection. These are
         # all best-effort: handler is wrapped so a malformed event never
@@ -385,6 +401,28 @@ class MetaAgent:
             winner_set = set(best.shape)
             loser_set = set(worst.shape)
             distinguishing = sorted(winner_set - loser_set)
+
+            # Item 8 GRADUATION: when the winner is overwhelming AND well
+            # sampled, auto-promote it (activate the skill + write the stack
+            # preference) instead of filing an approval-gated proposal. This
+            # is the only path that writes to the live skill library; the
+            # contrast proposal below never touches the library on its own —
+            # it waits for operator approval (apply_build_pattern_bias).
+            best_samples = best.success + best.failure
+            if (
+                best.success_rate >= GRADUATION_MIN_RATE
+                and best_samples >= GRADUATION_MIN_SAMPLES
+            ):
+                self._graduate_build_pattern(
+                    stack=stack,
+                    best=best,
+                    worst=worst,
+                    distinguishing=distinguishing,
+                )
+                # Graduation supersedes the approval-gated proposal for this
+                # stack on this tick — don't also spam the contrast proposal.
+                continue
+
             self._file_threshold_proposal(
                 signature=f"build_pattern_bias:{stack}",
                 title=f"Build pattern: prefer winning shape for {stack}",
@@ -425,38 +463,67 @@ class MetaAgent:
                     "distinguishing_files": distinguishing,
                 },
             )
-            # Also persist as a first-class Skill file so the next scaffold
-            # for this stack can read it directly without going through the
-            # scoreboard. Skill files are human-readable in data/skills/.
-            self._persist_build_pattern_skill(stack, best, worst, distinguishing)
+            # NOTE: the below-graduation path NO LONGER persists a skill every
+            # tick. The skill is only activated on operator approval (the
+            # cortex feature handler calls apply_build_pattern_bias) or on
+            # graduation (above). This closes the audit's "writes to live
+            # library every tick / bypasses approval" concern.
 
-    def _persist_build_pattern_skill(self, stack, best, worst, distinguishing) -> None:
-        """Write the winner-vs-loser pattern as a markdown skill file."""
+    def _graduate_build_pattern(self, *, stack, best, worst, distinguishing) -> None:
+        """Auto-promote a high-confidence winning shape (Item 8 graduation).
+
+        Activates the winning-shape skill + writes the stack preference
+        directly via build_pattern_bias, bypassing the approval queue — but
+        ONLY for patterns that clear GRADUATION_MIN_RATE / _MIN_SAMPLES.
+        Gated by a per-stack graduation cooldown so a graduated stack can't
+        re-write the live library on every tick.
+        """
+        signature = f"build_pattern_graduation:{stack}"
+        now = time.time()
+        last = self._graduation_last_fired.get(signature, 0.0)
+        if now - last < GRADUATION_DEDUP_SECONDS:
+            return
+
+        payload = {
+            "kind": "build_pattern_bias",
+            "stack": stack,
+            "winner_shape": list(best.shape),
+            "winner_success_rate": best.success_rate,
+            "winner_samples": best.success + best.failure,
+            "loser_shape": list(worst.shape),
+            "loser_success_rate": worst.success_rate,
+            "loser_samples": worst.success + worst.failure,
+            "distinguishing_files": list(distinguishing),
+            "graduated": True,
+        }
         try:
             from skyn3t.cortex.build_pattern_bias import (
-                persist_build_pattern_skill,
-                write_stack_preference,
+                apply_build_pattern_bias_sync,
             )
-
-            payload = {
-                "stack": stack,
-                "winner_shape": list(best.shape),
-                "winner_success_rate": best.success_rate,
-                "winner_samples": best.success + best.failure,
-                "loser_success_rate": worst.success_rate,
-                "distinguishing_files": list(distinguishing),
-            }
-            persist_build_pattern_skill(
-                stack=stack,
-                winner_shape=list(best.shape),
-                winner_success_rate=best.success_rate,
-                winner_samples=best.success + best.failure,
-                loser_success_rate=worst.success_rate,
-                distinguishing_files=list(distinguishing),
-            )
-            write_stack_preference(stack, payload)
+            result = apply_build_pattern_bias_sync(payload)
         except Exception:
-            logger.exception("skill persist failed for stack=%s", stack)
+            logger.exception(
+                "meta_agent: build-pattern graduation failed for stack=%s", stack
+            )
+            return
+
+        ok = bool(result.get("ok")) if isinstance(result, dict) else False
+        if ok:
+            # Only arm the cooldown when activation actually succeeded so a
+            # transient failure can retry on the next tick.
+            self._graduation_last_fired[signature] = now
+        self._actions.append({
+            "type": "build_pattern_graduated",
+            "signature": signature,
+            "stack": stack,
+            "winner_success_rate": best.success_rate,
+            "winner_samples": best.success + best.failure,
+            "skill": (result.get("skill") if isinstance(result, dict) else None),
+            "timestamp": _utcnow().isoformat(),
+            "result": "auto_promoted" if ok else "failed",
+        })
+        if len(self._actions) > self._max_actions:
+            self._actions = self._actions[-self._max_actions:]
 
     def _file_threshold_proposal(
         self,

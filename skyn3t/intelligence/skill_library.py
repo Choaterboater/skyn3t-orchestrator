@@ -52,6 +52,7 @@ Design choices:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -353,7 +354,7 @@ class SkillLibrary:
     def _scan(self) -> List[Skill]:
         return self._scan_dir(self.root)
 
-    def _write_skill(self, path: Path, skill: Skill) -> Path:
+    def _write_skill(self, path: Path, skill: Skill, *, count_mode: str = "add") -> Path:
         existing: Optional[Skill] = None
         if path.exists():
             try:
@@ -362,8 +363,23 @@ class SkillLibrary:
                 existing = None
         if existing is not None:
             skill.created_at = existing.created_at
-            skill.success_count = max(skill.success_count, existing.success_count)
-            skill.failure_count = max(skill.failure_count, existing.failure_count)
+            if count_mode == "add":
+                # ADDITIVE merge: the incoming skill carries *delta* counts that
+                # accumulate on top of the existing record. This lets independent
+                # observations of the same skill pile up instead of being clamped
+                # by max(). Callers using this mode MUST pass fresh/seed deltas
+                # (not cumulative totals) or the same outcome is double-counted.
+                skill.success_count = existing.success_count + skill.success_count
+                skill.failure_count = existing.failure_count + skill.failure_count
+            elif count_mode == "set":
+                # REPLACE merge: the incoming counts already represent the full,
+                # cumulative truth (e.g. winning-shape skills derived from the
+                # build-pattern scoreboard each tick). Re-running with the same
+                # evidence is idempotent — counts are set, not inflated.
+                pass  # keep skill.success_count / failure_count as provided
+            else:  # "max" — legacy clamp, kept for callers that opt in
+                skill.success_count = max(existing.success_count, skill.success_count)
+                skill.failure_count = max(existing.failure_count, skill.failure_count)
             skill.tags = sorted(set(skill.tags) | set(existing.tags))
         try:
             tmp = path.with_suffix(path.suffix + ".tmp")
@@ -436,17 +452,26 @@ class SkillLibrary:
         candidates.sort(key=lambda s: (s.relevance(query), s.last_used_at), reverse=True)
         return candidates[: max(0, int(limit))]
 
-    def upsert(self, skill: Skill) -> Path:
+    def upsert(self, skill: Skill, *, count_mode: str = "add") -> Path:
         """Write a skill atomically. Returns the path written.
 
-        If a file already exists for this slug, the success/failure counts
-        are merged (taking the max of existing+new, in case the caller has
-        only seen one outcome), and the `created_at` of the existing file
-        is preserved so the timeline is correct.
+        ``count_mode`` controls how counts merge with an existing file for the
+        same slug:
+
+        - ``"add"`` (default): counts are treated as *deltas* and ADDED to the
+          existing record — use for independent observations (genuine seed
+          deltas). Callers must NOT pass cumulative totals here.
+        - ``"set"``: the incoming counts are the full cumulative truth and
+          REPLACE the existing ones — idempotent. Use when re-deriving the same
+          skill from an authoritative source (e.g. the build-pattern
+          scoreboard) that re-fires on every approval/graduation.
+        - ``"max"``: legacy clamp (keep the larger of each).
+
+        The existing file's ``created_at`` is always preserved.
         """
         path = self._path_for(skill)
         with self._lock:
-            return self._write_skill(path, skill)
+            return self._write_skill(path, skill, count_mode=count_mode)
 
     def upsert_draft(self, skill: Skill) -> Path:
         """Write a pending skill draft without making it live."""
@@ -649,6 +674,66 @@ class SkillLibrary:
                 else:
                     kept.append(skill.name)
         return {"archived": archived, "kept": kept}
+
+    # ------------------------------------------------------------------
+    # Scheduled curation
+    # ------------------------------------------------------------------
+
+    @property
+    def _curate_state_path(self) -> Path:
+        """Small sidecar JSON tracking the last curate timestamp.
+
+        Lives next to ``root`` (not inside it) so it is never mis-scanned
+        as a skill file by ``_scan``.
+        """
+        return self.root.parent / f"{self.root.name}.curate.json"
+
+    def _read_last_curate_ts(self) -> float:
+        try:
+            data = json.loads(self._curate_state_path.read_text(encoding="utf-8"))
+            return float(data.get("last_curate_ts") or 0.0)
+        except FileNotFoundError:
+            return 0.0
+        except Exception:
+            logger.exception("curate state read failed: %s", self._curate_state_path)
+            return 0.0
+
+    def _write_last_curate_ts(self, ts: float) -> None:
+        path = self._curate_state_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"last_curate_ts": float(ts)}, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            logger.exception("curate state write failed: %s", path)
+
+    def curate_if_due(
+        self,
+        interval_seconds: float = 86400,
+        **curate_kwargs: Any,
+    ) -> Optional[Dict[str, List[str]]]:
+        """Run :meth:`curate` only when ``interval_seconds`` has elapsed
+        since the last run, persisting the last-curate timestamp in a small
+        sidecar JSON.
+
+        Returns the ``curate()`` result dict when a pass ran, or ``None``
+        when it was skipped because the interval had not yet elapsed.
+
+        The periodic invocation is wired by the continuous-improvement tick
+        (Owner G); this wrapper only handles the cadence + timestamp so
+        skill_library.py stays single-owner.
+        """
+        now = time.time()
+        last = self._read_last_curate_ts()
+        if last and (now - last) < float(interval_seconds):
+            return None
+        result = self.curate(**curate_kwargs)
+        self._write_last_curate_ts(now)
+        return result
 
 
 # Module-level singleton.

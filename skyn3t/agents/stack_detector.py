@@ -79,6 +79,15 @@ class StackDetection:
 # Manifest heuristics
 # ---------------------------------------------------------------------------
 
+# Canonical name aliases. The scoreboard (build_patterns.json) historically
+# split the same logical stack across two keys ("vite_react" vs "react_vite")
+# because different record sites named it differently. ``detect()`` already
+# emits "react_vite", but normalize any legacy/alias names through here so
+# every caller — and the backfill script — converges on one canonical bucket.
+_CANONICAL_STACK_NAMES: Dict[str, str] = {
+    "vite_react": "react_vite",
+}
+
 # Web-stack signatures by package.json dep. Order matters — more specific
 # (next > react_vite > generic_react) so the most-informative one wins.
 _WEB_STACK_BY_DEP: List[tuple[str, str]] = [
@@ -425,3 +434,26 @@ def detect(root: Path) -> StackDetection:
             detection.confidence_notes.append("no manifest files found")
 
     return detection
+
+
+def detect_stack_from_scaffold(artifact_or_scaffold_dir: Path) -> str:
+    """Return the canonical stack name for a scaffold/artifact directory.
+
+    Thin wrapper over :func:`detect` that flattens the rich
+    ``StackDetection`` to the single string the BuildPatternScoreboard
+    keys on. ``detect`` is already scaffold-aware (it peeks under
+    ``<root>/scaffold`` first), so callers can pass either the artifact
+    root or the scaffold dir directly.
+
+    This is THE one place build-outcome record sites should derive their
+    ``stack`` arg so success and failure paths agree on the bucket name.
+    Falls back to ``"unknown"`` when nothing is recognizable, and
+    normalizes legacy aliases (e.g. ``vite_react`` → ``react_vite``) via
+    :data:`_CANONICAL_STACK_NAMES`.
+    """
+    try:
+        name = detect(Path(artifact_or_scaffold_dir)).stack or "unknown"
+    except Exception:
+        # Never let stack detection crash a record path — degrade to unknown.
+        name = "unknown"
+    return _CANONICAL_STACK_NAMES.get(name, name)

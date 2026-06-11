@@ -163,7 +163,7 @@ class ExternalRepoDocIngestor:
         topics: List[str],
         stars: int,
     ) -> Dict[str, Any]:
-        if platform not in {"gitlab", "bitbucket"}:
+        if platform not in {"github", "gitlab", "bitbucket"}:
             return {"ingested": [], "warnings": [f"docs ingest not supported for {platform}"]}
         rag = await self._ensure_rag()
         if rag is None:
@@ -330,6 +330,8 @@ class ExternalRepoDocIngestor:
 
     @staticmethod
     def _raw_url(*, platform: str, repo: str, path: str) -> str:
+        if platform == "github":
+            return f"https://raw.githubusercontent.com/{repo}/HEAD/{path}"
         if platform == "gitlab":
             return f"https://gitlab.com/{repo}/-/raw/HEAD/{path}"
         if platform == "bitbucket":

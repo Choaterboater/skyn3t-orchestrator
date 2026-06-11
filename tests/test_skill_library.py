@@ -129,11 +129,24 @@ def test_upsert_merges_with_existing_file(tmp_path):
     lib.upsert(s2)
     [reloaded] = lib.all()
     assert reloaded.created_at == 100.0  # preserved
-    # max of existing+new on each count
-    assert reloaded.success_count == 5
-    assert reloaded.failure_count == 1
+    # default count_mode="add": existing + incoming (additive accumulation)
+    assert reloaded.success_count == 7  # 2 + 5
+    assert reloaded.failure_count == 1  # 0 + 1
     # tags merged
     assert sorted(reloaded.tags) == ["a", "b"]
+
+
+def test_upsert_count_mode_set_is_idempotent(tmp_path):
+    """count_mode='set' replaces counts (idempotent) instead of accumulating."""
+    lib = SkillLibrary(root=tmp_path / "skills")
+    seed = Skill(name="winner", tags=["x"], success_count=18, failure_count=2)
+    lib.upsert(seed, count_mode="set")
+    # Re-derive the same cumulative truth twice — must NOT inflate.
+    lib.upsert(Skill(name="winner", tags=["x"], success_count=18, failure_count=2),
+               count_mode="set")
+    [reloaded] = lib.all()
+    assert reloaded.success_count == 18
+    assert reloaded.failure_count == 2
 
 
 def test_find_by_tag_filters_and_orders(tmp_path):

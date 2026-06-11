@@ -1001,6 +1001,13 @@ class CodeAgent(BaseAgent):
         self._seed_design_tokens_into_scaffold(artifact_dir, out_dir)
         resolved_out_dir = out_dir.resolve()
         files_written: List[str] = []
+        # Phase 2 (skills grading): names of skills injected into the
+        # build prompt are surfaced in the TaskResult output so the runner
+        # can call skill_library.record_use(name, success=verdict=="yes")
+        # per build. Initialized at function scope so it is always defined
+        # by the time TaskResult is constructed, regardless of which
+        # branches below execute.
+        injected_skills: List[str] = []
 
         # Read prior-stage artifacts so we build on what research,
         # architecture, design, and brainstorm produced — not just the
@@ -1442,6 +1449,10 @@ class CodeAgent(BaseAgent):
                         + "\n\nLearned skills — apply when relevant:\n\n"
                         + "\n\n".join(skill_lines)
                     )
+                # Surface the injected skill names so the runner can credit
+                # or blame each one based on the build verdict (record_use).
+                # `seen` holds every skill name that was actually pulled in.
+                injected_skills = sorted(seen)
             except Exception:
                 logger.debug("skill injection failed", exc_info=True)
 
@@ -1468,18 +1479,32 @@ class CodeAgent(BaseAgent):
             # lessons into the prompt. This is the outer loop: every
             # failed build teaches the system what NOT to do next time.
             try:
-                from skyn3t.config.settings import get_settings
-                settings = get_settings()
-                vector_db_path = Path(settings.vector_db_path or "data/vector_db")
-                if not vector_db_path.exists():
-                    # No vector DB yet — nothing to recall.
-                    raise RuntimeError("vector db not initialized")
+                # Phase 2 (RAG observability): reuse the single live
+                # RAGEngine threaded through task.input_data by the runner
+                # (input_data['rag_engine']) so we hit the same warm,
+                # already-initialized ChromaDB the rest of the system uses
+                # — and so Owner I's per-query recall metric fires for this
+                # call too. RAGEngine.query self-initializes, so a passed
+                # engine needs no explicit initialize() here.
+                rag = d.get("rag_engine")
+                if rag is None:
+                    # Cold-start fallback for non-studio callers that did
+                    # not thread an engine in. Gate on a present vector DB
+                    # so we never wedge the scaffold flow building one.
+                    from skyn3t.config.settings import get_settings
+                    settings = get_settings()
+                    vector_db_path = Path(
+                        settings.vector_db_path or "data/vector_db"
+                    )
+                    if not vector_db_path.exists():
+                        # No vector DB yet — nothing to recall.
+                        raise RuntimeError("vector db not initialized")
 
-                from skyn3t.rag.rag_engine import RAGEngine
-                rag = RAGEngine()
-                # Cap initialization + query at 3s so a cold ChromaDB
-                # start doesn't wedge the scaffold flow.
-                await asyncio.wait_for(rag.initialize(), timeout=3.0)
+                    from skyn3t.rag.rag_engine import RAGEngine
+                    rag = RAGEngine()
+                    # Cap initialization at 3s so a cold ChromaDB start
+                    # doesn't wedge the scaffold flow.
+                    await asyncio.wait_for(rag.initialize(), timeout=3.0)
                 query_text = (
                     f"past build failures for {stack} project: {brief[:300]}"
                 )
@@ -1544,6 +1569,33 @@ class CodeAgent(BaseAgent):
                             )
             except Exception:
                 logger.debug("RAG recall query failed", exc_info=True)
+
+            # Phase 2 (lessons read-side): the runner pre-queries RAG for
+            # this task and threads the resulting lesson strings through
+            # task.input_data['lessons'] (List[str]). Append them to the
+            # system prompt here, alongside the live RAG-recall section, so
+            # they reach the model even on build paths where the inline RAG
+            # query above was skipped (no engine / no vector DB). Kept in a
+            # self-contained try so a malformed payload can't break the
+            # scaffold flow.
+            try:
+                lessons = d.get("lessons")
+                if isinstance(lessons, (list, tuple)):
+                    lesson_lines = [
+                        str(ln).strip() for ln in lessons if str(ln).strip()
+                    ]
+                    if lesson_lines:
+                        build_system = (
+                            build_system
+                            + "\n\nLessons from past builds — avoid these mistakes:\n\n"
+                            + "\n\n".join(f"- {ln}" for ln in lesson_lines)
+                        )
+                        await self.think(
+                            f"injected {len(lesson_lines)} lesson(s) from "
+                            f"input_data into prompt"
+                        )
+            except Exception:
+                logger.debug("input_data lessons injection failed", exc_info=True)
 
             from skyn3t.agents.stack_templates import manifest_for, readme_for_stack
 
@@ -2923,6 +2975,7 @@ class CodeAgent(BaseAgent):
                 "planned_count": planned_count,
                 "written_count": written_count,
                 "missing_files": missing_files,
+                "injected_skills": injected_skills,
             })
 
     def _write_fallback_scaffold(self, out_dir, brief: str) -> list[str]:

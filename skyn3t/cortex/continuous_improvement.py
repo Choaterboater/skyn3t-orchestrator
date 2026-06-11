@@ -64,6 +64,17 @@ class ImprovementMetrics:
     cheaper_routing_applied: int = 0
     seen_competitive_ingests: List[str] = field(default_factory=list)
     score_trend: Dict[str, float] = field(default_factory=dict)
+    # Item 7 — each-build-improves-next feedback metrics.
+    # Rolling per-stack first-attempt outcomes (True=passed) for non-retry builds.
+    first_attempt_results: Dict[str, List[bool]] = field(default_factory=dict)
+    # Rolling per-stack first-attempt success rate (mirrors score_trend shape).
+    first_attempt_trend: Dict[str, float] = field(default_factory=dict)
+    # Builds where lessons/skills were injected AND the build passed.
+    injection_hits: Dict[str, int] = field(default_factory=dict)
+    # Builds where lessons/skills were injected (denominator for hit-rate).
+    injection_total: Dict[str, int] = field(default_factory=dict)
+    # Rolling per-stack injection hit-rate (injection_hits/injection_total).
+    injection_hit_rate: Dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -82,6 +93,13 @@ class ImprovementMetrics:
             "cheaper_routing_applied": self.cheaper_routing_applied,
             "seen_competitive_ingests": list(self.seen_competitive_ingests),
             "score_trend": dict(self.score_trend),
+            "first_attempt_results": {
+                k: list(v) for k, v in self.first_attempt_results.items()
+            },
+            "first_attempt_trend": dict(self.first_attempt_trend),
+            "injection_hits": dict(self.injection_hits),
+            "injection_total": dict(self.injection_total),
+            "injection_hit_rate": dict(self.injection_hit_rate),
         }
 
 
@@ -114,6 +132,27 @@ def _load_metrics(settings: Any | None = None) -> ImprovementMetrics:
                     score_trend={
                         str(k): float(v)
                         for k, v in (raw.get("score_trend") or {}).items()
+                    },
+                    first_attempt_results={
+                        str(k): [bool(x) for x in v]
+                        for k, v in (raw.get("first_attempt_results") or {}).items()
+                        if isinstance(v, list)
+                    },
+                    first_attempt_trend={
+                        str(k): float(v)
+                        for k, v in (raw.get("first_attempt_trend") or {}).items()
+                    },
+                    injection_hits={
+                        str(k): int(v)
+                        for k, v in (raw.get("injection_hits") or {}).items()
+                    },
+                    injection_total={
+                        str(k): int(v)
+                        for k, v in (raw.get("injection_total") or {}).items()
+                    },
+                    injection_hit_rate={
+                        str(k): float(v)
+                        for k, v in (raw.get("injection_hit_rate") or {}).items()
                     },
                 )
     except Exception:
@@ -215,6 +254,8 @@ class ContinuousImprovementEngine:
             "last_model_sync_at": self.metrics.last_model_sync_at,
             "cheaper_routing_applied": self.metrics.cheaper_routing_applied,
             "score_trend": dict(self.metrics.score_trend),
+            "first_attempt_trend": dict(self.metrics.first_attempt_trend),
+            "injection_hit_rate": dict(self.metrics.injection_hit_rate),
             "stack_regression_actions": dict(self.metrics.stack_regression_actions),
             "autonomous_queue_depth": auto_status.get("queue_depth"),
             "autonomous_builds_enabled": auto_status.get("autonomous_builds"),
@@ -259,6 +300,34 @@ class ContinuousImprovementEngine:
         status = str(payload.get("status") or "")
         success = kind == "PROJECT_COMPLETED" and status == "done"
 
+        window = max(3, int(getattr(settings, "improvement_stack_score_window", 8)))
+
+        # Item 7 — first-attempt outcome: a build is a "first attempt" iff its
+        # slug carries no '-retry' marker (mirrors runner._maybe_auto_retry which
+        # appends '-retry' on auto retries). Append pass/fail to the per-stack
+        # rolling window so _tick can compute first-attempt success rate.
+        slug = str(payload.get("slug") or "")
+        is_first_attempt = slug.count("-retry") == 0
+        if is_first_attempt:
+            fa_bucket = self.metrics.first_attempt_results.setdefault(stack, [])
+            fa_bucket.append(bool(success))
+            self.metrics.first_attempt_results[stack] = fa_bucket[-window:]
+
+        # Item 7 — injection hit-rate: count builds that received injected
+        # lessons/skills and whether they passed. Source the injected counts from
+        # the PROJECT_COMPLETED payload (Owner A publishes injected_skills_count /
+        # lessons_count); read defensively so we work before that lands.
+        injected_skills_count = self._safe_int(payload.get("injected_skills_count"))
+        lessons_count = self._safe_int(payload.get("lessons_count"))
+        if (injected_skills_count + lessons_count) > 0:
+            self.metrics.injection_total[stack] = (
+                self.metrics.injection_total.get(stack, 0) + 1
+            )
+            if success:
+                self.metrics.injection_hits[stack] = (
+                    self.metrics.injection_hits.get(stack, 0) + 1
+                )
+
         try:
             from skyn3t.intelligence.build_patterns import get_default_scoreboard
 
@@ -268,7 +337,6 @@ class ContinuousImprovementEngine:
 
         score = self._extract_reviewer_score(payload)
         if score is not None:
-            window = max(3, int(getattr(settings, "improvement_stack_score_window", 8)))
             bucket = self.metrics.stack_scores.setdefault(stack, [])
             bucket.append(float(score))
             self.metrics.stack_scores[stack] = bucket[-window:]
@@ -278,6 +346,15 @@ class ContinuousImprovementEngine:
 
         self._check_stack_routing(stack, success=success)
         _save_metrics(self.metrics)
+
+    @staticmethod
+    def _safe_int(raw: Any) -> int:
+        try:
+            if raw is None or isinstance(raw, bool):
+                return int(bool(raw))
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 0
 
     def _extract_reviewer_score(self, payload: Dict[str, Any]) -> Optional[float]:
         for key in ("reviewer_score", "score"):
@@ -511,6 +588,16 @@ class ContinuousImprovementEngine:
 
         competitive_queued = await self._maybe_queue_competitive_practice(settings)
 
+        # Item 3 — curate the skill library on a cadence (Owner E owns the math
+        # and persists the last-curate timestamp inside curate_if_due). Called
+        # defensively so a not-yet-landed curate_if_due never breaks the tick.
+        self._maybe_curate_skills(settings)
+
+        # Item 7 — recompute rolling each-build-improves-next feedback metrics so
+        # the dashboard/operators can see whether builds are getting better.
+        first_attempt_trend = self._compute_first_attempt_trend()
+        injection_hit_rate = self._compute_injection_hit_rate()
+
         self._publish_tick(
             "tick",
             cheaper_routing_applied=cheaper_applied,
@@ -518,7 +605,45 @@ class ContinuousImprovementEngine:
             competitive_practice_queued=competitive_queued,
             builds_today=self.metrics.builds_today,
             score_trend=dict(self.metrics.score_trend),
+            first_attempt_trend=first_attempt_trend,
+            injection_hit_rate=injection_hit_rate,
         )
+
+    def _compute_first_attempt_trend(self) -> Dict[str, float]:
+        """Rolling first-attempt success rate per stack (fraction of passes)."""
+        trend: Dict[str, float] = {}
+        for stack, results in self.metrics.first_attempt_results.items():
+            if not results:
+                continue
+            trend[stack] = round(sum(1 for r in results if r) / len(results), 3)
+        self.metrics.first_attempt_trend = trend
+        return dict(trend)
+
+    def _compute_injection_hit_rate(self) -> Dict[str, float]:
+        """Rolling injection hit-rate per stack (passed builds / injected builds)."""
+        rate: Dict[str, float] = {}
+        for stack, total in self.metrics.injection_total.items():
+            if total <= 0:
+                continue
+            hits = self.metrics.injection_hits.get(stack, 0)
+            rate[stack] = round(hits / total, 3)
+        self.metrics.injection_hit_rate = rate
+        return dict(rate)
+
+    def _maybe_curate_skills(self, settings: Any) -> None:
+        """Item 3 — invoke Owner E's curate_if_due on a cadence (default 24h)."""
+        try:
+            from skyn3t.intelligence.skill_library import get_default_library
+
+            interval = float(
+                getattr(settings, "improvement_skill_curate_interval_seconds", 86_400)
+            )
+            lib = get_default_library()
+            curate_if_due = getattr(lib, "curate_if_due", None)
+            if callable(curate_if_due):
+                curate_if_due(interval)
+        except Exception:
+            logger.debug("skill library curate_if_due failed", exc_info=True)
 
     async def _maybe_queue_competitive_practice(self, settings: Any) -> bool:
         """Loop C: queue one micro practice brief per day from scout competitor ingest."""

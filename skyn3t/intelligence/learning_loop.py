@@ -46,6 +46,11 @@ class LearningLoop:
                 scoreboard = None
         self.scoreboard = scoreboard
         self._wired = False
+        # Task ids currently being injected (or already injected). Set
+        # synchronously before the first await so the orchestrator's direct
+        # inject_for_task call and the fire-and-forget _on_routed path cannot
+        # both pass the idempotency check during the rag.query await window.
+        self._injecting: set[str] = set()
 
     def start(self) -> None:
         if self._wired:
@@ -124,46 +129,105 @@ class LearningLoop:
             logger.exception("ingest_lesson failed")
 
     async def _inject(self, event) -> None:
-        if self.rag is None:
-            return
         payload = event.payload or {}
         task = payload.get("task")  # orchestrator may attach the TaskRequest reference
         task_id = payload.get("task_id") or (getattr(task, "task_id", None) if task else None)
         capability = payload.get("capability")
         title = payload.get("title") or payload.get("description") or capability or ""
+        await self.inject_for_task(task, title=title, task_id=task_id)
+
+    async def inject_for_task(
+        self,
+        task,
+        *,
+        title: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> List[str]:
+        """Query RAG for lessons matching ``title`` and inject them into ``task``.
+
+        Awaitable so the orchestrator can call it deterministically *before*
+        handing the task to the agent (no fire-and-forget race vs submit_task).
+        Returns the list of injected lesson texts (empty on no-op).
+
+        Idempotent per task: if this task already has lessons recorded inflight
+        on the scoreboard, we skip re-injection so _on_routed (back-compat) and a
+        direct orchestrator call cannot double-inject.
+        """
+        if self.rag is None:
+            return []
+        if task_id is None:
+            task_id = getattr(task, "task_id", None) if task else None
+        if title is None:
+            title = getattr(task, "title", None) or getattr(task, "description", None) or ""
         if not title:
-            return
-        # RAGEngine.query returns a dict {documents: [...], ...}; each document
-        # has id/content/metadata. The old code passed `top_k` (wrong kwarg)
-        # which silently no-op'd injection.
+            return []
+        # Idempotency guard (set synchronously, before any await): if this task
+        # is already being / has been injected, skip. This closes the race where
+        # the orchestrator's direct call and the fire-and-forget _on_routed path
+        # both reach rag.query before either records to the scoreboard.
+        if task_id:
+            if task_id in self._injecting:
+                return []
+            if (
+                self.scoreboard is not None
+                and getattr(self.scoreboard, "_inflight", None) is not None
+                and task_id in self.scoreboard._inflight
+            ):
+                return []
+            self._injecting.add(task_id)
         try:
-            result = await self.rag.query(title, n_results=self.max_inject)
-        except Exception:
-            logger.exception("rag.query during inject failed")
-            return
-        if isinstance(result, dict):
-            documents = result.get("documents") or []
-        elif isinstance(result, list):
-            documents = result
-        else:
-            documents = []
-        candidates = [
-            (str(d.get("id") or ""), str(d.get("content") or ""))
-            for d in documents
-            if d.get("content")
-        ]
-        # Apply scoreboard-based filtering — lessons with a sustained negative
-        # outcome score get dropped before they reach the agent.
-        if self.scoreboard is not None:
-            candidates = self.scoreboard.filter_lessons(candidates)
-        if not candidates:
-            return
-        # Record which lesson ids went into this task so we can attribute the
-        # eventual outcome back to them.
-        if self.scoreboard is not None and task_id:
-            self.scoreboard.record_injection(task_id, [lid for lid, _ in candidates if lid])
-        if task is not None and hasattr(task, "input_data"):
-            task.input_data.setdefault("lessons", []).extend(text for _, text in candidates)
+            # RAGEngine.query returns a dict {documents: [...], ...}; each document
+            # has id/content/metadata. The old code passed `top_k` (wrong kwarg)
+            # which silently no-op'd injection.
+            try:
+                result = await self.rag.query(title, n_results=self.max_inject)
+            except Exception:
+                logger.exception("rag.query during inject failed")
+                return []
+            if isinstance(result, dict):
+                documents = result.get("documents") or []
+            elif isinstance(result, list):
+                documents = result
+            else:
+                documents = []
+            candidates = [
+                (str(d.get("id") or ""), str(d.get("content") or ""))
+                for d in documents
+                if d.get("content")
+            ]
+            # Apply scoreboard-based filtering — lessons with a sustained negative
+            # outcome score get dropped before they reach the agent.
+            if self.scoreboard is not None:
+                candidates = self.scoreboard.filter_lessons(candidates)
+            if not candidates:
+                return []
+            # Only attribute (and only mutate input_data) when there is a real
+            # task with an input_data sink to inject into. Recording an injection
+            # with no task attached produces phantom attributions that corrupt the
+            # scoreboard because no outcome will ever be credited back to those
+            # lesson ids.
+            if task is None or not hasattr(task, "input_data"):
+                return []
+            texts = [text for _, text in candidates]
+            # Record which lesson ids went into this task so we can attribute the
+            # eventual outcome back to them.
+            if self.scoreboard is not None and task is not None and task_id:
+                self.scoreboard.record_injection(
+                    task_id, [lid for lid, _ in candidates if lid]
+                )
+            task.input_data.setdefault("lessons", []).extend(texts)
+            return texts
+        finally:
+            # Always release the in-flight guard once this call finishes. It only
+            # needs to cover the synchronous window before the first await (to win
+            # the race vs the fire-and-forget _on_routed path); cross-call
+            # idempotency within a single routing is held by scoreboard._inflight
+            # (checked above). Discarding unconditionally lets the orchestrator
+            # re-inject when it re-submits the SAME task_id on retry
+            # (_retry_task / _retry_on_agent) and prevents _injecting from growing
+            # without bound.
+            if task_id:
+                self._injecting.discard(task_id)
 
     # --- helpers ---
     def _summarize(self, payload: Dict[str, Any], outcome: str) -> str:

@@ -1160,6 +1160,10 @@ class StudioRunner:
             # input_data. Kimi K2.6 calls this "context sharding" — pass
             # essential outputs, not full traces.
             prior_summaries: Dict[str, str] = {}
+            # Names of skill-library entries the CodeAgent injected into the
+            # build, captured from the code-stage TaskResult so the verdict
+            # block can credit/debit each skill's success/failure tally.
+            injected_skills: List[str] = []
             token_budget_limit = self._studio_token_budget_limit()
             if token_budget_limit > 0:
                 manifest["token_budget"] = {
@@ -1242,6 +1246,33 @@ class StudioRunner:
                     pre_warnings = self._scoreboard_prewarnings(brief)
                     if pre_warnings:
                         input_data["scoreboard_prewarnings"] = pre_warnings
+                    # Reuse the single live RAG engine instead of letting the
+                    # CodeAgent cold-start its own (which pays init cost and
+                    # may point at an empty DB). Owner B reads
+                    # input_data['rag_engine'] and skips the cold-start.
+                    if self.rag is not None:
+                        input_data["rag_engine"] = self.rag
+                    # Read-side lesson injection. The studio build path does
+                    # NOT route through orchestrator.execute_task, so
+                    # TASK_ROUTED never fires and learning_loop._inject never
+                    # populates input_data['lessons']. Query the live RAG here
+                    # so the CodeAgent (Owner B) can fold past lessons into the
+                    # build prompt. Best-effort; never blocks the build.
+                    lessons = await self._lessons_for_code_stage(brief)
+                    if lessons:
+                        input_data["lessons"] = lessons
+                    # Track for the PROJECT_COMPLETED payload so the
+                    # continuous-improvement injection-hit-rate metric (Owner G)
+                    # can tell builds that received lessons apart from those
+                    # that didn't.
+                    manifest["lessons_count"] = len(lessons)
+                    # ADVISORY (non-binding) plan hints derived from the
+                    # build-pattern scoreboard's best historical shape and the
+                    # skill library's most-relevant entries. Never hard-pins a
+                    # shape — the planner/CodeAgent may ignore these.
+                    plan_advice = self._plan_advice(brief)
+                    if plan_advice:
+                        input_data["plan_advice"] = plan_advice
                     if "designer" in prior_summaries and self._brief_implies_visual_ui(
                         brief, artifact_dir
                     ):
@@ -1394,6 +1425,9 @@ class StudioRunner:
                     )
                     if stage.name == "code":
                         try:
+                            from skyn3t.agents.stack_detector import (
+                                detect_stack_from_scaffold,
+                            )
                             from skyn3t.intelligence.build_patterns import (
                                 get_default_scoreboard,
                             )
@@ -1401,13 +1435,10 @@ class StudioRunner:
                             stack = "unknown"
                             shape = []
                             if scaffold_dir.exists():
-                                try:
-                                    from skyn3t.agents.stack_templates import (
-                                        detect_stack,
-                                    )
-                                    stack = detect_stack(brief) or "unknown"
-                                except Exception:
-                                    pass
+                                # Canonical, scaffold-aware detection so the
+                                # failure bucket agrees with the success path
+                                # (no brief-based None->unknown split).
+                                stack = detect_stack_from_scaffold(scaffold_dir)
                                 shape = self._scaffold_shape(scaffold_dir)
                             sb = get_default_scoreboard()
                             sb.record(stack, shape, "no")
@@ -1478,6 +1509,9 @@ class StudioRunner:
                     # learner sees it.
                     if stage.name == "code":
                         try:
+                            from skyn3t.agents.stack_detector import (
+                                detect_stack_from_scaffold,
+                            )
                             from skyn3t.intelligence.build_patterns import (
                                 get_default_scoreboard,
                             )
@@ -1485,13 +1519,9 @@ class StudioRunner:
                             stack = "unknown"
                             shape = []
                             if scaffold_dir.exists():
-                                try:
-                                    from skyn3t.agents.stack_templates import (
-                                        detect_stack,
-                                    )
-                                    stack = detect_stack(brief) or "unknown"
-                                except Exception:
-                                    pass
+                                # Canonical, scaffold-aware detection so the
+                                # failure bucket agrees with the success path.
+                                stack = detect_stack_from_scaffold(scaffold_dir)
                                 shape = self._scaffold_shape(scaffold_dir)
                             sb = get_default_scoreboard()
                             sb.record(stack, shape, "no")
@@ -1511,6 +1541,15 @@ class StudioRunner:
 
                 ok = bool(getattr(result, "success", True))
                 output = getattr(result, "output", None) or {}
+                # Capture the skill-library entries the CodeAgent injected so
+                # the verdict block can record_use() each one with the build
+                # outcome (success/failure). Owner B exposes this in the
+                # code-stage TaskResult.output as 'injected_skills'.
+                if stage.name == "code":
+                    try:
+                        injected_skills = list(output.get("injected_skills") or [])
+                    except Exception:
+                        injected_skills = []
                 stage_files = self._normalize_stage_files(
                     output.get("files") if isinstance(output, dict) else None,
                     artifact_dir=artifact_dir,
@@ -2708,10 +2747,24 @@ class StudioRunner:
                             build_result.get("failure_hint") or ""
                         )
                     try:
+                        from skyn3t.agents.stack_detector import (
+                            detect_stack_from_scaffold,
+                        )
                         from skyn3t.intelligence.build_patterns import (
                             get_default_scoreboard,
                         )
-                        stack = str((build_result or {}).get("stack") or "unknown")
+                        # Canonical, scaffold-aware detection — replaces the
+                        # coarse build_verifier probe.kind ('node'/'python'/
+                        # 'static'/'swift') so success rows land in the same
+                        # bucket as failure rows (root cause of the live
+                        # react_vite/vite_react/unknown split).
+                        stack = detect_stack_from_scaffold(scaffold_dir)
+                        # Persist the canonical stack so the PROJECT_COMPLETED
+                        # payload carries the SAME token the scoreboard records
+                        # under — otherwise the continuous-improvement per-stack
+                        # trend (Owner G) buckets under "unknown" and never
+                        # aligns with best_shape's buckets.
+                        manifest["stack"] = stack
                         shape = self._scaffold_shape(scaffold_dir)
                         sb = get_default_scoreboard()
                         sb.record(stack, shape, str(verdict or "no"))
@@ -2735,6 +2788,23 @@ class StudioRunner:
                         sb.flush()
                     except Exception:
                         logger.exception("build_pattern record failed")
+                    # Grade the skills the CodeAgent injected into this build:
+                    # credit each one on a passing verdict, debit on a failing
+                    # one. Best-effort — never let skill grading break the run.
+                    if injected_skills:
+                        try:
+                            from skyn3t.intelligence.skill_library import (
+                                get_default_library,
+                            )
+                            lib = get_default_library()
+                            _passed = str(verdict).lower() == "yes"
+                            for _name in injected_skills:
+                                lib.record_use(_name, success=_passed)
+                        except Exception:
+                            logger.debug(
+                                "skill_library record_use after verdict failed",
+                                exc_info=True,
+                            )
             if manifest.get("status") != "failed":
                 manifest["status"], manifest["next_action"], manifest["error"] = (
                     self._finalize_project_outcome(
@@ -2802,6 +2872,10 @@ class StudioRunner:
                     "consistency_check": manifest.get("consistency_check") or {},
                     "stack": manifest.get("stack") or "",
                     "feature_tags": _feature_tags,
+                    # Injection signal for the each-build-improves-next metric
+                    # (Owner G): how many skills/lessons this build received.
+                    "injected_skills_count": len(injected_skills),
+                    "lessons_count": int(manifest.get("lessons_count") or 0),
                     "message": completion_message,
                     "error": manifest.get("error") or "",
                     "brief": str(manifest.get("brief_raw") or manifest.get("brief") or "")[:800],
@@ -4415,6 +4489,107 @@ class StudioRunner:
             logger.debug("scoreboard pre-warning lookup failed", exc_info=True)
         return warnings
 
+    @staticmethod
+    def _canonical_stack_for_brief(brief: str) -> Optional[str]:
+        """Best-effort canonical stack name from the brief (no scaffold yet).
+
+        At the code-stage input assembly the scaffold does not exist, so the
+        scaffold-aware detector cannot run. Fall back to the brief-based
+        detector but normalize through the SAME canonical alias map the
+        record sites use, so advisory hints/lessons key on the canonical
+        bucket name (e.g. ``vite_react`` -> ``react_vite``).
+        """
+        try:
+            from skyn3t.agents.stack_detector import _CANONICAL_STACK_NAMES
+            from skyn3t.agents.stack_templates import detect_stack
+
+            name = detect_stack(brief)
+            if not name:
+                return None
+            return _CANONICAL_STACK_NAMES.get(name, name)
+        except Exception:
+            logger.debug("canonical stack-for-brief lookup failed", exc_info=True)
+            return None
+
+    async def _lessons_for_code_stage(self, brief: str) -> List[str]:
+        """Query the live RAG for lessons relevant to this build.
+
+        Mirrors learning_loop.inject_for_task's extraction (RAGEngine.query
+        returns ``{documents: [{content, metadata}, ...]}``) so the CodeAgent
+        receives the same shape of lesson texts it would have gotten via the
+        orchestrator's TASK_ROUTED path (which never fires for studio builds).
+        Best-effort: returns ``[]`` when RAG is absent or the query fails.
+        """
+        if self.rag is None:
+            return []
+        title = (brief or "").strip()
+        if not title:
+            return []
+        try:
+            result = await self.rag.query(title, n_results=5)
+        except Exception:
+            logger.debug("rag.query for code-stage lessons failed", exc_info=True)
+            return []
+        if isinstance(result, dict):
+            documents = result.get("documents") or []
+        elif isinstance(result, list):
+            documents = result
+        else:
+            documents = []
+        lessons: List[str] = []
+        for d in documents:
+            try:
+                text = str(d.get("content") or "").strip()
+            except Exception:
+                continue
+            if text:
+                lessons.append(text)
+        return lessons
+
+    def _plan_advice(self, brief: str) -> List[str]:
+        """Return ADVISORY (non-binding) plan hints for the code stage.
+
+        Combines the build-pattern scoreboard's best historical shape for the
+        detected stack with the skill library's most-relevant entries. These
+        are hints only — the planner/CodeAgent may ignore them. Never hard-pins
+        a shape. Best-effort; returns ``[]`` on any failure.
+        """
+        advice: List[str] = []
+        stack = self._canonical_stack_for_brief(brief)
+        # Best historical shape for this stack (advisory).
+        if stack:
+            try:
+                from skyn3t.intelligence.build_patterns import (
+                    get_default_scoreboard,
+                )
+                best = get_default_scoreboard().best_shape(stack)
+                if best is not None and getattr(best, "shape", None):
+                    rate = getattr(best, "success_rate", 0.0)
+                    files = ", ".join(str(p) for p in best.shape[:12])
+                    advice.append(
+                        f"ADVISORY (non-binding): for {stack}, the most "
+                        f"successful past shape ({rate:.0%} success over "
+                        f"{best.success + best.failure} graded builds) used: "
+                        f"{files}. Consider it, but adapt to this brief."
+                    )
+            except Exception:
+                logger.debug("plan-advice best_shape lookup failed", exc_info=True)
+        # Most-relevant skills for this brief (advisory).
+        try:
+            from skyn3t.intelligence.skill_library import get_default_library
+
+            skills = get_default_library().find_relevant(brief, limit=3)
+            for s in skills:
+                name = getattr(s, "name", None)
+                if name:
+                    advice.append(
+                        f"ADVISORY (non-binding): a learned skill may help — "
+                        f"'{name}'. Apply only if it fits this brief."
+                    )
+        except Exception:
+            logger.debug("plan-advice find_relevant lookup failed", exc_info=True)
+        return advice
+
     def _code_stage_fast_retry_signals(
         self,
         *,
@@ -4662,11 +4837,16 @@ class StudioRunner:
         )
         if missing_mount_count:
             try:
-                from skyn3t.agents.stack_templates import detect_stack
+                from skyn3t.agents.stack_detector import (
+                    detect_stack_from_scaffold,
+                )
                 from skyn3t.intelligence.build_patterns import (
                     get_default_scoreboard,
                 )
-                stack = detect_stack(brief) or "unknown"
+                # Canonical, scaffold-aware detection so the tagged
+                # (stack, shape) bucket matches the verdict record sites
+                # (same root-cause fix as the three record() sites).
+                stack = detect_stack_from_scaffold(scaffold_dir)
                 shape = self._scaffold_shape(scaffold_dir)
                 if stack != "unknown" and shape:
                     get_default_scoreboard().record_tag(

@@ -926,10 +926,33 @@ class Orchestrator:
                         "task_id": task.task_id,
                         "agent": target_agent.name,
                         "capability": capability,
+                        # Attach the live TaskRequest plus title/description so the
+                        # LearningLoop can inject matching lessons into
+                        # task.input_data['lessons'] (consumer reads payload["task"]
+                        # and payload["title"]).
+                        "task": task,
+                        "title": task.title,
+                        "description": task.description,
                     },
                     correlation_id=task.task_id,
                 )
             )
+
+            # Deterministic lesson injection: do this synchronously *before*
+            # submit_task so the agent sees task.input_data['lessons'] when it
+            # reads input_data. The TASK_ROUTED subscriber (_on_routed) schedules
+            # injection fire-and-forget which can race the submit_task await
+            # below; inject_for_task is idempotent (guards via the scoreboard
+            # inflight map) so the two paths cannot double-inject.
+            if self._learning_loop is not None:
+                try:
+                    await self._learning_loop.inject_for_task(
+                        task, title=task.title, task_id=task.task_id
+                    )
+                except Exception:
+                    logger.exception(
+                        "lesson injection failed for task %s", task.task_id
+                    )
 
             # Join collective consciousness session
             if self._consciousness and target_agent:
