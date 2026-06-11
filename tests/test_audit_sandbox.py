@@ -72,26 +72,27 @@ class TestSeatbeltDenyDefault:
 
         assert "(deny default)" in profile
         assert "(allow default)" not in profile
-        # Still allows the system paths CLI agents need.
-        assert '(allow file-read* (subpath "/usr"))' in profile
-        assert '(allow process-exec (subpath "/usr")' in profile
-        # The caller's allowed dir is allowed (read/write/exec).
+        # Read + exec are broad (required for dyld + CLI configs to start the
+        # process — a narrower allow-list SIGABRTs the wrapped command).
+        assert "(allow file-read*)" in profile
+        assert "(allow process-exec*)" in profile
+        # WRITE is the confined capability: the caller's allowed dir is writable
+        # but nothing else (deny-default denies unlisted writes).
         allowed = str(Path(tmp_path).resolve())
-        assert f'process-exec (subpath "{allowed}")' in profile
+        assert f'file-write* process-exec (subpath "{allowed}")' in profile
+        # There is no broad file-write* allow (writes stay confined).
+        assert "(allow file-write*)" not in profile
 
     def test_credential_dirs_denied_after_allows(self, tmp_path) -> None:
         cfg = SandboxConfig(allowed_dirs=[tmp_path])
         sandbox = Sandbox(cfg)
         profile = sandbox._build_seatbelt_profile(tmp_path)
 
-        # Belt-and-suspenders deny rules must come AFTER the broad allow rules
-        # so that last-match-wins leaves credential dirs denied.
-        deny_idx = profile.index("(deny default)")
+        # The credential-dir deny must come AFTER the broad (allow file-read*)
+        # so last-match-wins leaves credential reads denied despite open reads.
         ssh_deny = str((Path.home() / ".ssh").resolve())
         assert ssh_deny in profile
-        assert profile.index(ssh_deny) > deny_idx
-        # The deny for the credential dir comes after the system allow rules.
-        assert profile.index(ssh_deny) > profile.index('(subpath "/usr")')
+        assert profile.index(ssh_deny) > profile.index("(allow file-read*)")
 
 
 # ---------------------------------------------------------------------------

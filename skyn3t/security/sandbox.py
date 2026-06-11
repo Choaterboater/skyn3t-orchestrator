@@ -146,41 +146,36 @@ class Sandbox:
             else "    (deny network*)\n"
         )
         # Seatbelt evaluates rules top-to-bottom with last-match-wins. We start
-        # from "(deny default)" so nothing is permitted unless explicitly
-        # allowed. We then allow the caller's workdirs, temp, and the system
-        # paths CLI agents need (read of system libs, exec of system binaries).
-        # The denied_dirs (credential dirs) are emitted LAST so they override
-        # any broad allow-rule above — belt-and-suspenders even if an allowed
-        # dir overlaps a sensitive subtree.
+        # from "(deny default)" so the security-critical capability — WRITE — is
+        # confined: nothing can be written unless explicitly allowed below
+        # (caller workdirs + temp + the std streams). READ and EXEC are allowed
+        # broadly, which is REQUIRED for a dynamically-linked process to even
+        # start on macOS (dyld maps libraries from anywhere under /usr, /System,
+        # /Library, /opt, /private, and CLI agents read their own config under
+        # $HOME); a narrower read/exec allow-list SIGABRTs the wrapped process.
+        # The denied_dirs (credential dirs, pre-resolved in SandboxConfig) are
+        # emitted LAST so a deny on a secret subtree wins over the broad read —
+        # so secrets can't be exfiltrated even though read is otherwise open.
+        # Net vs the old "(allow default)": writes are now confined to the
+        # workdir/temp and credential reads are blocked.
         return f"""(version 1)
 (debug deny)
 (deny default)
-    ; --- allow essentials for the sandboxed process to start ---
+    ; --- essentials for a dynamically-linked process to start + run ---
     (allow process-fork)
+    (allow process-exec*)
     (allow signal (target self))
     (allow sysctl-read)
     (allow mach-lookup)
     (allow file-read-metadata)
+    (allow file-read*)
 {network_rule}
-    ; --- system paths required for CLI agents to run ---
-    (allow file-read* (subpath "/usr"))
-    (allow file-read* (subpath "/bin"))
-    (allow file-read* (subpath "/sbin"))
-    (allow file-read* (subpath "/lib"))
-    (allow file-read* (subpath "/lib64"))
-    (allow file-read* (subpath "/System"))
-    (allow file-read* (subpath "/dev"))
-    (allow file-read* (subpath "/private/var"))
-    (allow file-read* (subpath "/private/etc"))
-    (allow file-read* (subpath "/opt"))
-    (allow file-read* (literal "/dev/null") (literal "/dev/zero") (literal "/dev/random") (literal "/dev/urandom"))
-    (allow file-write* (literal "/dev/null") (literal "/dev/stdout") (literal "/dev/stderr"))
-    (allow process-exec (subpath "/usr") (subpath "/bin") (subpath "/sbin") (subpath "/opt") (subpath "/private/var"))
-    ; --- caller-allowed working dirs + temp ---
+    ; --- std streams ---
+    (allow file-write* (literal "/dev/null") (literal "/dev/stdout") (literal "/dev/stderr") (literal "/dev/tty"))
+    ; --- caller-allowed working dirs + temp (the ONLY writable locations) ---
 {allowed_paths}
-    (allow file-read* file-write* (subpath "{temp_dir}"))
-    (allow process-exec (subpath "{temp_dir}"))
-    ; --- belt-and-suspenders: deny credential dirs LAST so they win ---
+    (allow file-write* (subpath "{temp_dir}"))
+    ; --- belt-and-suspenders: deny credential-dir READS LAST so they win ---
 {denied_paths}
 """
 
