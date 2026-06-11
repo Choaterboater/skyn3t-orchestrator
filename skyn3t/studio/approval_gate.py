@@ -42,7 +42,11 @@ def _skill_path() -> Path:
 
 
 _DEFAULT_CONFIG: Dict[str, Any] = {
-    "gates": ["ArchitectAgent"],
+    # Architect + designer gates catch stack drift and visual spec
+    # issues before CodeAgent burns budget. Disable via
+    # approval_gates.json {"disabled": true} or remove agents from
+    # "gates". move_fast and SKYN3T_AUTO_APPROVE bypass all gates.
+    "gates": ["ArchitectAgent", "DesignerAgent"],
     "notify": {"discord_webhook": ""},
     "disabled": False,
     "graduate_after": 5,
@@ -147,9 +151,20 @@ def should_gate(
     work is truly blocked." Approval gates squarely contradict that,
     so under ``move_fast`` we skip ALL gates regardless of the global
     approval_gates.json config or graduation status.
+
+    ``SKYN3T_AUTO_APPROVE=1`` (synonyms: ``SKYN3T_NO_APPROVAL=1``,
+    ``SKYN3T_AUTO_APPROVE_STUDIO=1``; implicit when
+    ``SKYN3T_AUTONOMOUS_BUILDS=1``) bypasses gates the same way.
     """
     if (autonomy or "").strip().lower() == "move_fast":
         return False
+    try:
+        from skyn3t.config.settings import auto_approve_enabled
+
+        if auto_approve_enabled():
+            return False
+    except Exception:
+        pass
     cfg = load_gate_config()
     if cfg.get("disabled"):
         return False

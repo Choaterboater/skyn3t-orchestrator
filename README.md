@@ -128,6 +128,7 @@ flowchart TB
 
 ## Documentation
 
+- [Rebuild plan & mega-prompt](docs/REBUILD_PLAN.md)
 - [SkyN3t summary](docs/skyn3t-summary.md)
 - [Technical flow diagrams](docs/technical_flow_diagram.md)
 - [Mission](docs/MISSION.md)

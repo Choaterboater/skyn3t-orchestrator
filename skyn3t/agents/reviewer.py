@@ -250,9 +250,9 @@ class ReviewerAgent(BaseAgent):
             verdict = "no-go"
         # Verdict text buckets the real (un-floored) verdict_score.
         # ReviewWatcher consumes the lowercase strings unchanged.
-        elif verdict_score >= 75 and not any("Missing core" in r for r in risks):
+        elif verdict_score >= 80 and not any("Missing core" in r for r in risks):
             verdict = "go"
-        elif verdict_score >= (60 if self._brief_implies_visual_ui(brief, scaffold_dir) else 50):
+        elif verdict_score >= (70 if self._brief_implies_visual_ui(brief, scaffold_dir) else 60):
             verdict = "go-with-fixes"
         else:
             verdict = "no-go"
@@ -300,7 +300,7 @@ class ReviewerAgent(BaseAgent):
                 "files": [str(review_path)],
                 "verdict": verdict,
                 # output["score"] feeds the downstream
-                # REVIEWER_SCORE_THRESHOLD=75 composite gate in
+                # REVIEWER_SCORE_THRESHOLD=80 composite gate in
                 # _finalize_project_outcome. After the bucket-floor
                 # removal, verdict_score == blended; we still emit
                 # score_unclamped for any out-of-tree consumer that
@@ -442,6 +442,15 @@ class ReviewerAgent(BaseAgent):
             f"2. ...\n\n"
             f"Or reply NO_ISSUES."
         )
+        try:
+            skills_block = self.load_skills_for_prompt(
+                tags=["reviewer", "critique", "quality", stage_name],
+                limit=3,
+            )
+            if skills_block:
+                role = role + skills_block
+        except Exception:
+            pass
         out = await self._llm_generate(
             role_prompt=role,
             brief=brief or "(no brief provided)",
@@ -1071,9 +1080,9 @@ class ReviewerAgent(BaseAgent):
         consistency_penalty = min(20, len(bad_consistency) * 4)
         score = int(round(completeness_pct * 100)) - risk_penalty - consistency_penalty
         score = max(0, min(100, score))
-        if score >= 75 and not any("Missing core" in r for r in risks):
+        if score >= 80 and not any("Missing core" in r for r in risks):
             verdict = "go"
-        elif score >= 50:
+        elif score >= 60:
             verdict = "go-with-fixes"
         else:
             verdict = "no-go"

@@ -178,24 +178,27 @@ async def _anthropic() -> List[Dict[str, Any]]:
 
 async def _openrouter() -> List[Dict[str, Any]]:
     try:
-        import httpx  # type: ignore
-        async with httpx.AsyncClient(timeout=15.0) as c:
-            r = await c.get("https://openrouter.ai/api/v1/models")
-            if r.status_code == 200:
-                data = r.json().get("data", [])
-                items = []
-                for m in data:
-                    mid = m.get("id")
-                    if not mid:
-                        continue
-                    name = m.get("name") or mid
-                    ctx = m.get("context_length")
-                    items.append({"id": mid, "label": name, "context_tokens": ctx})
-                if items:
-                    items.sort(key=lambda x: x["label"].lower())
-                    return items
+        from skyn3t.core.openrouter_catalog import (
+            get_catalog_async,
+            is_sync_enabled,
+            load_catalog,
+        )
+
+        if is_sync_enabled():
+            snap = await get_catalog_async()
+        else:
+            snap = load_catalog()
+        if snap.models:
+            return [
+                {
+                    "id": m["id"],
+                    "label": m.get("name") or m["id"],
+                    "context_tokens": m.get("context_length"),
+                }
+                for m in snap.models
+            ]
     except Exception:
-        logger.exception("openrouter models fetch failed")
+        logger.exception("openrouter catalog load failed")
     return STATIC["openrouter"]
 
 

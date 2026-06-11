@@ -58,6 +58,30 @@ def test_apply_install_wizard_choice_writes_env_and_routing(tmp_path, monkeypatc
     assert store.entries()["reviewer"]["tier"] == "balanced"
 
 
+def test_apply_studio_quality_wizard_writes_openrouter_and_policies(tmp_path, monkeypatch):
+    env_path = tmp_path / ".env"
+    store = ModelRoutingStore(tmp_path / "model_routing.json")
+    monkeypatch.setattr(routing_config, "_store", store)
+
+    result = cli_main._apply_install_wizard_choice(
+        "openrouter",
+        apply_routing_profile=True,
+        env_path=env_path,
+        openrouter_api_key="sk-or-test",
+        enable_quality_env=True,
+    )
+
+    text = env_path.read_text(encoding="utf-8")
+    assert "SKYN3T_LLM_BACKEND=openrouter" in text
+    assert "OPENROUTER_API_KEY=sk-or-test" in text
+    assert "SKYN3T_AUTO_RETRY=1" in text
+    assert "SKYN3T_EXECUTION_BACKEND=auto" in text
+    assert result["routing_applied"] is True
+    assert store.entries()["code"]["tier"] == "or_strong"
+    assert store.entries()["reviewer"]["tier"] == "or_strong"
+    assert store.entries()["designer"]["tier"] == "or_ui"
+
+
 def test_cli_init_runs_setup_wizard_when_interactive(monkeypatch, tmp_path):
     called = {"wizard": False}
 

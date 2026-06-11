@@ -1023,6 +1023,7 @@ class TestReviewerAgent:
         monkeypatch.setattr(agent, "think", noop)
         monkeypatch.setattr(agent, "share_learning", noop)
         monkeypatch.setattr(agent, "_llm_review", fake_llm_review)
+        monkeypatch.setattr(agent, "_verdict", lambda completeness, consistency, risks: ("go", 100))
 
         result = await agent.execute(
             TaskRequest(title="Review scaffold output", input_data={"artifact_dir": str(artifact_dir)})
@@ -1031,6 +1032,7 @@ class TestReviewerAgent:
         review_text = (artifact_dir / "review.md").read_text(encoding="utf-8")
 
         assert result.success is True
+        assert result.output["score"] >= 80
         assert result.output["verdict"] == "go"
         assert "scaffold/index.html" in review_text
         assert "Score: 90/100" not in review_text
@@ -1044,13 +1046,12 @@ class TestReviewerAgent:
         was removed by user request — it was hiding real run-over-run
         progress. verdict_score now equals the real blended value.
 
-        Setup: llm=69 + heuristic=100 + packaging at whatever the
+        Setup: llm=75 + heuristic=100 + packaging at whatever the
         fixture's _packaging_score produces. With the old ceiling
         this build would have been clamped to verdict_score=74 and
         stuck in the go-with-fixes bucket forever. Now the real blend
-        wins; with this fixture it comes out around 78 and the verdict
-        crosses into the "go" band (≥75) honestly — which is exactly
-        the run-over-run progress the floor was hiding."""
+        wins; with this fixture it crosses the "go" band (≥80) honestly
+        — which is exactly the run-over-run progress the floor was hiding."""
         from skyn3t.agents.reviewer import ReviewerAgent
 
         artifact_dir = tmp_path / "habit-tracker"
@@ -1072,7 +1073,7 @@ class TestReviewerAgent:
 
         async def fake_llm_review(*, brief, contents, **_kwargs):
             assert "scaffold/index.html" in contents
-            return ("## Summary\n\nStill has important gaps.\n", 69, None)
+            return ("## Summary\n\nStill has important gaps.\n", 75, None)
 
         monkeypatch.setattr(agent, "think", noop)
         monkeypatch.setattr(agent, "share_learning", noop)
@@ -1087,9 +1088,9 @@ class TestReviewerAgent:
         # Score is the real blended value. No bucket clamp now means
         # score == score_unclamped always.
         assert result.output["score"] == result.output["score_unclamped"]
-        # With the floor removed, score crosses the 75 threshold the
+        # With the floor removed, score crosses the 80 threshold the
         # old behavior was hiding. Verdict gets the honest answer.
-        assert result.output["score"] >= 75
+        assert result.output["score"] >= 80
         assert result.output["verdict"] == "go"
 
     @pytest.mark.asyncio

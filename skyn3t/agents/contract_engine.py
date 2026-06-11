@@ -991,6 +991,89 @@ def _check_feature_evidence(brief: str, scaffold_dir: Path) -> List[ContractFind
     return findings
 
 
+def _check_entrypoint_wiring(scaffold_dir: Path) -> List[ContractFinding]:
+    """Block when polished components exist but the app entry never mounts them.
+
+    This is the #1 cause of "pretty components, ugly App.jsx" runs that
+    reviewers punish — components ship, parse, and build, but the user
+    never sees them.
+    """
+    findings: List[ContractFinding] = []
+    entry_candidates = (
+        scaffold_dir / "src" / "App.jsx",
+        scaffold_dir / "src" / "App.tsx",
+        scaffold_dir / "App.jsx",
+        scaffold_dir / "App.tsx",
+    )
+    entry = next((p for p in entry_candidates if p.is_file()), None)
+    if entry is None:
+        return findings
+
+    components_dir = scaffold_dir / "src" / "components"
+    if not components_dir.is_dir():
+        components_dir = scaffold_dir / "components"
+    if not components_dir.is_dir():
+        return findings
+
+    try:
+        entry_text = entry.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return findings
+
+    orphans: List[str] = []
+    for comp_file in sorted(components_dir.rglob("*")):
+        if not comp_file.is_file() or comp_file.suffix not in (".jsx", ".tsx"):
+            continue
+        if comp_file.name.lower().startswith("index."):
+            continue
+        try:
+            body = comp_file.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if len(body.strip()) < 80:
+            continue
+        if "TODO[skyn3t]" in body or "@skyn3t-backfill-stub" in body:
+            continue
+        if not re.search(
+            r"\bexport\s+(?:default\s+)?(?:function|const|class)\b",
+            body,
+        ):
+            continue
+        stem = comp_file.stem
+        if stem in entry_text or re.search(
+            rf"\b{re.escape(stem)}\b",
+            entry_text,
+        ):
+            continue
+        orphans.append(comp_file.relative_to(scaffold_dir).as_posix())
+
+    if not orphans:
+        return findings
+
+    rel_entry = entry.relative_to(scaffold_dir).as_posix()
+    shown = ", ".join(orphans[:5])
+    if len(orphans) > 5:
+        shown += f", … (+{len(orphans) - 5} more)"
+    severity = "blocker" if len(orphans) >= 2 else "warning"
+    findings.append(
+        ContractFinding(
+            severity=severity,
+            category="orphan_components",
+            file=rel_entry,
+            message=(
+                f"App entry does not import or render {len(orphans)} "
+                f"polished component(s): {shown}."
+            ),
+            suggestion=(
+                "Import and render these components in the app entry so the "
+                "shipped UI matches the designed component library."
+            ),
+            fix_hint={"orphans": orphans[:12]},
+        )
+    )
+    return findings
+
+
 # ---------------------------------------------------------------------
 # Public entrypoint
 # ---------------------------------------------------------------------
@@ -1016,6 +1099,7 @@ def check_contract(
     findings.extend(_check_placeholders(scaffold_dir))
     findings.extend(_check_cli_prose_leak(scaffold_dir))
     findings.extend(_check_feature_evidence(brief or "", scaffold_dir))
+    findings.extend(_check_entrypoint_wiring(scaffold_dir))
 
     # Dedup
     seen: Set[Tuple[str, str, str]] = set()

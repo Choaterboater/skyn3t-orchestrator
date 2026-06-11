@@ -23,7 +23,11 @@ def test_expand_sparse_brief_skips_long_prompt() -> None:
 
 def test_execution_profile_inference_and_timeout_policy(tmp_path) -> None:
     runner = StudioRunner(event_bus=EventBus(), projects_root=tmp_path / "projects")
-    assert runner._infer_execution_profile("build a todo app", None) == "fast"
+    assert runner._infer_execution_profile("build a todo app", None) == "balanced"
+    assert (
+        runner._infer_execution_profile("build a todo app", {"execution_profile": "fast"})
+        == "fast"
+    )
     assert (
         runner._infer_execution_profile(
             "Build a dashboard with Sonarr, Radarr, Plex integrations and API sync",
@@ -256,12 +260,23 @@ async def test_run_post_code_checks_bails_on_unresolved_stubs_before_targeted_fi
     )
     manifest = {"history": [], "consistency_check": {}, "benchmark": {}, "artifacts": []}
 
-    async def should_not_run_targeted_fix(*args, **kwargs):
-        raise AssertionError("targeted fix should be skipped for unresolved stubs")
+    fix_called = {"count": 0}
+
+    async def stub_fix_does_not_clear(*args, **kwargs):
+        fix_called["count"] += 1
+        from skyn3t.agents.targeted_fix import FixResult
+
+        return FixResult(
+            ok=True,
+            files_changed=[],
+            files_created=[],
+            errors=[],
+            fix_label="stub-fix",
+        )
 
     monkeypatch.setattr(
         "skyn3t.agents.targeted_fix.apply_targeted_fix",
-        should_not_run_targeted_fix,
+        stub_fix_does_not_clear,
     )
 
     with pytest.raises(UnresolvedScaffoldStubError):
@@ -272,6 +287,8 @@ async def test_run_post_code_checks_bails_on_unresolved_stubs_before_targeted_fi
             stage_name="code",
             stage_output={"files": [str(scaffold_dir / "src" / "App.jsx")]},
         )
+
+    assert fix_called["count"] == 1
 
 
 @pytest.mark.asyncio
@@ -398,6 +415,20 @@ def test_critique_timeout_for_covers_rounds_x_inner_budget(tmp_path) -> None:
     )
     assert deep_code_visual >= 4 * 180.0 + 20.0
 
+    # Balanced/deep code stages get +60s floor over the base 420s.
+    balanced_code = runner._critique_timeout_for(
+        stage_name="code",
+        execution_profile="balanced",
+        brief="Build a dashboard UI",
+    )
+    assert balanced_code >= 480.0
+    deep_code = runner._critique_timeout_for(
+        stage_name="code",
+        execution_profile="deep",
+        brief="Build a dashboard UI",
+    )
+    assert deep_code >= (420.0 * 1.3) + 60.0
+
 
 def test_critique_timeout_floor_respects_unknown_stages(tmp_path) -> None:
     """Unknown / generic stage names should still get a sane floor
@@ -412,3 +443,126 @@ def test_critique_timeout_floor_respects_unknown_stages(tmp_path) -> None:
     # Floor for unknown stages is 120 * 0.6 = 72; rounds-budget is 2 * 180 + 20 = 380.
     # Outer must be at least the rounds-budget.
     assert generic >= 380.0
+
+
+@pytest.mark.asyncio
+async def test_pre_code_design_gate_flags_missing_palette(tmp_path) -> None:
+    runner = StudioRunner(event_bus=EventBus(), projects_root=tmp_path / "projects")
+    artifact_dir = tmp_path / "project"
+    artifact_dir.mkdir()
+    (artifact_dir / "brand.md").write_text("# Brand\n", encoding="utf-8")
+    manifest: dict = {"history": [], "benchmark": {}, "artifacts": []}
+
+    gate = await runner._run_pre_code_design_gate(
+        manifest=manifest,
+        artifact_dir=artifact_dir,
+        brief="Build a polished dashboard UI",
+    )
+
+    assert gate["blockers"]
+    assert any(f["file"] == "palette.json" for f in gate["blockers"])
+
+
+@pytest.mark.asyncio
+async def test_pre_code_design_gate_passes_valid_artifacts(tmp_path) -> None:
+    runner = StudioRunner(event_bus=EventBus(), projects_root=tmp_path / "projects")
+    artifact_dir = tmp_path / "project"
+    artifact_dir.mkdir()
+    (artifact_dir / "palette.json").write_text(
+        '{"bg": "#0F0D0A", "primary": "#E05C1A", "accent": "#4A90A4"}\n',
+        encoding="utf-8",
+    )
+    (artifact_dir / "brand.md").write_text(
+        "# Brand\n| Token | Hex |\n| bg | #0F0D0A |\n| primary | #E05C1A |\n",
+        encoding="utf-8",
+    )
+    (artifact_dir / "components.md").write_text(
+        "## Components\n- Dashboard shell\n",
+        encoding="utf-8",
+    )
+    manifest: dict = {"history": [], "benchmark": {}, "artifacts": []}
+
+    gate = await runner._run_pre_code_design_gate(
+        manifest=manifest,
+        artifact_dir=artifact_dir,
+        brief="Build a polished dashboard UI",
+    )
+
+    assert not gate["blockers"]
+
+
+@pytest.mark.asyncio
+async def test_critique_code_fix_triggers_reviewer_rescore(tmp_path, monkeypatch) -> None:
+    from skyn3t.core.agent import TaskRequest, TaskResult
+
+    runner = StudioRunner(event_bus=EventBus(), projects_root=tmp_path / "projects")
+    artifact_dir = tmp_path / "project"
+    scaffold_dir = artifact_dir / "scaffold"
+    (scaffold_dir / "src").mkdir(parents=True)
+    (scaffold_dir / "src" / "App.jsx").write_text(
+        "export default function App() { return null; }\n",
+        encoding="utf-8",
+    )
+    manifest: dict = {"history": [], "execution_profile": "balanced", "benchmark": {}, "artifacts": []}
+
+    rescore_calls: list = []
+
+    async def fake_rescore(**kwargs):
+        rescore_calls.append(kwargs)
+
+    monkeypatch.setattr(runner, "_rerun_reviewer_scoring", fake_rescore)
+
+    class FakeReviewer:
+        llm = None
+
+        async def initialize(self):
+            return None
+
+        async def critique(self, **kwargs):
+            return {
+                "has_issues": True,
+                "issues": [{"file": "src/App.jsx", "problem": "empty UI"}],
+                "critique_text": "Add real UI",
+            }
+
+    class FakeAgent:
+        async def think(self, *_args, **_kwargs):
+            return None
+
+        async def execute(self, *_args, **_kwargs):
+            return TaskResult(task_id="t1", success=True, output={})
+
+    from skyn3t.agents.targeted_fix import FixResult
+
+    async def fake_fix(**kwargs):
+        return FixResult(
+            ok=True,
+            files_changed=["src/App.jsx"],
+            files_created=[],
+            errors=[],
+            fix_label="critique-fix",
+        )
+
+    monkeypatch.setattr("skyn3t.studio.runner.get_agent", lambda *_a, **_k: FakeReviewer())
+    monkeypatch.setattr("skyn3t.agents.targeted_fix.apply_targeted_fix", fake_fix)
+
+    stage = type("Stage", (), {"name": "code", "agent": "CodeAgent"})()
+    result = TaskResult(
+        task_id="t1",
+        success=True,
+        output={"files": ["scaffold/src/App.jsx"], "summary": "code done"},
+    )
+    task = TaskRequest(title="code", input_data={"brief": "Build a dashboard UI"})
+
+    await runner._critique_and_revise(
+        stage=stage,
+        agent=FakeAgent(),
+        result=result,
+        artifact_dir=artifact_dir,
+        brief="Build a polished dashboard UI",
+        task=task,
+        manifest=manifest,
+    )
+
+    assert len(rescore_calls) >= 1
+    assert rescore_calls[0]["artifact_dir"] == artifact_dir

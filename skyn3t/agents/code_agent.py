@@ -1341,7 +1341,16 @@ class CodeAgent(BaseAgent):
                 "`require` / `module.exports`. Adapter files must "
                 "`export default router` (NOT `export { router }`). The "
                 "server entry imports adapters with the .js extension: "
-                "`import sonarrRouter from './adapters/sonarr.js';`."
+                "`import sonarrRouter from './adapters/sonarr.js';`.\n"
+                "- UI quality bar: ship something a stranger could demo "
+                "without embarrassment. Use :root CSS variables for "
+                "colors/spacing/type, hover and :focus-visible states, "
+                "@media responsive rules, and distinct loading/error/empty "
+                "views (not bare text). No Lorem ipsum, no placeholder "
+                "divs, no TODO comments left in shipped files.\n"
+                "- Feature completeness: implement the brief's core "
+                "workflow end-to-end in this file pass — wiring, handlers, "
+                "and edge cases — not a skeleton that 'looks like' the app."
             )
             if stack_hint:
                 build_system = build_system + "\n\n" + stack_hint
@@ -3841,8 +3850,9 @@ if __name__ == '__main__':
     async def _execute_code(self, task_or_code) -> Dict[str, Any]:
         """Execute Python code via the configured sandbox backend.
 
-        Defaults to InlineBackend for speed; set ``SKYN3T_EXECUTION_BACKEND=docker``
-        for real container isolation.
+        Uses ``SKYN3T_EXECUTION_BACKEND`` (default ``auto``): Docker pool when
+        Docker is running, otherwise inline. Set ``docker-pool`` to require
+        container isolation.
         """
         if isinstance(task_or_code, TaskRequest):
             code = task_or_code.input_data.get("code", "")

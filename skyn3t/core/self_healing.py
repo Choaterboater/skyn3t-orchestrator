@@ -1,11 +1,18 @@
 """Self-healing system for agents."""
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 from skyn3t.core.events import Event, EventBus, EventType
+from skyn3t.memory.tuner import apply_adjustments_to_config
+
+if TYPE_CHECKING:
+    from skyn3t.core.orchestrator import Orchestrator
+
+logger = logging.getLogger("skyn3t.core.self_healing")
 
 
 def _utcnow() -> datetime:
@@ -37,11 +44,13 @@ class SelfHealingManager:
 
     def __init__(self, event_bus: EventBus):
         self.event_bus = event_bus
+        self._orchestrator: Optional["Orchestrator"] = None
         self._lazy_healing_queue: Optional[asyncio.Queue[HealingAction]] = None
         self.healing_history: List[HealingAction] = []
         self._running = False
         self._healing_task: Optional[asyncio.Task] = None
         self._healing_handlers: Dict[str, Callable[[HealingAction], Any]] = {}
+        self._isolated_agents: set[str] = set()
 
         # Register default handlers
         self.register_healing_handler("restart", self._handle_restart)
@@ -50,6 +59,10 @@ class SelfHealingManager:
         self.register_healing_handler("throttle", self._handle_throttle)
         self.register_healing_handler("clear_cache", self._handle_clear_cache)
         self.register_healing_handler("increase_timeout", self._handle_increase_timeout)
+
+    def set_orchestrator(self, orchestrator: "Orchestrator") -> None:
+        """Attach the live orchestrator so healing actions can mutate agents."""
+        self._orchestrator = orchestrator
 
     def register_healing_handler(
         self, action_type: str, handler: Callable[[HealingAction], Any]
@@ -157,30 +170,84 @@ class SelfHealingManager:
         if asyncio.iscoroutine(result):
             await result
 
-    def _handle_restart(self, action: HealingAction) -> None:
-        """Restart the agent."""
-        # This is a placeholder - in a real system, you'd restart the agent process
-        print(f"[SelfHeal] Restarting agent: {action.agent_name}")
+    def _agent(self, action: HealingAction):
+        if self._orchestrator is None:
+            return None
+        return self._orchestrator.agents.get(action.agent_name)
 
-    def _handle_reset_queue(self, action: HealingAction) -> None:
-        """Reset the agent's task queue."""
-        print(f"[SelfHeal] Resetting queue for agent: {action.agent_name}")
+    async def _handle_restart(self, action: HealingAction) -> None:
+        """Restart the agent's task processor."""
+        agent = self._agent(action)
+        if agent is None:
+            logger.warning("[SelfHeal] restart skipped — agent %s not found", action.agent_name)
+            return
+        logger.info("[SelfHeal] restarting agent: %s", action.agent_name)
+        self._isolated_agents.discard(action.agent_name)
+        try:
+            await agent.shutdown()
+            await agent.initialize()
+            await agent.start()
+            agent.status = "idle"
+        except Exception:
+            logger.exception("[SelfHeal] restart failed for %s", action.agent_name)
+            raise
 
-    def _handle_isolate(self, action: HealingAction) -> None:
-        """Isolate the agent from receiving new tasks."""
-        print(f"[SelfHeal] Isolating agent: {action.agent_name}")
+    async def _handle_reset_queue(self, action: HealingAction) -> None:
+        """Drop queued tasks for a stuck agent."""
+        agent = self._agent(action)
+        if agent is None:
+            return
+        logger.info("[SelfHeal] resetting queue for agent: %s", action.agent_name)
+        queue = getattr(agent, "_task_queue", None)
+        if queue is None:
+            return
+        while not queue.empty():
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
-    def _handle_throttle(self, action: HealingAction) -> None:
-        """Throttle the agent's task processing."""
-        print(f"[SelfHeal] Throttling agent: {action.agent_name}")
+    async def _handle_isolate(self, action: HealingAction) -> None:
+        """Stop routing new tasks to the agent until a restart heal clears it."""
+        agent = self._agent(action)
+        if agent is None:
+            return
+        logger.info("[SelfHeal] isolating agent: %s", action.agent_name)
+        agent._enabled = False
+        self._isolated_agents.add(action.agent_name)
 
-    def _handle_clear_cache(self, action: HealingAction) -> None:
-        """Clear the agent's cache."""
-        print(f"[SelfHeal] Clearing cache for agent: {action.agent_name}")
+    async def _handle_throttle(self, action: HealingAction) -> None:
+        """Apply a safe request-interval bump via live agent config."""
+        agent = self._agent(action)
+        if agent is None:
+            return
+        logger.info("[SelfHeal] throttling agent: %s", action.agent_name)
+        agent.config = apply_adjustments_to_config(
+            dict(agent.config or {}),
+            [{"parameter": "request_interval", "reason": action.reason}],
+        )
 
-    def _handle_increase_timeout(self, action: HealingAction) -> None:
-        """Increase timeout for the agent."""
-        print(f"[SelfHeal] Increasing timeout for agent: {action.agent_name}")
+    async def _handle_clear_cache(self, action: HealingAction) -> None:
+        """Clear ephemeral agent caches without touching persisted memory."""
+        agent = self._agent(action)
+        if agent is None:
+            return
+        logger.info("[SelfHeal] clearing cache for agent: %s", action.agent_name)
+        for key in ("cache", "response_cache", "last_output"):
+            agent.metadata.pop(key, None)
+        if hasattr(agent, "_results"):
+            agent._results.clear()
+
+    async def _handle_increase_timeout(self, action: HealingAction) -> None:
+        """Increase the agent timeout within tuner safety bounds."""
+        agent = self._agent(action)
+        if agent is None:
+            return
+        logger.info("[SelfHeal] increasing timeout for agent: %s", action.agent_name)
+        agent.config = apply_adjustments_to_config(
+            dict(agent.config or {}),
+            [{"parameter": "timeout", "reason": action.reason}],
+        )
 
     def get_healing_history(self) -> List[Dict[str, Any]]:
         """Get healing history."""

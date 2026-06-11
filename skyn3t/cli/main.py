@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import shlex
 import shutil
 import sys
 import time as time_mod
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 import httpx
 import typer
@@ -72,7 +71,8 @@ def _print_getting_started(*, server_up: bool = False) -> None:
         "[bold cyan]skyn3t[/bold cyan]",
         "Interactive chat (after [bold]skyn3t start[/bold] is running)",
     )
-    quickstart.add_row("[bold cyan]skyn3t init[/bold cyan]", "Initialize data + launch the local-backend setup wizard")
+    quickstart.add_row("[bold cyan]skyn3t init[/bold cyan]", "Initialize data + multi-LLM setup wizard")
+    quickstart.add_row("[bold cyan]skyn3t wizard[/bold cyan]", "Re-run Studio Quality (OpenRouter) or local CLI routing")
     quickstart.add_row(
         "[bold cyan]skyn3t start[/bold cyan]",
         f"Start the API and dashboard on localhost:{get_settings().web_port}",
@@ -420,6 +420,7 @@ user_app = typer.Typer(help="User profile management", no_args_is_help=True)
 schedule_app = typer.Typer(help="Schedule recurring tasks", no_args_is_help=True)
 memory_app = typer.Typer(help="Memory inspection commands", no_args_is_help=True)
 skills_app = typer.Typer(help="Skill registry commands", no_args_is_help=True)
+models_app = typer.Typer(help="LLM model catalog commands", no_args_is_help=True)
 
 app.add_typer(studio_app, name="studio")
 app.add_typer(agent_app, name="agent")
@@ -434,6 +435,7 @@ app.add_typer(user_app, name="user")
 app.add_typer(schedule_app, name="schedule")
 app.add_typer(memory_app, name="memory")
 app.add_typer(skills_app, name="skills")
+app.add_typer(models_app, name="models")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -484,7 +486,7 @@ def _post_studio_start(client: httpx.Client, payload: dict) -> dict:
             timeout=_STUDIO_START_TIMEOUT,
         )
     resp.raise_for_status()
-    return resp.json()
+    return cast(dict[Any, Any], resp.json())
 
 
 def _error(message: str) -> None:
@@ -504,30 +506,15 @@ def _server_unavailable() -> None:
 
 
 def _env_file_path() -> Path:
-    return Path(".env").resolve()
+    from skyn3t.config.env_file import env_file_path
+
+    return env_file_path()
 
 
 def _upsert_env_setting(path: Path, key: str, value: str) -> None:
-    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
-    out: List[str] = []
-    replaced = False
-    for line in lines:
-        stripped = line.lstrip()
-        if not stripped or stripped.startswith("#") or "=" not in line:
-            out.append(line)
-            continue
-        existing_key, _existing_value = line.split("=", 1)
-        if existing_key.strip() != key:
-            out.append(line)
-            continue
-        out.append(f"{key}={value}")
-        replaced = True
-    if not replaced:
-        if out and out[-1] != "":
-            out.append("")
-        out.append(f"{key}={value}")
-    text = "\n".join(out).rstrip("\n") + "\n"
-    path.write_text(text, encoding="utf-8")
+    from skyn3t.config.env_file import upsert_env_setting
+
+    upsert_env_setting(path, key, value)
 
 
 def _detect_local_wizard_backends() -> List[Dict[str, str]]:
@@ -540,7 +527,10 @@ def _detect_local_wizard_backends() -> List[Dict[str, str]]:
 
 
 def _wizard_stage_policies(backend: str) -> Dict[str, str]:
-    from skyn3t.core.model_router import list_stage_routes
+    from skyn3t.core.model_router import list_stage_routes, studio_quality_policies
+
+    if backend in {"openrouter", "studio_quality", "auto"}:
+        return studio_quality_policies()
 
     stages = [
         str(item.get("stage") or "").strip().lower()
@@ -559,16 +549,38 @@ def _wizard_stage_policies(backend: str) -> Dict[str, str]:
     return {}
 
 
+def _env_has_openrouter_key(env_path: Path) -> bool:
+    if not env_path.is_file():
+        return False
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        if key.strip() == "OPENROUTER_API_KEY" and value.strip() not in {"", "sk-..."}:
+            return True
+    return False
+
+
 def _apply_install_wizard_choice(
     backend: str,
     *,
     apply_routing_profile: bool,
     env_path: Optional[Path] = None,
+    openrouter_api_key: Optional[str] = None,
+    enable_quality_env: bool = False,
 ) -> Dict[str, Any]:
     from skyn3t.config.model_routing import get_model_routing_store
 
     target_env = env_path or _env_file_path()
     _upsert_env_setting(target_env, "SKYN3T_LLM_BACKEND", backend)
+    if openrouter_api_key:
+        _upsert_env_setting(target_env, "OPENROUTER_API_KEY", openrouter_api_key)
+    if enable_quality_env:
+        _upsert_env_setting(target_env, "SKYN3T_AUTO_RETRY", "1")
+        # Prefer Docker pool isolation for CodeAgent Python execution when
+        # Docker is available; get_backend("auto") falls back to inline.
+        _upsert_env_setting(target_env, "SKYN3T_EXECUTION_BACKEND", "auto")
 
     applied_policies: Dict[str, str] = {}
     if apply_routing_profile:
@@ -581,20 +593,21 @@ def _apply_install_wizard_choice(
         "env_path": str(target_env),
         "routing_applied": bool(applied_policies),
         "routing_stage_count": len(applied_policies),
+        "quality_env": enable_quality_env,
     }
 
 
-def _run_install_wizard() -> Optional[str]:
+def _run_local_cli_wizard_subflow() -> Optional[Dict[str, Any]]:
     available = _detect_local_wizard_backends()
     if not available:
         console.print(
             "[yellow]No local CLI backends detected.[/yellow] "
-            "[dim]Install Copilot CLI, Claude CLI, or Kimi CLI and re-run "
-            "[bold]skyn3t init --wizard[/bold] if you want guided setup.[/dim]"
+            "[dim]Install Copilot CLI, Claude CLI, or Kimi CLI, or pick "
+            "Studio Quality (OpenRouter) instead.[/dim]"
         )
         return None
 
-    table = Table(title="Local backend setup", box=box.SIMPLE, header_style="bold cyan")
+    table = Table(title="Local CLI backends", box=box.SIMPLE, header_style="bold cyan")
     table.add_column("#", justify="right", style="cyan")
     table.add_column("Backend", style="white")
     table.add_column("Command", style="dim")
@@ -607,14 +620,7 @@ def _run_install_wizard() -> Optional[str]:
             entry["summary"],
         )
     console.print(table)
-    console.print(
-        "[dim]This writes your fallback backend to .env and can also apply a "
-        "local-only routing profile. You can still change routing later from env or the UI.[/dim]"
-    )
-    choice = typer.prompt(
-        "Choose your default local backend",
-        default="1",
-    ).strip()
+    choice = typer.prompt("Choose your default local backend", default="1").strip()
     try:
         selected = available[int(choice) - 1]
     except (ValueError, IndexError):
@@ -628,16 +634,103 @@ def _run_install_wizard() -> Optional[str]:
         selected["backend"],
         apply_routing_profile=apply_profile,
     )
+    return {**result, "label": selected["label"]}
+
+
+def _run_studio_quality_wizard_subflow(env_path: Path) -> Dict[str, Any]:
+    api_key: Optional[str] = None
+    if not _env_has_openrouter_key(env_path):
+        console.print(
+            "[dim]Studio Quality uses OpenRouter for per-stage routing "
+            "(strong code + strong review + UI designer).[/dim]"
+        )
+        if typer.confirm("Add an OpenRouter API key now?", default=True):
+            api_key = typer.prompt(
+                "OpenRouter API key",
+                hide_input=True,
+            ).strip()
+            if not api_key:
+                console.print("[yellow]Skipping API key — add OPENROUTER_API_KEY to .env later.[/yellow]")
+
+    result = _apply_install_wizard_choice(
+        "openrouter",
+        apply_routing_profile=True,
+        env_path=env_path,
+        openrouter_api_key=api_key,
+        enable_quality_env=True,
+    )
+    return {**result, "label": "Studio Quality (OpenRouter)"}
+
+
+def _run_install_wizard() -> Optional[str]:
+    env_path = _env_file_path()
+    console.print(
+        Panel(
+            "[bold]Multi-LLM setup[/bold]\n"
+            "Pick how SkyN3t should route agents. For best Project Studio "
+            "output, use [cyan]Studio Quality[/cyan] (OpenRouter per-stage tiers).",
+            border_style="cyan",
+        )
+    )
+    modes = [
+        {
+            "id": "studio",
+            "label": "Studio Quality (OpenRouter)",
+            "summary": "Recommended for builds — strong code + review + UI tiers",
+        },
+        {
+            "id": "local",
+            "label": "Local CLI subscription",
+            "summary": "Copilot / Claude / Kimi CLIs on this machine",
+        },
+        {
+            "id": "skip",
+            "label": "Skip for now",
+            "summary": "Leave .env and routing unchanged",
+        },
+    ]
+    table = Table(box=box.SIMPLE, header_style="bold cyan")
+    table.add_column("#", justify="right", style="cyan")
+    table.add_column("Mode", style="white")
+    table.add_column("Summary", style="dim")
+    for index, mode in enumerate(modes, start=1):
+        table.add_row(str(index), mode["label"], mode["summary"])
+    console.print(table)
+
+    choice = typer.prompt("Choose setup mode", default="1").strip()
+    try:
+        selected_mode = modes[int(choice) - 1]
+    except (ValueError, IndexError):
+        raise typer.BadParameter("Pick 1, 2, or 3.")
+
+    if selected_mode["id"] == "skip":
+        return None
+
+    if selected_mode["id"] == "studio":
+        result = _run_studio_quality_wizard_subflow(env_path)
+    else:
+        local_result = _run_local_cli_wizard_subflow()
+        if local_result is None:
+            return None
+        result = local_result
+
     routing_line = (
         f"routing profile updated for {result['routing_stage_count']} stages"
         if result["routing_applied"]
         else "routing profile left unchanged"
     )
+    quality_line = (
+        "SKYN3T_AUTO_RETRY=1 enabled"
+        if result.get("quality_env")
+        else "quality env left unchanged"
+    )
     return (
         "Setup wizard saved\n"
-        f"• Backend: {selected['label']} ({selected['backend']})\n"
+        f"• Mode: {result['label']}\n"
+        f"• Backend: {result['backend']}\n"
         f"• Env: {result['env_path']}\n"
-        f"• Routing: {routing_line}"
+        f"• Routing: {routing_line}\n"
+        f"• Retries: {quality_line}"
     )
 
 
@@ -746,7 +839,7 @@ def _watch_studio_project(slug: str) -> None:
                     gate_key = approval_gate_key(project)
                     if gate_key != seen_approval:
                         try:
-                            message = run_interactive_approval(
+                            approval_message = run_interactive_approval(
                                 console=console,
                                 client=client,
                                 slug=slug,
@@ -766,8 +859,8 @@ def _watch_studio_project(slug: str) -> None:
                         except (httpx.HTTPError, RuntimeError, ValueError) as exc:
                             _error(str(exc))
                             raise typer.Exit(1) from exc
-                        if message:
-                            console.print(f"[green]{message}[/green]")
+                        if approval_message:
+                            console.print(f"[green]{approval_message}[/green]")
                             seen_approval = gate_key
                             seen_history = len(project.get("history") or [])
                             last_snapshot = None
@@ -1082,11 +1175,24 @@ def start(
 
 
 @app.command()
+def wizard() -> None:
+    """🧙 Re-run multi-LLM setup (OpenRouter Studio Quality or local CLI routing)."""
+    if not _interactive_cli_ready():
+        _error("Setup wizard requires an interactive terminal.")
+        raise typer.Exit(1)
+    summary = _run_install_wizard()
+    if summary:
+        _success(summary)
+    else:
+        console.print("[dim]Setup wizard skipped — no changes written.[/dim]")
+
+
+@app.command()
 def init(
     wizard: bool = typer.Option(
         True,
         "--wizard/--no-wizard",
-        help="Run the local-backend setup wizard in interactive terminals",
+        help="Run the multi-LLM setup wizard in interactive terminals",
     ),
 ) -> None:
     """🔧 Initialize the SkyN3t system (directories + database)."""
@@ -1122,6 +1228,51 @@ def init(
             progress.update(t, completed=True)
             _error(f"Initialization failed: {exc}")
             raise typer.Exit(1)
+
+
+@models_app.command("sync")
+def models_sync(
+    force: bool = typer.Option(False, "--force", "-f", help="Ignore cache TTL and refetch"),
+) -> None:
+    """🔄 Fetch the latest OpenRouter model catalog into data/openrouter_models.json."""
+    from skyn3t.core.openrouter_catalog import sync_catalog, validate_tier_models
+
+    async def _run() -> Dict[str, Any]:
+        return await sync_catalog(force=force)
+
+    try:
+        result = asyncio.run(_run())
+    except Exception as exc:
+        _error(f"OpenRouter sync failed: {exc}")
+        raise typer.Exit(1)
+
+    status = str(result.get("status") or "unknown")
+    count = int(result.get("count") or 0)
+    source = str(result.get("source") or "")
+    if status == "failed":
+        _error(str(result.get("error") or "sync failed"))
+        raise typer.Exit(1)
+
+    lines = [
+        f"Status: [cyan]{status}[/cyan]",
+        f"Models: [bold]{count}[/bold]",
+        f"Source: {source}",
+    ]
+    if result.get("synced_at"):
+        lines.append(f"Synced at: {result['synced_at']:.0f}")
+    if result.get("error"):
+        lines.append(f"[yellow]Note:[/yellow] {result['error']}")
+
+    tier_rows = validate_tier_models()
+    missing = [r for r in tier_rows if not r.get("exists")]
+    if missing:
+        lines.append("")
+        lines.append("[yellow]Tier models missing from catalog:[/yellow]")
+        for row in missing:
+            fb = row.get("fallback") or "(none)"
+            lines.append(f"  • {row['tier']}: {row['model']} → fallback {fb}")
+
+    console.print(Panel.fit("\n".join(lines), title="OpenRouter catalog", border_style="cyan"))
 
 
 @app.command()
@@ -3292,6 +3443,34 @@ def skills_remove(name: str) -> None:
         _success(f"Removed skill '{name}'")
     else:
         _error(f"Skill '{name}' not found")
+
+
+@skills_app.command("hub")
+def skills_hub(
+    install: bool = typer.Option(False, "--install", help="Install missing hub skills"),
+) -> None:
+    """List or install skills from the local Skills Hub (examples/skills_seed, skills/)."""
+    from skyn3t.intelligence.skills_hub import install_from_hub, list_hub_entries
+
+    catalog = list_hub_entries()
+    if not install:
+        console.print("[bold]Skills Hub roots[/bold]")
+        for root in catalog.get("roots") or []:
+            console.print(f"  • {root}")
+        console.print(f"\nMarkdown skills: {len(catalog.get('markdown_skills') or [])}")
+        console.print(f"Agent SKILL.md dirs: {len(catalog.get('agent_skill_dirs') or [])}")
+        console.print("\nRun [cyan]skyn3t skills hub --install[/cyan] to install missing safe skills.")
+        return
+
+    result = install_from_hub(only_missing=True, reject_unsafe=True)
+    installed = result.get("installed") or []
+    if installed:
+        _success(f"Installed {len(installed)} skill(s): {', '.join(installed[:8])}")
+    else:
+        console.print("[dim]No new hub skills to install.[/dim]")
+    flagged = result.get("flagged") or []
+    if flagged:
+        console.print(f"[yellow]Flagged (unsafe): {len(flagged)}[/yellow]")
 
 
 def main() -> None:

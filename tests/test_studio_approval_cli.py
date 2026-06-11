@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import httpx
 from typer.testing import CliRunner
 
 import skyn3t.cli.studio_approval as studio_approval

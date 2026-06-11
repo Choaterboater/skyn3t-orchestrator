@@ -112,11 +112,11 @@ class LearningLoop:
             return
         try:
             res = await self.ingestor.ingest_lesson(
-                content=lesson.lesson,
-                metadata={
-                    "agent": lesson.agent, "capability": lesson.capability,
-                    "outcome": lesson.outcome, "tags": lesson.tags,
-                },
+                agent=lesson.agent or "learning_loop",
+                success=lesson.outcome == "success",
+                patterns=list(lesson.tags),
+                suggestions=[lesson.lesson],
+                task_id="",
             )
             if isinstance(res, str):
                 lesson.embedding_id = res

@@ -1,6 +1,6 @@
 # How to Raise Studio Review Scores
 
-Date: 2026-05-19
+Date: 2026-05-19 (updated 2026-06-11 — thresholds and contract gates)
 
 This guide explains how SkyN3t's reviewer currently scores Studio runs, why projects get stuck at low numbers like **49** or low-50s, and what to change in the generated project to raise the score on the next run.
 
@@ -21,6 +21,7 @@ If you want the score to go up, do these first:
 
 3. **Make the real entrypoint use the real designed components**
    - if the polished components are never rendered, the reviewer treats them as unused theater
+   - the **contract engine** now flags this deterministically as `orphan_components` (blocker when ≥2 polished components are not mounted in `App.jsx`/`App.tsx`)
 
 4. **Remove dead stubs and template leftovers**
    - wrong product title
@@ -66,11 +67,11 @@ The score logic uses two numbers:
 1. **Displayed blended score**
 2. **Verdict score**
 
-The verdict score is capped by the LLM bucket:
+Verdict buckets (current `reviewer.py` + `runner.REVIEWER_SCORE_THRESHOLD`):
 
-- if `llm_score < 50`, verdict stays in `no-go`
-- if `50 <= llm_score < 75`, verdict stays in `go-with-fixes`
-- only `llm_score >= 75` can become `go`
+- blended score **< 60** → `no-go` (70 for UI-heavy briefs in the go-with-fixes band)
+- **60–79** → `go-with-fixes` (project finishes as `needs_fixes`)
+- **≥ 80** → `go` (required for final `done` status alongside build/boot/integration `yes`)
 
 So the important rule is:
 
@@ -307,7 +308,7 @@ Do this:
 4. make every run instruction actually work
 5. make the architecture describe what was shipped, not what was imagined
 
-If the LLM score stays below 50, the run will keep feeling stuck in the bottom bucket.
+If the blended score stays below 60 (or below 80 for a clean `done`), the run will stay in `needs_fixes` or `failed`.
 
 ## Pre-review checklist for Studio runs
 

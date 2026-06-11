@@ -3,6 +3,7 @@
 import asyncio
 import io
 import json
+import os
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -1512,6 +1513,71 @@ async def test_routing_policy_patch_accepts_recommendation_metadata(monkeypatch,
     route = next(route for route in result["routes"] if route["stage"] == "research")
     assert route["tier"] == "or_cheap"
     assert route["persisted_via"] == "recommendation"
+
+
+@pytest.mark.asyncio
+async def test_routing_policy_get_includes_studio_quality_preset(monkeypatch, tmp_path):
+    import skyn3t.config.model_routing as routing_config
+
+    monkeypatch.setattr(
+        routing_config,
+        "_store",
+        ModelRoutingStore(tmp_path / "routing.json"),
+    )
+
+    result = await web_app.routing_policy_get()
+
+    preset = result["presets"]["studio_quality"]
+    assert preset["label"]
+    assert preset["policies"]["code"] == "or_strong"
+    assert preset["policies"]["designer"] == "or_ui"
+
+
+@pytest.mark.asyncio
+async def test_routing_preset_studio_quality_applies_policies(monkeypatch, tmp_path):
+    import skyn3t.config.model_routing as routing_config
+
+    store = ModelRoutingStore(tmp_path / "routing.json")
+    monkeypatch.setattr(routing_config, "_store", store)
+    monkeypatch.setattr(web_app, "orchestrator", SimpleNamespace(agents={}))
+
+    result = await web_app.routing_preset_studio_quality()
+
+    assert result["ok"] is True
+    assert store.entries()["reviewer"]["tier"] == "or_strong"
+    reviewer = next(route for route in result["routes"] if route["stage"] == "reviewer")
+    assert reviewer["source"] == "persisted"
+
+
+@pytest.mark.asyncio
+async def test_execution_backend_get_reports_inline(monkeypatch):
+    monkeypatch.setenv("SKYN3T_EXECUTION_BACKEND", "inline")
+    from skyn3t.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    result = await web_app.execution_backend_get()
+
+    assert result["configured"] == "inline"
+    assert result["resolved_class"] == "InlineBackend"
+    assert "auto" in result["valid_backends"]
+
+
+@pytest.mark.asyncio
+async def test_execution_backend_patch_writes_env(monkeypatch, tmp_path):
+    from skyn3t.config.settings import get_settings
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("SKYN3T_EXECUTION_BACKEND=inline\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SKYN3T_EXECUTION_BACKEND", "inline")
+    get_settings.cache_clear()
+
+    result = await web_app.execution_backend_patch({"backend": "auto"})
+
+    assert result["ok"] is True
+    assert "SKYN3T_EXECUTION_BACKEND=auto" in env_path.read_text(encoding="utf-8")
+    assert os.environ["SKYN3T_EXECUTION_BACKEND"] == "auto"
 
 
 @pytest.mark.asyncio

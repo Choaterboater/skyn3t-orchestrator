@@ -1,0 +1,641 @@
+"""Autonomous learning schedule + Studio build loop.
+
+When enabled via env flags, SkyN3t can:
+  - Schedule periodic GitHub scout runs (learning ingest)
+  - Propose micro-briefs from scout, build-pattern gaps, failures, competitive intel
+  - Start Studio builds in PROJECTS_DIR without CLI prompts
+
+SkyN3t repo mutations remain approval-gated — autonomous builds only create
+projects under PROJECTS_DIR. When ``SKYN3T_AUTONOMOUS_BUILDS=1``, Studio
+architect/designer gates are bypassed automatically (see
+``auto_approve_enabled()`` in ``settings.py``).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Deque, Dict, List, Optional
+from uuid import uuid4
+
+logger = logging.getLogger("skyn3t.cortex.autonomous_loop")
+
+STATE_PATH = Path("data/autonomous_loop_state.json")
+_SCOUT_JOB_NAME = "autonomous-repo-scout"
+
+
+@dataclass
+class AutonomousBrief:
+    """A queued autonomous Studio brief."""
+
+    brief: str
+    template: str = "auto"
+    source: str = "unknown"
+    trigger: str = ""
+    priority: int = 0
+    created_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class LoopState:
+    today_date: str = ""
+    daily_builds: int = 0
+    daily_spend_usd: float = 0.0
+    recent_brief_hashes: List[str] = field(default_factory=list)
+    queue: List[Dict[str, Any]] = field(default_factory=list)
+    last_tick_at: float = 0.0
+    last_build_slug: Optional[str] = None
+    last_skip_reason: Optional[str] = None
+    last_proof_slug: Optional[str] = None
+    last_proof_ok: Optional[bool] = None
+    last_proof_summary: Optional[str] = None
+    last_proof_at: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "today_date": self.today_date,
+            "daily_builds": self.daily_builds,
+            "daily_spend_usd": self.daily_spend_usd,
+            "recent_brief_hashes": list(self.recent_brief_hashes),
+            "queue": list(self.queue),
+            "last_tick_at": self.last_tick_at,
+            "last_build_slug": self.last_build_slug,
+            "last_skip_reason": self.last_skip_reason,
+            "last_proof_slug": self.last_proof_slug,
+            "last_proof_ok": self.last_proof_ok,
+            "last_proof_summary": self.last_proof_summary,
+            "last_proof_at": self.last_proof_at,
+        }
+
+
+def _load_state() -> LoopState:
+    try:
+        if STATE_PATH.exists():
+            raw = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            return LoopState(
+                today_date=str(raw.get("today_date") or ""),
+                daily_builds=int(raw.get("daily_builds") or 0),
+                daily_spend_usd=float(raw.get("daily_spend_usd") or 0.0),
+                recent_brief_hashes=list(raw.get("recent_brief_hashes") or []),
+                queue=list(raw.get("queue") or []),
+                last_tick_at=float(raw.get("last_tick_at") or 0.0),
+                last_build_slug=raw.get("last_build_slug"),
+                last_skip_reason=raw.get("last_skip_reason"),
+                last_proof_slug=raw.get("last_proof_slug"),
+                last_proof_ok=raw.get("last_proof_ok"),
+                last_proof_summary=raw.get("last_proof_summary"),
+                last_proof_at=float(raw.get("last_proof_at") or 0.0),
+            )
+    except Exception:
+        logger.debug("autonomous loop state load failed", exc_info=True)
+    return LoopState()
+
+
+def _save_state(state: LoopState) -> None:
+    try:
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        STATE_PATH.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
+    except Exception:
+        logger.exception("autonomous loop state save failed")
+
+
+def _brief_hash(brief: str) -> str:
+    normalized = " ".join((brief or "").strip().lower().split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _reset_daily_counters(state: LoopState) -> None:
+    today = time.strftime("%Y-%m-%d")
+    if state.today_date != today:
+        state.today_date = today
+        state.daily_builds = 0
+        state.daily_spend_usd = 0.0
+
+
+async def ensure_autonomous_scout_schedule(orchestrator: Any) -> Dict[str, Any]:
+    """Create a recurring repo-scout job when autonomous learning is on."""
+    from skyn3t.config.settings import get_settings
+
+    settings = get_settings()
+    if not getattr(settings, "autonomous_learning", True):
+        return {"scheduled": False, "reason": "autonomous_learning disabled"}
+
+    memory = getattr(orchestrator, "memory_store", None) or getattr(orchestrator, "_memory", None)
+    if memory is None:
+        return {"scheduled": False, "reason": "memory store unavailable"}
+
+    schedule_expr = str(getattr(settings, "autonomous_scout_schedule", "interval:12h") or "interval:12h")
+    try:
+        jobs = await memory.list_scheduled_jobs(enabled_only=False)
+    except Exception as exc:
+        return {"scheduled": False, "reason": f"list jobs failed: {exc}"}
+
+    for job in jobs:
+        name = str(job.get("name") or "")
+        agent = str(job.get("agent_name") or "")
+        if name == _SCOUT_JOB_NAME or (
+            agent in {"github_repo_scout", "repo_scout"} and name.startswith("autonomous-")
+        ):
+            return {"scheduled": True, "job_id": job.get("id"), "existing": True}
+
+    from skyn3t.config.settings import get_settings as _gs
+
+    cfg = _gs()
+    scout_config = {
+        "cadence": "daily",
+        "limit": max(1, min(int(cfg.cortex_scout_default_limit), 4)),
+        "queries": list(cfg.cortex_scout_fit_queries or [])[:5],
+        "platforms": ["github"],
+    }
+    job_id = str(uuid4())
+    try:
+        await memory.save_scheduled_job(
+            job_id=job_id,
+            name=_SCOUT_JOB_NAME,
+            schedule_expr=schedule_expr,
+            agent_name="github_repo_scout",
+            prompt=json.dumps(scout_config, sort_keys=True),
+            enabled=True,
+            next_run=None,
+            run_count=0,
+        )
+    except Exception as exc:
+        logger.exception("failed to save autonomous scout job")
+        return {"scheduled": False, "reason": str(exc)}
+    return {"scheduled": True, "job_id": job_id, "existing": False, "schedule_expr": schedule_expr}
+
+
+class AutonomousCoordinator:
+    """Owns scout schedule + autonomous Studio build loop."""
+
+    def __init__(self, orchestrator: Any, event_bus: Any):
+        self.orchestrator = orchestrator
+        self.event_bus = event_bus
+        self.state = _load_state()
+        self._pending: Deque[AutonomousBrief] = asyncio.Queue()
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+        self._wired = False
+        self._scout_boot: Dict[str, Any] = {}
+
+    async def start(self) -> None:
+        from skyn3t.config.settings import get_settings
+
+        settings = get_settings()
+        if getattr(settings, "autonomous_learning", True):
+            self._scout_boot = await ensure_autonomous_scout_schedule(self.orchestrator)
+            self._publish_alert(
+                "autonomous_learning_booted",
+                scout=self._scout_boot,
+            )
+            try:
+                from skyn3t.core.openrouter_catalog import schedule_background_sync
+
+                schedule_background_sync()
+            except Exception:
+                logger.debug("openrouter sync schedule from autonomous loop failed", exc_info=True)
+
+        if not getattr(settings, "autonomous_builds", False):
+            return
+
+        if self._running:
+            return
+        self._running = True
+        if not self._wired:
+            self._wire_events()
+        # Hydrate queue from persisted state
+        for item in self.state.queue:
+            try:
+                brief = AutonomousBrief(
+                    brief=str(item.get("brief") or ""),
+                    template=str(item.get("template") or "auto"),
+                    source=str(item.get("source") or "persisted"),
+                    trigger=str(item.get("trigger") or ""),
+                    priority=int(item.get("priority") or 0),
+                    created_at=float(item.get("created_at") or time.time()),
+                )
+                if brief.brief.strip():
+                    await self._pending.put(brief)
+            except Exception:
+                continue
+        self.state.queue = []
+        _save_state(self.state)
+        self._task = asyncio.create_task(self._loop())
+        self._publish_alert("autonomous_builds_started", scout=self._scout_boot)
+
+    async def stop(self) -> None:
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    def get_status(self) -> Dict[str, Any]:
+        from skyn3t.config.settings import get_settings
+
+        settings = get_settings()
+        return {
+            "autonomous_learning": bool(getattr(settings, "autonomous_learning", True)),
+            "autonomous_builds": bool(getattr(settings, "autonomous_builds", False)),
+            "autonomous_proof_run": bool(getattr(settings, "autonomous_proof_run", True)),
+            "scout_schedule": self._scout_boot,
+            "daily_builds": self.state.daily_builds,
+            "daily_spend_usd": self.state.daily_spend_usd,
+            "daily_cap": int(getattr(settings, "autonomous_build_daily_cap", 3)),
+            "daily_budget_usd": float(getattr(settings, "autonomous_build_daily_budget_usd", 5.0)),
+            "queue_depth": self._pending.qsize(),
+            "last_build_slug": self.state.last_build_slug,
+            "last_skip_reason": self.state.last_skip_reason,
+            "last_proof_slug": self.state.last_proof_slug,
+            "last_proof_ok": self.state.last_proof_ok,
+            "last_proof_summary": self.state.last_proof_summary,
+            "last_proof_at": self.state.last_proof_at,
+            "last_tick_at": self.state.last_tick_at,
+            "running": self._running,
+        }
+
+    def _wire_events(self) -> None:
+        self._wired = True
+        try:
+            from skyn3t.core.events import EventType
+
+            self.event_bus.subscribe(self._on_system_alert, EventType.SYSTEM_ALERT)
+        except Exception:
+            logger.exception("autonomous loop event subscribe failed")
+
+    def _on_system_alert(self, event: Any) -> None:
+        from skyn3t.config.settings import get_settings
+
+        if not getattr(get_settings(), "autonomous_builds", False):
+            return
+        payload = getattr(event, "payload", {}) or {}
+        kind = str(payload.get("kind") or "")
+        if kind == "PROJECT_FAILED":
+            try:
+                asyncio.create_task(self._enqueue_failure_brief(payload))
+            except Exception:
+                logger.debug("enqueue failure brief failed", exc_info=True)
+        elif kind == "PROJECT_COMPLETED":
+            try:
+                asyncio.create_task(self._on_project_completed(payload))
+            except Exception:
+                logger.debug("autonomous proof-run hook failed", exc_info=True)
+
+    async def _on_project_completed(self, payload: Dict[str, Any]) -> None:
+        """Fail-closed proof run after autonomous Studio builds finish."""
+        from skyn3t.config.settings import get_settings
+
+        settings = get_settings()
+        if not getattr(settings, "autonomous_proof_run", True):
+            return
+        if not getattr(settings, "autonomous_builds", False):
+            return
+
+        slug = str(payload.get("slug") or "").strip()
+        if not slug:
+            return
+        if not payload.get("autonomous") and not slug.startswith("auto-"):
+            return
+        if str(payload.get("status") or "") == "failed":
+            return
+
+        from skyn3t.studio.proof_run import run_proof_for_slug
+
+        proof = await run_proof_for_slug(
+            slug,
+            execution_profile=str(payload.get("execution_profile") or "balanced"),
+            strict=True,
+        )
+        self.state.last_proof_slug = slug
+        self.state.last_proof_ok = bool(proof.get("ok"))
+        self.state.last_proof_summary = str(proof.get("summary") or "")[:500]
+        self.state.last_proof_at = time.time()
+        _save_state(self.state)
+
+        if proof.get("ok"):
+            self._publish_alert(
+                "AUTONOMOUS_PROOF_PASSED",
+                slug=slug,
+                stack=proof.get("stack"),
+                summary=proof.get("summary"),
+            )
+            return
+
+        failure_msg = str(proof.get("summary") or proof.get("failure_hint") or "proof run failed")
+        self._publish_alert(
+            "AUTONOMOUS_PROOF_FAILED",
+            slug=slug,
+            stack=proof.get("stack"),
+            summary=failure_msg,
+            stderr=(proof.get("stderr") or "")[:800],
+        )
+        await self._enqueue_failure_brief(
+            {
+                "slug": slug,
+                "error": f"post-build proof failed: {failure_msg}",
+                "stack": proof.get("stack") or payload.get("stack") or "web",
+                "source": "proof_run",
+            }
+        )
+
+    async def _enqueue_failure_brief(self, payload: Dict[str, Any]) -> None:
+        error = str(payload.get("error") or payload.get("message") or "").strip()
+        stack = str(payload.get("stack") or "web").strip()
+        if not error:
+            return
+        brief = (
+            f"Autonomous practice build: minimal {stack} app that avoids the failure "
+            f"«{error[:120]}». Ship a runnable scaffold with dark theme and one core workflow."
+        )
+        await self._offer_brief(
+            AutonomousBrief(
+                brief=brief,
+                source="failure_lesson",
+                trigger=error[:200],
+                priority=80,
+            )
+        )
+
+    async def _offer_brief(self, item: AutonomousBrief) -> bool:
+        if not item.brief.strip():
+            return False
+        h = _brief_hash(item.brief)
+        if h in self.state.recent_brief_hashes:
+            return False
+        self.state.recent_brief_hashes.append(h)
+        self.state.recent_brief_hashes = self.state.recent_brief_hashes[-40:]
+        await self._pending.put(item)
+        self._persist_queue_snapshot()
+        self._publish_alert(
+            "AUTONOMOUS_BUILD_QUEUED",
+            brief=item.brief[:200],
+            source=item.source,
+            trigger=item.trigger[:120],
+        )
+        return True
+
+    def _persist_queue_snapshot(self) -> None:
+        # Best-effort snapshot for dashboard after queue changes
+        try:
+            items: List[Dict[str, Any]] = []
+            while not self._pending.empty():
+                b = self._pending.get_nowait()
+                items.append(
+                    {
+                        "brief": b.brief,
+                        "template": b.template,
+                        "source": b.source,
+                        "trigger": b.trigger,
+                        "priority": b.priority,
+                        "created_at": b.created_at,
+                    }
+                )
+            for b in items:
+                self._pending.put_nowait(
+                    AutonomousBrief(
+                        brief=b["brief"],
+                        template=b["template"],
+                        source=b["source"],
+                        trigger=b["trigger"],
+                        priority=b["priority"],
+                        created_at=b["created_at"],
+                    )
+                )
+            self.state.queue = items
+            _save_state(self.state)
+        except Exception:
+            logger.debug("queue snapshot failed", exc_info=True)
+
+    async def _loop(self) -> None:
+        from skyn3t.config.settings import get_settings
+
+        settings = get_settings()
+        interval = max(60, int(getattr(settings, "autonomous_build_interval_seconds", 900)))
+        await asyncio.sleep(30)  # warmup after orchestrator boot
+        while self._running:
+            try:
+                _reset_daily_counters(self.state)
+                self.state.last_tick_at = time.time()
+                await self._maybe_propose_briefs()
+                skip = await self._maybe_start_build()
+                if skip:
+                    self.state.last_skip_reason = skip
+                _save_state(self.state)
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("autonomous build loop tick failed")
+                await asyncio.sleep(interval)
+
+    async def _maybe_propose_briefs(self) -> None:
+        if self._pending.qsize() >= 3:
+            return
+        for fn in (
+            self._propose_from_build_patterns,
+            self._propose_from_scout,
+            self._propose_from_competitive,
+        ):
+            try:
+                item = await fn()
+                if item is not None:
+                    await self._offer_brief(item)
+            except Exception:
+                logger.debug("brief proposal %s failed", fn.__name__, exc_info=True)
+
+    async def _propose_from_build_patterns(self) -> Optional[AutonomousBrief]:
+        from skyn3t.intelligence.build_patterns import get_default_scoreboard
+
+        sb = get_default_scoreboard()
+        summary = sb.summary()
+        if summary.get("stacks_tracked", 0) == 0:
+            return None
+        stacks = [
+            "react_vite",
+            "next",
+            "fastapi",
+            "express",
+            "vite",
+            "python_fastapi",
+        ]
+        for stack in stacks:
+            worst = sb.worst_shape(stack, min_samples=2)
+            best = sb.best_shape(stack, min_samples=2)
+            if worst is None or best is None:
+                continue
+            if worst.success_rate >= 0.5:
+                continue
+            shape_hint = ", ".join(best.shape[:4]) if best.shape else "standard scaffold files"
+            brief = (
+                f"Autonomous pattern drill ({stack}): build a small runnable app using the "
+                f"winning scaffold shape ({shape_hint}). Avoid shapes that historically fail "
+                f"verification on this stack."
+            )
+            return AutonomousBrief(
+                brief=brief,
+                source="build_pattern_gap",
+                trigger=f"{stack}:{worst.success_rate:.0%} vs {best.success_rate:.0%}",
+                priority=60,
+            )
+        return None
+
+    async def _propose_from_scout(self) -> Optional[AutonomousBrief]:
+        scout = getattr(self.orchestrator, "_repo_scout", None)
+        if scout is None:
+            return None
+        last = getattr(scout, "_last_result", None) or {}
+        proposals = list(last.get("proposals") or [])
+        if not proposals:
+            return None
+        top = proposals[0]
+        repo = str(top.get("repo") or top.get("full_name") or "").strip()
+        topic = str(top.get("title") or top.get("summary") or repo or "scout finding").strip()
+        if not topic:
+            return None
+        brief = (
+            f"Autonomous scout drill: build a minimal demo app inspired by «{topic}» "
+            f"({repo or 'GitHub scout'}). Runnable React or Python scaffold only — "
+            "no SkyN3t repo changes."
+        )
+        return AutonomousBrief(
+            brief=brief,
+            source="scout_ingest",
+            trigger=repo or topic[:80],
+            priority=50,
+        )
+
+    async def _propose_from_competitive(self) -> Optional[AutonomousBrief]:
+        from skyn3t.cortex.competitive_intel import competitive_practice_brief
+
+        brief = competitive_practice_brief()
+        if not brief:
+            return None
+        return AutonomousBrief(
+            brief=brief,
+            source="competitive_intel",
+            trigger="catalog",
+            priority=40,
+        )
+
+    async def _maybe_start_build(self) -> Optional[str]:
+        from skyn3t.config.settings import get_settings
+
+        settings = get_settings()
+        daily_cap = max(0, int(getattr(settings, "autonomous_build_daily_cap", 3)))
+        daily_budget = float(getattr(settings, "autonomous_build_daily_budget_usd", 5.0))
+        per_build_cap = float(getattr(settings, "max_build_cost_usd", 1.0))
+
+        if self.state.daily_builds >= daily_cap:
+            return f"daily cap reached ({daily_cap})"
+        if daily_budget > 0 and self.state.daily_spend_usd >= daily_budget:
+            return f"daily token budget reached (${daily_budget:.2f})"
+
+        runner = self._get_runner()
+        if runner is None:
+            return "studio runner not available"
+
+        studio_active = self._count_active_studio(runner)
+        max_studio = int(getattr(runner, "MAX_CONCURRENT_PROJECTS", 3))
+        if studio_active >= max_studio:
+            return f"studio concurrency full ({studio_active}/{max_studio})"
+
+        from skyn3t.cortex.repo_scout import MultiSourceRepoScout
+
+        busy = MultiSourceRepoScout.busy_reason(
+            self.orchestrator,
+            studio_active=studio_active,
+        )
+        if busy:
+            return busy
+
+        if self._pending.empty():
+            return "queue empty"
+
+        # Pick highest priority brief
+        items: List[AutonomousBrief] = []
+        while not self._pending.empty():
+            items.append(await self._pending.get())
+        if not items:
+            return "queue empty"
+        items.sort(key=lambda b: (-b.priority, b.created_at))
+        chosen = items[0]
+        for rest in items[1:]:
+            await self._pending.put(rest)
+
+        slug_base = f"auto-{chosen.source}-{int(time.time())}"
+        extra = {
+            "autonomous": True,
+            "source": "autonomous",
+            "trigger_source": chosen.source,
+            "execution_profile": "balanced",
+            "max_cost_usd": min(per_build_cap, daily_budget - self.state.daily_spend_usd)
+            if daily_budget > 0
+            else per_build_cap,
+        }
+        self._publish_alert(
+            "AUTONOMOUS_BUILD_STARTED",
+            brief=chosen.brief[:200],
+            source=chosen.source,
+            trigger=chosen.trigger[:120],
+        )
+        try:
+            manifest = await runner.start(
+                chosen.template,
+                chosen.brief,
+                slug=slug_base[:48],
+                extra=extra,
+                mission_setup={"autonomy": "balanced"},
+            )
+            slug = str(manifest.get("slug") or slug_base)
+            self.state.daily_builds += 1
+            self.state.daily_spend_usd += float(extra.get("max_cost_usd") or per_build_cap)
+            self.state.last_build_slug = slug
+            self.state.last_skip_reason = None
+            logger.info(
+                "autonomous build started slug=%s source=%s",
+                slug,
+                chosen.source,
+            )
+            return None
+        except Exception as exc:
+            logger.exception("autonomous build start failed")
+            await self._pending.put(chosen)
+            return f"start failed: {exc}"
+
+    def _get_runner(self) -> Any:
+        getter = getattr(self.orchestrator, "get_studio_runner", None)
+        if callable(getter):
+            return getter()
+        return None
+
+    def _count_active_studio(self, runner: Any) -> int:
+        try:
+            projects = runner.list_projects()
+        except Exception:
+            return 0
+        active = {"running", "queued"}
+        return sum(1 for p in projects if str(p.get("status") or "") in active)
+
+    def _publish_alert(self, kind: str, **fields: Any) -> None:
+        try:
+            from skyn3t.core.events import Event, EventType
+
+            payload: Dict[str, Any] = {"kind": kind, "autonomous": True}
+            payload.update(fields)
+            self.event_bus.publish(
+                Event(
+                    event_type=EventType.SYSTEM_ALERT,
+                    source="autonomous_loop",
+                    payload=payload,
+                )
+            )
+        except Exception:
+            logger.debug("autonomous alert publish failed", exc_info=True)

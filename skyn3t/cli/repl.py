@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
-import os
 import re
 import secrets
 import shlex
@@ -30,10 +29,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from skyn3t.config.settings import resolve_api_base
 from skyn3t.cli.main import (
     _STUDIO_START_TIMEOUT,
-    _format_studio_progress_line,
     _studio_progress_snapshot,
 )
 from skyn3t.cli.studio_approval import (
@@ -46,6 +43,7 @@ from skyn3t.cli.studio_approval import (
     run_interactive_approval,
     submit_reject,
 )
+from skyn3t.config.settings import resolve_api_base
 from skyn3t.studio.repo_target import normalize_repo_target, resolve_repo_target
 
 API_BASE = resolve_api_base()
@@ -1330,6 +1328,10 @@ Slash commands are optional power-user shortcuts — `/help` lists them all.
 - `/agent NAME model ID` — patch agent model
 - `/agent NAME enable` / `/agent NAME disable`
 - `/whoami` — show api_url, active agent/backend/model, connection state
+- `/skills` — list installed skills
+- `/skills hub` — list Skills Hub seed entries
+- `/skills install hub` — install missing safe skills from the hub
+- `/skills search QUERY` — search installed skills by relevance
 
 **Optional:** `/project`, `/agent`, `/backend`, and `/model` override the defaults above.
 Ctrl-C cancels an in-flight task.
@@ -1452,6 +1454,9 @@ async def _slash(state: ReplState, raw: str) -> bool:
         return False
     if cmd == "/whoami":
         await _cmd_whoami(state)
+        return False
+    if cmd == "/skills":
+        await _cmd_skills(state, rest)
         return False
 
     _add_transcript(state, _info_line(f"unknown command: {cmd} (try /help)", "red"))
@@ -2891,6 +2896,75 @@ async def _cmd_agent(state: ReplState, rest: str) -> None:
     _add_transcript(state, _info_line(f"unknown /agent subcommand: {sub}", "red"))
 
 
+async def _cmd_skills(state: ReplState, rest: str) -> None:
+    sub = (rest or "").strip().lower()
+    try:
+        if sub.startswith("search "):
+            query = rest.strip()[7:].strip()
+            from skyn3t.intelligence.skill_library import get_default_library
+
+            lib = get_default_library()
+            hits = lib.find_relevant(query, limit=10)
+            if not hits:
+                _add_transcript(state, _info_line(f"No skills match '{query}'", "yellow"))
+                return
+            table = Table(title=f"Skills: {query}", header_style="bold magenta")
+            table.add_column("name", style="cyan")
+            table.add_column("score")
+            table.add_column("tags", style="dim")
+            for skill in hits:
+                table.add_row(skill.name, f"{skill.score:+.2f}", ", ".join(skill.tags[:4]))
+            _add_transcript(state, table)
+            return
+
+        if sub in {"install hub", "hub install"}:
+            from skyn3t.intelligence.skills_hub import install_from_hub
+
+            result = install_from_hub(only_missing=True, reject_unsafe=True)
+            installed = result.get("installed") or []
+            if installed:
+                _add_transcript(
+                    state,
+                    _info_line(
+                        f"installed {len(installed)} hub skill(s): {', '.join(installed[:6])}",
+                        "green",
+                    ),
+                )
+            else:
+                _add_transcript(state, _info_line("no new hub skills to install", "yellow"))
+            return
+
+        if sub == "hub":
+            from skyn3t.intelligence.skills_hub import list_hub_entries
+
+            catalog = list_hub_entries()
+            lines = [
+                f"Hub roots: {', '.join(catalog.get('roots') or [])}",
+                f"Markdown skills: {len(catalog.get('markdown_skills') or [])}",
+                f"Agent SKILL.md dirs: {len(catalog.get('agent_skill_dirs') or [])}",
+                "Run `/skills install hub` to install missing safe skills.",
+            ]
+            _add_transcript(state, _info_line("\n".join(lines), "cyan"))
+            return
+
+        from skyn3t.intelligence.skill_library import get_default_library
+
+        lib = get_default_library()
+        skills = lib.all()[:20]
+        if not skills:
+            _add_transcript(state, _info_line("No skills installed yet.", "yellow"))
+            return
+        table = Table(title="Installed skills", header_style="bold magenta")
+        table.add_column("name", style="cyan")
+        table.add_column("score")
+        table.add_column("tags", style="dim")
+        for skill in skills:
+            table.add_row(skill.name, f"{skill.score:+.2f}", ", ".join(skill.tags[:4]))
+        _add_transcript(state, table)
+    except Exception as exc:
+        _add_transcript(state, _info_line(f"skills command failed: {exc}", "red"))
+
+
 async def _cmd_whoami(state: ReplState) -> None:
     table = Table(title="whoami", header_style="bold magenta")
     table.add_column("field", style="cyan")
@@ -2915,7 +2989,7 @@ _SLASH_COMMANDS = [
     "/approve", "/approve-edits", "/reject",
     "/rag", "/ingest",
     "/doctor", "/memory", "/resume", "/retry",
-    "/model", "/backend", "/whoami",
+    "/model", "/backend", "/whoami", "/skills",
 ]
 
 
@@ -3144,18 +3218,19 @@ def _run_plain_prompt(
         paint()
         return
 
-    approval_future = asyncio.run_coroutine_threadsafe(
-        _handle_studio_approval_plain(state, line),
-        loop,
-    )
-    try:
-        if approval_future.result(timeout=120):
+    if _parse_studio_approval_plain(line) is not None:
+        approval_future = asyncio.run_coroutine_threadsafe(
+            _handle_studio_approval_plain(state, line),
+            loop,
+        )
+        try:
+            if approval_future.result(timeout=120):
+                paint()
+                return
+        except Exception as exc:
+            _add_transcript(state, _info_line(f"approval error: {exc}", "red"))
             paint()
             return
-    except Exception as exc:
-        _add_transcript(state, _info_line(f"approval error: {exc}", "red"))
-        paint()
-        return
 
     if _should_route_prompt_to_project(state, line):
         _add_transcript(state, _info_line("routing this into a project build…", "cyan"))

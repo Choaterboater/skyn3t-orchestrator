@@ -414,6 +414,8 @@ class TestStudioRunner:
                 )
 
         class TimeoutReviewer:
+            llm = None
+
             async def initialize(self) -> None:
                 return None
 
@@ -1515,7 +1517,7 @@ class TestStudioRunner:
         runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
         calls: list[str] = []
 
-        async def fake_build(scaffold_dir: str, brief: str):
+        async def fake_build(scaffold_dir: str, brief: str, *, execution_profile: str = "balanced"):
             calls.append("build")
             return {
                 "verdict": "yes",
@@ -1552,6 +1554,7 @@ class TestStudioRunner:
         async def fail_integration_fix_round(*args, **kwargs):
             raise AssertionError("integration fix loop should be skipped on reviewer no-go")
 
+        monkeypatch.setenv("SKYN3T_AUTO_RETRY", "0")
         monkeypatch.setattr(runner, "_run_build_verifier", fake_build)
         monkeypatch.setattr(runner, "_run_boot_verifier", fake_boot)
         monkeypatch.setattr(runner, "_run_integration_verifier", fake_integration)
@@ -1621,7 +1624,7 @@ class TestStudioRunner:
 
         runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
 
-        async def fake_build(scaffold_dir: str, brief: str):
+        async def fake_build(scaffold_dir: str, brief: str, *, execution_profile: str = "balanced"):
             return {
                 "verdict": "yes",
                 "stack": "node",
@@ -1647,6 +1650,7 @@ class TestStudioRunner:
         async def fake_retry(manifest, brief, slug):
             return None
 
+        monkeypatch.setenv("SKYN3T_AUTO_RETRY", "0")
         monkeypatch.setattr(runner, "_run_build_verifier", fake_build)
         monkeypatch.setattr(runner, "_run_boot_verifier", fake_boot)
         monkeypatch.setattr(runner, "_run_integration_verifier", should_not_run_integration)
@@ -1708,7 +1712,7 @@ class TestStudioRunner:
 
         runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
 
-        async def fake_build(scaffold_dir: str, brief: str):
+        async def fake_build(scaffold_dir: str, brief: str, *, execution_profile: str = "balanced"):
             return {
                 "verdict": "yes",
                 "stack": "node",
@@ -1727,6 +1731,7 @@ class TestStudioRunner:
         async def fake_retry(manifest, brief, slug):
             return None
 
+        monkeypatch.setenv("SKYN3T_AUTO_RETRY", "0")
         monkeypatch.setattr(runner, "_run_build_verifier", fake_build)
         monkeypatch.setattr(runner, "_run_boot_verifier", fake_boot)
         monkeypatch.setattr(runner, "_run_integration_verifier", lambda *args, **kwargs: None)

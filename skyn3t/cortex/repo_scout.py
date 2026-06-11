@@ -27,13 +27,18 @@ def default_fit_queries() -> List[str]:
     try:
         from skyn3t.config.settings import get_settings
 
+        settings = get_settings()
         configured = [
             str(item).strip()
-            for item in (get_settings().cortex_scout_fit_queries or [])
+            for item in (settings.cortex_scout_fit_queries or [])
             if str(item).strip()
         ]
-        if configured:
-            return configured
+        base = configured if configured else list(_DEFAULT_FIT_QUERIES)
+        if getattr(settings, "cortex_scout_include_competitive_queries", True):
+            from skyn3t.cortex.competitive_intel import merge_scout_fit_queries
+
+            return merge_scout_fit_queries(base)
+        return base
     except Exception:
         pass
     return list(_DEFAULT_FIT_QUERIES)

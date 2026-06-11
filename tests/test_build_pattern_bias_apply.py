@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from skyn3t.cortex.build_pattern_bias import apply_build_pattern_bias

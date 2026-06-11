@@ -11,7 +11,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 logger = logging.getLogger("skyn3t.cortex.build_pattern_bias")
 
@@ -81,6 +81,11 @@ def _write_stack_preference(stack: str, payload: Dict[str, Any]) -> None:
         "applied_at": time.time(),
     }
     PREFS_PATH.write_text(json.dumps(prefs, indent=2), encoding="utf-8")
+
+
+def write_stack_preference(stack: str, payload: Dict[str, Any]) -> None:
+    """Public wrapper for persisting operator-approved scaffold preferences."""
+    _write_stack_preference(stack, payload)
 
 
 async def apply_build_pattern_bias(payload: Dict[str, Any]) -> Dict[str, Any]:

@@ -119,6 +119,7 @@ class BuildVerifierAgent(BaseAgent):
             )
 
         forced_stack = (data.get("stack") or "").lower().strip() or None
+        execution_profile = str(data.get("execution_profile") or "balanced").strip().lower()
         probe = self._detect_stack(scaffold_dir, forced=forced_stack)
         await self.think(f"detected stack: {probe.kind} ({len(probe.entry_files)} entry files)")
 
@@ -137,7 +138,9 @@ class BuildVerifierAgent(BaseAgent):
                 },
             )
 
-        verdict, command, stdout, stderr = await self._run_verify(scaffold_dir, probe)
+        verdict, command, stdout, stderr = await self._run_verify(
+            scaffold_dir, probe, execution_profile=execution_profile,
+        )
         summary = self._summarize(probe, verdict, command)
         failure_hint = self._failure_hint(probe, verdict, stdout, stderr) if verdict == "no" else None
 
@@ -198,12 +201,18 @@ class BuildVerifierAgent(BaseAgent):
     # Verify runners
     # ------------------------------------------------------------------
 
-    async def _run_verify(self, scaffold_dir: Path, probe: StackProbe) -> tuple[str, str, str, str]:
+    async def _run_verify(
+        self,
+        scaffold_dir: Path,
+        probe: StackProbe,
+        *,
+        execution_profile: str = "balanced",
+    ) -> tuple[str, str, str, str]:
         """Return (verdict, command-as-string, stdout, stderr)."""
         if probe.kind == "python":
             return await self._verify_python(scaffold_dir, probe)
         if probe.kind == "node":
-            return await self._verify_node(scaffold_dir)
+            return await self._verify_node(scaffold_dir, execution_profile=execution_profile)
         if probe.kind == "static":
             return await self._verify_static(scaffold_dir, probe)
         if probe.kind == "swift":
@@ -221,7 +230,12 @@ class BuildVerifierAgent(BaseAgent):
         verdict = "yes" if proc["returncode"] == 0 else "no"
         return verdict, " ".join(cmd[:6]) + (" …" if len(cmd) > 6 else ""), proc["stdout"], proc["stderr"]
 
-    async def _verify_node(self, scaffold_dir: Path) -> tuple[str, str, str, str]:
+    async def _verify_node(
+        self,
+        scaffold_dir: Path,
+        *,
+        execution_profile: str = "balanced",
+    ) -> tuple[str, str, str, str]:
         """Node verifier — three escalating gates:
 
         Gate 1 — package.json shape: must parse as JSON, must have valid
@@ -303,10 +317,22 @@ class BuildVerifierAgent(BaseAgent):
                     phrase in (proc["stderr"] or "")
                     for phrase in ("ECONNREFUSED", "ENOTFOUND", "network", "timeout", "unable to connect")
                 )
-                if network_error:
+                offline_ok = os.environ.get("SKYN3T_VERIFY_OFFLINE", "").lower() in (
+                    "1", "true", "yes", "on",
+                )
+                if network_error and (
+                    offline_ok or execution_profile == "fast"
+                ):
                     return (
                         "yes",
                         " ".join(install_cmd) + " (network failure — falling back to syntax check)",
+                        proc["stdout"],
+                        proc["stderr"],
+                    )
+                if network_error:
+                    return (
+                        "no",
+                        " ".join(install_cmd) + " (network failure — npm install required)",
                         proc["stdout"],
                         proc["stderr"],
                     )

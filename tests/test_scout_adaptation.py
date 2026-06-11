@@ -2,8 +2,6 @@
 
 from types import SimpleNamespace
 
-import pytest
-
 from skyn3t.cortex.scout_adaptation import (
     build_adaptation_idea,
     file_adaptation_feature,
@@ -60,7 +58,6 @@ def test_build_adaptation_idea_includes_repo_and_query():
 
 
 def test_file_adaptation_feature_dedupes(tmp_path, monkeypatch):
-    from skyn3t.cortex import get_store
     from skyn3t.cortex.proposals import ProposalStore
 
     monkeypatch.setattr(

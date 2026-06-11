@@ -433,8 +433,19 @@ class MetaAgent:
     def _persist_build_pattern_skill(self, stack, best, worst, distinguishing) -> None:
         """Write the winner-vs-loser pattern as a markdown skill file."""
         try:
-            from skyn3t.cortex.build_pattern_bias import persist_build_pattern_skill
+            from skyn3t.cortex.build_pattern_bias import (
+                persist_build_pattern_skill,
+                write_stack_preference,
+            )
 
+            payload = {
+                "stack": stack,
+                "winner_shape": list(best.shape),
+                "winner_success_rate": best.success_rate,
+                "winner_samples": best.success + best.failure,
+                "loser_success_rate": worst.success_rate,
+                "distinguishing_files": list(distinguishing),
+            }
             persist_build_pattern_skill(
                 stack=stack,
                 winner_shape=list(best.shape),
@@ -443,6 +454,7 @@ class MetaAgent:
                 loser_success_rate=worst.success_rate,
                 distinguishing_files=list(distinguishing),
             )
+            write_stack_preference(stack, payload)
         except Exception:
             logger.exception("skill persist failed for stack=%s", stack)
 

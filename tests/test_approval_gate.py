@@ -24,7 +24,7 @@ def _reset_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 def test_load_gate_config_creates_default(tmp_path, monkeypatch):
     _reset_paths(tmp_path, monkeypatch)
     cfg = approval_gate.load_gate_config()
-    assert cfg["gates"] == ["ArchitectAgent"]
+    assert cfg["gates"] == ["ArchitectAgent", "DesignerAgent"]
     assert cfg["disabled"] is False
     assert cfg["graduate_after"] == 5
     assert (tmp_path / "approval_gates.json").exists()
@@ -36,6 +36,13 @@ def test_should_gate_true_when_agent_listed(tmp_path, monkeypatch):
         {"gates": ["ArchitectAgent"], "disabled": False, "graduate_after": 5}
     )
     assert approval_gate.should_gate("ArchitectAgent", "Build a dashboard") is True
+
+
+def test_default_gates_include_designer_agent(tmp_path, monkeypatch):
+    _reset_paths(tmp_path, monkeypatch)
+    cfg = approval_gate.load_gate_config()
+    assert "DesignerAgent" in cfg["gates"]
+    assert approval_gate.should_gate("DesignerAgent", "Build a dashboard UI") is True
 
 
 def test_should_gate_false_when_disabled(tmp_path, monkeypatch):
@@ -376,6 +383,69 @@ def test_should_gate_true_under_balanced_autonomy(tmp_path, monkeypatch):
     ) is True
 
 
+def test_should_gate_false_when_auto_approve_env(tmp_path, monkeypatch):
+    _reset_paths(tmp_path, monkeypatch)
+    approval_gate.save_gate_config(
+        {"gates": ["ArchitectAgent"], "disabled": False, "graduate_after": 5}
+    )
+    monkeypatch.setenv("SKYN3T_AUTO_APPROVE", "1")
+    from skyn3t.config.settings import get_settings
+
+    get_settings.cache_clear()
+    try:
+        assert approval_gate.should_gate(
+            "ArchitectAgent", "Build a dashboard", autonomy="balanced"
+        ) is False
+    finally:
+        get_settings.cache_clear()
+
+
+def test_should_gate_false_when_no_approval_synonym(tmp_path, monkeypatch):
+    _reset_paths(tmp_path, monkeypatch)
+    approval_gate.save_gate_config(
+        {"gates": ["ArchitectAgent", "DesignerAgent"], "disabled": False, "graduate_after": 5}
+    )
+    monkeypatch.setenv("SKYN3T_NO_APPROVAL", "1")
+    from skyn3t.config.settings import get_settings
+
+    get_settings.cache_clear()
+    try:
+        assert approval_gate.should_gate("DesignerAgent", "Build a UI") is False
+    finally:
+        get_settings.cache_clear()
+
+
+def test_should_gate_false_when_auto_approve_studio_synonym(tmp_path, monkeypatch):
+    _reset_paths(tmp_path, monkeypatch)
+    approval_gate.save_gate_config(
+        {"gates": ["ArchitectAgent"], "disabled": False, "graduate_after": 5}
+    )
+    monkeypatch.setenv("SKYN3T_AUTO_APPROVE_STUDIO", "1")
+    from skyn3t.config.settings import get_settings
+
+    get_settings.cache_clear()
+    try:
+        assert approval_gate.should_gate("ArchitectAgent", "Build a dashboard") is False
+    finally:
+        get_settings.cache_clear()
+
+
+def test_should_gate_false_when_autonomous_builds_implicit(tmp_path, monkeypatch):
+    _reset_paths(tmp_path, monkeypatch)
+    approval_gate.save_gate_config(
+        {"gates": ["ArchitectAgent"], "disabled": False, "graduate_after": 5}
+    )
+    monkeypatch.delenv("SKYN3T_AUTO_APPROVE", raising=False)
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILDS", "1")
+    from skyn3t.config.settings import get_settings
+
+    get_settings.cache_clear()
+    try:
+        assert approval_gate.should_gate("ArchitectAgent", "Build a dashboard") is False
+    finally:
+        get_settings.cache_clear()
+
+
 def test_should_gate_move_fast_is_case_insensitive(tmp_path, monkeypatch):
     _reset_paths(tmp_path, monkeypatch)
     approval_gate.save_gate_config(
@@ -426,6 +496,90 @@ async def test_move_fast_runs_through_without_pausing_for_approval(
     # pipeline after architect was bypassed.
     assert architect.calls == 1
     assert designer.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_balanced_autonomy_runs_through_when_autonomous_builds(
+    tmp_path, monkeypatch, event_bus
+):
+    """Autonomous loop starts builds with balanced autonomy; implicit
+    no-approval from SKYN3T_AUTONOMOUS_BUILDS must not pause at architect."""
+    _reset_paths(tmp_path / "gate_data", monkeypatch)
+    approval_gate.save_gate_config(
+        {"gates": ["ArchitectAgent"], "disabled": False, "graduate_after": 5}
+    )
+    monkeypatch.delenv("SKYN3T_AUTO_APPROVE", raising=False)
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILDS", "1")
+    from skyn3t.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    from skyn3t.studio.runner import StudioRunner
+
+    architect = _StubAgent()
+    designer = _StubAgent()
+
+    def fake_get_agent(name, *args, **kwargs):
+        return architect if name == "ArchitectAgent" else designer
+
+    monkeypatch.setattr("skyn3t.studio.runner.get_agent", fake_get_agent)
+    template = _two_stage_template()
+    monkeypatch.setattr("skyn3t.studio.runner.get_template", lambda _key: template)
+
+    runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
+    try:
+        manifest = await runner.start(
+            "demo",
+            "Build a homelab dashboard",
+            slug="gate-autobuilds",
+            mission_setup={"autonomy": "balanced"},
+            extra={"autonomous": True},
+        )
+        assert manifest["status"] != "awaiting_approval"
+        assert architect.calls == 1
+        assert designer.calls == 1
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_balanced_autonomy_runs_through_when_auto_approve(
+    tmp_path, monkeypatch, event_bus
+):
+    _reset_paths(tmp_path / "gate_data", monkeypatch)
+    approval_gate.save_gate_config(
+        {"gates": ["ArchitectAgent"], "disabled": False, "graduate_after": 5}
+    )
+    monkeypatch.setenv("SKYN3T_AUTO_APPROVE", "1")
+    from skyn3t.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    from skyn3t.studio.runner import StudioRunner
+
+    architect = _StubAgent()
+    designer = _StubAgent()
+
+    def fake_get_agent(name, *args, **kwargs):
+        return architect if name == "ArchitectAgent" else designer
+
+    monkeypatch.setattr("skyn3t.studio.runner.get_agent", fake_get_agent)
+    template = _two_stage_template()
+    monkeypatch.setattr("skyn3t.studio.runner.get_template", lambda _key: template)
+
+    runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
+    try:
+        manifest = await runner.start(
+            "demo",
+            "Build a homelab dashboard",
+            slug="gate-autoapprove",
+            mission_setup={"autonomy": "balanced"},
+        )
+        assert manifest["status"] != "awaiting_approval"
+        assert architect.calls == 1
+        assert designer.calls == 1
+    finally:
+        get_settings.cache_clear()
 
 
 @pytest.mark.asyncio
