@@ -134,6 +134,7 @@ class ExperienceIngestor:
     _PROJECT_EVENT_KINDS = {
         "PROJECT_STAGE_FAILED",
         "PROJECT_COMPLETED",
+        "PROJECT_FAILED",
         "CONTRACT_VERIFIER_BLOCKERS",
         "CONSISTENCY_REVIEW_BLOCKERS",
     }
@@ -404,6 +405,8 @@ class ExperienceIngestor:
         message = payload.get("message") or ""
         error = payload.get("error") or ""
         verdict = payload.get("verdict") or ""
+        status = str(payload.get("status") or "").strip().lower()
+        success = kind == "PROJECT_COMPLETED" and status in {"done", "needs_fixes"}
 
         # Build a structured lesson body. Keep it terse — RAG hits return
         # the content directly into a prompt; we want < 600 chars after
@@ -457,7 +460,7 @@ class ExperienceIngestor:
             "stage": stage,
             "stack": stack,
             "feature_tags": ", ".join(feature_tags) if feature_tags else "",
-            "success": False,
+            "success": success,
             "content_hash": content_hash,
             "error_signature": error_signature,
             "fix_applied": fix_applied,
@@ -467,8 +470,8 @@ class ExperienceIngestor:
             metadata,
             memory_layer="project",
             review_status="approved",
-            reusable=False,
-            confidence=0.8,
+            reusable=success,
+            confidence=0.85 if success else 0.8,
             auto_reject_reason="",
         )
         embedding_id = await self.rag.add_knowledge_one(
@@ -484,7 +487,7 @@ class ExperienceIngestor:
             await self._persist_experience_index(
                 embedding_id=embedding_id,
                 task_id=slug,
-                success=False,
+                success=success,
                 stack=stack or None,
                 stage=stage if stage != "?" else None,
                 error_signature=error_signature,

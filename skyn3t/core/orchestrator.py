@@ -6,7 +6,7 @@ import inspect
 import logging
 import threading
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set, cast
+from typing import Any, Callable, Dict, List, Optional, Set, cast
 from uuid import uuid4
 
 from skyn3t.core.agent import BaseAgent, TaskRequest, TaskResult
@@ -97,6 +97,8 @@ class Orchestrator:
         self._cortex_bootstrap: Optional[Any] = None
         self._cortex_started = False
         self._cortex_tasks: List[asyncio.Task] = []
+        self._studio_runner_getter: Optional[Callable[[], Any]] = None
+        self._autonomous_coordinator: Optional[Any] = None
 
         # Subscribe to system events
         self.event_bus.subscribe(self._on_task_completed, EventType.TASK_COMPLETED)
@@ -105,6 +107,7 @@ class Orchestrator:
         self.event_bus.subscribe(self._on_message, EventType.MESSAGE)
         self.event_bus.subscribe(self._on_collective_insight, EventType.COLLECTIVE_INSIGHT)
         self.event_bus.subscribe(self._on_self_heal_triggered, EventType.SELF_HEAL_TRIGGERED)
+        self.event_bus.subscribe(self._on_system_alert, EventType.SYSTEM_ALERT)
 
     # ------------------------------------------------------------------
     # Intelligence layer configuration
@@ -159,6 +162,28 @@ class Orchestrator:
             consciousness=self._consciousness,
         )
 
+    def _ensure_autonomy_prerequisites(self) -> None:
+        """Boot memory/brain layers when callers only invoked ``start()``."""
+        if self._memory is None:
+            self.enable_memory()
+        if self._consciousness is None:
+            self.enable_consciousness()
+        if self._ingestor is None:
+            self.enable_experience_ingestion()
+        if self._reflection is None:
+            self.enable_reflection()
+        if self._tuner is None:
+            self.enable_self_tuning()
+        if self._meta_agent is None:
+            self.enable_meta_agent()
+        self._self_healing.set_orchestrator(self)
+        try:
+            from skyn3t.intelligence.skills_hub import auto_install_hub_if_enabled
+
+            auto_install_hub_if_enabled()
+        except Exception:
+            logger.debug("skills hub auto-install skipped", exc_info=True)
+
     def _wire_rag_agents(self) -> None:
         """Attach the shared RAG engine to agents that missed it at construct time."""
         rag = getattr(self, "_rag", None)
@@ -167,7 +192,7 @@ class Orchestrator:
         for name in ("github_ingestor", "explorer", "project_memory", "docs_ingestor"):
             agent = self.agents.get(name)
             if agent is not None and getattr(agent, "rag", None) is None:
-                agent.rag = rag
+                setattr(agent, "rag", rag)
 
     async def _execute_plan_task(self, task: TaskRequest, agent_name: Optional[str]) -> str:
         """Adapter for planner to submit tasks through the orchestrator."""
@@ -177,6 +202,30 @@ class Orchestrator:
     def selector(self) -> AgentSelector:
         """Access the agent selector for tuning or inspection."""
         return self._agent_selector
+
+    def set_studio_runner_getter(self, getter: Callable[[], Any]) -> None:
+        """Lazy accessor for StudioRunner (wired by web lifespan)."""
+        self._studio_runner_getter = getter
+
+    def get_studio_runner(self) -> Any:
+        if self._studio_runner_getter is None:
+            return None
+        try:
+            return self._studio_runner_getter()
+        except Exception:
+            logger.debug("studio runner getter failed", exc_info=True)
+            return None
+
+    def get_autonomous_status(self) -> Dict[str, Any]:
+        coord = getattr(self, "_autonomous_coordinator", None)
+        if coord is None:
+            return {"available": False}
+        try:
+            status = coord.get_status()
+            status["available"] = True
+            return status
+        except Exception as exc:
+            return {"available": False, "error": str(exc)}
 
     def get_cortex_status(self) -> Dict[str, Any]:
         """Return runtime status for the Cortex proposal loop."""
@@ -198,6 +247,7 @@ class Orchestrator:
 
     async def start(self, max_concurrent: int = 10) -> None:
         """Start the orchestrator."""
+        self._ensure_autonomy_prerequisites()
         self._max_concurrent = max_concurrent
         self._task_semaphore = asyncio.Semaphore(max_concurrent)
         self._running = True
@@ -219,6 +269,13 @@ class Orchestrator:
             await self._meta_agent.start()
 
         await self._boot_cortex()
+
+        try:
+            from skyn3t.core.openrouter_catalog import schedule_background_sync
+
+            schedule_background_sync()
+        except Exception:
+            logger.debug("openrouter catalog background sync schedule failed", exc_info=True)
 
         try:
             from skyn3t.registry import register_default_roster
@@ -1937,6 +1994,28 @@ class Orchestrator:
             agent._errors.clear()
         except Exception:
             pass
+
+    def _on_system_alert(self, event: Event) -> None:
+        """Apply low-risk runtime config when the gated tuner commits changes."""
+        payload = event.payload or {}
+        if payload.get("kind") != "tuning_applied":
+            return
+        agent_name = str(payload.get("agent") or "").strip()
+        adjustments = payload.get("adjustments") or []
+        if not agent_name or not isinstance(adjustments, list):
+            return
+        agent = self.agents.get(agent_name)
+        if agent is None:
+            return
+        try:
+            from skyn3t.memory.tuner import apply_adjustments_to_config
+
+            agent.config = apply_adjustments_to_config(
+                dict(agent.config or {}),
+                list(adjustments),
+            )
+        except Exception:
+            logger.exception("live tuning apply failed for %s", agent_name)
 
     # ------------------------------------------------------------------
     # Background loops

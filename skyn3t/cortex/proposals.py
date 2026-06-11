@@ -434,14 +434,40 @@ class ProposalStore:
         auto_triage_eligible: bool,
         exclude_id: Optional[str] = None,
     ) -> _AutoTriageDecision:
-        if not requires_approval or origin != "system" or force_requires_approval:
-            return _AutoTriageDecision("pending")
         try:
-            from skyn3t.config.settings import get_settings
+            from skyn3t.config.settings import auto_approve_enabled, get_settings
 
             settings = get_settings()
+            full_auto = auto_approve_enabled(settings)
         except Exception:
             return _AutoTriageDecision("pending")
+
+        # Safety floor: never auto-approve SkyN3t repo self-edits.
+        if kind in {"code_patch", "studio_debug"}:
+            return _AutoTriageDecision("pending")
+        if kind == "feature" and str(payload.get("kind") or "").strip() != "build_pattern_bias":
+            return _AutoTriageDecision("pending")
+
+        if not requires_approval or origin != "system":
+            return _AutoTriageDecision("pending")
+        if force_requires_approval and not full_auto:
+            return _AutoTriageDecision("pending")
+
+        if full_auto:
+            if kind == "ingest":
+                topic = str(payload.get("topic") or payload.get("query") or title or "").strip()
+                repo = str(payload.get("repo") or "").strip()
+                if topic or repo:
+                    return _AutoTriageDecision(
+                        "auto_approved",
+                        "auto-approved ingest (no-approval mode)",
+                    )
+            if kind == "tuning":
+                return _AutoTriageDecision(
+                    "auto_approved",
+                    "auto-approved tuning (no-approval mode)",
+                )
+
         if not getattr(settings, "cortex_auto_approve_system", False):
             return _AutoTriageDecision("pending")
 
@@ -522,6 +548,27 @@ class ProposalStore:
             if invalid_studio_debug_reason is not None:
                 return _AutoTriageDecision("auto_rejected", invalid_studio_debug_reason)
 
+        if (
+            kind == "tuning"
+            and getattr(settings, "cortex_auto_approve_safe_tuning", True)
+            and self._is_safe_auto_approve_tuning(payload)
+        ):
+            return _AutoTriageDecision(
+                "auto_approved",
+                "auto-approved safe agent tuning",
+            )
+
+        if (
+            kind == "feature"
+            and str(payload.get("kind") or "").strip() == "build_pattern_bias"
+            and getattr(settings, "cortex_auto_approve_build_pattern_bias", True)
+            and self._is_safe_auto_approve_build_pattern_bias(payload)
+        ):
+            return _AutoTriageDecision(
+                "auto_approved",
+                "auto-approved build pattern bias",
+            )
+
         return _AutoTriageDecision("pending")
 
     def _low_signal_ingest_reason(
@@ -572,6 +619,29 @@ class ProposalStore:
         except (TypeError, ValueError):
             return False
         return 0 < limit <= max_limit
+
+    @staticmethod
+    def _is_safe_auto_approve_tuning(payload: Dict[str, Any]) -> bool:
+        adjustments = payload.get("adjustments") or []
+        if not isinstance(adjustments, list) or not adjustments:
+            return False
+        safe = {"request_interval", "timeout", "max_tokens", "prompt_suffix", "auth_retry"}
+        for adj in adjustments:
+            if not isinstance(adj, dict):
+                return False
+            if str(adj.get("parameter") or "").strip() not in safe:
+                return False
+        return True
+
+    @staticmethod
+    def _is_safe_auto_approve_build_pattern_bias(payload: Dict[str, Any]) -> bool:
+        stack = str(payload.get("stack") or "").strip()
+        winner_shape = payload.get("winner_shape") or []
+        if not stack:
+            return False
+        if not isinstance(winner_shape, list) or not winner_shape:
+            return False
+        return all(str(path).strip() for path in winner_shape)
 
     def _invalid_studio_debug_reason(self, payload: Dict[str, Any]) -> Optional[str]:
         raw_target = payload.get("target_file")

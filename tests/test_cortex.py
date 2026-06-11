@@ -1038,6 +1038,11 @@ async def test_self_tuning_files_review_gated_tuning_proposal(tmp_path, monkeypa
 
     store = ProposalStore(root=tmp_path / "proposals")
     monkeypatch.setattr("skyn3t.cortex.get_store", lambda: store)
+    disabled = SimpleNamespace(
+        cortex_auto_approve_system=False,
+        cortex_auto_approve_safe_tuning=False,
+    )
+    monkeypatch.setattr("skyn3t.config.settings.get_settings", lambda: disabled)
 
     bus = EventBus()
     gated = GatedTuner(bus, config_path=tmp_path / "config" / "runtime.json")

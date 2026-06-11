@@ -396,6 +396,8 @@ class MetaAgent:
                 ),
                 detail=(
                     f"_MetaAgent build-pattern scan._\n\n"
+                    f"**On approval:** activates the `{stack}-winning-shape` skill and "
+                    "records the preference — **no CodeImprover patch**.\n\n"
                     f"**Winning shape ({best.success_rate:.0%} success "
                     f"on {best.success + best.failure} graded builds):**\n"
                     + "\n".join(f"- `{p}`" for p in best.shape)
@@ -431,37 +433,28 @@ class MetaAgent:
     def _persist_build_pattern_skill(self, stack, best, worst, distinguishing) -> None:
         """Write the winner-vs-loser pattern as a markdown skill file."""
         try:
-            from skyn3t.intelligence.skill_library import Skill, get_default_library
-        except Exception:
-            return
-        body_lines = [
-            f"# Prefer this shape for `{stack}` builds.",
-            "",
-            f"Observed on {best.success + best.failure} graded builds: "
-            f"this shape succeeded **{best.success_rate:.0%}** of the time vs "
-            f"**{worst.success_rate:.0%}** for the alternative.",
-            "",
-            "## Winning shape",
-            "",
-        ]
-        body_lines.extend(f"- `{p}`" for p in best.shape)
-        if distinguishing:
-            body_lines.extend([
-                "",
-                "## Load-bearing files (present in winner, absent from loser)",
-                "",
-            ])
-            body_lines.extend(f"- `{p}`" for p in distinguishing)
-        skill = Skill(
-            name=f"{stack}-winning-shape",
-            tags=[stack, "build-success", "scaffold-shape"],
-            success_count=best.success,
-            failure_count=best.failure,
-            source="meta_agent:build_pattern_scan",
-            body="\n".join(body_lines),
-        )
-        try:
-            get_default_library().upsert(skill)
+            from skyn3t.cortex.build_pattern_bias import (
+                persist_build_pattern_skill,
+                write_stack_preference,
+            )
+
+            payload = {
+                "stack": stack,
+                "winner_shape": list(best.shape),
+                "winner_success_rate": best.success_rate,
+                "winner_samples": best.success + best.failure,
+                "loser_success_rate": worst.success_rate,
+                "distinguishing_files": list(distinguishing),
+            }
+            persist_build_pattern_skill(
+                stack=stack,
+                winner_shape=list(best.shape),
+                winner_success_rate=best.success_rate,
+                winner_samples=best.success + best.failure,
+                loser_success_rate=worst.success_rate,
+                distinguishing_files=list(distinguishing),
+            )
+            write_stack_preference(stack, payload)
         except Exception:
             logger.exception("skill persist failed for stack=%s", stack)
 
