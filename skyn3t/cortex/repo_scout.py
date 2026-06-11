@@ -20,8 +20,46 @@ _DEFAULT_FIT_QUERIES = [
     "developer workflow automation testing packaging",
 ]
 _DEFAULT_PLATFORMS = ["github", "gitlab", "bitbucket"]
+
+
+def default_fit_queries() -> List[str]:
+    """Configured via SKYN3T_CORTEX_SCOUT_FIT_QUERIES; falls back to built-ins."""
+    try:
+        from skyn3t.config.settings import get_settings
+
+        settings = get_settings()
+        configured = [
+            str(item).strip()
+            for item in (settings.cortex_scout_fit_queries or [])
+            if str(item).strip()
+        ]
+        base = configured if configured else list(_DEFAULT_FIT_QUERIES)
+        if getattr(settings, "cortex_scout_include_competitive_queries", True):
+            from skyn3t.cortex.competitive_intel import merge_scout_fit_queries
+
+            return merge_scout_fit_queries(base)
+        return base
+    except Exception:
+        pass
+    return list(_DEFAULT_FIT_QUERIES)
 _PERMISSIVE_LICENSE_MARKERS = ("mit", "apache", "bsd", "isc", "unlicense", "zlib", "mpl-2.0")
 _RESTRICTIVE_LICENSE_MARKERS = ("gpl", "agpl", "lgpl", "sspl", "commons clause")
+# Boost repos whose metadata looks relevant to SkyN3t's mission (agents, RAG, cortex).
+_RELEVANCE_TERMS = (
+    "agent",
+    "orchestrat",
+    "multi-agent",
+    "rag",
+    "retriev",
+    "cortex",
+    "llm",
+    "mcp",
+    "self-heal",
+    "proposal",
+    "memory",
+    "workflow",
+    "autonom",
+)
 
 
 @dataclass
@@ -47,6 +85,72 @@ class MultiSourceRepoScout:
         self.max_per_run = max_per_run
         self._wired = False
         self._last_result: Dict[str, Any] = {}
+        self._run_task: Optional[asyncio.Task] = None
+        self._run_state: str = "idle"
+
+    @property
+    def is_running(self) -> bool:
+        task = self._run_task
+        return task is not None and not task.done()
+
+    def get_run_status(self) -> Dict[str, Any]:
+        return {
+            "state": "running" if self.is_running else self._run_state,
+            "last_result": dict(self._last_result or {}),
+        }
+
+    def start_background(self, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Schedule ``run_once`` without blocking the caller."""
+        if self.is_running:
+            return {
+                "ok": False,
+                "started": False,
+                "error": "repo scout already running",
+                "status": self.get_run_status(),
+            }
+        cfg = dict(config or {})
+        self._run_state = "running"
+        self._run_task = asyncio.create_task(self._run_once_guarded(cfg))
+        self._run_task.add_done_callback(self._clear_run_task)
+        return {"ok": True, "started": True, "state": "running"}
+
+    def _clear_run_task(self, task: asyncio.Task) -> None:
+        self._run_task = None
+        if self._run_state == "running":
+            self._run_state = "completed" if not task.cancelled() else "cancelled"
+
+    async def _run_once_guarded(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        timeout = 300
+        try:
+            from skyn3t.config.settings import get_settings
+
+            timeout = max(
+                30,
+                int(getattr(get_settings(), "cortex_scout_run_timeout_seconds", 300)),
+            )
+        except Exception:
+            pass
+        try:
+            result = await asyncio.wait_for(self.run_once(config), timeout=timeout)
+            self._run_state = "completed" if result.get("ok") else "failed"
+            return result
+        except asyncio.TimeoutError:
+            logger.warning("repo scout run timed out after %ss", timeout)
+            result = {
+                "ok": False,
+                "error": f"repo scout timed out after {timeout}s",
+                "filed": 0,
+                "proposals": [],
+            }
+            self._last_result = result
+            self._run_state = "failed"
+            return result
+        except Exception as exc:
+            logger.exception("repo scout background run failed")
+            result = {"ok": False, "error": str(exc), "filed": 0, "proposals": []}
+            self._last_result = result
+            self._run_state = "failed"
+            return result
 
     def start(self) -> None:
         if self._wired:
@@ -74,6 +178,8 @@ class MultiSourceRepoScout:
         return {
             "wired": self._wired,
             "last_result": self._last_result,
+            "running": self.is_running,
+            "state": "running" if self.is_running else self._run_state,
         }
 
     def _on_event(self, event) -> None:
@@ -83,16 +189,38 @@ class MultiSourceRepoScout:
         scheduled = payload.get("payload") or {}
         if scheduled.get("agent_name") not in {"github_repo_scout", "repo_scout"}:
             return
+        if self.is_running:
+            logger.info("repo scout skipped scheduled run — already running")
+            return
+        if self._system_too_busy_for_orchestrator(self.orchestrator):
+            logger.info("repo scout skipped scheduled run — system busy")
+            return
         prompt = str(scheduled.get("prompt") or "").strip()
         config = self._parse_prompt_config(prompt)
-        task = asyncio.create_task(self.run_once(config))
-        task.add_done_callback(self._log_done)
+        self.start_background(config)
 
     @staticmethod
-    def _log_done(fut: "asyncio.Future[Any]") -> None:
-        exc = fut.exception()
-        if exc is not None:
-            logger.error("repo scout background task failed", exc_info=exc)
+    def _system_too_busy_for_orchestrator(orchestrator) -> bool:
+        return (
+            MultiSourceRepoScout.busy_reason(orchestrator, studio_active=0) is not None
+        )
+
+    @classmethod
+    def busy_reason(cls, orchestrator, *, studio_active: int = 0) -> Optional[str]:
+        """Return a human-readable reason when scout should not start."""
+        try:
+            from skyn3t.config.settings import get_settings
+
+            if not getattr(get_settings(), "cortex_scout_skip_when_busy", True):
+                return None
+        except Exception:
+            return None
+        if studio_active > 0:
+            return f"{studio_active} studio project(s) running or queued"
+        running = len(getattr(orchestrator, "running_tasks", {}) or {})
+        if running > 0:
+            return f"{running} orchestrator task(s) in flight"
+        return None
 
     @staticmethod
     def _parse_prompt_config(prompt: str) -> Dict[str, Any]:
@@ -111,7 +239,7 @@ class MultiSourceRepoScout:
         cadence = str(cfg.get("cadence") or "daily").strip() or "daily"
         fit_queries = [
             str(item).strip()
-            for item in (cfg.get("queries") or _DEFAULT_FIT_QUERIES)
+            for item in (cfg.get("queries") or default_fit_queries())
             if str(item).strip()
         ]
         platforms = self._normalize_platforms(cfg.get("platforms"))
@@ -537,31 +665,49 @@ class MultiSourceRepoScout:
         return filed
 
     @staticmethod
+    def _relevance_boost(candidate: _ScoutCandidate) -> float:
+        """How well repo metadata matches SkyN3t learning goals (not raw stars)."""
+        haystack = " ".join(
+            [
+                candidate.description or "",
+                candidate.language or "",
+                " ".join(candidate.topics or []),
+                candidate.query or "",
+            ]
+        ).lower()
+        hits = sum(1 for term in _RELEVANCE_TERMS if term in haystack)
+        return min(hits * 0.35, 2.0)
+
+    @staticmethod
     def _candidate_score(candidate: _ScoutCandidate) -> float:
         score = 0.0
         if candidate.lane == "fit":
-            score += 2.0
+            score += 2.5
         elif candidate.lane == "activity":
             score += 1.4
         else:
-            score += 1.0
+            score += 0.8
+
+        score += MultiSourceRepoScout._relevance_boost(candidate)
 
         if candidate.platform == "github":
-            score += min(candidate.stars / 5000.0, 4.0)
+            score += min(candidate.stars / 8000.0, 2.0)
         elif candidate.platform == "gitlab":
-            score += min(candidate.stars / 1500.0, 3.5)
+            score += min(candidate.stars / 2000.0, 1.8)
         else:
-            score += 1.0
+            score += 0.5
 
         if candidate.language:
-            score += 0.3
-        if candidate.description:
             score += 0.2
+        if candidate.description:
+            score += 0.15
         risk = MultiSourceRepoScout._license_reuse_risk(candidate.license_name)
         if risk == "low":
-            score += 0.3
+            score += 0.4
         elif risk == "high":
-            score -= 0.3
+            score -= 1.0
+        elif risk == "unknown":
+            score -= 0.15
         return score
 
     @staticmethod

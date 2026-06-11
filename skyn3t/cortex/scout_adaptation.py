@@ -30,6 +30,21 @@ def build_adaptation_idea(payload: Dict[str, Any]) -> str:
     description = str(payload.get("description") or "").strip()
     topics = [str(item).strip() for item in (payload.get("topics") or []) if str(item).strip()]
     language = str(payload.get("language") or "unknown").strip() or "unknown"
+    ingested_paths = [
+        str(item).strip()
+        for item in (payload.get("ingested_paths") or [])
+        if str(item).strip()
+    ]
+
+    from skyn3t.cortex.competitive_intel import build_competitive_adaptation_brief
+
+    competitive = build_competitive_adaptation_brief(
+        repo,
+        description=description,
+        ingested_paths=ingested_paths,
+    )
+    if competitive:
+        return competitive
 
     focus = query or ", ".join(topics[:4]) or "its strongest patterns"
     idea_lines = [
@@ -70,7 +85,7 @@ def should_spawn_feature(
         return False
 
     lane = str(payload.get("lane") or "").strip().lower()
-    if lane and lane not in {"fit", "activity"}:
+    if lane and lane not in {"fit", "activity", "popularity"}:
         return False
     reuse_risk = str(payload.get("reuse_risk") or "").lower()
     if reuse_risk == "high":
@@ -103,7 +118,7 @@ def file_adaptation_feature(
     from skyn3t.cortex import get_store
     from skyn3t.cortex.feature_suggester import infer_feature_target_file
 
-    idea = build_adaptation_idea(payload)
+    idea = build_adaptation_idea({**payload, "ingested_paths": ingested_paths})
     target_file = infer_feature_target_file(idea, repo_root=REPO_ROOT)
     query = str(payload.get("query") or payload.get("topic") or "").strip()
     lane = str(payload.get("lane") or "fit").strip() or "fit"
@@ -121,6 +136,16 @@ def file_adaptation_feature(
         "repo_root": str(REPO_ROOT.resolve()),
         "source_platform": str(payload.get("source_platform") or "github"),
     }
+    from skyn3t.cortex.competitive_intel import match_competitor
+
+    competitor = match_competitor(repo)
+    if competitor is not None:
+        feature_payload["competitive_intel"] = {
+            "name": competitor.get("name"),
+            "patterns": list(competitor.get("patterns") or []),
+            "skyn3t_targets": list(competitor.get("skyn3t_targets") or []),
+            "priority": competitor.get("priority"),
+        }
     if target_file:
         feature_payload["target_file"] = target_file
 

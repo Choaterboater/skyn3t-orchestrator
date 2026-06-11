@@ -1,0 +1,128 @@
+"""Apply build-pattern bias proposals without CodeImprover.
+
+MetaAgent files these as ``kind=feature`` with ``payload.kind=build_pattern_bias``.
+They describe scaffold shape statistics — not a repo patch — so approval should
+persist the winning-shape skill and record the operator's preference.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from pathlib import Path
+from typing import Any, Dict, List
+
+logger = logging.getLogger("skyn3t.cortex.build_pattern_bias")
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PREFS_PATH = REPO_ROOT / "data" / "build_pattern_preferences.json"
+
+
+def persist_build_pattern_skill(
+    *,
+    stack: str,
+    winner_shape: List[str],
+    winner_success_rate: float,
+    winner_samples: int,
+    loser_success_rate: float,
+    distinguishing_files: List[str],
+) -> str:
+    """Write or refresh the stack's winning-shape skill. Returns skill name."""
+    from skyn3t.intelligence.skill_library import Skill, get_default_library
+
+    name = f"{stack}-winning-shape"
+    body_lines = [
+        f"# Prefer this shape for `{stack}` builds.",
+        "",
+        f"Operator-approved pattern (observed on {winner_samples} graded builds, "
+        f"**{winner_success_rate:.0%}** success vs alternative at "
+        f"**{loser_success_rate:.0%}**).",
+        "",
+        "## Winning shape",
+        "",
+    ]
+    body_lines.extend(f"- `{p}`" for p in winner_shape)
+    if distinguishing_files:
+        body_lines.extend(
+            [
+                "",
+                "## Load-bearing files (present in winner, absent from loser)",
+                "",
+            ]
+        )
+        body_lines.extend(f"- `{p}`" for p in distinguishing_files)
+
+    skill = Skill(
+        name=name,
+        tags=[stack, "build-success", "scaffold-shape", "operator-approved"],
+        success_count=max(1, int(winner_samples * winner_success_rate)),
+        failure_count=max(0, winner_samples - int(winner_samples * winner_success_rate)),
+        source="cortex:build_pattern_bias",
+        body="\n".join(body_lines),
+    )
+    get_default_library().upsert(skill)
+    return name
+
+
+def _write_stack_preference(stack: str, payload: Dict[str, Any]) -> None:
+    PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    prefs: Dict[str, Any] = {}
+    if PREFS_PATH.exists():
+        try:
+            prefs = json.loads(PREFS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning("could not read %s; overwriting", PREFS_PATH)
+    prefs[stack] = {
+        "shape": list(payload.get("winner_shape") or []),
+        "winner_success_rate": payload.get("winner_success_rate"),
+        "loser_success_rate": payload.get("loser_success_rate"),
+        "distinguishing_files": list(payload.get("distinguishing_files") or []),
+        "applied_at": time.time(),
+    }
+    PREFS_PATH.write_text(json.dumps(prefs, indent=2), encoding="utf-8")
+
+
+def write_stack_preference(stack: str, payload: Dict[str, Any]) -> None:
+    """Public wrapper for persisting operator-approved scaffold preferences."""
+    _write_stack_preference(stack, payload)
+
+
+async def apply_build_pattern_bias(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Activate a build-pattern bias proposal (no LLM diff)."""
+    stack = str(payload.get("stack") or "").strip()
+    winner_shape = [str(p).strip() for p in (payload.get("winner_shape") or []) if str(p).strip()]
+    if not stack:
+        return {"ok": False, "error": "build_pattern_bias missing stack"}
+    if not winner_shape:
+        return {"ok": False, "error": "build_pattern_bias missing winner_shape"}
+
+    try:
+        skill_name = persist_build_pattern_skill(
+            stack=stack,
+            winner_shape=winner_shape,
+            winner_success_rate=float(payload.get("winner_success_rate") or 0.0),
+            winner_samples=int(payload.get("winner_samples") or 0),
+            loser_success_rate=float(payload.get("loser_success_rate") or 0.0),
+            distinguishing_files=[
+                str(p).strip()
+                for p in (payload.get("distinguishing_files") or [])
+                if str(p).strip()
+            ],
+        )
+        _write_stack_preference(stack, payload)
+    except Exception as exc:
+        logger.exception("apply_build_pattern_bias failed for stack=%s", stack)
+        return {"ok": False, "error": str(exc)}
+
+    return {
+        "ok": True,
+        "status": "applied",
+        "stack": stack,
+        "skill": skill_name,
+        "details": (
+            f"Recorded preferred scaffold shape for {stack} "
+            f"({len(winner_shape)} paths). Future Studio scaffolds can read "
+            f"skill `{skill_name}` and data/build_pattern_preferences.json."
+        ),
+    }

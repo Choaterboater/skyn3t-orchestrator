@@ -33,6 +33,20 @@ export default function ActivityPage() {
     refetchInterval: 6_000,
   });
 
+  // Backfill from REST when /ws/swarm is offline or slow to connect — the
+  // ring buffer is always available on /api/swarm/snapshot.
+  useEffect(() => {
+    const msgs = snapshot.data?.recent_messages;
+    if (!Array.isArray(msgs) || msgs.length === 0) return;
+    const seeded = dedupeActivityEvents(
+      [...(msgs as SwarmEvent[])].reverse(),
+    );
+    setEvents((prev) => {
+      if (!prev.length) return seeded.slice(0, 500);
+      return dedupeActivityEvents([...prev, ...seeded]).slice(0, 500);
+    });
+  }, [snapshot.data]);
+
   useEffect(() => {
     // Reconnecting WebSocket with backoff. The trick is StrictMode in
     // dev: it mounts → unmounts → re-mounts to flush effects. The
@@ -153,7 +167,14 @@ export default function ActivityPage() {
             Newest events on top.
           </p>
         </div>
-        <ConnBadge connected={connected} />
+        <ConnBadge
+          connected={connected}
+          snapshotCount={
+            Array.isArray(snapshot.data?.recent_messages)
+              ? snapshot.data.recent_messages.length
+              : 0
+          }
+        />
       </header>
 
       <div className="grid grid-cols-[minmax(0,1fr)_280px] gap-5">
@@ -181,8 +202,32 @@ export default function ActivityPage() {
           </div>
           <div className="rounded-lg border border-border bg-bg-2 min-h-[400px] max-h-[70vh] overflow-y-auto">
             {visible.length === 0 ? (
-              <p className="text-text-secondary text-sm p-6 text-center">
-                {connected ? "Waiting for events…" : "Disconnected from event bus."}
+              <p className="text-text-secondary text-sm p-6 text-center space-y-2">
+                {dedupedEvents.length === 0 ? (
+                  connected ? (
+                    <>Waiting for events…</>
+                  ) : (
+                    <>
+                      Offline from live stream — showing snapshot when available.
+                      <span className="block text-text-dim text-xs">
+                        Reconnecting automatically. If this persists, restart the backend.
+                      </span>
+                    </>
+                  )
+                ) : kindFilter === "useful" ? (
+                  <>
+                    No high-signal events in this window.
+                    <button
+                      type="button"
+                      className="block mx-auto text-accent hover:underline text-xs"
+                      onClick={() => setKindFilter("all")}
+                    >
+                      Show all ({dedupedEvents.length})
+                    </button>
+                  </>
+                ) : (
+                  <>No events match this filter.</>
+                )}
               </p>
             ) : (
               <ul className="divide-y divide-border">
@@ -320,20 +365,37 @@ function Chip({
   );
 }
 
-function ConnBadge({ connected }: { connected: boolean }) {
+function ConnBadge({
+  connected,
+  snapshotCount,
+}: {
+  connected: boolean;
+  snapshotCount: number;
+}) {
   const color = connected
     ? "bg-status-green/20 text-status-green border-status-green/30"
-    : "bg-status-red/20 text-status-red border-status-red/30";
+    : snapshotCount > 0
+      ? "bg-status-yellow/20 text-status-yellow border-status-yellow/30"
+      : "bg-status-red/20 text-status-red border-status-red/30";
+  const label = connected
+    ? "live"
+    : snapshotCount > 0
+      ? `snapshot (${snapshotCount})`
+      : "offline";
   return (
     <span
       className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[0.65rem] uppercase tracking-wider border ${color}`}
     >
       <span
         className={`w-1.5 h-1.5 rounded-full ${
-          connected ? "bg-status-green" : "bg-status-red"
+          connected
+            ? "bg-status-green"
+            : snapshotCount > 0
+              ? "bg-status-yellow"
+              : "bg-status-red"
         } ${connected ? "animate-pulse" : ""}`}
       />
-      {connected ? "live" : "offline"}
+      {label}
     </span>
   );
 }

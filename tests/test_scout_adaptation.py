@@ -2,8 +2,6 @@
 
 from types import SimpleNamespace
 
-import pytest
-
 from skyn3t.cortex.scout_adaptation import (
     build_adaptation_idea,
     file_adaptation_feature,
@@ -20,6 +18,15 @@ def test_should_spawn_feature_only_for_scout_github():
     assert should_spawn_feature(payload, source="repo_scout:github", ingested_count=2) is True
     assert should_spawn_feature(payload, source="explorer", ingested_count=2) is False
     assert should_spawn_feature(payload, source="repo_scout:gitlab", ingested_count=2) is False
+
+
+def test_should_spawn_feature_allows_popularity_lane():
+    payload = {
+        "repo": "octo/trending-tool",
+        "lane": "popularity",
+        "reuse_risk": "low",
+    }
+    assert should_spawn_feature(payload, source="repo_scout:github", ingested_count=1) is True
 
 
 def test_should_spawn_feature_respects_high_reuse_risk(monkeypatch):
@@ -51,7 +58,6 @@ def test_build_adaptation_idea_includes_repo_and_query():
 
 
 def test_file_adaptation_feature_dedupes(tmp_path, monkeypatch):
-    from skyn3t.cortex import get_store
     from skyn3t.cortex.proposals import ProposalStore
 
     monkeypatch.setattr(
