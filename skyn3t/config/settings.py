@@ -124,6 +124,12 @@ class Settings(BaseSettings):
     cortex_auto_approve_scout_ingest: bool = Field(
         default=True, alias="SKYN3T_CORTEX_AUTO_APPROVE_SCOUT_INGEST"
     )
+    cortex_auto_approve_safe_tuning: bool = Field(
+        default=True, alias="SKYN3T_CORTEX_AUTO_APPROVE_SAFE_TUNING"
+    )
+    cortex_auto_approve_build_pattern_bias: bool = Field(
+        default=True, alias="SKYN3T_CORTEX_AUTO_APPROVE_BUILD_PATTERN_BIAS"
+    )
     cortex_auto_triage_max_scout_ingest_limit: int = Field(
         default=10, alias="SKYN3T_CORTEX_AUTO_TRIAGE_MAX_SCOUT_INGEST_LIMIT"
     )
@@ -133,9 +139,61 @@ class Settings(BaseSettings):
     cortex_scout_spawn_min_ingested: int = Field(
         default=1, alias="SKYN3T_CORTEX_SCOUT_SPAWN_MIN_INGESTED"
     )
+    cortex_scout_skip_when_busy: bool = Field(
+        default=True, alias="SKYN3T_CORTEX_SCOUT_SKIP_WHEN_BUSY"
+    )
+    cortex_scout_run_timeout_seconds: int = Field(
+        default=300, alias="SKYN3T_CORTEX_SCOUT_RUN_TIMEOUT_SECONDS"
+    )
+    cortex_scout_fit_queries: List[str] = Field(
+        default_factory=lambda: [
+            "multi agent orchestrator cli memory rag",
+            "cortex autonomy self-healing proposal review agent learning",
+            "design system ui components app builder",
+            "game framework rendering ui workflow",
+            "developer workflow automation testing packaging",
+        ],
+        alias="SKYN3T_CORTEX_SCOUT_FIT_QUERIES",
+    )
+    cortex_scout_default_limit: int = Field(
+        default=2, alias="SKYN3T_CORTEX_SCOUT_DEFAULT_LIMIT"
+    )
+    cortex_scout_include_competitive_queries: bool = Field(
+        default=True,
+        alias="SKYN3T_CORTEX_SCOUT_COMPETITIVE",
+    )
 
-    # Execution backend for code agent: inline (fast, no isolation),
-    # docker (real sandbox), or auto (probe docker, fall back to inline).
+    # Autonomous loops — scout schedule + optional Studio builds without CLI
+    autonomous_learning: bool = Field(default=True, alias="SKYN3T_AUTONOMOUS_LEARNING")
+    autonomous_builds: bool = Field(default=False, alias="SKYN3T_AUTONOMOUS_BUILDS")
+    autonomous_build_daily_cap: int = Field(default=3, alias="SKYN3T_AUTONOMOUS_BUILD_DAILY_CAP")
+    autonomous_build_interval_seconds: int = Field(
+        default=900, alias="SKYN3T_AUTONOMOUS_BUILD_INTERVAL_SECONDS"
+    )
+    autonomous_build_daily_budget_usd: float = Field(
+        default=5.0, alias="SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD"
+    )
+    autonomous_scout_schedule: str = Field(
+        default="interval:12h", alias="SKYN3T_AUTONOMOUS_SCOUT_SCHEDULE"
+    )
+    autonomous_proof_run: bool = Field(
+        default=True, alias="SKYN3T_AUTONOMOUS_PROOF_RUN"
+    )
+    skills_hub_auto_install: bool = Field(
+        default=True, alias="SKYN3T_SKILLS_HUB_AUTO_INSTALL"
+    )
+    # Skip Studio architect/designer gates and auto-triage Cortex ingest/tuning.
+    # Also enabled implicitly when SKYN3T_AUTONOMOUS_BUILDS=1 (unless
+    # SKYN3T_AUTO_APPROVE=0). Synonyms: SKYN3T_NO_APPROVAL=1,
+    # SKYN3T_AUTO_APPROVE_STUDIO=1.
+    auto_approve: bool = Field(default=False, alias="SKYN3T_AUTO_APPROVE")
+
+    # Studio per-project token budget (estimated chars/4). 0 = disabled.
+    # Inspired by Forge cost caps — stops runaway LLM spend mid-pipeline.
+    studio_token_budget: int = Field(default=0, alias="SKYN3T_STUDIO_TOKEN_BUDGET")
+
+    # CodeAgent Python execution: auto (Docker pool when available, else inline),
+    # inline, docker, or docker-pool.
     execution_backend: str = Field(default="auto", alias="SKYN3T_EXECUTION_BACKEND")
 
     # Public URL — used in notification embeds (Discord etc.) so users can
@@ -181,6 +239,18 @@ class Settings(BaseSettings):
             return []
         return [str(v).strip()]
 
+    @field_validator("cortex_scout_fit_queries", mode="before")
+    @classmethod
+    def parse_scout_fit_queries(cls, v: Any) -> List[str]:
+        if isinstance(v, str):
+            return [part.strip() for part in v.split(",") if part.strip()]
+        if isinstance(v, list):
+            return [str(part).strip() for part in v if str(part).strip()]
+        if v is None:
+            return []
+        text = str(v).strip()
+        return [text] if text else []
+
     @field_validator(
         "data_dir",
         "logs_dir",
@@ -203,6 +273,35 @@ class Settings(BaseSettings):
         self.projects_dir.mkdir(parents=True, exist_ok=True)
         self.audit_log_dir.mkdir(parents=True, exist_ok=True)
         Path(self.vector_db_path).mkdir(parents=True, exist_ok=True)
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_falsy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"0", "false", "no", "off"}
+
+
+def auto_approve_enabled(settings: Settings | None = None) -> bool:
+    """True when human approval gates should be bypassed for Studio + Cortex.
+
+    Explicit opt-in: ``SKYN3T_AUTO_APPROVE=1``, ``SKYN3T_NO_APPROVAL=1``, or
+    ``SKYN3T_AUTO_APPROVE_STUDIO=1``. Implicit opt-in:
+    ``SKYN3T_AUTONOMOUS_BUILDS=1`` unless ``SKYN3T_AUTO_APPROVE=0``.
+    Repo self-edits (``code_patch`` / ``feature`` ideas) are never
+    auto-approved here — they stay review-gated.
+    """
+    cfg = settings or get_settings()
+    if (
+        getattr(cfg, "auto_approve", False)
+        or _env_truthy("SKYN3T_NO_APPROVAL")
+        or _env_truthy("SKYN3T_AUTO_APPROVE_STUDIO")
+    ):
+        return True
+    if _env_falsy("SKYN3T_AUTO_APPROVE"):
+        return False
+    return bool(getattr(cfg, "autonomous_builds", False))
 
 
 def resolve_api_base(settings: Settings | None = None) -> str:
