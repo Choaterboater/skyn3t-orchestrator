@@ -66,6 +66,21 @@ export type RoutingPolicyUpdate =
       applied_via?: "manual" | "recommendation";
     };
 
+export type RoutingPreset = {
+  label: string;
+  description?: string;
+  policies: Record<string, string>;
+};
+
+export type ExecutionBackendView = {
+  configured: string;
+  resolved: string;
+  resolved_class: string;
+  docker_available: boolean;
+  valid_backends: string[];
+  auto_retry: boolean;
+};
+
 export type RoutingRecommendation = {
   stage: string;
   current_tier: string;
@@ -211,6 +226,33 @@ export type CortexComponentStatus = {
   error?: string | null;
 };
 
+export type ScoutLastResult = {
+  ok?: boolean;
+  filed?: number;
+  error?: string;
+  warnings?: string[];
+  proposals?: Array<{
+    proposal_id?: string;
+    kind?: string;
+    repo?: string;
+    lane?: string;
+  }>;
+};
+
+export type GithubScoutStatus = {
+  available: boolean;
+  state?: string;
+  busy_reason?: string | null;
+  last_result?: ScoutLastResult;
+};
+
+export type GithubScoutConfig = {
+  mode: string;
+  default_limit: number;
+  discovery_lanes: string[];
+  summary?: string;
+};
+
 export type CortexStatus = {
   running: boolean;
   booted: boolean;
@@ -307,8 +349,50 @@ export type SystemStatus = {
   completed_tasks?: number;
 };
 
+export type AutonomousStatus = {
+  available?: boolean;
+  autonomous_learning?: boolean;
+  autonomous_builds?: boolean;
+  autonomous_proof_run?: boolean;
+  daily_builds?: number;
+  daily_cap?: number;
+  daily_spend_usd?: number;
+  daily_budget_usd?: number;
+  queue_depth?: number;
+  last_build_slug?: string | null;
+  last_skip_reason?: string | null;
+  last_proof_slug?: string | null;
+  last_proof_ok?: boolean | null;
+  last_proof_summary?: string | null;
+  last_proof_at?: number;
+  last_tick_at?: number;
+  running?: boolean;
+  scout_schedule?: Record<string, unknown>;
+  error?: string;
+};
+
+export type OpenRouterCatalog = {
+  synced_at?: number;
+  model_count?: number;
+  sync_enabled?: boolean;
+  stale?: boolean;
+  models?: Array<{ id?: string; name?: string; pricing?: Record<string, unknown> }>;
+  tier_validation?: Record<string, unknown>;
+};
+
 export const api = {
   status: () => fetchJson<SystemStatus>("/api/status"),
+  autonomousStatus: () =>
+    fetchJson<AutonomousStatus>("/api/autonomous/status").catch((err) => {
+      if (err instanceof HttpError && err.status === 503) {
+        return { available: false } as AutonomousStatus;
+      }
+      throw err;
+    }),
+  openrouterModels: (refresh = false) =>
+    fetchJson<OpenRouterCatalog>(
+      `/api/models/openrouter${refresh ? "?refresh=1" : ""}`,
+    ),
   swarmSnapshot: () => fetchJson<any>("/api/swarm/snapshot"),
   usageTotals: () =>
     fetchJson<{
@@ -393,7 +477,11 @@ export const api = {
       { method: "DELETE" },
     ),
   routingPolicy: () =>
-    fetchJson<{ tiers: RoutingTier[]; routes: RoutingRoute[] }>("/api/routing/policy"),
+    fetchJson<{
+      tiers: RoutingTier[];
+      routes: RoutingRoute[];
+      presets?: Record<string, RoutingPreset>;
+    }>("/api/routing/policy"),
   routingRecommendations: () =>
     fetchJson<{ recommendations: RoutingRecommendation[] }>("/api/routing/recommendations")
       .then((d) => d.recommendations ?? []),
@@ -406,6 +494,18 @@ export const api = {
     fetchJson<{ ok?: boolean; tiers: RoutingTier[]; routes: RoutingRoute[] }>(
       `/api/routing/policy/${encodeURIComponent(stage)}`,
       { method: "DELETE" },
+    ),
+  applyStudioQualityRouting: () =>
+    fetchJson<{ ok?: boolean; tiers: RoutingTier[]; routes: RoutingRoute[] }>(
+      "/api/routing/presets/studio-quality",
+      { method: "POST", body: "{}" },
+    ),
+  executionBackend: () =>
+    fetchJson<ExecutionBackendView>("/api/execution/backend"),
+  patchExecutionBackend: (backend: string) =>
+    fetchJson<{ ok?: boolean; configured: string; resolved_class: string }>(
+      "/api/execution/backend",
+      { method: "PATCH", body: JSON.stringify({ backend }) },
     ),
   projects: () =>
     fetchJson<{ projects: ProjectRow[] }>("/api/studio/projects").then(
@@ -514,6 +614,13 @@ export const api = {
       body: JSON.stringify({ idea }),
     }),
   cortexStatus: () => fetchJson<CortexStatus>("/api/cortex/status"),
+  githubScoutStatus: () => fetchJson<GithubScoutStatus>("/api/github/scout/status"),
+  githubScoutConfig: () => fetchJson<GithubScoutConfig>("/api/github/scout/config"),
+  runGithubScout: (payload: { limit?: number; queries?: string[] }) =>
+    fetchJson<{ ok?: boolean; started?: boolean; state?: string; error?: string }>(
+      "/api/github/scout/run",
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
   traces: (limit = 50) =>
     fetchJson<{ traces: any[] }>(`/traces?limit=${limit}`).then(
       (d) => d.traces ?? [],

@@ -299,6 +299,18 @@ class CortexBootstrap:
                 (),
                 (),
             ),
+            (
+                "autonomous_loop",
+                "_autonomous_coordinator",
+                lambda: _import_and_build(
+                    "skyn3t.cortex.autonomous_loop", "AutonomousCoordinator",
+                    self.orchestrator,
+                    self.event_bus,
+                ),
+                (),
+                (),
+                (),
+            ),
         ]
 
         for name, orch_attr, factory, creates, handles, subs in specs:

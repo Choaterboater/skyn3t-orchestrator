@@ -3,6 +3,7 @@
 import asyncio
 import io
 import json
+import os
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -917,21 +918,65 @@ async def test_reject_skill_draft_updates_memory(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_github_scout_config_returns_auto_mode(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "skyn3t.config.settings.get_settings",
+        lambda: SimpleNamespace(cortex_scout_default_limit=3),
+    )
+
+    result = await web_app.github_scout_config()
+
+    assert result["mode"] == "auto"
+    assert result["default_limit"] == 3
+    assert "trending" in result["discovery_lanes"]
+
+
+@pytest.mark.asyncio
 async def test_run_github_scout_returns_component_result(monkeypatch):
     class FakeScout:
-        async def run_once(self, config):
+        is_running = False
+
+        def start_background(self, config):
             assert config == {"cadence": "weekly", "limit": 2, "platforms": ["github"]}
-            return {"ok": True, "filed": 1}
+            return {"ok": True, "started": True, "state": "running"}
 
     async def fake_ensure():
         return FakeScout()
 
-    monkeypatch.setattr(web_app, "orchestrator", SimpleNamespace())
+    monkeypatch.setattr(web_app, "orchestrator", SimpleNamespace(running_tasks={}))
     monkeypatch.setattr(web_app, "_ensure_repo_scout", fake_ensure)
+    monkeypatch.setattr(web_app, "_count_active_studio_projects", lambda _app: 0)
 
-    result = await web_app.run_github_scout({"cadence": "weekly", "limit": 2})
+    response = await web_app.run_github_scout({"cadence": "weekly", "limit": 2})
 
-    assert result == {"ok": True, "filed": 1}
+    assert response.status_code == 202
+    body = json.loads(response.body)
+    assert body["started"] is True
+    assert body["state"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_run_github_scout_skips_when_studio_busy(monkeypatch):
+    class FakeScout:
+        is_running = False
+
+        def start_background(self, config):
+            raise AssertionError("should not start when studio busy")
+
+    async def fake_ensure():
+        return FakeScout()
+
+    monkeypatch.setattr(web_app, "orchestrator", SimpleNamespace(running_tasks={}))
+    monkeypatch.setattr(web_app, "_ensure_repo_scout", fake_ensure)
+    monkeypatch.setattr(web_app, "_count_active_studio_projects", lambda _app: 2)
+
+    response = await web_app.run_github_scout({"limit": 1})
+
+    assert response.status_code == 409
+    body = json.loads(response.body)
+    assert body["reason"] == "system_busy"
 
 
 @pytest.mark.asyncio
@@ -969,20 +1014,25 @@ async def test_schedule_github_scout_persists_job(monkeypatch):
 @pytest.mark.asyncio
 async def test_run_repo_scout_defaults_to_multi_platform(monkeypatch):
     class FakeScout:
-        async def run_once(self, config):
+        is_running = False
+
+        def start_background(self, config):
             assert config["platforms"] == ["github", "gitlab", "bitbucket"]
             assert config["cadence"] == "weekly"
-            return {"ok": True, "filed": 2}
+            return {"ok": True, "started": True, "state": "running"}
 
     async def fake_ensure():
         return FakeScout()
 
-    monkeypatch.setattr(web_app, "orchestrator", SimpleNamespace())
+    monkeypatch.setattr(web_app, "orchestrator", SimpleNamespace(running_tasks={}))
     monkeypatch.setattr(web_app, "_ensure_repo_scout", fake_ensure)
+    monkeypatch.setattr(web_app, "_count_active_studio_projects", lambda _app: 0)
 
-    result = await web_app.run_repo_scout({"cadence": "weekly"})
+    response = await web_app.run_repo_scout({"cadence": "weekly"})
 
-    assert result == {"ok": True, "filed": 2}
+    assert response.status_code == 202
+    body = json.loads(response.body)
+    assert body["started"] is True
 
 
 @pytest.mark.asyncio
@@ -1463,6 +1513,71 @@ async def test_routing_policy_patch_accepts_recommendation_metadata(monkeypatch,
     route = next(route for route in result["routes"] if route["stage"] == "research")
     assert route["tier"] == "or_cheap"
     assert route["persisted_via"] == "recommendation"
+
+
+@pytest.mark.asyncio
+async def test_routing_policy_get_includes_studio_quality_preset(monkeypatch, tmp_path):
+    import skyn3t.config.model_routing as routing_config
+
+    monkeypatch.setattr(
+        routing_config,
+        "_store",
+        ModelRoutingStore(tmp_path / "routing.json"),
+    )
+
+    result = await web_app.routing_policy_get()
+
+    preset = result["presets"]["studio_quality"]
+    assert preset["label"]
+    assert preset["policies"]["code"] == "or_strong"
+    assert preset["policies"]["designer"] == "or_ui"
+
+
+@pytest.mark.asyncio
+async def test_routing_preset_studio_quality_applies_policies(monkeypatch, tmp_path):
+    import skyn3t.config.model_routing as routing_config
+
+    store = ModelRoutingStore(tmp_path / "routing.json")
+    monkeypatch.setattr(routing_config, "_store", store)
+    monkeypatch.setattr(web_app, "orchestrator", SimpleNamespace(agents={}))
+
+    result = await web_app.routing_preset_studio_quality()
+
+    assert result["ok"] is True
+    assert store.entries()["reviewer"]["tier"] == "or_strong"
+    reviewer = next(route for route in result["routes"] if route["stage"] == "reviewer")
+    assert reviewer["source"] == "persisted"
+
+
+@pytest.mark.asyncio
+async def test_execution_backend_get_reports_inline(monkeypatch):
+    monkeypatch.setenv("SKYN3T_EXECUTION_BACKEND", "inline")
+    from skyn3t.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    result = await web_app.execution_backend_get()
+
+    assert result["configured"] == "inline"
+    assert result["resolved_class"] == "InlineBackend"
+    assert "auto" in result["valid_backends"]
+
+
+@pytest.mark.asyncio
+async def test_execution_backend_patch_writes_env(monkeypatch, tmp_path):
+    from skyn3t.config.settings import get_settings
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("SKYN3T_EXECUTION_BACKEND=inline\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SKYN3T_EXECUTION_BACKEND", "inline")
+    get_settings.cache_clear()
+
+    result = await web_app.execution_backend_patch({"backend": "auto"})
+
+    assert result["ok"] is True
+    assert "SKYN3T_EXECUTION_BACKEND=auto" in env_path.read_text(encoding="utf-8")
+    assert os.environ["SKYN3T_EXECUTION_BACKEND"] == "auto"
 
 
 @pytest.mark.asyncio

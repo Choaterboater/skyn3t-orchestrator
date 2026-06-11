@@ -45,6 +45,12 @@ export default function AgentsPage() {
     queryFn: api.routingPolicy,
     refetchInterval: 15_000,
   });
+  const executionBackend = useQuery({
+    queryKey: ["execution_backend"],
+    queryFn: api.executionBackend,
+    refetchInterval: 30_000,
+    retry: false,
+  });
   const routingRecommendations = useQuery({
     queryKey: ["routing_recommendations"],
     queryFn: api.routingRecommendations,
@@ -56,6 +62,7 @@ export default function AgentsPage() {
     qc.invalidateQueries({ queryKey: ["agents"] });
     qc.invalidateQueries({ queryKey: ["routing_policy"] });
     qc.invalidateQueries({ queryKey: ["routing_recommendations"] });
+    qc.invalidateQueries({ queryKey: ["execution_backend"] });
   };
 
   return (
@@ -96,11 +103,19 @@ export default function AgentsPage() {
         <p className="text-text-secondary">No agents registered yet.</p>
       )}
 
+      {executionBackend.data && (
+        <ExecutionBackendCard
+          view={executionBackend.data}
+          onChanged={invalidate}
+        />
+      )}
+
       {routing.data && (
         <RoutingPolicyCard
           routes={routing.data.routes ?? []}
           tiers={routing.data.tiers ?? []}
           recommendations={routingRecommendations.data ?? []}
+          preset={routing.data.presets?.studio_quality}
           onChanged={invalidate}
         />
       )}
@@ -155,19 +170,98 @@ export default function AgentsPage() {
   );
 }
 
+function ExecutionBackendCard({
+  view,
+  onChanged,
+}: {
+  view: import("../api/client").ExecutionBackendView;
+  onChanged: () => void;
+}) {
+  const [draft, setDraft] = useState(view.configured);
+  const save = useMutation({
+    mutationFn: (backend: string) => api.patchExecutionBackend(backend),
+    onSuccess: () => onChanged(),
+  });
+
+  useEffect(() => {
+    setDraft(view.configured);
+  }, [view.configured]);
+
+  const dockerHint = view.docker_available
+    ? "Docker is running — auto selects the pooled sandbox."
+    : "Docker not detected — auto falls back to inline execution.";
+
+  return (
+    <section className="rounded-lg border border-border bg-bg-2 overflow-hidden">
+      <header className="px-4 py-3 border-b border-border flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="font-mono text-accent">Code execution sandbox</h2>
+          <p className="text-text-secondary text-sm mt-1">
+            Isolates CodeAgent Python runs. Studio Quality wizard sets{" "}
+            <code className="font-mono text-xs bg-bg-3 px-1 rounded">auto</code>{" "}
+            (Docker pool when available).
+          </p>
+          <p className="text-text-dim text-xs mt-1">{dockerHint}</p>
+        </div>
+        <div className="text-right text-xs font-mono text-text-dim">
+          resolved: {view.resolved_class}
+          {view.auto_retry && (
+            <div className="text-accent mt-1">SKYN3T_AUTO_RETRY=1</div>
+          )}
+        </div>
+      </header>
+      <div className="px-4 py-3 flex flex-wrap items-center gap-3">
+        <select
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          className="min-w-[180px] bg-bg-3 border border-border rounded px-2 py-1.5 text-sm font-mono outline-none focus:border-accent"
+        >
+          {view.valid_backends.map((name) => (
+            <option key={name} value={name}>
+              {name}
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          disabled={save.isPending || draft === view.configured}
+          onClick={() => save.mutate(draft)}
+          className="text-sm px-3 py-1.5 rounded border border-accent-line text-accent hover:bg-accent-soft disabled:opacity-50"
+        >
+          save to .env
+        </button>
+        {save.isError && (
+          <span className="text-status-red text-xs">
+            {save.error instanceof Error ? save.error.message : "save failed"}
+          </span>
+        )}
+      </div>
+    </section>
+  );
+}
+
 function RoutingPolicyCard({
   routes,
   tiers,
   recommendations,
+  preset,
   onChanged,
 }: {
   routes: RoutingRoute[];
   tiers: RoutingTier[];
   recommendations: RoutingRecommendation[];
+  preset?: import("../api/client").RoutingPreset;
   onChanged: () => void;
 }) {
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const recByStage = new Map(recommendations.map((rec) => [rec.stage, rec]));
+  const applyPreset = useMutation({
+    mutationFn: () => api.applyStudioQualityRouting(),
+    onSuccess: () => {
+      setDrafts({});
+      onChanged();
+    },
+  });
   const save = useMutation({
     mutationFn: ({ stage, tier }: { stage: string; tier: string }) =>
       api.patchRoutingPolicy({ [stage]: { tier, applied_via: "manual" } }),
@@ -180,14 +274,27 @@ function RoutingPolicyCard({
 
   return (
     <section className="rounded-lg border border-border bg-bg-2 overflow-hidden">
-      <header className="px-4 py-3 border-b border-border">
-        <h2 className="font-mono text-accent">Routing policy</h2>
-        <p className="text-text-secondary text-sm mt-1">
-          Stage defaults now come from saved policy first, then env bootstrap, then built-in defaults.
-        </p>
-        <p className="text-text-dim text-xs mt-1">
-          Recommendations are advisory. Saving marks an override manual; apply rec marks it recommendation until you reset it.
-        </p>
+      <header className="px-4 py-3 border-b border-border flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="font-mono text-accent">Model routing</h2>
+          <p className="text-text-secondary text-sm mt-1">
+            Per-stage tier map for Project Studio. Saved policy beats env, then built-in defaults.
+          </p>
+          <p className="text-text-dim text-xs mt-1">
+            {preset?.description ??
+              "Use Studio Quality to match the skyn3t wizard OpenRouter preset."}
+          </p>
+        </div>
+        <button
+          type="button"
+          disabled={applyPreset.isPending}
+          onClick={() => applyPreset.mutate()}
+          className="text-sm px-3 py-1.5 rounded border border-accent-line text-accent hover:bg-accent-soft disabled:opacity-50 whitespace-nowrap"
+        >
+          {applyPreset.isPending
+            ? "applying…"
+            : preset?.label ?? "Apply Studio Quality"}
+        </button>
       </header>
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
