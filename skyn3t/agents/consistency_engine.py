@@ -1619,7 +1619,7 @@ _ENTRYPOINT_STEMS = ("app", "main", "index", "page", "layout", "root")
 #     re-detect them here so output['entrypoint_is_stub'] / this category
 #     fire even if marker text changes location).
 _EXPORT_DEFAULT_NULL_RE = re.compile(
-    r"export\s+default\s+null\s*;?\s*$", re.MULTILINE
+    r"export\s+default\s+null\s*;?\s*(?://.*)?$", re.MULTILINE
 )
 _GENERATION_FAILED_JSX_RE = re.compile(
     r"(?i)generation\s+failed", re.MULTILINE
