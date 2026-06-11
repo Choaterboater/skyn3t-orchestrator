@@ -7,9 +7,11 @@ import shlex
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
+from rich.panel import Panel
+from rich.text import Text
 
 APPROVAL_ARTIFACT = "architecture.md"
 
@@ -30,6 +32,28 @@ def approval_summary(project: Dict[str, Any]) -> str:
     stage = str(gate.get("stage") or "stage")
     agent = str(gate.get("agent") or "agent")
     return f"{stage} ({agent})"
+
+
+def build_approval_panel(project: Dict[str, Any], original: str) -> Panel:
+    """Rich panel for architecture review (REPL transcript or Typer output)."""
+    summary = approval_summary(project)
+    preview = original if len(original) <= 3500 else original[:3500] + "\n\n…"
+    return Panel(
+        preview,
+        title=f"[bold yellow]Approval required · {summary}[/bold yellow]",
+        border_style="yellow",
+    )
+
+
+def approval_choice_hint() -> Text:
+    return Text.from_markup(
+        "(a)pprove  (e)dits in $EDITOR  (r)eject  (w)ait — "
+        "or type approve / approve with edits / reject …"
+    )
+
+
+def approval_renderables(project: Dict[str, Any], original: str) -> List[Any]:
+    return [build_approval_panel(project, original), approval_choice_hint()]
 
 
 def fetch_approval_document(
@@ -119,28 +143,19 @@ def run_interactive_approval(
     prompt_choice: Callable[[], str],
     prompt_feedback: Callable[[], str],
     edit_text: Callable[[str], Optional[str]],
+    emit: Optional[Callable[[Any], None]] = None,
+    display: bool = True,
 ) -> Optional[str]:
     """Walk the operator through approve / edits / reject. Returns status line."""
-    from rich.panel import Panel
-
-    summary = approval_summary(project)
     try:
         original = fetch_approval_document(client, slug)
     except httpx.HTTPError as exc:
         raise RuntimeError(f"could not load {APPROVAL_ARTIFACT}: {exc}") from exc
 
-    preview = original if len(original) <= 3500 else original[:3500] + "\n\n…"
-    console.print(
-        Panel(
-            preview,
-            title=f"[bold yellow]Approval required · {summary}[/bold yellow]",
-            border_style="yellow",
-        )
-    )
-    console.print(
-        "[dim](a)pprove  (e)dits in $EDITOR  (r)eject  (w)ait — "
-        "same actions as Studio web UI[/dim]"
-    )
+    if display:
+        show = emit if emit is not None else console.print
+        for renderable in approval_renderables(project, original):
+            show(renderable)
     choice = prompt_choice().strip().lower() or "a"
     if choice in {"w", "wait", "skip", "s"}:
         return None

@@ -382,6 +382,11 @@ class StudioRunner:
             manifest["execution_profile"] = execution_profile
             manifest["mission_setup"] = setup
             manifest["repo_target"] = repo
+            if extra.get("autonomous") or str(extra.get("source") or "") == "autonomous":
+                manifest["autonomous"] = True
+                manifest["trigger_source"] = str(
+                    extra.get("trigger_source") or extra.get("source") or "autonomous"
+                )
             manifest["workflow_summary"] = self._workflow_from_template(template, template_key)
             self._clear_quality_summary(manifest)
 
@@ -655,13 +660,7 @@ class StudioRunner:
         if status != "interrupted":
             raise ValueError(f"project status is {status!r}, not interrupted")
 
-        start_index = 0
-        for idx, stage in enumerate(manifest.get("stages") or []):
-            if isinstance(stage, dict) and str(stage.get("status") or "").lower() != "done":
-                start_index = idx
-                break
-        else:
-            start_index = len(manifest.get("stages") or [])
+        start_index = self._resume_start_index(manifest)
 
         stage_name = None
         stages = manifest.get("stages") or []
@@ -1140,9 +1139,36 @@ class StudioRunner:
             # input_data. Kimi K2.6 calls this "context sharding" — pass
             # essential outputs, not full traces.
             prior_summaries: Dict[str, str] = {}
+            token_budget_limit = self._studio_token_budget_limit()
+            if token_budget_limit > 0:
+                manifest["token_budget"] = {
+                    "limit": token_budget_limit,
+                    "used": self._project_token_total(slug),
+                }
             for stage_idx, stage in enumerate(stages):
                 if stage_idx < (_start_from_index or 0):
                     continue
+                if self._studio_token_budget_exceeded(slug):
+                    limit = token_budget_limit
+                    used = self._project_token_total(slug)
+                    message = (
+                        f"Studio token budget exhausted ({used:,} / {limit:,} estimated tokens). "
+                        "Raise SKYN3T_STUDIO_TOKEN_BUDGET or use execution_profile=fast."
+                    )
+                    manifest["token_budget"] = {"limit": limit, "used": used, "exceeded": True}
+                    self._append_history(
+                        manifest,
+                        "STUDIO_TOKEN_BUDGET_EXCEEDED",
+                        status="failed",
+                        stage=stage.name,
+                        message=message,
+                    )
+                    self._save_manifest(artifact_dir, manifest)
+                    return self.mark_project_failed(
+                        slug,
+                        error=message,
+                        next_action="Increase SKYN3T_STUDIO_TOKEN_BUDGET or restart with a shorter brief.",
+                    ) or manifest
                 agent = get_agent(stage.agent, event_bus=self.event_bus, rag=self.rag)
                 if hasattr(agent, "initialize"):
                     maybe = agent.initialize()
@@ -1178,6 +1204,33 @@ class StudioRunner:
                     pre_warnings = self._scoreboard_prewarnings(brief)
                     if pre_warnings:
                         input_data["scoreboard_prewarnings"] = pre_warnings
+                    if "designer" in prior_summaries and self._brief_implies_visual_ui(
+                        brief, artifact_dir
+                    ):
+                        gate = await self._run_pre_code_design_gate(
+                            manifest=manifest,
+                            artifact_dir=artifact_dir,
+                            brief=brief,
+                        )
+                        if gate.get("findings"):
+                            input_data["design_gate_findings"] = gate["findings"]
+                        blockers = gate.get("blockers") or []
+                        if blockers:
+                            constraint_block = self._format_design_gate_constraints(blockers)
+                            input_data["brief"] = (
+                                f"{input_data.get('brief') or brief}\n\n"
+                                f"---\n"
+                                f"DESIGN GATE (address before writing code):\n\n"
+                                f"{constraint_block}\n"
+                                f"---\n"
+                            )
+                            self._append_history(
+                                manifest,
+                                "DESIGN_GATE_BLOCKERS",
+                                status="running",
+                                stage="code",
+                                message=f"{len(blockers)} design gate blocker(s) injected into code stage.",
+                            )
                 task = TaskRequest(
                     title=f"{template_key}:{stage.name}",
                     input_data=input_data,
@@ -1978,9 +2031,14 @@ class StudioRunner:
                         stage.name,
                         critique_timeout_seconds,
                     )
+                    critique_event = (
+                        "CRITIQUE_INCOMPLETE"
+                        if stage.name == "code"
+                        else "CRITIQUE_FAILED"
+                    )
                     self._append_history(
                         manifest,
-                        "CRITIQUE_FAILED",
+                        critique_event,
                         status="running",
                         stage=stage.name,
                         message=(
@@ -2043,6 +2101,16 @@ class StudioRunner:
                     agent=stage.agent,
                     message=stage_summary or manifest["next_action"],
                 )
+                self._record_pipeline_checkpoint(
+                    manifest,
+                    stage_index=stage_idx,
+                    stage_name=stage.name,
+                )
+                if token_budget_limit > 0:
+                    manifest["token_budget"] = {
+                        "limit": token_budget_limit,
+                        "used": self._project_token_total(slug),
+                    }
                 self._save_manifest(artifact_dir, manifest)
                 # Accumulate this stage's essential output for downstream
                 # stages. _bound_essential_summary caps at 2000 chars per
@@ -2101,10 +2169,17 @@ class StudioRunner:
                             scaffold_dir = artifact_dir / "scaffold"
                             if review_md.is_file() and scaffold_dir.is_dir():
                                 from skyn3t.agents.reviewer_fixes import apply_reviewer_fixes
+                                execution_profile = str(
+                                    manifest.get("execution_profile") or "balanced"
+                                ).strip().lower()
+                                fix_budget = 0.75 if execution_profile == "deep" else 0.50
+                                fix_max_files = 8 if execution_profile == "deep" else 5
                                 summary = await apply_reviewer_fixes(
                                     review_md_path=review_md,
                                     scaffold_dir=scaffold_dir,
                                     brief=brief or "",
+                                    budget_usd=fix_budget,
+                                    max_files=fix_max_files,
                                 )
                                 manifest.setdefault("auto_fixes", {})["reviewer_targeted"] = {
                                     "candidates_found": summary.candidates_found,
@@ -2135,6 +2210,11 @@ class StudioRunner:
                                         )
                                     except Exception:
                                         pass
+                                    await self._rerun_reviewer_scoring(
+                                        artifact_dir=artifact_dir,
+                                        brief=brief or "",
+                                        manifest=manifest,
+                                    )
                                     self._save_manifest(artifact_dir, manifest)
                     except Exception:
                         logger.exception("reviewer-driven targeted fixes failed")
@@ -2299,7 +2379,11 @@ class StudioRunner:
                 failed_verifier = "build"
                 try:
                     build_result = await self._run_build_verifier(
-                        str(scaffold_dir), brief,
+                        str(scaffold_dir),
+                        brief,
+                        execution_profile=str(
+                            manifest.get("execution_profile") or "balanced"
+                        ),
                     )
                 except Exception:
                     logger.exception("build_verifier invocation failed")
@@ -2323,7 +2407,11 @@ class StudioRunner:
                                 break
                             try:
                                 build_result = await self._run_build_verifier(
-                                    str(scaffold_dir), brief,
+                                    str(scaffold_dir),
+                                    brief,
+                                    execution_profile=str(
+                                        manifest.get("execution_profile") or "balanced"
+                                    ),
                                 ) or build_result
                             except Exception:
                                 logger.exception("re-verify after fix failed")
@@ -2632,6 +2720,9 @@ class StudioRunner:
                     "slug": slug,
                     "template": template_key,
                     "title": template.title,
+                    "autonomous": bool(manifest.get("autonomous")),
+                    "trigger_source": manifest.get("trigger_source") or "",
+                    "execution_profile": manifest.get("execution_profile") or "balanced",
                     "stages_completed": sum(
                         1
                         for stage_record in manifest.get("stages", [])
@@ -2675,19 +2766,18 @@ class StudioRunner:
                 except Exception:
                     logger.exception("persist retry-as-skill failed for slug=%s", slug)
 
-            # Auto-retry DISABLED by user — endless retry cycles were
-            # wasting wall-clock and burning CLI quota without producing
-            # better output. When a project fails, it stays failed; the
-            # user starts a fresh build explicitly via Telegram.
-            #
-            # Original behavior (preserved here for re-enable):
-            #
-            #   if manifest.get("status") == "failed":
-            #       await self._maybe_auto_retry(
-            #           manifest,
-            #           str(manifest.get("brief_raw") or manifest.get("brief") or brief),
-            #           slug,
-            #       )
+            # Bounded auto-retry: one fresh attempt with failure context and
+            # a cross-model debate hint. Disable with SKYN3T_AUTO_RETRY=0.
+            if (
+                manifest.get("status") == "failed"
+                and os.environ.get("SKYN3T_AUTO_RETRY", "1").strip().lower()
+                not in ("0", "false", "no", "off")
+            ):
+                await self._maybe_auto_retry(
+                    manifest,
+                    str(manifest.get("brief_raw") or manifest.get("brief") or brief),
+                    slug,
+                )
             return manifest
         except Exception as exc:
             # The runner itself crashed (agent init blew up, get_agent raised, etc).
@@ -3419,7 +3509,13 @@ class StudioRunner:
         except Exception:
             logger.exception("skill upsert failed for retry-recovery skill %s", name)
 
-    async def _run_build_verifier(self, scaffold_dir: str, brief: str) -> Optional[Dict[str, Any]]:
+    async def _run_build_verifier(
+        self,
+        scaffold_dir: str,
+        brief: str,
+        *,
+        execution_profile: str = "balanced",
+    ) -> Optional[Dict[str, Any]]:
         """Invoke BuildVerifierAgent in-process and return its output dict.
 
         Constructed fresh per project rather than fetched from the orchestrator
@@ -3438,7 +3534,11 @@ class StudioRunner:
                 TaskRequest(
                     title="build-verify",
                     description=f"verify scaffold for: {brief[:120]}",
-                    input_data={"scaffold_dir": scaffold_dir, "brief": brief},
+                    input_data={
+                        "scaffold_dir": scaffold_dir,
+                        "brief": brief,
+                        "execution_profile": execution_profile,
+                    },
                 )
             )
         except Exception:
@@ -3447,6 +3547,56 @@ class StudioRunner:
         if not result.success or not isinstance(result.output, dict):
             return None
         return result.output
+
+    async def _rerun_reviewer_scoring(
+        self,
+        *,
+        artifact_dir: Path,
+        brief: str,
+        manifest: Dict[str, Any],
+    ) -> None:
+        """Re-score after targeted fixes so quality_summary reflects repairs."""
+        try:
+            reviewer = get_agent("ReviewerAgent", event_bus=self.event_bus, rag=self.rag)
+            if hasattr(reviewer, "initialize"):
+                maybe = reviewer.initialize()
+                if hasattr(maybe, "__await__"):
+                    await maybe
+            result = await reviewer.execute(
+                TaskRequest(
+                    title="reviewer-rescore",
+                    input_data={
+                        "brief": brief,
+                        "artifact_dir": str(artifact_dir),
+                    },
+                )
+            )
+        except Exception:
+            logger.exception("reviewer re-score failed after targeted fixes")
+            return
+        output = getattr(result, "output", None) or {}
+        if not isinstance(output, dict):
+            return
+        candidate = self._extract_quality_candidate(
+            stage=type("Stage", (), {"name": "reviewer", "agent": "ReviewerAgent"})(),
+            output=output,
+            artifact_dir=artifact_dir,
+        )
+        if candidate is None:
+            return
+        manifest["quality_summary"] = self._merge_quality_summary(
+            manifest.get("quality_summary"),
+            candidate,
+        )
+        self._append_history(
+            manifest,
+            "REVIEWER_RESCORED",
+            status="running",
+            message=(
+                f"Reviewer re-scored after fixes: "
+                f"{candidate.get('verdict')} ({candidate.get('score')}/100)."
+            ),
+        )
 
     async def _run_boot_verifier(self, scaffold_dir: str, brief: str) -> Optional[Dict[str, Any]]:
         """Invoke BootVerifierAgent — actually start the server and
@@ -3636,11 +3786,35 @@ class StudioRunner:
 
         # Instantiate a real ReviewerAgent for cross-model critique.
         try:
-            reviewer = get_agent("ReviewerAgent", event_bus=self.event_bus, rag=self.rag)
+            from skyn3t.core.model_router import has_stage_policy, resolve_model
+
+            producer_key = str(stage.name or "").strip().lower()
+            if not has_stage_policy(producer_key):
+                producer_key = str(stage.agent or "").strip().lower()
+            producer_backend = ""
+            try:
+                producer_backend, _ = resolve_model(producer_key, brief=brief)
+            except Exception:
+                producer_backend = ""
+            reviewer_backend, reviewer_model = resolve_model("reviewer", brief=brief)
+            reviewer_config: Dict[str, Any] = {}
+            if reviewer_backend:
+                reviewer_config["backend"] = reviewer_backend
+            if reviewer_model:
+                reviewer_config["model"] = reviewer_model
+            reviewer = get_agent(
+                "ReviewerAgent",
+                event_bus=self.event_bus,
+                rag=self.rag,
+                config=reviewer_config or None,
+            )
             if hasattr(reviewer, "initialize"):
                 maybe = reviewer.initialize()
                 if hasattr(maybe, "__await__"):
                     await maybe
+            critique_client = reviewer.llm
+            if critique_client is not None and producer_backend:
+                critique_client._skip_backends.add(producer_backend)
         except Exception as e:
             logger.warning(f"Failed to instantiate ReviewerAgent for critique: {e}")
             return result
@@ -3705,9 +3879,14 @@ class StudioRunner:
                     round_num,
                 )
                 if manifest is not None:
+                    critique_event = (
+                        "CRITIQUE_INCOMPLETE"
+                        if stage.name == "code"
+                        else "CRITIQUE_FAILED"
+                    )
                     self._append_history(
                         manifest,
-                        "CRITIQUE_FAILED",
+                        critique_event,
                         status="running",
                         stage=stage.name,
                         message=(
@@ -3852,6 +4031,12 @@ class StudioRunner:
                                 status="running",
                                 stage=stage.name,
                                 message=fix_msg,
+                            )
+                        if fix_result.files_changed and manifest is not None:
+                            await self._rerun_reviewer_scoring(
+                                artifact_dir=artifact_dir,
+                                brief=brief,
+                                manifest=manifest,
                             )
                         # Re-check after fix
                         report = check_consistency(scaffold_dir, brief=brief)
@@ -4116,6 +4301,150 @@ class StudioRunner:
                 logger.debug("code-stage fast-retry probe failed", exc_info=True)
         return missing_planned_files, unresolved_stub_files
 
+    @staticmethod
+    def _brief_implies_visual_ui(brief: str, artifact_dir: Path) -> bool:
+        from skyn3t.agents.reviewer import ReviewerAgent
+
+        return ReviewerAgent._brief_implies_visual_ui(brief, artifact_dir)
+
+    @staticmethod
+    def _format_design_gate_constraints(blockers: List[Dict[str, str]]) -> str:
+        lines: List[str] = []
+        for idx, blocker in enumerate(blockers, start=1):
+            file_name = blocker.get("file") or "(artifact)"
+            message = blocker.get("message") or ""
+            suggestion = blocker.get("suggestion") or ""
+            lines.append(f"{idx}. [{file_name}] {message}")
+            if suggestion:
+                lines.append(f"   Fix: {suggestion}")
+        return "\n".join(lines)
+
+    async def _run_pre_code_design_gate(
+        self,
+        *,
+        manifest: Dict[str, Any],
+        artifact_dir: Path,
+        brief: str,
+    ) -> Dict[str, Any]:
+        """Deterministic design-artifact review before CodeAgent runs."""
+        import json as _json
+
+        from skyn3t.agents.consistency_engine import (
+            _check_collapsed_brand_palette,
+            _scan_cross_artifact_drift,
+        )
+
+        findings: List[Dict[str, str]] = []
+        blockers: List[Dict[str, str]] = []
+
+        def _add(
+            *,
+            file: str,
+            message: str,
+            suggestion: str = "",
+            severity: str = "blocker",
+        ) -> None:
+            entry = {
+                "file": file,
+                "message": message,
+                "suggestion": suggestion,
+                "severity": severity,
+            }
+            findings.append(entry)
+            if severity == "blocker":
+                blockers.append(entry)
+
+        palette_path = artifact_dir / "palette.json"
+        brand_path = artifact_dir / "brand.md"
+        components_path = artifact_dir / "components.md"
+
+        if not palette_path.is_file():
+            _add(
+                file="palette.json",
+                message="Missing palette.json — designer stage should ship a color palette.",
+                suggestion="Generate palette.json with at least bg, primary, and accent hex codes.",
+            )
+        else:
+            try:
+                palette_data = _json.loads(palette_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
+                _add(
+                    file="palette.json",
+                    message=f"palette.json is not valid JSON: {exc}",
+                    suggestion="Rewrite palette.json as valid JSON with named color tokens.",
+                )
+                palette_data = None
+            if isinstance(palette_data, dict):
+                color_keys = [
+                    k
+                    for k, v in palette_data.items()
+                    if isinstance(v, str) and re.search(r"#[0-9A-Fa-f]{3,8}\b", v)
+                ]
+                if len(color_keys) < 2:
+                    _add(
+                        file="palette.json",
+                        message="palette.json has fewer than two hex color tokens.",
+                        suggestion="Add at least bg + primary (+ accent) hex codes.",
+                    )
+
+        if not brand_path.is_file() or not brand_path.read_text(encoding="utf-8").strip():
+            _add(
+                file="brand.md",
+                message="Missing or empty brand.md.",
+                suggestion="Ship brand voice, typography, and palette table in brand.md.",
+            )
+        else:
+            try:
+                brand_text = brand_path.read_text(encoding="utf-8")
+                for issue in _check_collapsed_brand_palette(brand_text):
+                    _add(
+                        file=issue.file or "brand.md",
+                        message=issue.message,
+                        suggestion=issue.suggestion or "",
+                        severity="blocker" if issue.severity == "error" else "warning",
+                    )
+            except OSError:
+                pass
+
+        if not components_path.is_file() or not components_path.read_text(encoding="utf-8").strip():
+            _add(
+                file="components.md",
+                message="Missing or empty components.md.",
+                suggestion="List primary UI components, states, and layout notes.",
+                severity="warning",
+            )
+
+        # Cross-artifact drift between palette / brand / components (no scaffold yet).
+        scaffold_probe = artifact_dir / "scaffold"
+        try:
+            for issue in _scan_cross_artifact_drift(scaffold_probe, brief):
+                _add(
+                    file=issue.file or "(design artifacts)",
+                    message=issue.message,
+                    suggestion=issue.suggestion or "",
+                    severity="blocker" if issue.severity == "error" else "warning",
+                )
+        except Exception:
+            logger.debug("pre-code design drift scan failed", exc_info=True)
+
+        if findings:
+            self._append_history(
+                manifest,
+                "DESIGN_GATE_REVIEW",
+                status="running",
+                stage="code",
+                message=(
+                    f"Pre-code design gate: {len(blockers)} blocker(s), "
+                    f"{len(findings) - len(blockers)} warning(s)."
+                ),
+            )
+            manifest.setdefault("design_gate", {})["pre_code"] = {
+                "blocker_count": len(blockers),
+                "finding_count": len(findings),
+            }
+
+        return {"findings": findings, "blockers": blockers}
+
     async def _run_post_code_checks(
         self,
         *,
@@ -4204,14 +4533,9 @@ class StudioRunner:
             except Exception:
                 logger.exception("missing_mount scoreboard tag failed")
 
-        unresolved_stub_files = self._unresolved_todo_stub_files(report.issues)
-        if unresolved_stub_files:
-            hint = self._todo_stub_retry_hint(unresolved_stub_files)
-            manifest["consistency_check"]["unresolved_todo_stubs"] = unresolved_stub_files
-            manifest["_retry_hint"] = hint
-            manifest["next_action"] = "Retrying with the unresolved stub failure as a hint."
-            self._save_manifest(artifact_dir, manifest)
-            raise UnresolvedScaffoldStubError(hint)
+        todo_stub_issues = [
+            i for i in report.issues if i.category == "todo_stub" and i.severity == "error"
+        ]
 
         # Fail fast on stack mismatch before mutating files with targeted fix.
         if mismatches:
@@ -4229,7 +4553,7 @@ class StudioRunner:
                 + "; ".join(mismatches)
             )
 
-        if not report.ok:
+        if not report.ok or todo_stub_issues:
             from skyn3t.adapters import LLMClient
             from skyn3t.agents.targeted_fix import FileIssue, apply_targeted_fix
 
@@ -4246,6 +4570,29 @@ class StudioRunner:
                 for i in report.issues
                 if i.severity == "error"
             ]
+            # Ensure todo_stub blockers are always queued for targeted fix
+            # even when mixed with other error categories.
+            seen_stub_paths = {
+                issue.path
+                for issue in consistency_issues
+                if issue.suggested_action == "regenerate"
+            }
+            for stub in todo_stub_issues:
+                target = self._consistency_fix_target(
+                    scaffold_dir=scaffold_dir,
+                    issue_file=stub.file,
+                    category=stub.category,
+                )
+                if not target or target in seen_stub_paths:
+                    continue
+                seen_stub_paths.add(target)
+                consistency_issues.append(
+                    FileIssue(
+                        path=target,
+                        error_message=stub.message,
+                        suggested_action="regenerate",
+                    )
+                )
             if consistency_issues:
                 client = LLMClient(event_bus=self.event_bus, caller_name="consistency_fix")
                 fix_result = await apply_targeted_fix(
@@ -4265,6 +4612,21 @@ class StudioRunner:
                 # crash in the next stage (otherwise the post-fix state
                 # only saves later, and is lost if the run dies first).
                 self._save_manifest(artifact_dir, manifest)
+            unresolved_stub_files = self._unresolved_todo_stub_files(report.issues)
+            if unresolved_stub_files:
+                hint = self._todo_stub_retry_hint(unresolved_stub_files)
+                manifest["consistency_check"]["unresolved_todo_stubs"] = unresolved_stub_files
+                manifest["_retry_hint"] = hint
+                manifest["next_action"] = "Retrying with the unresolved stub failure as a hint."
+                self._append_history(
+                    manifest,
+                    "TODO_STUB_BLOCKERS",
+                    status="running",
+                    stage=stage_name,
+                    message=f"{len(unresolved_stub_files)} TODO stub(s) remain after targeted fix.",
+                )
+                self._save_manifest(artifact_dir, manifest)
+                raise UnresolvedScaffoldStubError(hint)
             if not report.ok:
                 self._append_history(
                     manifest,
@@ -4686,6 +5048,67 @@ class StudioRunner:
             logger.debug("penpot handoff materialization failed", exc_info=True)
             return []
 
+    @staticmethod
+    def _record_pipeline_checkpoint(
+        manifest: Dict[str, Any],
+        *,
+        stage_index: int,
+        stage_name: str,
+    ) -> None:
+        """Forge/Ark-style checkpoint for resume after crash or restart."""
+        manifest["pipeline_checkpoint"] = {
+            "last_completed_index": stage_index,
+            "last_completed_stage": stage_name,
+            "resume_index": stage_index + 1,
+            "updated_at": time.time(),
+        }
+
+    @staticmethod
+    def _resume_start_index(manifest: Dict[str, Any]) -> int:
+        """Pick pipeline resume index from stage statuses and checkpoint."""
+        stages = manifest.get("stages") or []
+        first_incomplete = len(stages)
+        for idx, stage in enumerate(stages):
+            if isinstance(stage, dict) and str(stage.get("status") or "").lower() != "done":
+                first_incomplete = idx
+                break
+
+        checkpoint = manifest.get("pipeline_checkpoint") or {}
+        resume_index = checkpoint.get("resume_index")
+        if not isinstance(resume_index, int) or resume_index < 0:
+            return first_incomplete
+
+        # Never skip an incomplete stage; checkpoint helps when statuses lag.
+        if first_incomplete < len(stages):
+            return min(first_incomplete, resume_index)
+        return resume_index
+
+    def _studio_token_budget_limit(self) -> int:
+        try:
+            from skyn3t.config.settings import get_settings
+
+            return max(0, int(get_settings().studio_token_budget or 0))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _project_token_total(slug: str) -> int:
+        try:
+            from skyn3t.observability.token_tracker import get_default_tracker
+
+            row = get_default_tracker().for_project(slug)
+            if not row:
+                return 0
+            return int(row.get("total_tokens") or 0)
+        except Exception:
+            return 0
+
+    def _studio_token_budget_exceeded(self, slug: str) -> bool:
+        limit = self._studio_token_budget_limit()
+        if limit <= 0:
+            return False
+        return self._project_token_total(slug) >= limit
+
     def _normalize_manifest(self, manifest: Dict[str, Any]) -> Dict[str, Any]:
         manifest.setdefault("stages", [])
         manifest.setdefault("artifacts", [])
@@ -4705,6 +5128,8 @@ class StudioRunner:
         manifest.setdefault("current_stage", None)
         manifest.setdefault("current_agent", None)
         manifest.setdefault("next_action", "")
+        manifest.setdefault("pipeline_checkpoint", None)
+        manifest.setdefault("token_budget", None)
         manifest["mission_setup"] = normalize_mission_setup(manifest.get("mission_setup"))
         manifest["repo_target"] = normalize_repo_target(manifest.get("repo_target"))
         if "workflow_summary" not in manifest:
@@ -4837,7 +5262,7 @@ class StudioRunner:
     # enough: v15 scored 100/100 but the program didn't boot until
     # four manual fixes. Now we require boot=yes AND build=yes AND
     # reviewer >= REVIEWER_SCORE_THRESHOLD before declaring done.
-    REVIEWER_SCORE_THRESHOLD = 75
+    REVIEWER_SCORE_THRESHOLD = 80
 
     def _finalize_project_outcome(
         self,
@@ -4902,8 +5327,16 @@ class StudioRunner:
 
         # 2. Reviewer-driven outcome, with the score threshold layered on.
         if quality is None:
-            # No reviewer ran at all — fall back to verifier signals.
-            # If verifiers said yes (or skipped), that's enough for done.
+            # Code builds should always record a reviewer verdict. If we
+            # ran mechanical verifiers but have no quality signal, don't
+            # silently mark the run as shippable.
+            if manifest is not None and manifest.get("build_verification") is not None:
+                return (
+                    "needs_fixes",
+                    "Build verification ran but no reviewer score was recorded — "
+                    "inspect the scaffold before shipping.",
+                    None,
+                )
             return "done", "Project finished — open an artifact or download the zip.", None
 
         verdict = str(quality.get("verdict") or "").strip().lower()
@@ -5054,10 +5487,11 @@ class StudioRunner:
             "sonarr", "radarr", "plex", "jellyfin", "unifi", "home assistant",
         )
         cue_hits = sum(1 for cue in integration_cues if cue in text)
-        if len(words) <= 12 and cue_hits == 0:
-            return "fast"
         if len(words) >= 80 or cue_hits >= 2:
             return "deep"
+        # Default balanced. Short prompts like "build a habit tracker"
+        # used to auto-select "fast", which cut critique rounds and
+        # produced thin, demo-quality scaffolds.
         return "balanced"
 
     @staticmethod
@@ -5322,6 +5756,8 @@ class StudioRunner:
             floor = max(60.0, floor * 0.6)
         elif profile == "deep":
             floor = floor * 1.3
+        if normalized == "code" and profile in {"balanced", "deep"}:
+            floor += 60.0
 
         return max(rounds_budget, floor)
 

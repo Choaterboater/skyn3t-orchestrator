@@ -10,6 +10,7 @@ No LLM dependency.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -75,15 +76,27 @@ class ContractVerifierAgent(BaseAgent):
 
         try:
             report = check_contract(scaffold_dir, brief, artifact_dir)
-        except Exception:
-            logger.exception("contract verifier failed; treating as pass to avoid blocking pipeline")
+        except Exception as exc:
+            logger.exception("contract verifier failed; blocking run until repaired")
             return TaskResult(
                 task_id=task.task_id, success=True,
                 output={
-                    "verdict": "pass",
-                    "blocker_count": 0,
+                    "verdict": "needs_fix",
+                    "blocker_count": 1,
                     "warning_count": 0,
-                    "report_json": '{"ok": true, "findings": []}',
+                    "report_json": json.dumps(
+                        {
+                            "ok": False,
+                            "findings": [
+                                {
+                                    "severity": "blocker",
+                                    "category": "contract_engine_crash",
+                                    "file": "(engine)",
+                                    "message": f"Contract engine crashed: {exc}",
+                                }
+                            ],
+                        }
+                    ),
                     "scaffold_dir": str(scaffold_dir),
                 },
             )

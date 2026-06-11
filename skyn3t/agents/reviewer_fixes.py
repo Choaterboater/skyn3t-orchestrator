@@ -26,8 +26,8 @@ from typing import List
 logger = logging.getLogger(__name__)
 
 
-MAX_FILES_FIXED = 3
-MAX_BUDGET_USD = 0.20  # Hard cap — we're already inside the build-level cap.
+MAX_FILES_FIXED = 5
+MAX_BUDGET_USD = 0.50  # Hard cap — we're already inside the build-level cap.
 MODEL_LADDER = (
     "openrouter/owl-alpha",       # free
     "xiaomi/mimo-v2-flash",       # cheap paid
@@ -207,7 +207,12 @@ def _resolve_to_scaffold(rel_or_name: str, scaffold_dir: Path) -> str:
     return ""
 
 
-def parse_review_for_fixes(review_md_text: str, scaffold_dir: Path) -> List[FixCandidate]:
+def parse_review_for_fixes(
+    review_md_text: str,
+    scaffold_dir: Path,
+    *,
+    max_files: int = MAX_FILES_FIXED,
+) -> List[FixCandidate]:
     """Pull (file, issue) pairs out of a review.md.
 
     Walks the review prose, splits into bullet/paragraph chunks. For
@@ -245,7 +250,7 @@ def parse_review_for_fixes(review_md_text: str, scaffold_dir: Path) -> List[FixC
             out.append(FixCandidate(file_path=resolved, issue=issue))
             seen_files.add(resolved)
             break  # one file per chunk — don't burn a chunk on 3 files
-        if len(out) >= MAX_FILES_FIXED:
+        if len(out) >= max(1, max_files):
             break
     return out
 
@@ -371,6 +376,8 @@ async def apply_reviewer_fixes(
     scaffold_dir: Path,
     brief: str,
     budget_usd: float = MAX_BUDGET_USD,
+    *,
+    max_files: int = MAX_FILES_FIXED,
 ) -> FixRunSummary:
     """Top-level entry point. Read review.md, find fixable candidates,
     run the fix loop within a budget cap. Returns a summary."""
@@ -384,7 +391,7 @@ async def apply_reviewer_fixes(
         summary.skipped_reason = "review.md unreadable"
         return summary
 
-    candidates = parse_review_for_fixes(review_text, scaffold_dir)
+    candidates = parse_review_for_fixes(review_text, scaffold_dir, max_files=max_files)
     summary.candidates_found = len(candidates)
     if not candidates:
         summary.skipped_reason = "no actionable file references in review"
