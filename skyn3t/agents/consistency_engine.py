@@ -66,7 +66,7 @@ _HALLUCINATION_WHITELIST: Set[str] = set()
 # as warnings, not errors.
 _IMPORT_RE = re.compile(
     r"""
-    ^\s*import\s+(?:(?:\{[^}]*\}|[^'"{}]*?)\s+from\s+)?['"]([^'"]+)['"];
+    ^\s*import\s+(?:(?:\{[^}]*\}|[^'"{}]*?)\s+from\s+)?['"]([^'"]+)['"]\s*;?
     """,
     re.VERBOSE | re.MULTILINE,
 )
@@ -468,6 +468,10 @@ def _scan_for_import_style_mismatch(
                         break
             if target is None:
                 continue  # broken_import check already flagged this
+            try:
+                target_rel = target.relative_to(scaffold_dir).as_posix()
+            except ValueError:
+                continue  # resolved above scaffold root — can't describe it
             has_default, named_exports = _get_exports(target)
 
             missing = [name for name in named if name not in named_exports]
@@ -488,13 +492,13 @@ def _scan_for_import_style_mismatch(
                         f"'{import_path}'` to `import {missing_name} "
                         f"from '{import_path}'`, or add "
                         f"`export {{ {missing_name} }}` to "
-                        f"{target.relative_to(scaffold_dir).as_posix()}."
+                        f"{target_rel}."
                     )
                 else:
                     suggestion = (
                         f"Either add `export {{ {missing_name} }}` "
                         f"or `export const {missing_name} = ...` to "
-                        f"{target.relative_to(scaffold_dir).as_posix()}, "
+                        f"{target_rel}, "
                         f"or remove the import."
                     )
                 issues.append(
@@ -1769,7 +1773,10 @@ def check_consistency(scaffold_dir: Path, brief: str = "") -> ConsistencyReport:
             resolved = _resolve_relative(path, src)
             if resolved is None:
                 continue
-            resolved_rel = resolved.relative_to(scaffold_dir).as_posix()
+            try:
+                resolved_rel = resolved.relative_to(scaffold_dir).as_posix()
+            except ValueError:
+                continue  # resolved above scaffold root — skip
             if resolved_rel in export_map:
                 export_map[resolved_rel].append(importer_rel)
             # Also match without extension

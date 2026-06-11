@@ -1877,18 +1877,27 @@ class CodeAgent(BaseAgent):
                                         event_bus=self.event_bus,
                                         caller_name=self.name,
                                     )
-                                    _try_body = await file_client.complete(
-                                        _entry_prompt,
-                                        system=(
-                                            "You write production-grade source code. "
-                                            "Never use TODO comments, placeholders, or "
-                                            "'replace with real implementation' language. "
-                                            "Output the complete file body only."
-                                        ),
-                                        max_tokens=8000,
-                                        temperature=0.2,
-                                        timeout=90.0,
-                                    )
+                                    # Per-model client owns an httpx pool;
+                                    # close it before the next ladder rung so
+                                    # long builds don't exhaust sockets/FDs.
+                                    try:
+                                        _try_body = await file_client.complete(
+                                            _entry_prompt,
+                                            system=(
+                                                "You write production-grade source code. "
+                                                "Never use TODO comments, placeholders, or "
+                                                "'replace with real implementation' language. "
+                                                "Output the complete file body only."
+                                            ),
+                                            max_tokens=8000,
+                                            temperature=0.2,
+                                            timeout=90.0,
+                                        )
+                                    finally:
+                                        try:
+                                            await file_client.aclose()
+                                        except Exception:
+                                            pass
                                 except Exception as _fp_exc:
                                     logger.warning(
                                         "OPENROUTER FAST-PATH %s failed for %s: %s",
@@ -2075,14 +2084,20 @@ class CodeAgent(BaseAgent):
                                 caller_name=self.name,
                                 backend_is_policy=bool(esc_backend),
                             )
-                            retry_body = await retry_client.complete(
-                                file_prompt,
-                                system=build_system,
-                                max_tokens=8000,
-                                temperature=0.3,
-                                timeout=_FILE_RETRY_TIMEOUT_SECONDS,
-                                _allow_backend_failover=False,
-                            )
+                            try:
+                                retry_body = await retry_client.complete(
+                                    file_prompt,
+                                    system=build_system,
+                                    max_tokens=8000,
+                                    temperature=0.3,
+                                    timeout=_FILE_RETRY_TIMEOUT_SECONDS,
+                                    _allow_backend_failover=False,
+                                )
+                            finally:
+                                try:
+                                    await retry_client.aclose()
+                                except Exception:
+                                    pass
                             if (
                                 (not retry_body or "[deterministic-stub]" in retry_body)
                                 and primary
@@ -2094,14 +2109,20 @@ class CodeAgent(BaseAgent):
                                     event_bus=self.event_bus,
                                     caller_name=self.name,
                                 )
-                                retry_body = await retry_client.complete(
-                                    file_prompt,
-                                    system=build_system,
-                                    max_tokens=8000,
-                                    temperature=0.3,
-                                    timeout=_FILE_RETRY_TIMEOUT_SECONDS,
-                                    _allow_backend_failover=False,
-                                )
+                                try:
+                                    retry_body = await retry_client.complete(
+                                        file_prompt,
+                                        system=build_system,
+                                        max_tokens=8000,
+                                        temperature=0.3,
+                                        timeout=_FILE_RETRY_TIMEOUT_SECONDS,
+                                        _allow_backend_failover=False,
+                                    )
+                                finally:
+                                    try:
+                                        await retry_client.aclose()
+                                    except Exception:
+                                        pass
                             marked_retry = _extract_marked_files(retry_body or "")
                             if marked_retry:
                                 retry_match = (
@@ -2209,18 +2230,24 @@ class CodeAgent(BaseAgent):
                                 f"Imports at the top, default export at the bottom for React components. "
                                 f"Match the brief's actual product — do not invent unrelated functionality."
                             )
-                            focused_body = await focused_client.complete(
-                                focused_prompt,
-                                system=(
-                                    "You write production-grade source code. "
-                                    "Never use TODO comments, placeholders, or 'replace with real implementation' "
-                                    "language. Generate the complete, working file. If the file is a React "
-                                    "component, build the actual UI the brief describes."
-                                ),
-                                max_tokens=8000,
-                                temperature=0.2,
-                                timeout=_FILE_RETRY_TIMEOUT_SECONDS,
-                            )
+                            try:
+                                focused_body = await focused_client.complete(
+                                    focused_prompt,
+                                    system=(
+                                        "You write production-grade source code. "
+                                        "Never use TODO comments, placeholders, or 'replace with real implementation' "
+                                        "language. Generate the complete, working file. If the file is a React "
+                                        "component, build the actual UI the brief describes."
+                                    ),
+                                    max_tokens=8000,
+                                    temperature=0.2,
+                                    timeout=_FILE_RETRY_TIMEOUT_SECONDS,
+                                )
+                            finally:
+                                try:
+                                    await focused_client.aclose()
+                                except Exception:
+                                    pass
                             focused_body = _strip_cli_prelude((focused_body or "").strip(), rel)
                             focused_body = _strip_fences(focused_body)
                             focused_body = _strip_copilot_footer(focused_body)
@@ -2340,18 +2367,27 @@ class CodeAgent(BaseAgent):
                                             default_model=_m,
                                             backend="openrouter",
                                         )
-                                        _or_body = await or_client.complete(
-                                            _focused_prompt_or,
-                                            system=(
-                                                "You write production-grade source code. "
-                                                "Never use TODO comments, placeholders, or "
-                                                "'replace with real implementation' language. "
-                                                "Generate the complete, working file."
-                                            ),
-                                            max_tokens=8000,
-                                            temperature=0.2,
-                                            timeout=90.0,
-                                        )
+                                        # Close each per-model client's httpx
+                                        # pool before the next rung — otherwise
+                                        # a long ladder leaks sockets/FDs.
+                                        try:
+                                            _or_body = await or_client.complete(
+                                                _focused_prompt_or,
+                                                system=(
+                                                    "You write production-grade source code. "
+                                                    "Never use TODO comments, placeholders, or "
+                                                    "'replace with real implementation' language. "
+                                                    "Generate the complete, working file."
+                                                ),
+                                                max_tokens=8000,
+                                                temperature=0.2,
+                                                timeout=90.0,
+                                            )
+                                        finally:
+                                            try:
+                                                await or_client.aclose()
+                                            except Exception:
+                                                pass
                                         _or_body = _strip_cli_prelude((_or_body or "").strip(), rel)
                                         _or_body = _strip_fences(_or_body)
                                         if (
@@ -3055,7 +3091,26 @@ class CodeAgent(BaseAgent):
                             timeout=120,
                         )
                         body = await coro
-                        if not body or "TODO" in body or "skyn3t-backfill" in body:
+                        # Apply the same fence/prelude sanitization the other
+                        # generation paths use — CLI/OpenRouter backends often
+                        # wrap output in ``` fences or lead with prose, which
+                        # would otherwise be written verbatim and break the
+                        # build. Gate on the syntax check so a fenced/truncated
+                        # body falls through to the deterministic placeholder.
+                        body = _strip_cli_prelude((body or "").strip(), rel_path)
+                        body = _strip_fences(body)
+                        body = _strip_copilot_footer(body)
+                        # Reject only genuine stub markers — a blanket
+                        # `"TODO" in body` wrongly discarded legitimate files
+                        # that merely mention "TODO" (a comment, a todo-app's
+                        # own UI text, etc.).
+                        if (
+                            not body
+                            or "[deterministic-stub]" in body
+                            or "TODO[skyn3t]" in body
+                            or "skyn3t-backfill" in body
+                            or not _syntax_ok(body, rel_path)
+                        ):
                             body = None
                     except Exception:
                         body = None

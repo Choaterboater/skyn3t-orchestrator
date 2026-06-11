@@ -169,10 +169,29 @@ class NeverStopWatchdog:
         try:
             stop_fn = getattr(inst, "stop", None)
             if callable(stop_fn) and getattr(inst, "_running", False):
-                result = stop_fn()
-                if asyncio.iscoroutine(result):
-                    await result
+                # A component's stop() does ``await self._task`` and only swallows
+                # CancelledError. When the loop died with a non-CancelledError
+                # exception (e.g. ImportError above the inner try), awaiting that
+                # finished task re-raises it — which would abort recovery before
+                # start() ever runs and leave _running stuck True, looping the
+                # same failure forever. Swallow ALL exceptions from stop() here.
+                try:
+                    result = stop_fn()
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception:
+                    logger.debug(
+                        "never-stop: %s stop() raised during recovery (ignored)",
+                        name,
+                        exc_info=True,
+                    )
                 reason = "task_died_after_stop"
+
+            # Clear any finished task reference and reset _running so start()
+            # actually restarts the loop (start() short-circuits while _running
+            # is True, and stop() may have re-raised before nulling the task).
+            self._clear_dead_task(inst, name)
+            setattr(inst, "_running", False)
 
             start_fn = getattr(inst, "start", None)
             if not callable(start_fn):
@@ -190,6 +209,13 @@ class NeverStopWatchdog:
         except Exception as exc:
             logger.exception("never-stop recovery failed for %s", name)
             self._publish_recovery(name, reason=f"recovery_failed:{exc}")
+
+    def _clear_dead_task(self, inst: Any, name: str) -> None:
+        """Null out a finished task reference so start() recreates it."""
+        attr = "_dispatcher_task" if name == "agent_fleet" else "_task"
+        task = getattr(inst, attr, None)
+        if task is not None and task.done():
+            setattr(inst, attr, None)
 
     async def _maybe_replenish_queue(self) -> None:
         from skyn3t.config.settings import get_settings

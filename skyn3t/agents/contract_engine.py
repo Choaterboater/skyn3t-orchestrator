@@ -105,61 +105,82 @@ _HEX_RE = re.compile(r"#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b")
 _TECH_STACK_ROLES: Tuple[str, ...] = ("frontend", "backend", "db")
 
 # Architecture-mention keyword tuple -> (required npm package fragments,
-# required source-code import patterns). The second field is what fixes
-# canary-115's false-pass: package.json declared `next` but no `app/`
-# directory or `from "next"` import existed, so the architecture's
-# Next.js claim was a lie. The drift check now verifies both that the
-# package is declared AND that at least one import pattern appears in
-# non-vendor source.
+# required source-code import patterns, owning role). The import_patterns
+# field is what fixes canary-115's false-pass: package.json declared
+# `next` but no `app/` directory or `from "next"` import existed, so the
+# architecture's Next.js claim was a lie. The drift check now verifies
+# both that the package is declared AND that at least one import pattern
+# appears in non-vendor source.
 #
 # Empty import_patterns means "package declaration is sufficient" — use
 # this when the dep doesn't have a recognizable import shape (e.g. CSS-
 # only deps).
-ARCHITECTURE_TECH_MAP: List[Tuple[Tuple[str, ...], List[str], List[str]]] = [
+#
+# The role field ("frontend" | "backend") tells the auto-fix WHICH
+# package.json the missing dep belongs in. Frontend frameworks (Next.js,
+# SvelteKit) own the root manifest; backend/db/infra deps (hono, fastify,
+# pg, prisma, drizzle, node-cron, aes-256-gcm…) belong in server/. Before
+# this field existed the role was derived from arch_path — which never
+# contains "server" — so it was ALWAYS "frontend" and backend deps were
+# added to the ROOT package.json, producing a re-check that passed (deps
+# are unioned) while server/ still couldn't boot.
+ARCHITECTURE_TECH_MAP: List[Tuple[Tuple[str, ...], List[str], List[str], str]] = [
     # framework mismatches
     ((r"\bnext\.?js\b", r"\bapp router\b"),
      ["next"],
-     [r"from\s+['\"]next/", r"import\s+.*\s+from\s+['\"]next['\"]"]),
+     [r"from\s+['\"]next/", r"import\s+.*\s+from\s+['\"]next['\"]"],
+     "frontend"),
     ((r"\bhono\b",),
      ["hono", "@hono/node-server"],
-     [r"from\s+['\"]hono['\"]", r"new\s+Hono\s*\("]),
+     [r"from\s+['\"]hono['\"]", r"new\s+Hono\s*\("],
+     "backend"),
     ((r"\bfastify\b",),
      ["fastify"],
-     [r"require\s*\(\s*['\"]fastify['\"]", r"from\s+['\"]fastify['\"]"]),
+     [r"require\s*\(\s*['\"]fastify['\"]", r"from\s+['\"]fastify['\"]"],
+     "backend"),
     ((r"\bnestjs\b", r"\bnest\.js\b"),
      ["@nestjs/core"],
-     [r"from\s+['\"]@nestjs/"]),
+     [r"from\s+['\"]@nestjs/"],
+     "backend"),
     ((r"\bsveltekit\b", r"\bsvelte ?kit\b"),
      ["@sveltejs/kit"],
-     [r"from\s+['\"]@sveltejs/kit['\"]"]),
+     [r"from\s+['\"]@sveltejs/kit['\"]"],
+     "frontend"),
     # databases
     ((r"\bbetter-?sqlite3?\b",),
      ["better-sqlite3"],
-     [r"require\s*\(\s*['\"]better-sqlite3['\"]", r"from\s+['\"]better-sqlite3['\"]"]),
+     [r"require\s*\(\s*['\"]better-sqlite3['\"]", r"from\s+['\"]better-sqlite3['\"]"],
+     "backend"),
     ((r"\bprisma\b",),
      ["@prisma/client", "prisma"],
-     [r"from\s+['\"]@prisma/client['\"]", r"new\s+PrismaClient\s*\("]),
+     [r"from\s+['\"]@prisma/client['\"]", r"new\s+PrismaClient\s*\("],
+     "backend"),
     ((r"\bdrizzle\b",),
      ["drizzle-orm"],
-     [r"from\s+['\"]drizzle-orm"]),
+     [r"from\s+['\"]drizzle-orm"],
+     "backend"),
     ((r"\bpostgres(?:ql)?\b", r"\bpg\b"),
      ["pg", "postgres", "@vercel/postgres"],
-     [r"require\s*\(\s*['\"]pg['\"]", r"from\s+['\"]pg['\"]", r"from\s+['\"]postgres['\"]"]),
+     [r"require\s*\(\s*['\"]pg['\"]", r"from\s+['\"]pg['\"]", r"from\s+['\"]postgres['\"]"],
+     "backend"),
     ((r"\bmongodb\b", r"\bmongoose\b"),
      ["mongodb", "mongoose"],
-     [r"from\s+['\"]mongoose['\"]", r"require\s*\(\s*['\"]mongodb['\"]"]),
+     [r"from\s+['\"]mongoose['\"]", r"require\s*\(\s*['\"]mongodb['\"]"],
+     "backend"),
     # scheduling — architecture promises cron but scaffold rarely ships it
     ((r"\bnode-cron\b", r"\bcron jobs?\b"),
      ["node-cron", "croner", "agenda"],
      [r"require\s*\(\s*['\"]node-cron['\"]", r"from\s+['\"]node-cron['\"]",
-      r"from\s+['\"]croner['\"]", r"new\s+Agenda\s*\("]),
+      r"from\s+['\"]croner['\"]", r"new\s+Agenda\s*\("],
+     "backend"),
     # AES-256-GCM is a stdlib feature, but architecture promises it
     # specifically — check for the actual call shape, not just `crypto`
     # (every node project imports crypto somewhere).
     ((r"\baes-?256-?gcm\b", r"\benvelope encryption\b"),
      ["crypto", "node:crypto"],
      [r"createCipheriv\s*\(\s*['\"]aes-256-gcm",
-      r"createDecipheriv\s*\(\s*['\"]aes-256-gcm"]),
+      r"createDecipheriv\s*\(\s*['\"]aes-256-gcm"],
+     "backend"),
 ]
 
 # tech-stack name -> npm-package fragments. Match rule: at least one
@@ -712,7 +733,7 @@ def _check_architecture_drift(scaffold_dir: Path, artifact_dir: Path) -> List[Co
     declared_deps = _read_package_deps(scaffold_dir)
     source_blob = _scaffold_source_blob(scaffold_dir)
     seen: Set[str] = set()
-    for keyword_patterns, expected_packages, import_patterns in ARCHITECTURE_TECH_MAP:
+    for keyword_patterns, expected_packages, import_patterns, role in ARCHITECTURE_TECH_MAP:
         if not any(re.search(kw, pruned, re.IGNORECASE) for kw in keyword_patterns):
             continue
 
@@ -734,9 +755,11 @@ def _check_architecture_drift(scaffold_dir: Path, artifact_dir: Path) -> List[Co
             continue
         seen.add(label)
 
-        target_pkg = _package_json_for_role(
-            scaffold_dir, "backend" if "server" in str(arch_path).lower() else "frontend"
-        )
+        # Route the missing dep to the right manifest based on the tech's
+        # owning role, NOT arch_path (which never contains "server" and so
+        # always resolved to "frontend" — sending backend/db deps to the
+        # ROOT package.json while server/ stayed unbootable).
+        target_pkg = _package_json_for_role(scaffold_dir, role)
 
         # Tailor the message to which gate failed — package missing,
         # vs declared-but-unused (the canary-115 false-pass case).
@@ -770,6 +793,7 @@ def _check_architecture_drift(scaffold_dir: Path, artifact_dir: Path) -> List[Co
             suggestion=suggestion,
             fix_hint={
                 "keyword": label,
+                "role": role,
                 "expected_packages": expected_packages,
                 "expected_import_patterns": import_patterns,
                 "package_declared": package_declared,

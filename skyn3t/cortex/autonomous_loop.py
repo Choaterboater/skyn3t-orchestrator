@@ -117,6 +117,22 @@ def _reset_daily_counters(state: LoopState) -> None:
         state.daily_spend_usd = 0.0
 
 
+def _parse_schedule_expr(schedule_expr: str):
+    """Resolve a scout cadence expression to its first next_run, or None.
+
+    Delegates to ``SchedulerAgent._parse_schedule`` so the autonomous loop and
+    the scheduler agree on which cadence forms (including ``interval:<N><unit>``)
+    are valid. Returns ``None`` when the expression cannot be parsed.
+    """
+    try:
+        from skyn3t.agents.scheduler_agent import SchedulerAgent
+
+        return SchedulerAgent._parse_schedule(SchedulerAgent.__new__(SchedulerAgent), schedule_expr)
+    except Exception:
+        logger.debug("scout schedule parse failed for %r", schedule_expr, exc_info=True)
+        return None
+
+
 async def ensure_autonomous_scout_schedule(orchestrator: Any) -> Dict[str, Any]:
     """Create a recurring repo-scout job when autonomous learning is on."""
     from skyn3t.config.settings import get_settings
@@ -152,6 +168,15 @@ async def ensure_autonomous_scout_schedule(orchestrator: Any) -> Dict[str, Any]:
         "queries": list(cfg.cortex_scout_fit_queries or [])[:5],
         "platforms": ["github"],
     }
+
+    # Compute a concrete first next_run so the recurring job actually fires.
+    # If the cadence expression is unparseable we must NOT claim it is
+    # scheduled — otherwise next_run stays None forever and status lies.
+    next_run = _parse_schedule_expr(schedule_expr)
+    if next_run is None:
+        logger.warning("autonomous scout schedule %r is unparseable; not scheduling", schedule_expr)
+        return {"scheduled": False, "reason": f"unparseable schedule: {schedule_expr}"}
+
     job_id = str(uuid4())
     try:
         await memory.save_scheduled_job(
@@ -161,13 +186,19 @@ async def ensure_autonomous_scout_schedule(orchestrator: Any) -> Dict[str, Any]:
             agent_name="github_repo_scout",
             prompt=json.dumps(scout_config, sort_keys=True),
             enabled=True,
-            next_run=None,
+            next_run=next_run,
             run_count=0,
         )
     except Exception as exc:
         logger.exception("failed to save autonomous scout job")
         return {"scheduled": False, "reason": str(exc)}
-    return {"scheduled": True, "job_id": job_id, "existing": False, "schedule_expr": schedule_expr}
+    return {
+        "scheduled": True,
+        "job_id": job_id,
+        "existing": False,
+        "schedule_expr": schedule_expr,
+        "next_run": next_run.isoformat(),
+    }
 
 
 class AutonomousCoordinator:

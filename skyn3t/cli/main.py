@@ -656,8 +656,9 @@ def _apply_install_wizard_choice(
         _upsert_env_setting(target_env, "OPENROUTER_API_KEY", openrouter_api_key)
     if enable_quality_env:
         _upsert_env_setting(target_env, "SKYN3T_AUTO_RETRY", "1")
-        # Prefer Docker pool isolation for CodeAgent Python execution when
-        # Docker is available; get_backend("auto") falls back to inline.
+        # Prefer Docker pool isolation for CodeAgent Python execution. When
+        # Docker is unavailable, get_backend("auto") refuses to run untrusted
+        # code in-process unless SKYN3T_ALLOW_INLINE_EXEC=1 is set.
         _upsert_env_setting(target_env, "SKYN3T_EXECUTION_BACKEND", "auto")
 
     applied_policies: Dict[str, str] = {}

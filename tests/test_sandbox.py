@@ -120,8 +120,17 @@ class TestGetBackend:
         assert isinstance(backend, InlineBackend)
 
     @pytest.mark.asyncio
-    async def test_auto_falls_back_when_docker_missing(self, monkeypatch) -> None:
+    async def test_auto_raises_when_docker_missing_and_inline_not_allowed(self, monkeypatch) -> None:
+        # SECURITY (C1): "auto" must NOT silently fall back to in-process exec.
         monkeypatch.setattr("shutil.which", lambda _name: None)
+        monkeypatch.delenv("SKYN3T_ALLOW_INLINE_EXEC", raising=False)
+        with pytest.raises(RuntimeError, match="in-process execution is disabled"):
+            await get_backend("auto")
+
+    @pytest.mark.asyncio
+    async def test_auto_allows_inline_only_with_explicit_optin(self, monkeypatch) -> None:
+        monkeypatch.setattr("shutil.which", lambda _name: None)
+        monkeypatch.setenv("SKYN3T_ALLOW_INLINE_EXEC", "1")
         backend = await get_backend("auto")
         assert isinstance(backend, InlineBackend)
 

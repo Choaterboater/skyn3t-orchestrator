@@ -1616,6 +1616,20 @@ class StudioRunner:
                     )
                     break
 
+                # Merge the isolated code worktree back into scaffold/ as
+                # soon as the code stage succeeds. CodeAgent wrote into
+                # artifact_dir/.worktrees/<track>; every downstream reader
+                # below (contract verifier, consistency reviewer, post-code
+                # checks, the final verifiers and delivered scaffold) reads
+                # artifact_dir/scaffold. Without this the main checkout is
+                # empty. No-op when worktree isolation wasn't enabled.
+                if stage.name == "code":
+                    try:
+                        if self._merge_worktree_into_scaffold(artifact_dir, manifest):
+                            self._save_manifest(artifact_dir, manifest)
+                    except Exception:
+                        logger.exception("worktree merge-back failed")
+
                 # Contract verifier fix loop: deterministic
                 # palette/tech_stack/placeholder findings → targeted
                 # regen of the offending files. Runs before the
@@ -2840,6 +2854,10 @@ class StudioRunner:
             is_stub_bail = isinstance(exc, UnresolvedScaffoldStubError)
             is_missing_files_bail = isinstance(exc, MissingPlannedFilesError)
             is_intentional_bail = is_stack_mismatch or is_stub_bail or is_missing_files_bail
+            # Tracks whether the bail branch below decided to give up (e.g.
+            # stub retries exhausted) so we don't fire an auto-retry that
+            # claims "Retrying with…" when next_action says we stopped.
+            bail_gave_up = False
             if is_intentional_bail:
                 logger.info(
                     "studio runner bailed for slug=%s (intentional): %s", slug, exc
@@ -2866,6 +2884,7 @@ class StudioRunner:
                 # Cap the retry depth — prevent infinite stub loops.
                 retry_depth = str(slug).count("-retry")
                 if retry_depth >= 3:
+                    bail_gave_up = True
                     manifest["next_action"] = (
                         "Project failed: unresolved stub error persisted "
                         f"after {retry_depth} retry attempts. Giving up."
@@ -2913,6 +2932,26 @@ class StudioRunner:
                 )
             except Exception:
                 logger.exception("failure thread update failed")
+            # Auto-retry for the intentional bails that promise a retry in
+            # next_action ("Retrying with…"). Without this, those paths
+            # re-raised and dead-ended — claiming a retry that never fired.
+            # The stack-mismatch bail intentionally stops, so it's excluded.
+            # _maybe_auto_retry enforces its own one-retry-per-project cap
+            # (slug "-retry" suffix), so this can't loop.
+            should_auto_retry_bail = (
+                (is_missing_files_bail or (is_stub_bail and not bail_gave_up))
+                and os.environ.get("SKYN3T_AUTO_RETRY", "1").strip().lower()
+                not in ("0", "false", "no", "off")
+            )
+            if should_auto_retry_bail:
+                try:
+                    await self._maybe_auto_retry(
+                        manifest,
+                        str(manifest.get("brief_raw") or manifest.get("brief") or brief),
+                        slug,
+                    )
+                except Exception:
+                    logger.exception("auto-retry on intentional bail failed for slug=%s", slug)
             raise
         finally:
             try:
@@ -6003,13 +6042,112 @@ class StudioRunner:
             }
         )
 
+    def _merge_worktree_into_scaffold(
+        self, artifact_dir: Path, manifest: Dict[str, Any]
+    ) -> bool:
+        """Merge an isolated code-stage worktree back into ``scaffold/``.
+
+        CodeAgent runs in ``artifact_dir/.worktrees/<track>`` when worktree
+        isolation is enabled (see the ``stage.name == "code"`` setup). Those
+        files never reach ``scaffold/``, so post-code checks, verifiers, and
+        the delivered scaffold read the empty main checkout. This copies the
+        worktree's file tree into ``scaffold/`` (preferring a ``git merge
+        --ff-only`` of the worktree branch when the repo state allows it),
+        then removes the worktree. No-op when no worktree was created.
+
+        Returns True when a merge-back was performed.
+        """
+        wt = manifest.get("worktree")
+        if not isinstance(wt, dict):
+            return False
+        wt_path_raw = wt.get("path")
+        if not wt_path_raw:
+            return False
+        scaffold_dir = artifact_dir / "scaffold"
+        wt_path = Path(wt_path_raw)
+        if not wt_path.exists():
+            # Worktree already cleaned up (e.g. resumed run). Nothing to do.
+            manifest.pop("worktree", None)
+            return False
+        merged = False
+        # Preferred path: fast-forward the worktree branch into the scaffold
+        # checkout so git history stays coherent. Falls back to a file-tree
+        # copy if the main checkout has diverged or isn't a usable repo.
+        try:
+            from skyn3t.worktree import _run_git, is_git_repo
+
+            branch = str(wt.get("branch") or "")
+            if branch and is_git_repo(scaffold_dir) and is_git_repo(wt_path):
+                # Commit any uncommitted worktree changes onto its branch
+                # first; otherwise the ff-only merge sees nothing.
+                _run_git(wt_path, "add", "-A")
+                _run_git(
+                    wt_path,
+                    "commit",
+                    "-m",
+                    "chore: skyn3t code stage",
+                    "--allow-empty",
+                )
+                ff = _run_git(scaffold_dir, "merge", "--ff-only", branch)
+                merged = ff.returncode == 0
+                if not merged:
+                    logger.debug(
+                        "worktree ff-only merge failed (%s); falling back to copy",
+                        ff.stderr.strip() or ff.stdout.strip(),
+                    )
+        except Exception:
+            logger.debug("worktree git merge-back failed; falling back to copy", exc_info=True)
+
+        if not merged:
+            # File-tree copy fallback: overlay the worktree onto scaffold/,
+            # skipping git metadata. This always lands the generated files.
+            try:
+                import shutil
+
+                scaffold_dir.mkdir(parents=True, exist_ok=True)
+                for src in wt_path.rglob("*"):
+                    rel = src.relative_to(wt_path)
+                    if rel.parts and rel.parts[0] == ".git":
+                        continue
+                    dest = scaffold_dir / rel
+                    if src.is_dir():
+                        dest.mkdir(parents=True, exist_ok=True)
+                    else:
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src, dest)
+                merged = True
+            except Exception:
+                logger.exception("worktree file-tree copy-back failed")
+
+        # Clean up the worktree regardless of merge strategy so the next
+        # stage / retry starts from a clean tree.
+        try:
+            from skyn3t.worktree import remove_worktree
+
+            remove_worktree(scaffold_dir, wt_path, force=True)
+        except Exception:
+            logger.debug("remove_worktree failed", exc_info=True)
+        manifest.pop("worktree", None)
+        if merged:
+            logger.info(
+                "merged code worktree track=%s back into scaffold/", wt.get("track")
+            )
+        return merged
+
     def _save_manifest(self, artifact_dir: Path, manifest: Dict[str, Any]) -> None:
         manifest = self._normalize_manifest(manifest)
         history = manifest.get("history") or []
         if len(history) > 200:
             manifest["history"] = history[-200:]
         manifest["updated_at"] = time.time()
-        (artifact_dir / "project.json").write_text(json.dumps(manifest, indent=2))
+        # Atomic write: render to project.json.tmp then os.replace() so a
+        # crash mid-write can't leave a truncated/corrupt manifest on disk
+        # (mirrors studio/approval_gate._atomic_write).
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        target = artifact_dir / "project.json"
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        os.replace(tmp, target)
 
     def mark_project_failed(
         self,

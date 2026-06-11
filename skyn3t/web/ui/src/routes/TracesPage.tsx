@@ -5,18 +5,47 @@ import { api } from "../api/client";
 // Recent finished spans, newest first. Click one to see attrs + status.
 // This is a debugging view — not the kind of thing you stare at, but
 // you want it when something is slow or failing.
+//
+// Backend shape (TraceSpan.to_dict): id, trace_id, parent_id, name,
+// start_time/end_time as ISO strings, duration_ms, status, attributes.
+// The error message (if any) lives in attributes.status_message — there
+// is no top-level error field.
 type Span = {
+  id: string;
   trace_id: string;
-  span_id: string;
   name: string;
-  start_ts?: number;
-  end_ts?: number;
+  start_time?: string;
+  end_time?: string;
   duration_ms?: number;
   status?: string;
   attributes?: Record<string, any>;
-  error?: string;
   parent_id?: string | null;
 };
+
+// Normalized view model derived from the backend span, with the fields the
+// UI actually renders. Exported so it can be unit-tested in isolation.
+export type SpanView = Span & {
+  span_id: string;
+  startedLabel: string | null;
+  error: string | null;
+};
+
+export function normalizeSpan(raw: Span): SpanView {
+  const startedLabel = raw.start_time
+    ? new Date(raw.start_time).toLocaleString()
+    : null;
+  const statusMessage = raw.attributes?.status_message;
+  const error =
+    typeof statusMessage === "string" && statusMessage.length > 0
+      ? statusMessage
+      : null;
+  return {
+    ...raw,
+    span_id: raw.id,
+    startedLabel,
+    error,
+  };
+}
 
 export default function TracesPage() {
   const [selected, setSelected] = useState<string | null>(null);
@@ -26,9 +55,12 @@ export default function TracesPage() {
     refetchInterval: 8_000,
   });
 
-  const spans: Span[] = (data ?? []) as Span[];
+  const spans: SpanView[] = useMemo(
+    () => ((data ?? []) as Span[]).map(normalizeSpan),
+    [data],
+  );
   const sel = useMemo(
-    () => spans.find((s) => s.span_id === selected) ?? null,
+    () => spans.find((s) => s.id === selected) ?? null,
     [spans, selected],
   );
 
@@ -79,11 +111,11 @@ export default function TracesPage() {
               )}
               {spans.map((s) => (
                 <tr
-                  key={s.span_id}
-                  onClick={() => setSelected(s.span_id)}
+                  key={s.id}
+                  onClick={() => setSelected(s.id)}
                   className={[
                     "border-t border-border cursor-pointer",
-                    selected === s.span_id
+                    selected === s.id
                       ? "bg-accent-soft"
                       : "hover:bg-bg-3",
                   ].join(" ")}
@@ -93,7 +125,7 @@ export default function TracesPage() {
                       {s.name}
                     </div>
                     <div className="text-[0.6rem] text-text-dim font-mono mt-0.5 truncate">
-                      {s.span_id?.slice(0, 12)}
+                      {s.id?.slice(0, 12)}
                       {s.parent_id ? ` ← ${s.parent_id.slice(0, 8)}` : ""}
                     </div>
                   </td>
@@ -121,7 +153,7 @@ export default function TracesPage() {
   );
 }
 
-function SpanDetail({ s }: { s: Span }) {
+function SpanDetail({ s }: { s: SpanView }) {
   return (
     <div className="rounded-lg border border-border bg-bg-2 p-3 space-y-3 max-h-[75vh] overflow-y-auto">
       <div>
@@ -130,17 +162,12 @@ function SpanDetail({ s }: { s: Span }) {
         </div>
         <div className="font-mono text-sm break-all">{s.name}</div>
       </div>
-      <Kv label="span_id" value={s.span_id} mono />
+      <Kv label="span_id" value={s.id} mono />
       <Kv label="trace_id" value={s.trace_id} mono />
       {s.parent_id && <Kv label="parent_id" value={s.parent_id} mono />}
       <Kv label="duration" value={formatDuration(s.duration_ms)} />
       <Kv label="status" value={s.status ?? "—"} />
-      {s.start_ts && (
-        <Kv
-          label="started"
-          value={new Date(s.start_ts * 1000).toLocaleString()}
-        />
-      )}
+      {s.startedLabel && <Kv label="started" value={s.startedLabel} />}
       {s.error && (
         <div>
           <div className="text-xs uppercase tracking-wider text-status-red mb-1">

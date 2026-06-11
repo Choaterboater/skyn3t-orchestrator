@@ -702,36 +702,49 @@ async def enforce_request_size(request: Request, call_next):
             )
         return await call_next(request)
 
-    # Chunked / no-Content-Length uploads still need a hard cap.
-    # Wrap the ASGI receive callable to count bytes as they stream in
-    # and bail with 413 once the cap is exceeded. Without this, a
-    # malicious chunked POST can stream unlimited bytes through the
-    # middleware.
-    original_receive = request.receive
-    counter = {"bytes": 0, "exceeded": False}
+    # Chunked / no-Content-Length uploads still need a hard cap. Drain the
+    # body HERE, before call_next, capping as we go — and short-circuit with a
+    # 413 the moment the cap is crossed. The route never runs, so it can't
+    # buffer the oversized body or fire its side effects (e.g. /api/rag/add
+    # persisting embeddings).
+    #
+    # The earlier approach — counting bytes in a receive wrapper and overriding
+    # the response after call_next — was illusory: the route had already
+    # consumed the whole body and run before the 413 was surfaced. Raising from
+    # the receive wrapper doesn't work cleanly either: Starlette's
+    # BaseHTTPMiddleware runs the downstream app under an anyio task group, so
+    # the exception comes back wrapped in an ExceptionGroup and FastAPI's body
+    # parser turns it into a generic 400 instead of our 413.
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_REQUEST_BODY_BYTES:
+            return JSONResponse(
+                {"error": f"request body too large (>{MAX_REQUEST_BODY_BYTES} bytes)"},
+                status_code=413,
+            )
+        chunks.append(chunk)
 
-    async def _counting_receive():
-        message = await original_receive()
-        if message.get("type") == "http.request":
-            body = message.get("body") or b""
-            counter["bytes"] += len(body)
-            if counter["bytes"] > MAX_REQUEST_BODY_BYTES:
-                counter["exceeded"] = True
-        return message
-
-    request._receive = _counting_receive  # type: ignore[attr-defined]
-    response = await call_next(request)
-    if counter["exceeded"]:
-        return JSONResponse(
-            {"error": f"request body too large (>{MAX_REQUEST_BODY_BYTES} bytes)"},
-            status_code=413,
-        )
-    return response
+    # Cache the (within-cap) body so the downstream route reads it from memory
+    # instead of re-consuming the now-exhausted stream.
+    request._body = b"".join(chunks)  # type: ignore[attr-defined]
+    return await call_next(request)
 
 
 @app.middleware("http")
 async def enforce_web_access(request: Request, call_next):
-    if request.method == "OPTIONS" or request.url.path.startswith("/webhooks/"):
+    # OPTIONS (CORS preflight) and inbound webhooks are exempt from the web
+    # token. /api/discord/interactions is also exempt: Discord calls it from
+    # remote, tokenless servers and the endpoint enforces its own Ed25519
+    # signature check (the real gate) — web-token-gating it would 401 every
+    # interaction before that verification runs.
+    path = request.url.path
+    if (
+        request.method == "OPTIONS"
+        or path.startswith("/webhooks/")
+        or path == "/api/discord/interactions"
+    ):
         return await call_next(request)
     allowed, detail, should_issue_cookie = _authorize_http_request(request)
     if not allowed:
@@ -1481,7 +1494,7 @@ async def execution_backend_patch(payload: Dict[str, Any]):
         return JSONResponse(
             {
                 "error": "Docker is not available on this host",
-                "hint": "Install Docker or use backend=auto for inline fallback",
+                "hint": "Install Docker, or set SKYN3T_ALLOW_INLINE_EXEC=1 and use backend=inline for trusted local dev only",
             },
             status_code=400,
         )
@@ -1491,11 +1504,21 @@ async def execution_backend_patch(payload: Dict[str, Any]):
     os.environ["SKYN3T_EXECUTION_BACKEND"] = backend
     get_settings.cache_clear()
 
-    resolved_class = (await get_backend(backend)).__class__.__name__
+    # ``get_backend("auto")`` now refuses to silently fall back to in-process
+    # exec: it raises when Docker is unavailable and inline opt-in is unset.
+    # The selection is still persisted (it becomes usable once Docker is
+    # present), but report honestly instead of 500-ing.
+    try:
+        resolved_class: Optional[str] = (await get_backend(backend)).__class__.__name__
+        warning = None
+    except RuntimeError as exc:
+        resolved_class = None
+        warning = str(exc)
     return {
         "ok": True,
         "configured": backend,
         "resolved_class": resolved_class,
+        "warning": warning,
         "env_path": str(env_path),
     }
 

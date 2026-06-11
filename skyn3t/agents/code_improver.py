@@ -4,10 +4,12 @@ import asyncio
 import difflib
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,6 +19,12 @@ from skyn3t.core.events import EventBus
 logger = logging.getLogger("skyn3t.agents.code_improver")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]   # /.../jarvis
+
+# Serialize patch applies: each apply does a `git checkout -b` + `git apply`
+# against a shared working tree, so concurrent applies (or an apply racing a
+# manual checkout) would corrupt each other. A single module-level lock makes
+# the whole branch/apply/checks/rollback sequence atomic per process.
+_APPLY_LOCK = asyncio.Lock()
 
 
 
@@ -1317,12 +1325,94 @@ class CodeImproverAgent(BaseAgent):
                     "rejected_diff_path": None,
                     "note": "not a git repo; saved patch as preview only"}
 
-        branch = f"skyn3t/auto/{int(time.time())}"
+        # Serialize the whole branch/apply/checks/rollback sequence and guard the
+        # shared working tree: concurrent applies (or an apply racing a manual
+        # checkout) would corrupt each other. The lock makes it atomic per
+        # process; the stash handling below tolerates a dirty tree without
+        # losing the user's uncommitted work.
+        async with _APPLY_LOCK:
+            return await self._do_apply_git(payload, repo_root, target_file, patch)
+
+    async def _do_apply_git(self, payload: Dict[str, Any], repo_root: Path,
+                            target_file: str, patch: str) -> Dict[str, Any]:
+        """Branch + apply + commit + checks, run under ``_APPLY_LOCK``.
+
+        Stashes any uncommitted changes first (so we never start from a dirty
+        tree that the patch could clobber) and restores them in ``finally`` on
+        every exit path. Branch names carry a uuid+pid suffix so the 1s-resolution
+        timestamps can never collide across concurrent or rapid applies.
+        """
         # Save current branch
         cur = await asyncio.to_thread(
             self._run_git, ["rev-parse", "--abbrev-ref", "HEAD"], repo_root
         )
         cur_branch = (cur.get("stdout","") or "").strip() or "main"
+
+        # Guard the tree: if it's dirty, stash so the apply starts clean and the
+        # user's uncommitted work is preserved + restored afterwards.
+        stashed = False
+        status = await asyncio.to_thread(
+            self._run_git, ["status", "--porcelain"], repo_root
+        )
+        if status.get("ok") and (status.get("stdout", "") or "").strip():
+            stash_msg = f"skyn3t-auto-apply {uuid.uuid4().hex[:8]}"
+            stash_r = await asyncio.to_thread(
+                self._run_git,
+                ["stash", "push", "--include-untracked", "-m", stash_msg],
+                repo_root,
+            )
+            if not stash_r.get("ok"):
+                return {"ok": False, "applied": False, "branch": None,
+                        "error": ("working tree is dirty and could not be stashed: "
+                                  f"{stash_r.get('stderr', '')[:300]}"),
+                        "rejected_diff_path": None}
+            stashed = True
+
+        try:
+            return await self._apply_on_branch(
+                payload, repo_root, target_file, patch, cur_branch
+            )
+        finally:
+            if stashed:
+                # The stashed changes were the user's uncommitted work on
+                # ``cur_branch``; restore them there (not onto the auto branch we
+                # may have ended up on after a successful apply).
+                head = await asyncio.to_thread(
+                    self._run_git, ["rev-parse", "--abbrev-ref", "HEAD"], repo_root
+                )
+                head_branch = (head.get("stdout", "") or "").strip()
+                # NB: never ``return`` from this ``finally`` — a return here would
+                # silently discard the value produced by ``_apply_on_branch`` (the
+                # success dict or structured error). Use a flag to skip the pop
+                # while still letting the try-block's return value propagate.
+                can_pop = True
+                if head_branch != cur_branch:
+                    co = await asyncio.to_thread(
+                        self._run_git, ["checkout", cur_branch], repo_root
+                    )
+                    if not co.get("ok"):
+                        logger.error(
+                            "could not return to %s to restore stashed changes; "
+                            "leaving stash in place: %s",
+                            cur_branch, co.get("stderr", "")[:300],
+                        )
+                        can_pop = False
+                if can_pop:
+                    pop_r = await asyncio.to_thread(
+                        self._run_git, ["stash", "pop"], repo_root
+                    )
+                    if not pop_r.get("ok"):
+                        logger.error(
+                            "could not restore stashed changes after auto-apply: %s",
+                            pop_r.get("stderr", "")[:300],
+                        )
+
+    async def _apply_on_branch(self, payload: Dict[str, Any], repo_root: Path,
+                               target_file: str, patch: str,
+                               cur_branch: str) -> Dict[str, Any]:
+        # uuid+pid suffix so 1s-resolution timestamps never collide across
+        # concurrent or rapid applies.
+        branch = f"skyn3t/auto/{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         # Create + checkout branch
         r = await asyncio.to_thread(self._run_git, ["checkout", "-b", branch], repo_root)
         if not r["ok"]:

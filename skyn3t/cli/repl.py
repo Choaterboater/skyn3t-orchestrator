@@ -116,6 +116,11 @@ _STUDIO_BUILD_NOISE_MARKERS = (
 
 _STUDIO_SNIPPET_LIMIT = 240
 
+# Approval-with-edits opens an interactive $EDITOR; an edit session can take
+# arbitrarily long, so the dispatcher waits effectively unbounded (1 day)
+# instead of the regular 120s RPC timeout that would orphan the editor.
+_APPROVAL_EDITOR_TIMEOUT = 86400.0
+
 _STUDIO_SLUG_RE = re.compile(
     r"\b([a-z0-9][a-z0-9-]{8,}-[a-f0-9]{6,8})\b",
     re.IGNORECASE,
@@ -1601,7 +1606,9 @@ async def _cmd_studio_approve(
                 _add_transcript(state, renderable)
             edited: Optional[str] = None
             if with_edits:
-                edited = edit_markdown_in_editor(original)
+                # Run the blocking $EDITOR off the event loop so the background
+                # ws/poll/studio-sync listeners stay responsive while editing.
+                edited = await asyncio.to_thread(edit_markdown_in_editor, original)
                 if edited is None:
                     _add_transcript(state, _info_line("edit cancelled", "yellow"))
                     return
@@ -1621,17 +1628,22 @@ async def _cmd_studio_approve(
 
 async def _cmd_studio_reject(state: ReplState, rest: str) -> None:
     parts = rest.split(maxsplit=1)
-    slug = _resolve_studio_slug(state, parts[0] if parts else "")
-    feedback = parts[1].strip() if len(parts) > 1 else ""
+    # Only consume the first word as an explicit slug when it actually matches
+    # the active project. Otherwise the whole input is feedback against the
+    # active slug (mirrors the plain-language reject path), so multi-word
+    # feedback like "/reject use SQLite only" is no longer mistaken for a slug.
+    if parts and state.studio_slug and parts[0] == state.studio_slug:
+        slug = state.studio_slug
+        feedback = parts[1].strip() if len(parts) > 1 else ""
+    else:
+        slug = state.studio_slug
+        feedback = rest.strip()
     if not slug:
         _add_transcript(
             state,
             _info_line("usage: /reject [slug] FEEDBACK...", "yellow"),
         )
         return
-    if not feedback and len(parts) == 1 and state.studio_slug and parts[0] != state.studio_slug:
-        feedback = parts[0]
-        slug = state.studio_slug
     if not feedback:
         _add_transcript(
             state,
@@ -1691,7 +1703,9 @@ async def _handle_studio_approval_plain(state: ReplState, line: str) -> bool:
             original = fetch_approval_document(client, slug)
             edited: Optional[str] = None
             if choice == "e":
-                edited = edit_markdown_in_editor(original)
+                # Run the blocking $EDITOR off the event loop so the background
+                # ws/poll/studio-sync listeners stay responsive while editing.
+                edited = await asyncio.to_thread(edit_markdown_in_editor, original)
                 if edited is None:
                     _add_transcript(state, _info_line("edit cancelled", "yellow"))
                     return True
@@ -3218,13 +3232,18 @@ def _run_plain_prompt(
         paint()
         return
 
-    if _parse_studio_approval_plain(line) is not None:
+    _approval_parsed = _parse_studio_approval_plain(line)
+    if _approval_parsed is not None:
         approval_future = asyncio.run_coroutine_threadsafe(
             _handle_studio_approval_plain(state, line),
             loop,
         )
+        # "approve with edits" opens $EDITOR (off-loop), which can take far
+        # longer than the regular RPC timeout — give it effectively unbounded
+        # time so the editor isn't orphaned and the approval finishes cleanly.
+        approval_timeout = _APPROVAL_EDITOR_TIMEOUT if _approval_parsed[0] == "e" else 120
         try:
-            if approval_future.result(timeout=120):
+            if approval_future.result(timeout=approval_timeout):
                 paint()
                 return
         except Exception as exc:
@@ -3392,8 +3411,15 @@ def run() -> None:
                     _paint_snapshot()
                     continue
                 command_future = asyncio.run_coroutine_threadsafe(_slash(state, line), loop)
+                # /approve-edits opens $EDITOR (off-loop), which can take far
+                # longer than the regular command timeout — give it effectively
+                # unbounded time so the editor isn't orphaned mid-approval.
+                _slash_cmd = line.split(maxsplit=1)[0]
+                command_timeout = (
+                    _APPROVAL_EDITOR_TIMEOUT if _slash_cmd == "/approve-edits" else 120
+                )
                 try:
-                    should_exit = command_future.result(timeout=120)
+                    should_exit = command_future.result(timeout=command_timeout)
                 except Exception as exc:
                     _add_transcript(state, _info_line(f"command error: {exc}", "red"))
                     should_exit = False

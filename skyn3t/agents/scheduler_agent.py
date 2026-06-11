@@ -498,22 +498,35 @@ class SchedulerAgent(BaseAgent):
         )
 
     def _parse_interval_seconds(self, schedule: str) -> Optional[float]:
-        """Return interval (in seconds) for "every N <unit>" schedules, else None."""
+        """Return interval (in seconds) for recurring schedules, else None.
+
+        Recognises both the human form ("every N <unit>") and the compact
+        prefix form ("interval:<N><unit>" where unit is s/m/h/d), the latter
+        being how the autonomous loop expresses the scout cadence.
+        """
+        normalized = schedule.strip().lower()
         m = re.match(
             r"every\s+(\d+)\s+(second|seconds|minute|minutes|hour|hours|day|days)",
-            schedule.strip().lower(),
+            normalized,
         )
-        if not m:
-            return None
-        value = int(m.group(1))
-        unit = m.group(2)
-        unit_seconds = {
-            "second": 1, "seconds": 1,
-            "minute": 60, "minutes": 60,
-            "hour": 3600, "hours": 3600,
-            "day": 86400, "days": 86400,
-        }[unit]
-        return float(value * unit_seconds)
+        if m:
+            value = int(m.group(1))
+            unit = m.group(2)
+            unit_seconds = {
+                "second": 1, "seconds": 1,
+                "minute": 60, "minutes": 60,
+                "hour": 3600, "hours": 3600,
+                "day": 86400, "days": 86400,
+            }[unit]
+            return float(value * unit_seconds)
+
+        prefix = re.match(r"interval:\s*(\d+)\s*([smhd])\b", normalized)
+        if prefix:
+            value = int(prefix.group(1))
+            unit_seconds = {"s": 1, "m": 60, "h": 3600, "d": 86400}[prefix.group(2)]
+            return float(value * unit_seconds)
+
+        return None
 
     def _parse_schedule(self, schedule: str, base_time: Optional[datetime] = None) -> Optional[datetime]:
         """Parse a schedule string and return the next run time."""
@@ -533,6 +546,12 @@ class SchedulerAgent(BaseAgent):
                 return now + timedelta(hours=value)
             elif unit in ("day", "days"):
                 return now + timedelta(days=value)
+
+        # Compact interval prefix: "interval:<N><unit>" (unit = s/m/h/d).
+        # This is how the autonomous loop expresses the scout cadence.
+        prefix_seconds = self._parse_interval_seconds(schedule)
+        if prefix_seconds is not None and schedule.startswith("interval:"):
+            return now + timedelta(seconds=prefix_seconds)
 
         # Simple cron-like: "daily at HH:MM"
         daily_match = re.match(r"daily\s+at\s+(\d{1,2}):(\d{2})", schedule)

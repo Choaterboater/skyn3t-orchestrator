@@ -122,14 +122,17 @@ class DocumentProcessor:
 
             # Detect function/class definitions
             if stripped.startswith(("def ", "class ", "async def ")):
+                # Always flush the accumulated chunk at a boundary so we don't
+                # drop small functions/classes. An empty current_chunk (e.g. a
+                # leading def/class) simply has nothing to flush.
                 if current_chunk:
                     chunk_text = "\n".join(current_chunk)
                     if len(chunk_text.split()) > self.chunk_size:
                         # Split large chunks
                         subchunks = self._chunk_text(chunk_text)
                         chunks.extend(subchunks)
-                else:
-                    chunks.append(chunk_text)
+                    else:
+                        chunks.append(chunk_text)
                 current_chunk = [line]
             else:
                 current_chunk.append(line)

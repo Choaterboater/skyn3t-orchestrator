@@ -133,7 +133,7 @@ class Sandbox:
     def _build_seatbelt_profile(self, temp_dir: Path) -> str:
         """Build a macOS seatbelt profile string."""
         allowed_paths = "\n".join(
-            f'    (allow file-read* file-write* (subpath "{d}"))'
+            f'    (allow file-read* file-write* process-exec (subpath "{d}"))'
             for d in self.config.allowed_dirs
         )
         denied_paths = "\n".join(
@@ -145,13 +145,24 @@ class Sandbox:
             if self.config.allow_network
             else "    (deny network*)\n"
         )
-        home_dir = str(Path.home())
+        # Seatbelt evaluates rules top-to-bottom with last-match-wins. We start
+        # from "(deny default)" so nothing is permitted unless explicitly
+        # allowed. We then allow the caller's workdirs, temp, and the system
+        # paths CLI agents need (read of system libs, exec of system binaries).
+        # The denied_dirs (credential dirs) are emitted LAST so they override
+        # any broad allow-rule above — belt-and-suspenders even if an allowed
+        # dir overlaps a sensitive subtree.
         return f"""(version 1)
 (debug deny)
-(allow default)
-{allowed_paths}
-{denied_paths}
+(deny default)
+    ; --- allow essentials for the sandboxed process to start ---
+    (allow process-fork)
+    (allow signal (target self))
+    (allow sysctl-read)
+    (allow mach-lookup)
+    (allow file-read-metadata)
 {network_rule}
+    ; --- system paths required for CLI agents to run ---
     (allow file-read* (subpath "/usr"))
     (allow file-read* (subpath "/bin"))
     (allow file-read* (subpath "/sbin"))
@@ -160,10 +171,17 @@ class Sandbox:
     (allow file-read* (subpath "/System"))
     (allow file-read* (subpath "/dev"))
     (allow file-read* (subpath "/private/var"))
-    (allow file-read* file-write* (subpath "{temp_dir}"))
+    (allow file-read* (subpath "/private/etc"))
+    (allow file-read* (subpath "/opt"))
+    (allow file-read* (literal "/dev/null") (literal "/dev/zero") (literal "/dev/random") (literal "/dev/urandom"))
+    (allow file-write* (literal "/dev/null") (literal "/dev/stdout") (literal "/dev/stderr"))
     (allow process-exec (subpath "/usr") (subpath "/bin") (subpath "/sbin") (subpath "/opt") (subpath "/private/var"))
+    ; --- caller-allowed working dirs + temp ---
+{allowed_paths}
+    (allow file-read* file-write* (subpath "{temp_dir}"))
     (allow process-exec (subpath "{temp_dir}"))
-    (allow process-exec (subpath "{home_dir}"))
+    ; --- belt-and-suspenders: deny credential dirs LAST so they win ---
+{denied_paths}
 """
 
     def _validate_path(self, path: str) -> bool:
@@ -718,10 +736,16 @@ class DockerBackend(ExecutionBackend):
             fh.write(code)
             code_path = fh.name
 
+        # Deterministic container name so we can forcibly kill it on timeout.
+        import uuid
+
+        container_name = f"skyn3t-run-{language}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
         cmd = [
             self.docker_path,
             "run",
             "--rm",
+            "--name", container_name,
             "--network", "none",
             "--memory", f"{memory_mb}m",
             "--memory-swap", f"{memory_mb}m",
@@ -754,6 +778,18 @@ class DockerBackend(ExecutionBackend):
                 stderr=stderr.decode("utf-8", errors="replace"),
             )
         except asyncio.TimeoutError:
+            # The `docker run` client returning isn't enough — the container keeps
+            # running (and consuming the full mem/CPU budget) until forcibly
+            # stopped. Kill the local client AND the container itself.
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await self._force_kill_container(container_name)
+            try:
+                await proc.wait()
+            except Exception:
+                pass
             return ExecutionResult(
                 success=False,
                 error=f"Execution timed out after {timeout}s",
@@ -765,6 +801,22 @@ class DockerBackend(ExecutionBackend):
                 os.unlink(code_path)
             except Exception:
                 pass
+
+    async def _force_kill_container(self, container_name: str) -> None:
+        """Forcibly kill a running container by name (best-effort)."""
+        try:
+            kill_proc = await asyncio.create_subprocess_exec(
+                self.docker_path, "kill", container_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(kill_proc.communicate(), timeout=10.0)
+        except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+            logger.warning(
+                "Failed to docker kill timed-out container %s: %s",
+                container_name,
+                exc,
+            )
 
 
 class DockerPoolBackend(ExecutionBackend):
@@ -943,6 +995,17 @@ class DockerPoolBackend(ExecutionBackend):
                 stderr=_decode_subprocess_output(stderr_data),
             )
         except asyncio.TimeoutError:
+            # The local `docker exec` client returning/cancelling is NOT enough —
+            # the process spawned INSIDE the pooled container keeps consuming its
+            # CPU/mem (the container is long-lived and reused). Kill the local
+            # client and the in-container process (matched by the unique
+            # remote_path), then clean up the temp file.
+            try:
+                proc.kill()
+            except (ProcessLookupError, Exception):
+                pass
+            await self._kill_in_container(name, remote_path)
+            asyncio.create_task(self._rm_in_container(name, remote_path))
             return ExecutionResult(
                 success=False,
                 error=f"Execution timed out after {timeout}s",
@@ -954,6 +1017,21 @@ class DockerPoolBackend(ExecutionBackend):
                 os.unlink(local_path)
             except Exception:
                 pass
+
+    async def _kill_in_container(self, name: str, remote_path: str) -> None:
+        """Best-effort kill of any process still running ``remote_path`` inside
+        the pooled container. The local ``docker exec`` client dying does not
+        stop the spawned process, so an unkilled run would consume the shared
+        container's resources until the container itself is recycled."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.docker_path, "exec", name, "pkill", "-f", remote_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        except Exception:
+            pass
 
     async def _rm_in_container(self, name: str, remote_path: str) -> None:
         try:
@@ -988,10 +1066,14 @@ async def get_backend(name: str = "auto") -> ExecutionBackend:
     """Return an execution backend by name.
 
     Names:
-      - ``inline``      → InlineBackend
+      - ``inline``      → InlineBackend (explicit opt-in for trusted code only)
       - ``docker``      → DockerBackend (raises if unavailable)
       - ``docker-pool`` → DockerPoolBackend (raises if unavailable)
-      - ``auto``        → DockerPoolBackend if Docker is up, else InlineBackend
+      - ``auto``        → DockerPoolBackend if Docker is up; otherwise raises.
+                          Will NOT silently run untrusted code in-process. The
+                          insecure InlineBackend is used only when explicitly
+                          opted in via the ``SKYN3T_ALLOW_INLINE_EXEC=1`` env
+                          flag (off by default).
     """
     name = name.lower().strip()
     if name == "inline":
@@ -1011,6 +1093,23 @@ async def get_backend(name: str = "auto") -> ExecutionBackend:
         if await docker.available():
             logger.info("DockerPoolBackend selected (Docker is available)")
             return docker
-        logger.warning("Docker unavailable; falling back to InlineBackend")
-        return InlineBackend()
+        # SECURITY: do NOT silently fall back to the in-process InlineBackend
+        # for untrusted/generated code — exec() in-process is trivially
+        # escapable to full host RCE. Owner decision: Docker default,
+        # opt-in inline. InlineBackend is allowed only when the operator
+        # explicitly sets SKYN3T_ALLOW_INLINE_EXEC=1.
+        if os.getenv("SKYN3T_ALLOW_INLINE_EXEC", "").strip() in ("1", "true", "yes", "on"):
+            logger.warning(
+                "SECURITY: Docker unavailable and SKYN3T_ALLOW_INLINE_EXEC is set — "
+                "running untrusted code IN-PROCESS via InlineBackend. This is NOT a "
+                "real sandbox and is trivially escapable to full host RCE. Use only "
+                "for trusted code; install Docker for real isolation."
+            )
+            return InlineBackend()
+        raise RuntimeError(
+            "Docker is not available and in-process execution is disabled. "
+            "Refusing to run untrusted code with the insecure InlineBackend. "
+            "Install/start Docker, or set SKYN3T_ALLOW_INLINE_EXEC=1 to opt in to "
+            "trusted-only in-process execution."
+        )
     raise ValueError(f"Unknown execution backend: {name}")

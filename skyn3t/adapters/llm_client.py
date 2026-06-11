@@ -25,6 +25,11 @@ _default_event_bus = None
 # callers don't thread RAG through every code path.
 _default_rag = None
 
+# Provider-qualified model-id prefixes that are valid only on a specific
+# metered/API backend (OpenRouter, Anthropic, OpenAI, ...). Kept for
+# documentation / observability; the actual drop logic below is allow-list
+# based so we catch *any* new publisher prefix (e.g. xiaomi/, moonshotai/)
+# without having to enumerate every OpenRouter vendor.
 _CROSS_PROVIDER_MODEL_PREFIXES = (
     "openrouter/",
     "anthropic/",
@@ -38,6 +43,15 @@ _CROSS_PROVIDER_MODEL_PREFIXES = (
     "tencent/",
     "stepfun/",
     "xai/",
+    "xiaomi/",
+)
+
+# "/"-qualified model ids that ARE valid on a local CLI backend and must be
+# preserved across failover. The kimi CLI's managed model is the only known
+# CLI-local id that embeds a slash; everything else with a slash is a
+# provider-qualified id (OpenRouter/API) that a CLI backend would reject.
+_CLI_LOCAL_MODEL_PREFIXES = (
+    "kimi-code/",
 )
 
 
@@ -68,15 +82,23 @@ def install_default_rag(rag) -> None:
 def _drop_cross_provider_model_name(model: Optional[str]) -> Optional[str]:
     """Drop provider-qualified model IDs before cross-backend failover.
 
-    ``openrouter/foo`` or ``anthropic/bar`` are valid only for those specific
-    providers. When we retry on a different backend, passing them through makes
-    the second backend fail immediately on model validation instead of using its
-    own default model.
+    ``openrouter/foo``, ``anthropic/bar`` or ``xiaomi/baz`` are valid only for
+    the metered/API backend that publishes them. When we retry on a different
+    backend (typically a local CLI), passing them through makes the second
+    backend fail immediately on model validation instead of using its own
+    default model — which silently degrades to the deterministic stub.
+
+    Allow-list approach: any "/"-qualified id is dropped UNLESS it matches a
+    known CLI-local prefix (``kimi-code/``). This catches new OpenRouter
+    publisher prefixes (xiaomi/, moonshotai/, ...) without enumerating them,
+    while preserving the lone CLI-local slashed id.
     """
     if not model:
         return None
     lower = model.lower()
-    return None if lower.startswith(_CROSS_PROVIDER_MODEL_PREFIXES) else model
+    if lower.startswith(_CLI_LOCAL_MODEL_PREFIXES):
+        return model
+    return None if "/" in model else model
 
 
 @dataclass
@@ -683,8 +705,12 @@ async def _run_capture(args: list[str], cwd: Optional[str] = None) -> str:
 
     # On Unix, prepend stdbuf to force line-buffering at the C stdio
     # level. This is a best-effort safety net for non-Python CLIs.
+    # Guard on shutil.which: some hosts (notably macOS without coreutils)
+    # lack stdbuf, and prepending a missing binary makes EVERY completion
+    # fail with FileNotFoundError AFTER the version probe already passed —
+    # a silent slide into the deterministic stub.
     exec_args = list(args)
-    if _sys.platform != "win32":
+    if _sys.platform != "win32" and _sh.which("stdbuf"):
         exec_args = ["stdbuf", "-oL", "-eL"] + exec_args
 
     proc = None
