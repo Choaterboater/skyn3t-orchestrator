@@ -24,38 +24,66 @@ _CLUSTER_BUILD_TIMEOUT_SECONDS = 240.0
 
 
 def _strip_fences(body: str) -> str:
-    """Strip a single fenced code block, even when prose surrounds it
-    or when the LLM forgot to close the fence.
+    """Return ONLY the first fenced code block's contents when a fence
+    is present — discarding any leading AND trailing prose — and pass
+    the body through unchanged when no fence is present.
 
     The model is told to return raw file contents, but CLI backends
     sometimes wrap the output in a fenced ``` block, with optional
     leading/trailing prose ("Here is the file:\n```js\n...\n```\nLet
-    me know if..."). The narrow whole-string match only handled the
-    case where prose was absent — leaving an unclosed ``` at the top
-    of the file when prose was present, which then fails the syntax
-    check before the user sees it.
+    me know if...").
+
+    The earlier implementation only discarded trailing prose when the
+    closing fence happened to sit on its own line (``\n```\n``). The
+    real ``sonos.js`` leak was a closing fence with no preceding
+    newline (``...connect() }```\nThat should work for sonos.``) —
+    the paired-fence regex required a ``\n`` before the closing
+    backticks, so it missed the close entirely and the prose after it
+    leaked onto disk. This rewrite finds the opening fence, then the
+    NEXT closing fence regardless of surrounding whitespace, and
+    returns only what's between them. Behavior for inputs WITHOUT a
+    fence is identical to before (passthrough), and inputs that were
+    already handled correctly (clean ``\n```\n`` close, leading prose,
+    audit fixtures) produce the same result.
     """
     if not body:
         return body
-    # Paired fences: ```lang\ncontent\n```
-    m = _RE.search(r"```[a-zA-Z0-9_+\-]*\n([\s\S]*?)\n```", body)
-    if m:
-        return m.group(1)
-    # v43: LLM sometimes emits the entire file content correctly,
-    # then appends a lone ``` on the final line (no opening fence).
-    # This leaves a syntax error that breaks the build. Strip it.
+    # Locate the first opening fence (optional language tag), then the
+    # NEXT closing fence after the opening fence's content begins. The
+    # closing fence may or may not be preceded by a newline — both
+    # "...code\n```" and "...code```" are matched so trailing prose
+    # after the close is dropped either way.
+    open_m = _RE.search(r"(?:^|\n)[ \t]*```[a-zA-Z0-9_+\-]*[ \t]*\n", body)
+    if open_m:
+        content_start = open_m.end()
+        rest = body[content_start:]
+        # v43 guard: a lone trailing fence ("code\n```\n") can look
+        # like an opening fence to the search above (it has a \n before
+        # AND after it). If nothing of substance follows the matched
+        # fence, it was a CLOSING fence, not an opening one — fall
+        # through to the trailing-fence stripper below.
+        if rest.strip():
+            # Closing fence: ``` at a line start (optionally indented),
+            # OR appended directly to the end of a content line. Search
+            # only the region AFTER the opening fence's content.
+            close_m = _RE.search(
+                r"\n[ \t]*```[ \t]*(?:\n|$)|```[ \t]*(?:\n|$)", rest
+            )
+            if close_m:
+                return rest[:close_m.start()]
+            # Opening fence but no closing fence — the LLM forgot to
+            # close. We can't reliably tell where code ends, so keep
+            # the post-fence remainder (v44 behavior) rather than guess.
+            return rest
+    # No opening fence (or the "opening" was actually a lone trailing
+    # fence). v43: LLM sometimes emits the entire file content
+    # correctly, then appends a lone ``` on the final line. Strip that
+    # trailing fence so the file parses.
     stripped = body.rstrip()
     if stripped.endswith("\n```"):
         return stripped[:-4].rstrip()
-    # v44: LLM sometimes opens with ```lang and forgets to close.
-    # The opening fence then sits as the first line of the file and
-    # node --check / the structural syntax gate trips on it. If the
-    # body starts with ```... followed by what looks like code, drop
-    # the opening fence line. Symmetrically with the closing-fence
-    # case above.
-    open_match = _RE.match(r"^```[a-zA-Z0-9_+\-]*\s*\n", body)
-    if open_match:
-        return body[open_match.end():]
+    if stripped.endswith("```") and not stripped.startswith("```"):
+        return stripped[:-3].rstrip()
     return body
 
 
@@ -209,6 +237,64 @@ def _entrypoint_import_instructions(
         "still import and adapt with props, not "
         "reinvent.\n\n"
     )
+
+
+def _planned_component_names(file_specs: List[Dict[str, Any]]) -> List[str]:
+    """Return the bare component names (file stems) of every planned
+    ``components/*.{jsx,tsx}`` entry — the components an entrypoint was
+    told to IMPORT. Used to detect inline-redefinition drift."""
+    names: List[str] = []
+    for spec in file_specs or []:
+        if not isinstance(spec, dict):
+            continue
+        path = (spec.get("path") or "").strip()
+        if not path or "components/" not in path.lower():
+            continue
+        if not path.lower().endswith((".jsx", ".tsx")):
+            continue
+        stem = Path(path).stem
+        if stem and stem[0].isupper():
+            names.append(stem)
+    return names
+
+
+def _inline_redefined_planned(
+    body: str, file_specs: List[Dict[str, Any]]
+) -> List[str]:
+    """Return planned component names that ``body`` defines inline
+    (``function Foo(`` / ``const Foo =`` / ``class Foo``) WITHOUT also
+    importing them — the 'two parallel component trees, one orphaned'
+    drift. Empty list when nothing is redefined or on any parse issue
+    (fail-open).
+    """
+    try:
+        if not body:
+            return []
+        planned = _planned_component_names(file_specs)
+        if not planned:
+            return []
+        offenders: List[str] = []
+        for name in planned:
+            esc = _RE.escape(name)
+            defines = bool(
+                _RE.search(rf"\bfunction\s+{esc}\s*\(", body)
+                or _RE.search(rf"\bconst\s+{esc}\s*=", body)
+                or _RE.search(rf"\bclass\s+{esc}\b", body)
+            )
+            if not defines:
+                continue
+            # Imported anywhere? (default OR named import of this name)
+            imported = bool(
+                _RE.search(
+                    rf"""import\s+(?:[^'";\n]*\b{esc}\b[^'";\n]*)\s+from""",
+                    body,
+                )
+            )
+            if not imported:
+                offenders.append(name)
+        return offenders
+    except Exception:
+        return []
 
 
 def _relevant_context(prior_context: str, rel_path: str) -> str:
@@ -700,6 +786,183 @@ def _placeholder_for(rel_path: str, purpose: str, stack: str) -> str:
     return f"# {rel_path}\n# {py_note.lstrip('# ')}\n"
 
 
+# Markers that uniquely identify a generation-failure stub body. Kept
+# module-level so both _is_entrypoint_stub and the code-stage output
+# scan (stub_markers) reference the SAME strings — the placeholder
+# bodies emitted by _placeholder_for and _backfill stubs use these.
+_STUB_TODO_MARKER = "TODO[skyn3t]: code generation failed"
+_STUB_BACKFILL_MARKER = "@skyn3t-backfill-stub"
+_STUB_GENERATION_FAILED_PHRASE = "Generation failed for this component"
+
+
+def _is_entrypoint_stub(body: str, rel_path: str) -> bool:
+    """Return True when an entry file (App.*/main.*/page.*) body is a
+    generation-failure stub rather than a real implementation.
+
+    Detects the shapes that _placeholder_for / the backfill path emit
+    when every LLM attempt fails:
+
+      * the ``// TODO[skyn3t]: code generation failed`` marker comment
+      * the ``@skyn3t-backfill-stub`` marker
+      * a body that reduces to ``export default null`` (the bare-JS
+        placeholder shape)
+      * the React placeholder whose JSX renders the "Generation failed
+        for this component" copy
+
+    Used to set output['entrypoint_is_stub'] and, after extraction
+    hardening, to force ONE extra regen of the entrypoint before
+    accepting it.
+
+    Fail-open: on any unexpected input (None, non-entry path, parse
+    surprise) it returns False so it can NEVER block a legitimate
+    file. Pure string/regex over an in-memory body — no external tool,
+    cannot fail externally.
+    """
+    try:
+        if not body:
+            # An empty entrypoint is not a "stub" per this contract —
+            # it's an empty file the existing placeholder path handles.
+            return False
+        rl = (rel_path or "").lower()
+        # Only entry files qualify. Accept with or without a leading
+        # directory (src/App.jsx as well as App.jsx) and the Next.js
+        # page.* form.
+        if not rl.endswith(_ENTRYPOINT_PROMPT_TAIL):
+            return False
+        # Explicit failure markers — unambiguous.
+        if _STUB_TODO_MARKER in body:
+            return True
+        if _STUB_BACKFILL_MARKER in body:
+            return True
+        if _STUB_GENERATION_FAILED_PHRASE in body:
+            return True
+        # Body reduces to `export default null` once comments/blank
+        # lines are removed (the bare-JS placeholder shape leaking into
+        # an entry slot). Strip line/block comments cheaply.
+        no_block = _RE.sub(r"/\*[\s\S]*?\*/", "", body)
+        meaningful = [
+            ln.strip()
+            for ln in no_block.splitlines()
+            if ln.strip() and not ln.strip().startswith("//")
+            and not ln.strip().startswith("#")
+        ]
+        joined = " ".join(meaningful)
+        if _RE.fullmatch(r"export\s+default\s+null\s*;?", joined):
+            return True
+        return False
+    except Exception:
+        # Pure fail-open: never let a detector crash gate a file.
+        return False
+
+
+def _collect_stub_signal(
+    out_dir,
+    file_specs: List[Dict[str, Any]],
+    files_written: List[str],
+) -> Tuple[List[str], List[Dict[str, str]], List[str], bool]:
+    """Build the Phase 3 pre-verifier signal for the code-stage output.
+
+    Returns a 4-tuple ``(planned_imports, stub_markers, entrypoint_files,
+    entrypoint_is_stub)``:
+
+      * ``planned_imports`` — scaffold-relative planned ``components/*``
+        component paths the entrypoint MUST import (from ``file_specs``).
+      * ``stub_markers`` — ``[{'file': rel, 'kind': 'entrypoint-stub'|
+        'component-stub'|'export-default-null', 'marker': matched_text}]``
+        for every written file that shipped as a stub.
+      * ``entrypoint_files`` — scaffold-relative entry files written.
+      * ``entrypoint_is_stub`` — True if ANY entry file is a stub.
+
+    Pure-Python over already-written files; no external tool. On any
+    failure returns ``([], [], [], False)`` so the existing output keys
+    still return and the runner treats absence as 'no signal'.
+    """
+    planned_imports: List[str] = []
+    stub_markers: List[Dict[str, str]] = []
+    entrypoint_files: List[str] = []
+    entrypoint_is_stub = False
+    try:
+        resolved_out = str(Path(out_dir).resolve())
+
+        def _rel_of(p: str) -> Optional[str]:
+            try:
+                return str(
+                    Path(p).resolve().relative_to(resolved_out)
+                ).replace("\\", "/")
+            except Exception:
+                return None
+
+        # planned_imports: scaffold-relative planned component paths.
+        for s in (file_specs if isinstance(file_specs, list) else []):
+            if not isinstance(s, dict):
+                continue
+            pth = (s.get("path") or "").lstrip("/").strip()
+            if not pth or "components/" not in pth.lower():
+                continue
+            if not pth.lower().endswith((".jsx", ".tsx")):
+                continue
+            planned_imports.append(pth.replace("\\", "/"))
+
+        # Scan every written file for stub markers + entrypoint stub.
+        for f in (files_written or []):
+            rel_f = _rel_of(f)
+            if rel_f is None:
+                continue
+            rl_f = rel_f.lower()
+            is_entry = rl_f.endswith(_ENTRYPOINT_PROMPT_TAIL)
+            if is_entry:
+                entrypoint_files.append(rel_f)
+            try:
+                body_f = Path(f).read_text(encoding="utf-8")
+            except Exception:
+                continue
+            # entrypoint stub takes precedence as a distinct kind.
+            if is_entry and _is_entrypoint_stub(body_f, rel_f):
+                entrypoint_is_stub = True
+                marker = (
+                    _STUB_TODO_MARKER
+                    if _STUB_TODO_MARKER in body_f
+                    else _STUB_BACKFILL_MARKER
+                    if _STUB_BACKFILL_MARKER in body_f
+                    else _STUB_GENERATION_FAILED_PHRASE
+                    if _STUB_GENERATION_FAILED_PHRASE in body_f
+                    else "export default null"
+                )
+                stub_markers.append({
+                    "file": rel_f,
+                    "kind": "entrypoint-stub",
+                    "marker": marker,
+                })
+                continue
+            # Generic component / module stub markers.
+            if _STUB_TODO_MARKER in body_f:
+                stub_markers.append({
+                    "file": rel_f,
+                    "kind": "component-stub",
+                    "marker": _STUB_TODO_MARKER,
+                })
+            elif _STUB_BACKFILL_MARKER in body_f:
+                stub_markers.append({
+                    "file": rel_f,
+                    "kind": "component-stub",
+                    "marker": _STUB_BACKFILL_MARKER,
+                })
+            elif rl_f.endswith((".js", ".mjs", ".cjs", ".ts")) and _RE.search(
+                r"^\s*export\s+default\s+null\s*;?\s*$",
+                body_f,
+                _RE.MULTILINE,
+            ):
+                stub_markers.append({
+                    "file": rel_f,
+                    "kind": "export-default-null",
+                    "marker": "export default null",
+                })
+        return planned_imports, stub_markers, entrypoint_files, entrypoint_is_stub
+    except Exception:
+        logger.debug("stub-signal scan failed (non-fatal)", exc_info=True)
+        return [], [], [], False
+
+
 class CodeAgent(BaseAgent):
     """Agent for safe code execution, analysis, refactoring, and testing."""
 
@@ -751,6 +1014,13 @@ class CodeAgent(BaseAgent):
         self._sandbox_dir = self.config.get("sandbox_dir", tempfile.gettempdir())
         self._max_output_size = self.config.get("max_output_size", 10000)
         self._execution_timeout = self.config.get("execution_timeout", 30)
+        # Budget for the extra entrypoint-stub / inline-redefinition
+        # regen attempts (Phase 3). One extra LLM call per offending
+        # entry file, capped per scaffold so it can never loop. Reset
+        # at the start of each _scaffold_from_brief run.
+        self._entrypoint_regen_budget = int(
+            os.environ.get("SKYN3T_ENTRYPOINT_REGEN_BUDGET", "2")
+        )
 
     async def initialize(self) -> None:
         """Initialize the code agent."""
@@ -766,6 +1036,185 @@ class CodeAgent(BaseAgent):
             return bool(result.get("success", False))
         except Exception:
             return False
+
+    async def _regen_entrypoint_if_needed(
+        self,
+        *,
+        rel: str,
+        body: str,
+        purpose: str,
+        brief: str,
+        stack: str,
+        file_specs: List[Dict[str, Any]],
+    ) -> str:
+        """Force ONE extra regen of an entry file when the accepted body
+        is either a generation-failure stub (``_is_entrypoint_stub``) or
+        inline-redefines a planned component it was told to import
+        (``_inline_redefined_planned``).
+
+        Returns a regenerated body when the extra attempt produces a
+        better one, otherwise the ORIGINAL body unchanged. Gated behind
+        the per-scaffold ``self._entrypoint_regen_budget`` so it can
+        never loop; the existing per-file retry tiers remain the primary
+        path — this is a targeted top-up for the two specific entry-file
+        failure modes the Phase 3 audit flagged.
+
+        Fail-open: any exception (or an exhausted budget, or an absent
+        OpenRouter key / LLM client) returns the original body. No
+        external tool can hard-fail this — when generation is
+        unavailable we simply keep what we had.
+        """
+        try:
+            rl = (rel or "").lower()
+            if not rl.endswith(_ENTRYPOINT_PROMPT_TAIL):
+                return body
+            if getattr(self, "_entrypoint_regen_budget", 0) <= 0:
+                return body
+
+            is_stub = _is_entrypoint_stub(body, rel)
+            redefined = _inline_redefined_planned(body, file_specs)
+            if not is_stub and not redefined:
+                return body
+
+            self._entrypoint_regen_budget -= 1
+            reason = "stub" if is_stub else f"inline-redefines {redefined}"
+            logger.warning(
+                "ENTRYPOINT REGEN for %s (reason=%s, budget_left=%d)",
+                rel, reason, self._entrypoint_regen_budget,
+            )
+            try:
+                await self.think(f"forced entrypoint regen for {rel} ({reason})")
+            except Exception:
+                pass
+
+            import os as _os_regen
+            _or_key = _os_regen.environ.get("OPENROUTER_API_KEY")
+            if not _or_key:
+                try:
+                    from skyn3t.config.settings import get_settings as _gs
+                    _or_key = getattr(_gs(), "openrouter_api_key", None)
+                    if _or_key:
+                        _os_regen.environ.setdefault("OPENROUTER_API_KEY", _or_key)
+                except Exception:
+                    _or_key = None
+            if not _or_key:
+                # No regen channel available — keep the original body so
+                # the existing placeholder/fix-loop path still applies.
+                return body
+
+            import_rule = _entrypoint_import_instructions(
+                rel=rel, file_specs=file_specs,
+            )
+            stub_directive = (
+                "The previous attempt shipped a STUB / placeholder. "
+                "This is NOT acceptable — implement the file FULLY: real "
+                "imports, real state, the actual UI the brief describes. "
+                "No TODO comments, no 'generation failed' copy, no "
+                "`export default null`.\n\n"
+                if is_stub else ""
+            )
+            redefine_directive = (
+                "The previous attempt INLINE-REDEFINED these planned "
+                f"components instead of importing them: {', '.join(redefined)}. "
+                "IMPORT each of them from their planned `components/` path "
+                "and DELETE the inline definitions. Do not reinvent a "
+                "component that already has a planned file.\n\n"
+                if redefined else ""
+            )
+            regen_prompt = (
+                f"Re-implement the entry file `{rel}` for this product brief:\n\n"
+                f"BRIEF:\n{(brief or '').strip()[:1500]}\n\n"
+                f"PURPOSE OF THIS FILE: {purpose or 'Top-level entrypoint implementing the brief.'}\n"
+                f"STACK: {stack or 'react_vite'}\n\n"
+                f"{stub_directive}{redefine_directive}{import_rule}"
+                "Output ONLY the file body. No fences, no markdown, no "
+                "commentary. Imports at the top, default export at the "
+                "bottom for React components. Write a complete, runnable "
+                "implementation that matches the brief."
+            )
+            try:
+                from skyn3t.core.project_type_router import (
+                    ladder_for_file_and_brief,
+                )
+                _ladder = list(ladder_for_file_and_brief(rel, brief or ""))
+            except Exception:
+                _ladder = [
+                    "openrouter/owl-alpha",
+                    "deepseek/deepseek-v3.2",
+                    "xiaomi/mimo-v2-flash",
+                ]
+            from skyn3t.adapters import LLMClient as _LLMCRegen
+            for _model in _ladder[:3]:
+                regen_client = None
+                try:
+                    regen_client = _LLMCRegen(
+                        default_model=_model,
+                        backend="openrouter",
+                        event_bus=self.event_bus,
+                        caller_name=self.name,
+                    )
+                    try:
+                        cand = await regen_client.complete(
+                            regen_prompt,
+                            system=(
+                                "You write production-grade source code. "
+                                "Never use TODO comments, placeholders, or "
+                                "'replace with real implementation' language. "
+                                "Output the complete file body only."
+                            ),
+                            max_tokens=8000,
+                            temperature=0.2,
+                            timeout=90.0,
+                        )
+                    finally:
+                        try:
+                            await regen_client.aclose()
+                        except Exception:
+                            pass
+                except Exception as _regen_exc:
+                    logger.warning(
+                        "ENTRYPOINT REGEN %s failed for %s: %s",
+                        _model, rel, _regen_exc,
+                    )
+                    continue
+                marked = _extract_marked_files(cand or "")
+                if marked:
+                    m = (
+                        marked.get(rel)
+                        or marked.get(rel.lstrip("/"))
+                        or marked.get(Path(rel).name)
+                    )
+                    if not m and len(marked) == 1:
+                        m = next(iter(marked.values()))
+                    if m:
+                        cand = m
+                cand = _strip_cli_prelude((cand or "").strip(), rel)
+                cand = _strip_fences(cand)
+                cand = _strip_copilot_footer(cand)
+                # Accept only if it's a strict improvement: parses,
+                # right stack, not itself a stub, and (when the trigger
+                # was redefinition) no longer redefines inline.
+                if (
+                    cand
+                    and "[deterministic-stub]" not in cand
+                    and not _is_entrypoint_stub(cand, rel)
+                    and not _inline_redefined_planned(cand, file_specs)
+                    and _syntax_ok(cand, rel)
+                    and _stack_ok(cand, rel, stack)
+                ):
+                    logger.warning(
+                        "ENTRYPOINT REGEN ACCEPTED for %s via %s", rel, _model,
+                    )
+                    return cand
+            logger.warning(
+                "ENTRYPOINT REGEN exhausted for %s — keeping original body", rel,
+            )
+            return body
+        except Exception:
+            logger.exception(
+                "entrypoint regen errored for %s; keeping original body", rel,
+            )
+            return body
 
     async def execute(self, task: TaskRequest, stdin_data: str | None = None) -> TaskResult:
         """Execute a code-related task."""
@@ -1000,6 +1449,11 @@ class CodeAgent(BaseAgent):
         out_dir.mkdir(parents=True, exist_ok=True)
         self._seed_design_tokens_into_scaffold(artifact_dir, out_dir)
         resolved_out_dir = out_dir.resolve()
+        # Reset the per-scaffold entrypoint-regen budget so a long-lived
+        # agent reused across builds gets a fresh allowance each run.
+        self._entrypoint_regen_budget = int(
+            os.environ.get("SKYN3T_ENTRYPOINT_REGEN_BUDGET", "2")
+        )
         files_written: List[str] = []
         # Phase 2 (skills grading): names of skills injected into the
         # build prompt are surfaced in the TaskResult output so the runner
@@ -1996,6 +2450,14 @@ class CodeAgent(BaseAgent):
                                 await self.think(
                                     f"entrypoint fast-path SUCCESS for {rel} via {_accepted_model}"
                                 )
+                                # Entry-file hardening: force ONE regen if
+                                # the accepted body is a stub or inline-
+                                # redefines a planned component. Budget-
+                                # gated; returns the original on any issue.
+                                body_local = await self._regen_entrypoint_if_needed(
+                                    rel=rel, body=body_local, purpose=purpose,
+                                    brief=brief, stack=stack, file_specs=file_specs,
+                                )
                                 return rel, body_local, target
                             else:
                                 logger.warning(
@@ -2476,6 +2938,17 @@ class CodeAgent(BaseAgent):
                             logger.exception(
                                 "fourth-tier OpenRouter retry failed for %s", rel,
                             )
+
+                    # Entry-file hardening (Phase 3): before falling back
+                    # to a placeholder, if this is an entry file whose
+                    # accepted body is a stub or inline-redefines a
+                    # planned component, force ONE budget-gated regen.
+                    # No-op for non-entry files and when no offending
+                    # pattern is present; returns the original on failure.
+                    body_local = await self._regen_entrypoint_if_needed(
+                        rel=rel, body=body_local or "", purpose=purpose,
+                        brief=brief, stack=stack, file_specs=file_specs,
+                    )
 
                     # If we STILL have nothing usable, write a visible
                     # placeholder so downstream imports resolve. The reviewer
@@ -2963,6 +3436,15 @@ class CodeAgent(BaseAgent):
             except Exception:
                 logger.debug("completeness check failed", exc_info=True)
 
+        # Phase 3 pre-verifier signal: planned_imports / stub_markers /
+        # entrypoint_files / entrypoint_is_stub. Pure-Python over the
+        # already-written files; on ANY failure the fields default to
+        # []/False and the existing keys above still return — the runner
+        # treats absence as 'no signal' and never blocks.
+        planned_imports, stub_markers, entrypoint_files, entrypoint_is_stub = (
+            _collect_stub_signal(out_dir, file_specs, files_written)
+        )
+
         return TaskResult(
             task_id=task.task_id, success=True,
             output={
@@ -2976,6 +3458,10 @@ class CodeAgent(BaseAgent):
                 "written_count": written_count,
                 "missing_files": missing_files,
                 "injected_skills": injected_skills,
+                "planned_imports": planned_imports,
+                "stub_markers": stub_markers,
+                "entrypoint_files": entrypoint_files,
+                "entrypoint_is_stub": entrypoint_is_stub,
             })
 
     def _write_fallback_scaffold(self, out_dir, brief: str) -> list[str]:

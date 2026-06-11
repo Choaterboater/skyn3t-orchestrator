@@ -233,6 +233,31 @@ def brand_for(slug: str) -> Optional[ServiceBrand]:
     return _BRAND_CATALOG.get(slug.lower())
 
 
+def icon_img_snippet(slug: str) -> Optional[str]:
+    """Return an instruction to render the service's REAL brand asset.
+
+    The dashboard-icons CDN already gives us a correct SVG logo per
+    service. Generated UIs otherwise hand-roll a wonky inline <svg> or
+    drop an emoji. This snippet tells generation to use an
+    ``<img src={icon_url} alt={name} />`` against the CDN instead.
+
+    Pure lookup; returns ``None`` for unknown slugs so the caller falls
+    back to its current behavior (no broken instruction emitted).
+    """
+    b = brand_for(slug)
+    if b is None:
+        return None
+    return (
+        f"Render the {b.name} logo as a real CDN image, NOT a hand-rolled "
+        f"SVG or emoji:\n"
+        f'  <img src="{b.icon_url}" alt="{b.name}" '
+        f'height="20" width="20" loading="lazy" '
+        f'style={{{{ borderRadius: "var(--brand-radius-sm)" }}}} />\n'
+        f"Tint accents (status dots, progress bars, badges) with the "
+        f"{b.name} brand color {b.color}."
+    )
+
+
 def brand_kit_markdown(slugs: List[str]) -> str:
     """Render a markdown block describing the visual shape per service.
 

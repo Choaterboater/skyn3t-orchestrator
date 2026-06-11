@@ -70,6 +70,14 @@ HEALTH_ENDPOINTS: Tuple[str, ...] = ("/api/health", "/health", "/healthz", "/")
 
 _STUB_MARKER = "TODO[skyn3t]: code generation failed"
 
+# Functional smoke gate. Default-ON; flip off with SKYN3T_VERIFY_FUNCTIONAL=0
+# (or false/no/off). Mirrors the build_verifier flag convention.
+_FUNCTIONAL_OFF = {"0", "false", "no", "off"}
+
+
+def _functional_verify_enabled() -> bool:
+    return os.environ.get("SKYN3T_VERIFY_FUNCTIONAL", "").strip().lower() not in _FUNCTIONAL_OFF
+
 
 def _named_export_mismatch_hint(stderr: str, scaffold_dir: Path) -> Optional[str]:
     export_match = re.search(
@@ -134,6 +142,32 @@ def _named_export_mismatch_hint(stderr: str, scaffold_dir: Path) -> Optional[str
         f"{rel_imported}, but that module does not export it. Either add the "
         f"`{missing_export}` export or change the import to match the module's real exports."
     )
+
+
+# express router.<verb>(...) call sites: router.get('/'), app.post('/api/x'), …
+# {ident} is filled per-file with the recognised router variable names so we
+# don't misread an unrelated `foo.get(...)` chain.
+_ROUTER_VERB_TMPL = (
+    r"\b(?:{ident})\s*\.\s*(get|post|put|patch|delete)\s*\(\s*"
+    r"""(['"`])([^'"`]*)\2"""
+)
+# Identify the router variable: `const router = express.Router()` /
+# `const r = Router()` / `var api = express()`.
+_ROUTER_DECL_RE = re.compile(
+    r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*"
+    r"(?:"
+    r"express\s*\(\s*\)"            # express()
+    r"|[^\n;=]*?Router\s*\(\s*\)"   # express.Router() / require('express').Router() / Router()
+    r")",
+)
+# frontend fetch('/api/...') / axios.get('/api/...') call sites.
+_FETCH_RE = re.compile(
+    r"""(?:fetch|axios(?:\s*\.\s*(get|post|put|patch|delete))?)\s*\(\s*"""
+    r"""(['"`])(/api/[^'"`?]*)\2""",
+    re.IGNORECASE,
+)
+_FRONTEND_GLOBS = ("src", "app", "client", "public")
+_FRONTEND_EXTS = {".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte", ".html"}
 
 
 @dataclass
@@ -245,6 +279,10 @@ class BootVerifierAgent(BaseAgent):
                     ),
                     "scaffold_dir": str(scaffold_dir),
                     "failure_hint": None,
+                    "functional_smoke": {
+                        "ran": False, "verdict": "skipped",
+                        "checks": [], "spa_dom_mutated": None,
+                    },
                 },
             )
 
@@ -330,6 +368,34 @@ class BootVerifierAgent(BaseAgent):
         # Step 4: health-check.
         health_status, health_url = await self._health_check(actual_port)
 
+        # Step 4b: functional smoke (server still live). Guarded by
+        # SKYN3T_VERIFY_FUNCTIONAL (default on). Degrades to a 'skipped'
+        # verdict (top-level verdict unchanged) when no routes derivable
+        # or Playwright absent for the SPA case.
+        functional_smoke: Dict[str, Any] = {
+            "ran": False, "verdict": "skipped", "checks": [], "spa_dom_mutated": None,
+        }
+        if _functional_verify_enabled() and health_status and 200 <= health_status < 400:
+            try:
+                routes = self._derive_primary_routes(scaffold_dir)
+                if routes:
+                    # Bound the smoke so a multi-entity scaffold with slow
+                    # handlers can't blow the pipeline ceiling: cap at the
+                    # remaining total_timeout budget (and never more than 90s).
+                    remaining = self.total_timeout - (time.monotonic() - start)
+                    smoke_deadline = time.monotonic() + max(10.0, min(90.0, remaining))
+                    functional_smoke = await self._functional_smoke_api(
+                        actual_port, routes, deadline=smoke_deadline,
+                    )
+                else:
+                    # No API routes derivable → SPA path (DOM-mutation assert).
+                    functional_smoke = await self._functional_smoke_spa(actual_port)
+            except Exception:
+                logger.debug("functional smoke failed (degrading to skipped)", exc_info=True)
+                functional_smoke = {
+                    "ran": False, "verdict": "skipped", "checks": [], "spa_dom_mutated": None,
+                }
+
         # Step 5: kill the server.
         await self._kill_proc(server_proc)
         # Grab any final output the process emitted between health-check
@@ -347,13 +413,40 @@ class BootVerifierAgent(BaseAgent):
             pass
 
         if health_status and 200 <= health_status < 400:
-            summary = (
-                f"server booted and {health_url} returned HTTP {health_status} "
-                f"(stack: {probe.kind})"
-            )
+            # Liveness passed. Fold the functional smoke into the verdict:
+            # a failed CRUD round-trip (functional verdict 'no') hardens
+            # the top-level verdict to 'no'; 'skipped'/'yes' leave it 'yes'.
+            functional_failed = functional_smoke.get("verdict") == "no"
+            top_verdict = "no" if functional_failed else "yes"
+            failed_checks = [
+                c for c in functional_smoke.get("checks", []) if not c.get("ok")
+            ]
+            if functional_failed:
+                failed_desc = ", ".join(
+                    f"{c.get('method')} {c.get('route')} → {c.get('detail')}"
+                    for c in failed_checks
+                ) or "a CRUD round-trip failed"
+                summary = (
+                    f"server booted (HTTP {health_status} on {health_url}) but a "
+                    f"functional round-trip failed: {failed_desc} (stack: {probe.kind})"
+                )
+                functional_hint = (
+                    "Server boots and answers a health GET, but a real API "
+                    f"round-trip failed ({failed_desc}). This is the "
+                    "'boots but 502s on every /api call' class: check that the "
+                    "routers are mounted, the DB layer initialises (better-sqlite3 "
+                    "with the json-file fallback), and the route handlers don't "
+                    "throw on POST/GET/PATCH/DELETE."
+                )
+            else:
+                summary = (
+                    f"server booted and {health_url} returned HTTP {health_status} "
+                    f"(stack: {probe.kind})"
+                )
+                functional_hint = None
             try:
                 await self.share_learning(
-                    f"boot_verifier: {probe.kind} → yes ({health_status})",
+                    f"boot_verifier: {probe.kind} → {top_verdict} ({health_status})",
                     scope="build",
                 )
             except Exception:
@@ -361,7 +454,7 @@ class BootVerifierAgent(BaseAgent):
             return TaskResult(
                 task_id=task.task_id, success=True,
                 output={
-                    "verdict": "yes",
+                    "verdict": top_verdict,
                     "kind": probe.kind,
                     "command": " ".join(probe.boot_cmd),
                     "port": actual_port,
@@ -371,7 +464,8 @@ class BootVerifierAgent(BaseAgent):
                     "stderr": boot_err[-4000:],
                     "summary": summary,
                     "scaffold_dir": str(scaffold_dir),
-                    "failure_hint": None,
+                    "failure_hint": functional_hint,
+                    "functional_smoke": functional_smoke,
                 },
             )
 
@@ -809,6 +903,355 @@ class BootVerifierAgent(BaseAgent):
                 continue
         return last_status, last_url
 
+    # ── functional smoke ──────────────────────────────────────────
+
+    @staticmethod
+    def _derive_primary_routes(scaffold_dir: Path) -> List[Dict[str, str]]:
+        """Statically derive testable API routes for the functional smoke.
+
+        Two sources, merged & de-duped:
+          1. ``server/routes/*.js`` — express ``router.<verb>('/path', ...)``
+             (and ``app.<verb>(...)``) call sites. The router file basename
+             is treated as the entity and the mount prefix
+             (``/api/<entity>``) is reconstructed when the in-file path is
+             relative (``router.get('/')``).
+          2. Frontend ``fetch('/api/...')`` / ``axios.<verb>('/api/...')``
+             call sites under src/, app/, client/, public/.
+
+        Returns a list of ``{'method','path','entity'}`` dicts. Pure static
+        parse — returns ``[]`` when nothing is parseable, so the caller can
+        degrade to liveness-only.
+        """
+        routes: List[Dict[str, str]] = []
+        seen: set[Tuple[str, str]] = set()
+
+        def _add(method: str, path: str, entity: str, source: str) -> None:
+            method = (method or "GET").upper()
+            if not path:
+                return
+            if not path.startswith("/"):
+                path = "/" + path
+            # Collapse accidental double slashes from prefix joins.
+            while "//" in path:
+                path = path.replace("//", "/")
+            key = (method, path)
+            if key in seen:
+                return
+            seen.add(key)
+            # ``source`` distinguishes routes backed by an owns-its-data router
+            # file ("server") from frontend fetch() call sites ("frontend").
+            # Only "server" routes are hard-gated — a frontend fetch() to a
+            # proxy-to-external upstream that's unreachable in the boot sandbox
+            # must NOT fold the verdict to 'no'.
+            routes.append({"method": method, "path": path, "entity": entity,
+                           "source": source})
+
+        # 1) server/routes/*.js
+        routes_dir = scaffold_dir / "server" / "routes"
+        if routes_dir.is_dir():
+            for rf in sorted(routes_dir.glob("*.js")):
+                entity = rf.stem
+                try:
+                    src = rf.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                # Recognised receivers: the conventional router/app plus any
+                # locally-declared Router()/express() variable.
+                idents = {"router", "app"}
+                for dm in _ROUTER_DECL_RE.finditer(src):
+                    idents.add(dm.group(1))
+                verb_re = re.compile(
+                    _ROUTER_VERB_TMPL.format(
+                        ident="|".join(re.escape(i) for i in sorted(idents))
+                    ),
+                    re.IGNORECASE,
+                )
+                for m in verb_re.finditer(src):
+                    verb = m.group(1)
+                    in_path = m.group(3) or "/"
+                    if in_path.startswith("/api/"):
+                        full = in_path
+                    elif in_path in ("", "/"):
+                        full = f"/api/{entity}"
+                    else:
+                        # router-relative path mounted under /api/<entity>
+                        full = f"/api/{entity}/{in_path.lstrip('/')}"
+                    _add(verb, full, entity, "server")
+
+        # 2) frontend fetch / axios call sites
+        for top in _FRONTEND_GLOBS:
+            base = scaffold_dir / top
+            if not base.is_dir():
+                continue
+            for fp in base.rglob("*"):
+                if not fp.is_file() or fp.suffix not in _FRONTEND_EXTS:
+                    continue
+                if "node_modules" in fp.parts:
+                    continue
+                try:
+                    src = fp.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                if "/api/" not in src:
+                    continue
+                for m in _FETCH_RE.finditer(src):
+                    verb = m.group(1) or "GET"
+                    path = m.group(3)
+                    # entity = first path segment after /api/
+                    parts = [p for p in path.split("/") if p]
+                    entity = parts[1] if len(parts) >= 2 else (parts[0] if parts else "api")
+                    _add(verb, path, entity, "frontend")
+
+        return routes
+
+    async def _http_request(
+        self, port: int, method: str, path: str,
+        body: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[int, str]:
+        """Single HTTP round-trip against the live boot server.
+
+        Returns (status, body_text). status==0 means the request never
+        reached the server (connection refused / timeout). Blocking urllib
+        is run in an executor so the event loop stays free.
+        """
+        import urllib.error
+        import urllib.request
+
+        url = f"http://127.0.0.1:{port}{path}"
+        data: Optional[bytes] = None
+        headers = {
+            "User-Agent": "skyn3t-boot-verifier",
+            "Accept": "application/json, text/html, */*",
+        }
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+
+        def _do() -> Tuple[int, str]:
+            req = urllib.request.Request(
+                url, data=data, headers=headers, method=method.upper(),
+            )
+            try:
+                resp = urllib.request.urlopen(req, timeout=self.health_timeout)
+                txt = resp.read(8192).decode(errors="replace")
+                return resp.getcode(), txt
+            except urllib.error.HTTPError as e:
+                try:
+                    txt = e.read(8192).decode(errors="replace")
+                except Exception:
+                    txt = ""
+                return e.code, txt
+            except Exception:
+                return 0, ""
+
+        loop = asyncio.get_event_loop()
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, _do),
+                timeout=self.health_timeout + 1,
+            )
+        except Exception:
+            return 0, ""
+
+    @staticmethod
+    def _sample_body_for(entity: str) -> Dict[str, Any]:
+        """A bland, generic POST body that satisfies most CRUD validators
+        without coupling to any specific schema. The server's store is the
+        ephemeral better-sqlite3 / json fallback DB, so this never touches
+        a real data dir."""
+        return {
+            "name": "skyn3t_boot_smoke",
+            "title": "skyn3t_boot_smoke",
+            "value": "smoke",
+            "description": "functional smoke test record",
+            "completed": False,
+            "status": "active",
+        }
+
+    async def _functional_smoke_api(
+        self, port: int, routes: List[Dict[str, str]],
+        *, deadline: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Exercise a POST -> GET-assert -> PATCH/DELETE round-trip per
+        collection entity. A failed round-trip is recorded; the verdict
+        folds to 'no' ONLY when an owns-its-data entity (one backed by a
+        ``server/routes/<entity>.js`` handler) fails.
+
+        Conservative: we only treat a check as failed on a hard server
+        error (5xx) or a dead connection (status 0). 4xx (validation,
+        not-found on a fabricated id) is tolerated — the server is alive
+        and routing, which is what this gate proves beyond liveness.
+
+        Proxy-to-external entities (derived only from frontend ``fetch()``
+        with no matching server router) are exercised for information but are
+        NEVER hard-gated: their upstream is unreachable in the boot sandbox,
+        so a 5xx there is expected and must not fail an otherwise-correct
+        scaffold. ``deadline`` (monotonic) bounds the whole smoke so a
+        multi-entity scaffold with slow handlers can't blow the pipeline
+        ceiling — remaining entities are left unexercised, not failed.
+        """
+        checks: List[Dict[str, Any]] = []
+
+        # Group collection routes by entity → collection path (the
+        # shortest /api/<entity> GET/POST target). ``owns_data`` is True when
+        # at least one route for the entity came from a server router file.
+        by_entity: Dict[str, Dict[str, Any]] = {}
+        for r in routes:
+            ent = r.get("entity") or "api"
+            path = r["path"]
+            slot = by_entity.setdefault(
+                ent, {"methods": set(), "collection": None, "owns_data": False}
+            )
+            slot["methods"].add(r["method"])
+            # Hard-gate server-sourced (owns-its-data) routes AND routes with no
+            # explicit source (e.g. directly-constructed routes). Only routes
+            # EXPLICITLY derived from a frontend fetch() (proxy-to-external) are
+            # soft, so an unreachable sandbox upstream can't fail a correct app.
+            if r.get("source") != "frontend":
+                slot["owns_data"] = True
+            # Collection path = no trailing :id / param segment.
+            is_item = ("/:" in path) or bool(re.search(r"/\$\{", path)) or path.rstrip("/").split("/")[-1].startswith(":")
+            if not is_item:
+                cur = slot["collection"]
+                if cur is None or len(path) < len(cur):
+                    slot["collection"] = path
+
+        truncated = False
+
+        def _record(route: str, method: str, ok: bool, detail: str, hard: bool) -> None:
+            checks.append({"route": route, "method": method, "ok": ok,
+                           "detail": detail, "hard": hard})
+
+        for ent, slot in by_entity.items():
+            if deadline is not None and time.monotonic() > deadline:
+                truncated = True
+                break
+            collection = slot["collection"]
+            if not collection:
+                continue
+            methods = slot["methods"]
+            hard = bool(slot["owns_data"])
+
+            created_id: Optional[str] = None
+
+            # POST create
+            if "POST" in methods:
+                status, txt = await self._http_request(
+                    port, "POST", collection, body=self._sample_body_for(ent),
+                )
+                ok = status != 0 and status < 500
+                _record(collection, "POST", ok, f"HTTP {status}", hard)
+                if ok and status < 300 and txt:
+                    try:
+                        obj = json.loads(txt)
+                        if isinstance(obj, dict):
+                            for k in ("id", "_id", "uuid"):
+                                if obj.get(k) is not None:
+                                    created_id = str(obj[k])
+                                    break
+                    except Exception:
+                        pass
+
+            # GET list assert
+            if "GET" in methods:
+                status, txt = await self._http_request(port, "GET", collection)
+                ok = status != 0 and status < 500
+                _record(collection, "GET", ok, f"HTTP {status}", hard)
+
+            # PATCH / DELETE the created record (if we got an id back).
+            if created_id is not None:
+                item_path = f"{collection.rstrip('/')}/{created_id}"
+                if "PATCH" in methods:
+                    status, _ = await self._http_request(
+                        port, "PATCH", item_path,
+                        body={"name": "skyn3t_boot_smoke_patched"},
+                    )
+                    _record(item_path, "PATCH", status != 0 and status < 500, f"HTTP {status}", hard)
+                if "DELETE" in methods:
+                    status, _ = await self._http_request(port, "DELETE", item_path)
+                    _record(item_path, "DELETE", status != 0 and status < 500, f"HTTP {status}", hard)
+
+        ran = len(checks) > 0
+        # Only a FAILED HARD (owns-data) check folds the verdict to 'no'.
+        hard_failed = any((not c["ok"]) and c.get("hard") for c in checks)
+        return {
+            "ran": ran,
+            "verdict": ("no" if hard_failed else "yes") if ran else "skipped",
+            "checks": checks,
+            "spa_dom_mutated": None,
+            "truncated": truncated,
+        }
+
+    async def _functional_smoke_spa(self, port: int) -> Dict[str, Any]:
+        """For an SPA with no derivable API: reuse the Playwright path to
+        assert that a core user action mutates the DOM. Degrades to
+        'skipped' (verdict unchanged) when Playwright/chromium is absent.
+        """
+        result = await asyncio.to_thread(self._spa_dom_mutation_check, port)
+        if result is None:
+            return {
+                "ran": False,
+                "verdict": "skipped",
+                "checks": [],
+                "spa_dom_mutated": None,
+            }
+        mutated, detail = result
+        return {
+            "ran": True,
+            # Don't HARD-fail an SPA on a non-mutation: many valid SPAs are
+            # static-render. We record the signal but keep verdict 'yes'
+            # when the page rendered, 'no' only when the page errored out.
+            "verdict": "yes" if mutated else "skipped",
+            "checks": [{"route": "/", "method": "GET", "ok": True, "detail": detail}],
+            "spa_dom_mutated": mutated,
+        }
+
+    @staticmethod
+    def _spa_dom_mutation_check(port: int) -> Optional[Tuple[bool, str]]:
+        """Headless Chromium: load the SPA, click the first interactive
+        control, and check whether the DOM node count changed. Returns
+        ``None`` when Playwright/chromium is unavailable (skip, don't
+        penalize) — same contract as build_verifier._render_smoke_test.
+        """
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception:
+            return None
+        url = f"http://127.0.0.1:{port}/"
+        try:
+            with sync_playwright() as p:
+                try:
+                    browser = p.chromium.launch(headless=True)
+                except Exception as exc:
+                    if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc):
+                        return None
+                    return (False, f"chromium launch failed: {exc}")
+                try:
+                    page = browser.new_context().new_page()
+                    try:
+                        page.goto(url, wait_until="load", timeout=15000)
+                    except Exception as exc:
+                        return (False, f"goto failed: {exc}")
+                    page.wait_for_timeout(300)
+                    before = page.evaluate("() => document.querySelectorAll('*').length")
+                    clicked = page.evaluate(
+                        "() => { const el = document.querySelector("
+                        "'button, a[href], [role=button], input[type=submit]'); "
+                        "if (el) { el.click(); return true; } return false; }"
+                    )
+                    page.wait_for_timeout(400)
+                    after = page.evaluate("() => document.querySelectorAll('*').length")
+                    mutated = bool(clicked) and after != before
+                    detail = (
+                        f"clicked={clicked} nodes {before}->{after}"
+                        if clicked else f"no interactive control found; nodes={before}"
+                    )
+                    return (mutated, detail)
+                finally:
+                    browser.close()
+        except Exception as exc:
+            return (False, f"playwright session failed: {exc}")
+
     # ── diagnostics ───────────────────────────────────────────────
 
     @staticmethod
@@ -963,4 +1406,11 @@ class BootVerifierAgent(BaseAgent):
             "summary": summary,
             "scaffold_dir": str(scaffold_dir),
             "failure_hint": failure_hint,
+            # Functional smoke never ran on a failure path (install/boot/
+            # health failed before the round-trip stage) — report skipped
+            # so the output shape is uniform across verdicts.
+            "functional_smoke": {
+                "ran": False, "verdict": "skipped",
+                "checks": [], "spa_dom_mutated": None,
+            },
         }

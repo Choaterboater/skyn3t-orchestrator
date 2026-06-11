@@ -376,3 +376,187 @@ async def extract(image_path: Path) -> Optional[DesignReference]:
 def load_by_sha(sha: str) -> Optional[DesignReference]:
     """Public lookup by image SHA. Used by the reference library."""
     return _cached(sha)
+
+
+# ── Screenshot scoring rubric ───────────────────────────────────────────
+# build_verifier's visual gate renders the generated app, screenshots it,
+# and (optionally) calls score_screenshot for a 0-100 design-quality
+# rubric. Reuses the same CLI ladder + JSON-fence stripping as extract().
+# Inherits extract()'s graceful-None contract: any failure → None, so the
+# build verifier never blocks when vision CLIs are absent.
+
+_SCORE_SYSTEM_PROMPT = (
+    "You are a brutally honest senior product designer scoring a rendered "
+    "screenshot of a freshly-generated web app. Reward distinctive, "
+    "intentional design; punish generic-AI output. Output ONLY the "
+    "requested JSON object — no prose, no fenced code block."
+)
+
+_SCORE_USER_PROMPT_TEMPLATE = """Open the screenshot at this absolute path and score it as a finished software UI:
+
+IMAGE PATH: {image_path}
+{context_block}
+Return STRICT JSON matching this shape (no prose, no markdown fences):
+
+{{
+  "score": 0-100,
+  "verdict": "pass" | "fail",
+  "reasons": ["short concrete observations driving the score"],
+  "generic_ai_tells": ["any generic-AI tells you can see — empty list if none"]
+}}
+
+Scoring rubric (be strict):
+- 80-100: distinctive, intentional, production-grade. Considered type scale, deliberate color use, real layout rhythm, a signature detail.
+- 50-79: competent but safe. Works, nothing memorable.
+- 0-49: generic-AI output, broken layout, unstyled, or default-template look.
+
+Mark these GENERIC-AI TELLS when present (each one drags the score down):
+- Centered single column floating on a flat purple/indigo gradient.
+- Three evenly-spaced rounded cards with a tiny icon + filler heading.
+- Default system font paired with a violet/indigo accent and nothing else.
+- Emoji used as primary iconography.
+- Unmotivated drop shadows / uniform border-radius with no hierarchy.
+- Visibly unstyled (browser-default) or horizontally-overflowing content.
+
+verdict is "fail" when score < 60 OR any layout-breaking tell is present.
+Output ONLY the JSON object. No preamble. No conclusion."""
+
+
+def _build_score_prompt(image_path: Path, brief: str, mood: str) -> str:
+    ctx: List[str] = []
+    if brief:
+        ctx.append(f"PRODUCT BRIEF (what this app is meant to be): {brief.strip()[:600]}")
+    if mood:
+        ctx.append(f"INTENDED AESTHETIC / MOOD: {mood.strip()[:200]}")
+    context_block = ("\n" + "\n".join(ctx) + "\n") if ctx else ""
+    return _SCORE_USER_PROMPT_TEMPLATE.format(
+        image_path=str(image_path),
+        context_block=context_block,
+    )
+
+
+def _coerce_score_payload(data: dict) -> Optional[dict]:
+    """Normalize a parsed CLI response into the score_screenshot shape.
+
+    Returns ``None`` when the payload doesn't carry a usable score so the
+    caller can fall through to the next CLI / to heuristics-only.
+    """
+    if not isinstance(data, dict):
+        return None
+    raw_score = data.get("score")
+    try:
+        score = int(round(float(raw_score)))
+    except (TypeError, ValueError):
+        return None
+    score = max(0, min(100, score))
+    verdict = str(data.get("verdict") or "").strip().lower()
+    if verdict not in ("pass", "fail"):
+        # Derive a verdict if the model omitted/garbled it.
+        verdict = "pass" if score >= 60 else "fail"
+    reasons = [str(x) for x in (data.get("reasons") or []) if x]
+    tells = [str(x) for x in (data.get("generic_ai_tells") or []) if x]
+    return {
+        "score": score,
+        "verdict": verdict,
+        "reasons": reasons,
+        "generic_ai_tells": tells,
+    }
+
+
+async def _try_claude_cli_score(image_path: Path, prompt: str) -> Optional[dict]:
+    if not shutil.which("claude"):
+        return None
+    args = [
+        "claude", "-p",
+        "--append-system-prompt", _SCORE_SYSTEM_PROMPT,
+        "--add-dir", str(image_path.parent),
+        prompt,
+    ]
+    try:
+        out = await _run_cli(args)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("claude CLI score call failed: %s", e)
+        return None
+    try:
+        parsed = json.loads(_strip_json_fences(out))
+    except Exception:  # noqa: BLE001
+        logger.warning("claude CLI returned non-JSON score for %s: %s", image_path.name, out[:200])
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+async def _try_copilot_cli_score(image_path: Path, prompt: str) -> Optional[dict]:
+    if not shutil.which("copilot"):
+        return None
+    args = [
+        "copilot",
+        "--available-tools=read",
+        "--add-dir", str(image_path.parent),
+        "-p", prompt,
+    ]
+    try:
+        out = await _run_cli(args)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("copilot CLI score call failed: %s", e)
+        return None
+    try:
+        parsed = json.loads(_strip_json_fences(out))
+    except Exception:  # noqa: BLE001
+        logger.warning("copilot CLI returned non-JSON score for %s: %s", image_path.name, out[:200])
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+async def _try_kimi_cli_score(image_path: Path, prompt: str) -> Optional[dict]:
+    if not shutil.which("kimi"):
+        return None
+    args = ["kimi", "--print", "--quiet", "--no-thinking", "-p", prompt]
+    try:
+        out = await _run_cli(args)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("kimi CLI score call failed: %s", e)
+        return None
+    try:
+        parsed = json.loads(_strip_json_fences(out))
+    except Exception:  # noqa: BLE001
+        logger.warning("kimi CLI returned non-JSON score for %s: %s", image_path.name, out[:200])
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+async def score_screenshot(
+    image_path: Path,
+    *,
+    brief: str = "",
+    mood: str = "",
+) -> Optional[dict]:
+    """Score a rendered screenshot 0-100 via the vision CLI ladder.
+
+    Returns ``{'score': int 0-100, 'verdict': 'pass'|'fail',
+    'reasons': List[str], 'generic_ai_tells': List[str]}`` or ``None``.
+
+    Mirrors extract()'s graceful-None contract: returns ``None`` when the
+    image is missing or NO vision-capable CLI produces a usable score, so
+    build_verifier treats None as 'rubric unavailable' and gates on cheap
+    heuristics only — never blocking.
+    """
+    image_path = Path(image_path)
+    if not image_path.exists():
+        logger.warning("design-vision score: image missing: %s", image_path)
+        return None
+
+    prompt = _build_score_prompt(image_path, brief, mood)
+    for try_fn in (_try_claude_cli_score, _try_copilot_cli_score, _try_kimi_cli_score):
+        try:
+            data = await try_fn(image_path, prompt)
+        except Exception:  # noqa: BLE001
+            logger.warning("design-vision score CLI raised", exc_info=True)
+            continue
+        if not isinstance(data, dict):
+            continue
+        coerced = _coerce_score_payload(data)
+        if coerced is not None:
+            return coerced
+
+    logger.info("design-vision score: no vision CLI produced a score for %s", image_path.name)
+    return None

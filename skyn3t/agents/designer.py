@@ -341,6 +341,25 @@ class DesignerAgent(BaseAgent):
         )
         await self.think(f"wrote {tokens_css_path.name}")
 
+        # Entry stylesheet that ACTUALLY CONSUMES tokens.css. The seeded
+        # tokens were downstream-ignored; this index.css begins with
+        # `@import './tokens.css';` and wires the base document to the
+        # var(--brand-*) tokens so the design contract is enforced at the
+        # CSS layer too. Exposed via output['entry_css'] (NOT folded into
+        # `files`) so existing consumers of the files list are unchanged.
+        entry_css_path = artifact_dir / "index.css"
+        try:
+            entry_css_path.write_text(
+                self._render_entry_css(
+                    palette_json, fonts, has_tokens=tokens_css_path.exists()
+                ),
+                encoding="utf-8",
+            )
+            await self.think(f"wrote {entry_css_path.name}")
+        except Exception:  # noqa: BLE001
+            logger.exception("entry stylesheet writeout failed (non-fatal)")
+            entry_css_path = None  # type: ignore[assignment]
+
         tokens_json_path = artifact_dir / "tokens.json"
         tokens_json_path.write_text(
             json.dumps(self._render_design_tokens(palette_json, fonts), indent=2),
@@ -411,6 +430,7 @@ class DesignerAgent(BaseAgent):
                 "files": files,
                 "palette": palette_json,
                 "mood": mood,
+                "entry_css": str(entry_css_path) if entry_css_path else None,
                 "summary": f"Brand pack written ({len(files)} files).",
             },
         )
@@ -848,6 +868,7 @@ class DesignerAgent(BaseAgent):
             "Logo concepts section with 3 distinct, brief-specific concepts "
             "(NOT generic templates). Tie every section to the brief's "
             "aesthetic intent.\n\n"
+            f"{self._token_contract_prompt_rule(mood)}\n\n"
             f"Inferred mood label: {mood}\n"
             f"Palette to reference (use these exact hex codes):\n"
             f"  primary={primary}\n  secondary={secondary}\n  accent={accent}\n"
@@ -1055,8 +1076,9 @@ class DesignerAgent(BaseAgent):
             "on how the components should feel given the aesthetic intent. "
             "Then provide a Markdown table with columns: Component | Class "
             "hint. Include 6-10 components that are appropriate to the "
-            "target platform AND the aesthetic. Use the exact hex values "
-            "supplied below in class hints where a color is needed.\n\n"
+            "target platform AND the aesthetic. Class hints MUST reference "
+            "var(--brand-*) tokens (not raw hex).\n\n"
+            f"{self._token_contract_prompt_rule(mood)}\n\n"
             f"Target platform: {target}\n"
             f"Inferred mood label: {mood}\n"
             f"Palette tokens to reference verbatim where helpful:\n"
@@ -1135,6 +1157,7 @@ class DesignerAgent(BaseAgent):
             "  (e.g. 'HabitCard' not 'Card', 'StreakBadge' not 'Badge').\n"
             "- Use src/components/<Name>.jsx paths (PascalCase filenames).\n"
             "- Include hooks if logic is reused (src/hooks/<useFoo>.js).\n\n"
+            f"{self._token_contract_prompt_rule(mood)}\n\n"
             "Return STRICT JSON, no commentary, no fences:\n"
             "{\n"
             '  "files": [\n'
@@ -1298,10 +1321,105 @@ class DesignerAgent(BaseAgent):
         out.append("")
         return "\n".join(out)
 
+    # ─── Token-contract prompt rule ─────────────────────────────────────
+    # The seeded tokens.css already carries a full --brand-* set, but
+    # downstream generation ignores it: the model hardcodes hex / reaches
+    # for the Tailwind default palette and ships a generic-AI look. This
+    # static rule is the NON-NEGOTIABLE wording injected into the
+    # component/visual prompts so generated CSS/JSX consumes the tokens
+    # and avoids the generic-AI tells. code_agent reuses the exact text.
+
+    @staticmethod
+    def _token_contract_prompt_rule(mood: str = "") -> str:
+        """Return the NON-NEGOTIABLE token-contract + design-methodology rule.
+
+        Pure string construction — no external tool. ``mood`` only seeds
+        the "named aesthetic direction" line; an empty mood still yields a
+        valid rule. Exposed as a staticmethod so code_agent can paste the
+        EXACT same wording into its per-file prompts.
+        """
+        mood_line = (
+            f"- Pick ONE named aesthetic direction appropriate to the brief "
+            f"(mood seed: '{mood}'). "
+            if mood else
+            "- Pick ONE named aesthetic direction appropriate to the brief. "
+        )
+        return (
+            "NON-NEGOTIABLE DESIGN CONTRACT (do not violate any line):\n"
+            "- The entry stylesheet MUST begin with `@import './tokens.css';` "
+            "and EVERY color, radius, and motion value MUST come from a "
+            "var(--brand-*) token (e.g. var(--brand-primary), "
+            "var(--brand-accent), var(--brand-bg), var(--brand-text), "
+            "var(--brand-radius-md), var(--brand-motion-base)).\n"
+            "- DO NOT hardcode hex colors (#RRGGBB), rgb()/hsl() literals, or "
+            "reach for the Tailwind default palette (no `bg-blue-500`, "
+            "`text-gray-700`, `rounded-lg` defaults that bypass the tokens). "
+            "Map any Tailwind utility you need back onto a var(--brand-*) "
+            "token via arbitrary-value syntax (e.g. "
+            "`bg-[var(--brand-primary)]`, `rounded-[var(--brand-radius-md)]`).\n"
+            "FRONTEND-DESIGN METHODOLOGY (avoid generic-AI output):\n"
+            + mood_line +
+            "and commit to it across spacing, type scale, and motion.\n"
+            "- FORBID the generic-AI tells: no centered single column on a "
+            "flat gradient, no three evenly-spaced rounded cards with a tiny "
+            "icon + lorem heading, no default system-font + violet/indigo "
+            "accent, no emoji-as-iconography, no unmotivated drop shadows.\n"
+            "- Require at least ONE distinctive, brief-appropriate detail "
+            "(a deliberate type pairing, an asymmetric layout beat, a custom "
+            "empty state, a signature accent treatment) so the result reads "
+            "as designed, not defaulted."
+        )
+
     # ─── Usable code-asset renderers ────────────────────────────────────
     # These produce real files a developer can drop into a project, not
     # markdown summaries. They cover the gap between "the agent told me
     # what to build" and "the agent gave me something I can use."
+
+    @staticmethod
+    def _render_entry_css(
+        palette: Dict[str, str],
+        fonts: Dict[str, str],
+        *,
+        has_tokens: bool = True,
+    ) -> str:
+        """Emit the entry-stylesheet content that CONSUMES tokens.css.
+
+        Per the design contract this content begins with
+        ``@import './tokens.css';`` so the seeded tokens are actually
+        used, then wires the base document to var(--brand-*) tokens.
+
+        Degrade: when ``has_tokens`` is False the ``@import`` line is
+        omitted (no broken import) — the body still references the
+        tokens, which is harmless if a tokens.css is supplied later.
+        Pure string construction; never raises.
+        """
+        lines: List[str] = []
+        if has_tokens:
+            lines.append("@import './tokens.css';")
+            lines.append("")
+        lines.extend([
+            "/* Generated by SkyN3t DesignerAgent — entry stylesheet.",
+            " * All colors / radii / motion resolve through var(--brand-*).",
+            " */",
+            "*, *::before, *::after { box-sizing: border-box; }",
+            "html, body, #root { min-height: 100%; }",
+            "body {",
+            "  margin: 0;",
+            "  background: var(--brand-bg);",
+            "  color: var(--brand-text);",
+            "  font-family: var(--brand-font-body);",
+            "  -webkit-font-smoothing: antialiased;",
+            "}",
+            "h1, h2, h3 { font-family: var(--brand-font-heading); }",
+            "code, pre, kbd { font-family: var(--brand-font-mono); }",
+            "a { color: var(--brand-accent); }",
+            ":focus-visible {",
+            "  outline: 2px solid var(--brand-accent);",
+            "  outline-offset: 2px;",
+            "}",
+            "",
+        ])
+        return "\n".join(lines)
 
     @staticmethod
     def _render_tokens_css(palette: Dict[str, str], fonts: Dict[str, str]) -> str:

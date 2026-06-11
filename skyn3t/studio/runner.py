@@ -23,6 +23,7 @@ from skyn3t.config.settings import get_settings
 from skyn3t.core.agent import AgentCapability, TaskRequest, TaskResult
 from skyn3t.core.event_context import push_event_context
 from skyn3t.studio.clarification import (
+    auto_answer_specs,
     format_user_intent_brief_block,
     parse_user_intent,
     user_keeps_category_defaults,
@@ -1138,7 +1139,20 @@ class StudioRunner:
                     agent="PackagingAgent",
                     capability="packaging",
                     handoff_to="consistency_reviewer",
-                    input_extra={},
+                    # Phase-3: derive build targets (pwa/desktop/capacitor/
+                    # docker) from the brief so packaging runs the right
+                    # wrappers on a successful scaffold. Empty list = legacy
+                    # "no extra targets" behavior (PackagingAgent ignores it).
+                    input_extra={
+                        "package_targets": self._derive_package_targets(
+                            str(
+                                manifest.get("brief_raw")
+                                or manifest.get("brief")
+                                or brief
+                            ),
+                            decisions=load_decisions(artifact_dir),
+                        ),
+                    },
                 )
                 stages.insert(reviewer_idx, consistency_stage)
                 if not (isinstance(extra, dict) and extra.get("packaging_enabled") is False):
@@ -1550,6 +1564,19 @@ class StudioRunner:
                         injected_skills = list(output.get("injected_skills") or [])
                     except Exception:
                         injected_skills = []
+                    # Phase-3 stub hard-gate signal (code_stage.planned_imports_signal):
+                    # persist the planned-imports sidecar so the consistency
+                    # engine's _scan_planned_component_unused can read it, and
+                    # surface the entrypoint-stub / stub-marker signals onto the
+                    # manifest. The actual regen + block happens in
+                    # _run_post_code_checks (the consistency engine's
+                    # stub_entrypoint scanner feeds the existing targeted-fix
+                    # loop and raises UnresolvedScaffoldStubError if it sticks).
+                    self._consume_code_stage_stub_signal(
+                        manifest=manifest,
+                        artifact_dir=artifact_dir,
+                        output=output if isinstance(output, dict) else None,
+                    )
                 stage_files = self._normalize_stage_files(
                     output.get("files") if isinstance(output, dict) else None,
                     artifact_dir=artifact_dir,
@@ -1559,52 +1586,104 @@ class StudioRunner:
                 # Conversational pause: if any stage returns needs_clarification=True, halt and
                 # persist a special manifest status so the dashboard can prompt the user.
                 if isinstance(output, dict) and output.get("needs_clarification"):
-                    manifest["status"] = "awaiting_clarification"
-                    manifest["clarification"] = {
-                        "asked_by": stage.agent,
-                        "questions": output.get("questions", []),
-                        "question_options": output.get("question_options", []),
-                        "asked_at": time.time(),
-                    }
-                    question_count = len(output.get("questions", []))
-                    manifest["next_action"] = (
-                        f"Answer {question_count} clarification question(s) to continue."
-                    )
-                    self._set_stage_record(
-                        manifest,
-                        stage,
-                        status="waiting",
-                        started_at=stage_started_at,
-                        completed_at=time.time(),
-                        task_id=task.task_id,
-                        summary=stage_summary or manifest["next_action"],
-                        files=stage_files,
-                        next_action=manifest["next_action"],
-                        question_count=question_count,
-                    )
-                    self._append_history(
-                        manifest,
-                        "PROJECT_AWAITING_CLARIFICATION",
-                        status="awaiting_clarification",
-                        stage=stage.name,
-                        agent=stage.agent,
-                        message=manifest["next_action"],
-                        question_count=question_count,
-                    )
-                    self._finalize_benchmark(manifest)
-                    self._save_manifest(artifact_dir, manifest)
-                    self._publish("PROJECT_AWAITING_CLARIFICATION",
-                                   {"slug": slug, "stage": stage.name,
-                                    "questions": output.get("questions", [])})
-                    await self._dispatch_clarification_notifications(
-                        manifest,
-                        slug,
-                        stage.agent,
-                        list(output.get("questions", [])),
-                    )
-                    self._save_manifest(artifact_dir, manifest)
-                    # IMPORTANT: do NOT continue to next stage. Return now; user will resume.
-                    return manifest
+                    # Phase-3 auto-answer (clarification.auto_answer_specs):
+                    # when mission autonomy is balanced/move_fast, synthesize
+                    # sensible default answers from the kickoff specs and
+                    # CONTINUE the pipeline instead of stalling. Guarded by
+                    # SKYN3T_AUTO_CLARIFY (default-on) and gated to non-
+                    # confirm_first autonomy; confirm_first / empty specs fall
+                    # through to the existing awaiting-clarification halt.
+                    rerun_output: Optional[Dict[str, Any]] = None
+                    rerun_task = None
+                    if self._maybe_auto_answer_clarification(
+                        manifest=manifest,
+                        artifact_dir=artifact_dir,
+                        output=output,
+                        stage=stage,
+                        slug=slug,
+                    ):
+                        _ai_block = str(manifest.get("_auto_clarify_brief_block") or "")
+                        if _ai_block:
+                            brief = (brief or "").rstrip() + "\n\n" + _ai_block
+                        if not isinstance(extra, dict):
+                            extra = {}
+                        extra = {**extra, "clarifications": True}
+                        extra.pop("require_clarification", None)
+                        # Re-run THIS stage with clarifications=True so the agent
+                        # emits its REAL output (e.g. BrainstormAgent skips
+                        # re-asking but still produces brainstorm.md/angles).
+                        # A bare ``continue`` here would SKIP the stage, lose its
+                        # output + prior_summaries, and leave the stage record
+                        # stuck at status='running'.
+                        rerun_output, rerun_task = await self._redispatch_stage_with_clarifications(
+                            agent=agent,
+                            stage=stage,
+                            base_input=input_data,
+                            brief=brief,
+                            template_key=template_key,
+                            slug=slug,
+                            stage_timeout=_stage_to,
+                        )
+                    if isinstance(rerun_output, dict) and not rerun_output.get("needs_clarification"):
+                        # Auto-clarify resolved: adopt the real output and fall
+                        # through to the normal stage-completion path below, which
+                        # finalizes the stage record as 'done' and records the
+                        # summary into prior_summaries for downstream stages.
+                        output = rerun_output
+                        if rerun_task is not None:
+                            task = rerun_task
+                        stage_files = self._normalize_stage_files(
+                            output.get("files") if isinstance(output, dict) else None,
+                            artifact_dir=artifact_dir,
+                        )
+                        stage_summary = self._summarize_stage_output(output)
+                    else:
+                        manifest["status"] = "awaiting_clarification"
+                        manifest["clarification"] = {
+                            "asked_by": stage.agent,
+                            "questions": output.get("questions", []),
+                            "question_options": output.get("question_options", []),
+                            "asked_at": time.time(),
+                        }
+                        question_count = len(output.get("questions", []))
+                        manifest["next_action"] = (
+                            f"Answer {question_count} clarification question(s) to continue."
+                        )
+                        self._set_stage_record(
+                            manifest,
+                            stage,
+                            status="waiting",
+                            started_at=stage_started_at,
+                            completed_at=time.time(),
+                            task_id=task.task_id,
+                            summary=stage_summary or manifest["next_action"],
+                            files=stage_files,
+                            next_action=manifest["next_action"],
+                            question_count=question_count,
+                        )
+                        self._append_history(
+                            manifest,
+                            "PROJECT_AWAITING_CLARIFICATION",
+                            status="awaiting_clarification",
+                            stage=stage.name,
+                            agent=stage.agent,
+                            message=manifest["next_action"],
+                            question_count=question_count,
+                        )
+                        self._finalize_benchmark(manifest)
+                        self._save_manifest(artifact_dir, manifest)
+                        self._publish("PROJECT_AWAITING_CLARIFICATION",
+                                       {"slug": slug, "stage": stage.name,
+                                        "questions": output.get("questions", [])})
+                        await self._dispatch_clarification_notifications(
+                            manifest,
+                            slug,
+                            stage.agent,
+                            list(output.get("questions", [])),
+                        )
+                        self._save_manifest(artifact_dir, manifest)
+                        # IMPORTANT: do NOT continue to next stage. Return now; user will resume.
+                        return manifest
 
                 for f in stage_files:
                     if f not in manifest["artifacts"]:
@@ -2490,8 +2569,16 @@ class StudioRunner:
                 if build_result is not None:
                     manifest["build_verification"] = build_result
                     verdict = str(build_result.get("verdict") or "")
+                    # Phase-3: surface the new visual + test sub-gates onto the
+                    # manifest. These already fold into build_verifier's
+                    # top-level verdict (so `verdict` above already reflects a
+                    # 'no'); we promote them for the dashboard + failure_hint.
+                    self._surface_verifier_subgates(manifest, "build_verification", build_result)
                     if not skip_fix_loops:
-                        FIX_ATTEMPTS = 2
+                        # Entrypoint-stub failures get a deeper fix budget — the
+                        # entrypoint is the highest-leverage file, so spend one
+                        # extra round on it before giving up (change #4).
+                        FIX_ATTEMPTS = 3 if manifest.get("_entrypoint_stub_gate") else 2
                         attempt = 0
                         while verdict == "no" and attempt < FIX_ATTEMPTS:
                             attempt += 1
@@ -2574,8 +2661,17 @@ class StudioRunner:
                         if boot_result is not None:
                             manifest["boot_verification"] = boot_result
                             boot_verdict = boot_result.get("verdict")
+                            # Phase-3: surface the functional CRUD smoke sub-gate.
+                            # boot_verifier already folded a failed round-trip
+                            # into its top-level verdict, so boot_verdict above
+                            # already reflects a 'no'.
+                            self._surface_verifier_subgates(
+                                manifest, "boot_verification", boot_result
+                            )
                             if not skip_fix_loops:
-                                BOOT_FIX_ATTEMPTS = 2
+                                BOOT_FIX_ATTEMPTS = (
+                                    3 if manifest.get("_entrypoint_stub_gate") else 2
+                                )
                                 boot_attempt = 0
                                 while boot_verdict == "no" and boot_attempt < BOOT_FIX_ATTEMPTS:
                                     boot_attempt += 1
@@ -2745,6 +2841,18 @@ class StudioRunner:
                         )
                         manifest["_retry_hint"] = (
                             build_result.get("failure_hint") or ""
+                        )
+                        # Phase-3 (change #5): non-destructively record the
+                        # terminal verifier failure into artifact_dir so a
+                        # failed project still ships a human-readable FAILED.md
+                        # and a machine-readable completeness scoreboard. Only
+                        # ever CREATES files; wrapped so it can never break the
+                        # failure path or the auto-retry that follows.
+                        self._write_failure_disposition(
+                            artifact_dir=artifact_dir,
+                            manifest=manifest,
+                            scaffold_dir=scaffold_dir,
+                            brief=brief,
                         )
                     try:
                         from skyn3t.agents.stack_detector import (
@@ -2978,6 +3086,16 @@ class StudioRunner:
                 manifest["_retry_hint"] = str(exc)
             else:
                 manifest["next_action"] = "Project stopped because the runner crashed."
+            # Phase-3 (change #5): non-destructively record the terminal bail
+            # disposition (FAILED.md + completeness scoreboard) into the
+            # existing artifact_dir. Wrapped internally so it can never break
+            # the failure-state save or the auto-retry that follows.
+            self._write_failure_disposition(
+                artifact_dir=artifact_dir,
+                manifest=manifest,
+                scaffold_dir=artifact_dir / "scaffold",
+                brief=str(manifest.get("brief_raw") or manifest.get("brief") or brief),
+            )
             self._finalize_benchmark(manifest)
             self._append_history(
                 manifest,
@@ -3712,6 +3830,195 @@ class StudioRunner:
         except (TypeError, ValueError):
             return False
         return score >= self._reviewer_score_threshold(manifest)
+
+    @staticmethod
+    def _completeness_scoreboard_enabled() -> bool:
+        """SKYN3T_COMPLETENESS_SCOREBOARD default-on flag."""
+        return os.environ.get(
+            "SKYN3T_COMPLETENESS_SCOREBOARD", "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+
+    def _write_failure_disposition(
+        self,
+        *,
+        artifact_dir: Path,
+        manifest: Dict[str, Any],
+        scaffold_dir: Path,
+        brief: str = "",
+    ) -> None:
+        """Non-destructively record a terminal failure (change #5).
+
+        Writes FAILED.md (human-readable) and, when enabled, a
+        completeness_scoreboard.json (machine-readable stub/orphan/dead-route
+        counts) INTO the existing artifact_dir. Only ever CREATES files —
+        never deletes/moves existing work. Each write is independently wrapped
+        so one failing helper can't suppress the other or break the failure
+        path / auto-retry.
+        """
+        try:
+            self._write_failed_md(artifact_dir, manifest)
+        except Exception:
+            logger.debug("FAILED.md write failed (non-fatal)", exc_info=True)
+        if self._completeness_scoreboard_enabled():
+            try:
+                self._write_completeness_scoreboard(artifact_dir, scaffold_dir, brief)
+            except Exception:
+                logger.debug(
+                    "completeness_scoreboard write failed (non-fatal)", exc_info=True
+                )
+
+    @staticmethod
+    def _write_failed_md(artifact_dir: Path, manifest: Dict[str, Any]) -> None:
+        """Write a human-readable FAILED.md into artifact_dir (create-only)."""
+        try:
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return
+        slug = str(manifest.get("slug") or artifact_dir.name)
+        error = str(manifest.get("error") or "").strip()
+        next_action = str(manifest.get("next_action") or "").strip()
+        hint = str(manifest.get("_retry_hint") or "").strip()
+        failed_stages = [
+            str(s.get("name"))
+            for s in (manifest.get("stages") or [])
+            if isinstance(s, dict)
+            and str(s.get("status") or "").lower() in ("failed", "error")
+        ]
+        bv = manifest.get("build_verification") or {}
+        boot = manifest.get("boot_verification") or {}
+        lines = [
+            f"# Build failed: {slug}",
+            "",
+            f"- Status: {manifest.get('status') or 'failed'}",
+            f"- Stack: {manifest.get('stack') or 'unknown'}",
+            f"- Execution profile: {manifest.get('execution_profile') or 'balanced'}",
+        ]
+        if failed_stages:
+            lines.append(f"- Failed stage(s): {', '.join(failed_stages)}")
+        lines += ["", "## Error", "", error or "(no error message recorded)"]
+        if next_action:
+            lines += ["", "## Next action", "", next_action]
+        if hint:
+            lines += ["", "## Failure hint", "", hint]
+        if isinstance(bv, dict) and bv.get("verdict"):
+            lines += [
+                "",
+                "## Build verification",
+                "",
+                f"- verdict: {bv.get('verdict')}",
+                f"- summary: {str(bv.get('summary') or '')[:500]}",
+            ]
+        if isinstance(boot, dict) and boot.get("verdict"):
+            lines += [
+                "",
+                "## Boot verification",
+                "",
+                f"- verdict: {boot.get('verdict')}",
+                f"- summary: {str(boot.get('summary') or '')[:500]}",
+            ]
+        path = artifact_dir / "FAILED.md"
+        try:
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except Exception:
+            logger.debug("FAILED.md file write failed", exc_info=True)
+
+    @staticmethod
+    def _write_completeness_scoreboard(
+        artifact_dir: Path, scaffold_dir: Path, brief: str = ""
+    ) -> None:
+        """Write completeness_scoreboard.json into artifact_dir (create-only).
+
+        Computes stub / orphan / dead-route counts from check_consistency +
+        the boot verifier's route derivation. Pure/static — never raises out
+        (each source is independently guarded).
+        """
+        try:
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return
+        stub_count = 0
+        orphan_count = 0
+        dead_route_count = 0
+        by_category: Dict[str, int] = {}
+        consistency_ok: Optional[bool] = None
+
+        if scaffold_dir.exists() and scaffold_dir.is_dir():
+            try:
+                from skyn3t.agents.consistency_engine import check_consistency
+
+                report = check_consistency(scaffold_dir, brief or "")
+                consistency_ok = bool(getattr(report, "ok", False))
+                for issue in getattr(report, "issues", []) or []:
+                    cat = str(getattr(issue, "category", "") or "")
+                    by_category[cat] = by_category.get(cat, 0) + 1
+                    if cat in ("stub_entrypoint", "todo_stub", "truncated_stylesheet"):
+                        stub_count += 1
+                    if cat in ("planned_component_unused", "orphan_export", "orphan_classname"):
+                        orphan_count += 1
+            except Exception:
+                logger.debug("scoreboard consistency scan failed", exc_info=True)
+            try:
+                from skyn3t.agents.boot_verifier import BootVerifierAgent
+
+                routes = BootVerifierAgent._derive_primary_routes(scaffold_dir)
+                dead_route_count = len(routes) if isinstance(routes, list) else 0
+            except Exception:
+                logger.debug("scoreboard route derivation failed", exc_info=True)
+
+        scoreboard = {
+            "slug": artifact_dir.name,
+            "generated_at": time.time(),
+            "consistency_ok": consistency_ok,
+            "stub_count": stub_count,
+            "orphan_count": orphan_count,
+            "derived_route_count": dead_route_count,
+            "issues_by_category": by_category,
+        }
+        path = artifact_dir / "completeness_scoreboard.json"
+        try:
+            path.write_text(json.dumps(scoreboard, indent=2), encoding="utf-8")
+        except Exception:
+            logger.debug("completeness_scoreboard file write failed", exc_info=True)
+
+    @staticmethod
+    def _surface_verifier_subgates(
+        manifest: Dict[str, Any],
+        key: str,
+        result: Optional[Dict[str, Any]],
+    ) -> None:
+        """Promote the Phase-3 verifier sub-gates onto manifest for surfacing.
+
+        Pulls visual_verification / test_run (build) and functional_smoke
+        (boot) out of the verifier result dict into manifest['verifier_subgates']
+        so the dashboard and failure-hint routing can see them without parsing
+        the whole verification record. The sub-gates already fold into the
+        agent's top-level verdict; this is read-only promotion. Any missing
+        sub-gate is treated as 'skipped' and never hardens the verdict here.
+        """
+        if not isinstance(result, dict):
+            return
+        try:
+            bucket = manifest.setdefault("verifier_subgates", {})
+            sub: Dict[str, Any] = {}
+            for sub_key in ("visual_verification", "test_run", "functional_smoke"):
+                val = result.get(sub_key)
+                if isinstance(val, dict):
+                    sub[sub_key] = {
+                        "ran": bool(val.get("ran")),
+                        "verdict": val.get("verdict"),
+                    }
+                    if "score" in val:
+                        sub[sub_key]["score"] = val.get("score")
+            if sub:
+                bucket[key] = sub
+            # Mirror the verifier's own failure_hint up to the manifest so the
+            # retry path (_maybe_auto_retry reads manifest['_retry_hint']) and
+            # the dashboard see the concrete visual/test/functional reason.
+            hint = result.get("failure_hint")
+            if hint and str(result.get("verdict") or "").lower() == "no":
+                manifest["_retry_hint"] = str(hint)
+        except Exception:
+            logger.debug("surface verifier sub-gates failed", exc_info=True)
 
     async def _run_build_verifier(
         self,
@@ -4762,6 +5069,255 @@ class StudioRunner:
 
         return {"findings": findings, "blockers": blockers}
 
+    @staticmethod
+    def _stub_hard_gate_enabled() -> bool:
+        """SKYN3T_STUB_HARD_GATE default-on flag."""
+        return os.environ.get(
+            "SKYN3T_STUB_HARD_GATE", "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+
+    @staticmethod
+    def _auto_clarify_enabled() -> bool:
+        """SKYN3T_AUTO_CLARIFY default-on flag."""
+        return os.environ.get(
+            "SKYN3T_AUTO_CLARIFY", "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+
+    async def _redispatch_stage_with_clarifications(
+        self,
+        *,
+        agent: Any,
+        stage: Any,
+        base_input: Dict[str, Any],
+        brief: str,
+        template_key: str,
+        slug: str,
+        stage_timeout: Optional[float],
+    ) -> Tuple[Optional[Dict[str, Any]], Any]:
+        """Re-run a clarifying stage ONCE with clarifications=True.
+
+        After auto-answering a clarification, the stage must be re-executed so
+        the agent emits its real output (BrainstormAgent, for example, returns
+        early at its needs_clarification branch BEFORE producing brainstorm.md /
+        angles / JTBD, and only emits them on a run where input_data
+        ['clarifications'] is set). Returns ``(output, task)``; ``output`` is
+        ``None`` on failure or if the re-run still asks for clarification, so the
+        caller can fall back to the awaiting-clarification halt. Never raises.
+        """
+        import asyncio as _asyncio
+
+        rerun_input = dict(base_input)
+        rerun_input["brief"] = brief
+        rerun_input["clarifications"] = True
+        rerun_input.pop("require_clarification", None)
+        rerun_task = TaskRequest(
+            title=f"{template_key}:{stage.name}",
+            input_data=rerun_input,
+        )
+        try:
+            with push_event_context(
+                project_slug=slug,
+                project_stage=stage.name,
+                project_template=template_key,
+                task_id=rerun_task.task_id,
+                correlation_id=rerun_task.task_id,
+            ):
+                result = await _asyncio.wait_for(
+                    agent.execute(rerun_task), timeout=stage_timeout
+                )
+            out = getattr(result, "output", None)
+            return (out if isinstance(out, dict) else None), rerun_task
+        except Exception:
+            logger.debug(
+                "auto-clarify stage re-dispatch failed (falling back to halt)",
+                exc_info=True,
+            )
+            return None, rerun_task
+
+    def _maybe_auto_answer_clarification(
+        self,
+        *,
+        manifest: Dict[str, Any],
+        artifact_dir: Path,
+        output: Dict[str, Any],
+        stage: Any,
+        slug: str,
+    ) -> bool:
+        """Try to auto-answer a clarification halt (change #1).
+
+        Returns True when the clarification was auto-answered (the caller then
+        folds manifest['_auto_clarify_brief_block'] into the brief and CONTINUEs
+        the stage loop) and False to leave the existing awaiting-clarification
+        halt intact (confirm_first autonomy, flag off, empty specs, or any
+        error). Pure function delegate — never raises into the loop.
+        """
+        if not self._auto_clarify_enabled():
+            return False
+        try:
+            autonomy = str(
+                (manifest.get("mission_setup") or {}).get("autonomy") or ""
+            ).strip().lower()
+            # Reconstruct the clarification specs from the stage output. The
+            # clarification stage emits question_options entries shaped exactly
+            # like the specs auto_answer_specs consumes (id/question/options/
+            # free_text/placeholder); fall back to bare questions otherwise.
+            specs = output.get("question_options")
+            if not isinstance(specs, list) or not specs:
+                specs = [
+                    {"question": q}
+                    for q in (output.get("questions") or [])
+                    if isinstance(q, str) and q.strip()
+                ]
+            brief_for_answers = str(
+                manifest.get("brief_raw") or manifest.get("brief") or ""
+            )
+            result = auto_answer_specs(
+                [s for s in specs if isinstance(s, dict)],
+                brief_for_answers,
+                mode=autonomy,
+            )
+        except Exception:
+            logger.debug("auto_answer_specs failed; leaving halt intact", exc_info=True)
+            return False
+
+        if not isinstance(result, dict) or not result.get("auto_answered"):
+            return False
+
+        brief_block = str(result.get("brief_block") or "")
+        manifest["_auto_clarify_brief_block"] = brief_block
+        user_intent = result.get("user_intent")
+        if isinstance(user_intent, dict) and user_intent:
+            manifest["user_intent"] = user_intent
+        manifest["clarification"] = None
+        manifest.setdefault("clarification_history", []).append(
+            {
+                "questions": list(result.get("questions") or []),
+                "answers": list(result.get("answers") or []),
+                "auto_answered": True,
+                "answered_at": time.time(),
+            }
+        )
+        self._append_history(
+            manifest,
+            "PROJECT_CLARIFICATION_AUTO_ANSWERED",
+            status="running",
+            stage=getattr(stage, "name", None),
+            agent=getattr(stage, "agent", None),
+            message=(
+                f"Auto-answered {len(result.get('questions') or [])} clarification "
+                f"question(s) ({autonomy} autonomy); continuing without a halt."
+            ),
+        )
+        try:
+            self._save_manifest(artifact_dir, manifest)
+        except Exception:
+            logger.debug("auto-clarify manifest save failed", exc_info=True)
+        try:
+            self._publish(
+                "PROJECT_CLARIFICATION_AUTO_ANSWERED",
+                {"slug": slug, "stage": getattr(stage, "name", None)},
+            )
+        except Exception:
+            logger.debug("auto-clarify publish failed", exc_info=True)
+        return True
+
+    def _consume_code_stage_stub_signal(
+        self,
+        *,
+        manifest: Dict[str, Any],
+        artifact_dir: Path,
+        output: Optional[Dict[str, Any]],
+    ) -> None:
+        """Consume the code stage's pre-verifier stub signal.
+
+        Implements the runner side of code_stage.planned_imports_signal +
+        the stub hard-gate (change #2). Two effects, both non-blocking:
+
+          1. Writes scaffold/.skyn3t_planned_imports.json from
+             output['planned_imports'] so the consistency engine's
+             _scan_planned_component_unused can flag generated-then-orphaned
+             components.
+          2. Surfaces output['entrypoint_is_stub'] / ['stub_markers'] /
+             ['entrypoint_files'] onto manifest['code_stub_signal'] and, when
+             the entrypoint shipped as a stub AND the hard-gate is enabled,
+             raises the post-code stub-fix budget so the existing
+             _run_post_code_checks machinery (which already detects the
+             stub via the consistency engine's stub_entrypoint scanner and
+             regenerates / raises UnresolvedScaffoldStubError) hits it harder.
+
+        Every read is .get() with a safe default; absence is treated as
+        'no signal' and never blocks. Sidecar/budget writes are wrapped so a
+        failure here can never break the code stage.
+        """
+        if not isinstance(output, dict):
+            return
+        scaffold_dir = artifact_dir / "scaffold"
+        planned_imports: List[str] = []
+        stub_markers: List[Dict[str, str]] = []
+        entrypoint_files: List[str] = []
+        entrypoint_is_stub = False
+        try:
+            raw_planned = output.get("planned_imports")
+            if isinstance(raw_planned, list):
+                planned_imports = [str(x) for x in raw_planned if isinstance(x, str)]
+            raw_markers = output.get("stub_markers")
+            if isinstance(raw_markers, list):
+                stub_markers = [m for m in raw_markers if isinstance(m, dict)]
+            raw_entry = output.get("entrypoint_files")
+            if isinstance(raw_entry, list):
+                entrypoint_files = [str(x) for x in raw_entry if isinstance(x, str)]
+            entrypoint_is_stub = bool(output.get("entrypoint_is_stub"))
+        except Exception:
+            logger.debug("code-stage stub signal parse failed", exc_info=True)
+            return
+
+        manifest["code_stub_signal"] = {
+            "planned_imports_count": len(planned_imports),
+            "stub_marker_count": len(stub_markers),
+            "entrypoint_files": entrypoint_files,
+            "entrypoint_is_stub": entrypoint_is_stub,
+        }
+
+        # 1. Persist the planned-imports sidecar for the consistency engine.
+        if planned_imports and scaffold_dir.exists():
+            try:
+                sidecar = scaffold_dir / ".skyn3t_planned_imports.json"
+                sidecar.write_text(
+                    json.dumps({"planned_imports": planned_imports}),
+                    encoding="utf-8",
+                )
+            except Exception:
+                logger.debug("planned-imports sidecar write failed", exc_info=True)
+
+        # 2. Entrypoint stub hard-gate: deepen the post-code stub-fix budget
+        #    so the existing consistency fix loop spends a stronger regen on
+        #    the entrypoint before _run_post_code_checks bails.
+        if entrypoint_is_stub and self._stub_hard_gate_enabled():
+            manifest["_entrypoint_stub_gate"] = True
+            self._append_history(
+                manifest,
+                "ENTRYPOINT_STUB_DETECTED",
+                status="running",
+                stage="code",
+                message=(
+                    "Entrypoint shipped as a generation-failure stub "
+                    f"({', '.join(entrypoint_files) or 'entrypoint'}); forcing "
+                    "a dedicated entrypoint regen before delivery."
+                ),
+            )
+            # Bias the next code-stage retry toward a stronger model — the
+            # entrypoint is the highest-leverage file in the scaffold.
+            try:
+                slug = str(manifest.get("slug") or "")
+                if slug:
+                    self._maybe_escalate_cheap_smart(
+                        slug=slug,
+                        stage_name="code",
+                        reason="entrypoint shipped as a generation-failure stub",
+                    )
+            except Exception:
+                logger.debug("entrypoint-stub escalation failed", exc_info=True)
+
     async def _run_post_code_checks(
         self,
         *,
@@ -5072,11 +5628,21 @@ class StudioRunner:
     def _unresolved_todo_stub_files(issues: List[Any]) -> List[str]:
         files: List[str] = []
         seen: Set[str] = set()
+        # stub_entrypoint (Phase-3) is the sharper sibling of todo_stub for
+        # entry files; an unresolved one must hard-gate delivery the same way,
+        # so include it here → raises UnresolvedScaffoldStubError when it
+        # survives the targeted-fix pass.
+        blocking_categories = {"todo_stub", "stub_entrypoint"}
         for issue in issues:
             category = getattr(issue, "category", None)
             severity = getattr(issue, "severity", None)
             file_path = str(getattr(issue, "file", "") or "").strip()
-            if category != "todo_stub" or severity != "error" or not file_path or file_path in seen:
+            if (
+                category not in blocking_categories
+                or severity != "error"
+                or not file_path
+                or file_path in seen
+            ):
                 continue
             seen.add(file_path)
             files.append(file_path)
@@ -5981,7 +6547,10 @@ class StudioRunner:
 
     @staticmethod
     def _consistency_fix_action(category: str) -> str:
-        if category in {"broken_import", "missing_mount", "todo_stub"}:
+        # stub_entrypoint (Phase-3 consistency_engine.new_scanners) is a
+        # generation-failure entry file — always regenerate, never just
+        # placeholder it, so the hard-gate forces a real entrypoint.
+        if category in {"broken_import", "missing_mount", "todo_stub", "stub_entrypoint"}:
             return "regenerate"
         return "create_placeholder"
 
@@ -6742,6 +7311,127 @@ class StudioRunner:
             return text
         return text[: max(0, cls._PRIOR_SUMMARY_CAP - 3)].rstrip() + "..."
 
+    @staticmethod
+    def _derive_package_targets(
+        brief: str, *, decisions: Optional[Dict[str, Any]] = None
+    ) -> List[str]:
+        """Derive PackagingAgent build targets from the brief/decisions.
+
+        Phase-3 (runner.consume_gates / packaging_agent.target_driven_packaging):
+        select a subset of {'pwa','desktop','capacitor','docker'} so packaging
+        emits the right wrappers on a successful scaffold. Pure heuristic — no
+        external tool. Returns [] on any uncertainty (the safe legacy default
+        where PackagingAgent runs no extra targets). PackagingAgent itself
+        re-normalizes and best-effort/skips any target whose CLI is missing,
+        so a generous guess here never hard-fails packaging.
+        """
+        try:
+            text = re.sub(r"\s+", " ", str(brief or "").lower()).strip()
+        except Exception:
+            return []
+        if not text:
+            return []
+        targets: List[str] = []
+
+        def _add(t: str) -> None:
+            if t not in targets:
+                targets.append(t)
+
+        family = ""
+        backend_pinned = False
+        try:
+            dec = decisions if isinstance(decisions, dict) else {}
+            family = str(dec.get("family") or dec.get("project_family") or "").strip().lower()
+            stack = dec.get("stack") if isinstance(dec.get("stack"), dict) else {}
+            backend = str((stack or {}).get("backend") or dec.get("backend") or "").lower()
+            backend_pinned = bool(backend) and backend not in ("none", "static", "")
+        except Exception:
+            family = ""
+            backend_pinned = False
+
+        mobile_signals = (
+            "mobile app",
+            "ios app",
+            "iphone",
+            "ipad",
+            "android",
+            "app store",
+            "play store",
+            "native app",
+            "phone app",
+        )
+        desktop_signals = (
+            "desktop app",
+            "mac app",
+            "macos app",
+            "windows app",
+            "electron",
+            "tauri",
+            "computer app",
+            "menu bar app",
+            "system tray",
+        )
+        docker_signals = (
+            "docker",
+            "docker compose",
+            "containerize",
+            "container ",
+            "kubernetes",
+            "self-host",
+            "self host",
+            "deploy to a server",
+        )
+        server_signals = (
+            "backend",
+            "server",
+            "api",
+            "database",
+            "postgres",
+            "express",
+            "node server",
+            "fullstack",
+            "full-stack",
+            "full stack",
+        )
+
+        is_mobile = any(s in text for s in mobile_signals)
+        is_desktop = any(s in text for s in desktop_signals)
+        is_server = (
+            family == "fullstack"
+            or backend_pinned
+            or any(s in text for s in server_signals)
+        )
+
+        if is_mobile:
+            # FULL-NATIVE owner decision: wrap mobile briefs with Capacitor
+            # (iOS + Android) rather than a PWA-only shim.
+            _add("capacitor")
+        if is_desktop:
+            _add("desktop")
+        if any(s in text for s in docker_signals) or is_server:
+            _add("docker")
+        # PWA for SPA-flavored web briefs (the common case) when we're not
+        # already producing a native/desktop wrapper. Gated on a web signal so
+        # a pure docs/plan brief gets nothing.
+        web_signals = (
+            "web app",
+            "webapp",
+            "single-page",
+            "single page",
+            "spa",
+            "dashboard",
+            "pwa",
+            "progressive web",
+            "offline",
+            "installable",
+            "tracker",
+            "landing page",
+            "website",
+        )
+        if not is_mobile and not is_desktop and any(s in text for s in web_signals):
+            _add("pwa")
+        return targets
+
     async def _maybe_auto_retry(self, manifest: Dict[str, Any], brief: str, slug: str) -> None:
         """If a project failed and hasn't already been retried, launch a second
         attempt with the dynamic "auto" planner and the failure context as a
@@ -6811,8 +7501,39 @@ class StudioRunner:
                 f"Try a different shape — pick alternative agents or a simpler stack."
                 f"{debate_note}"
             )
-        retry_brief = (brief or "").rstrip() + lesson_block
+        # Phase-3 (change #4): stub/entrypoint failures get a STRONGER model on
+        # retry. Detect a stub/entrypoint failure from the gate flag or the
+        # error text, append an explicit escalation directive, and pre-escalate
+        # the retry slug's code stage to the strong tier via cheap_smart.
+        _err_blob = (
+            f"{manifest.get('error') or ''} {manifest.get('next_action') or ''} "
+            f"{build_hint}"
+        ).lower()
+        is_stub_failure = bool(manifest.get("_entrypoint_stub_gate")) or any(
+            tok in _err_blob
+            for tok in ("stub", "entrypoint", "code generation failed", "skyn3t-backfill")
+        )
+        escalation_note = ""
+        if is_stub_failure:
+            escalation_note = (
+                "\n\nThe prior attempt's ENTRYPOINT (App/main/page) or a core "
+                "file shipped as a generation-failure stub. This retry MUST "
+                "generate a complete, runnable entrypoint that imports and "
+                "renders the real components — no placeholders, no "
+                "'export default null', no 'Generation failed' JSX. Use the "
+                "strongest available model for the code stage."
+            )
+        retry_brief = (brief or "").rstrip() + lesson_block + escalation_note
         retry_slug = f"{slug}-retry"
+        if is_stub_failure:
+            try:
+                self._maybe_escalate_cheap_smart(
+                    slug=retry_slug,
+                    stage_name="code",
+                    reason="prior attempt shipped an entrypoint/core stub",
+                )
+            except Exception:
+                logger.debug("retry stub escalation failed", exc_info=True)
         try:
             self._publish(
                 "PROJECT_RETRY_LAUNCHED",

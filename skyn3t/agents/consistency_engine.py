@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Set
 @dataclass
 class ConsistencyIssue:
     severity: str  # "error" | "warning"
-    category: str  # "broken_import" | "missing_dep" | "orphan_export" | "hallucination" | "missing_mount" | "design_quality" | "todo_stub" | "cross_artifact_palette_drift" | "cross_artifact_font_drift" | "brand_kit_ignored_by_scaffold"
+    category: str  # "broken_import" | "missing_dep" | "orphan_export" | "hallucination" | "missing_mount" | "design_quality" | "todo_stub" | "cross_artifact_palette_drift" | "cross_artifact_font_drift" | "brand_kit_ignored_by_scaffold" | "stub_entrypoint" | "planned_component_unused" | "design_token_contract" | "orphan_classname" | "tailwind_without_config" | "truncated_stylesheet"
     file: str
     message: str
     suggestion: str = ""
@@ -1595,6 +1595,556 @@ def auto_fix_cross_artifact_drift(scaffold_dir: Path) -> Dict[str, int]:
     return edits
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Phase 3 scanners: stub-entrypoint, design-token-contract, CSS coverage /
+# orphan classNames, truncated stylesheet, planned-but-unused component.
+#
+# Every one of these is wrapped at the call site in check_consistency in a
+# try/except that swallows the exception and returns [] so a single buggy
+# scanner can never take down the whole gate (mirrors the existing
+# relative_to guards). Keep them additive: existing fixtures pin issue
+# lists by category, so new categories must not leak into old findings.
+# ─────────────────────────────────────────────────────────────────────────
+
+# Files that are an SPA / app entrypoint. We only HARD-gate stubs in these
+# — a stubbed leaf component is already covered by the todo_stub detector
+# with its own (softer) message; a stubbed *entrypoint* means the whole app
+# renders nothing, so it deserves a sharper, separate category.
+_ENTRYPOINT_STEMS = ("app", "main", "index", "page", "layout", "root")
+
+# Body shapes that mean "this entry file is a generation-failure stub":
+#   - export default null  (the explicit empty-app placeholder)
+#   - a component whose only JSX is a "Generation failed" message
+#   - the SkyN3t failure markers (these are also caught by todo_stub, but we
+#     re-detect them here so output['entrypoint_is_stub'] / this category
+#     fire even if marker text changes location).
+_EXPORT_DEFAULT_NULL_RE = re.compile(
+    r"export\s+default\s+null\s*;?\s*$", re.MULTILINE
+)
+_GENERATION_FAILED_JSX_RE = re.compile(
+    r"(?i)generation\s+failed", re.MULTILINE
+)
+_ENTRYPOINT_STUB_MARKERS = (
+    "TODO[skyn3t]: code generation failed",
+    "@skyn3t-backfill-stub",
+)
+
+
+def _is_entrypoint_stub_body(body: str) -> bool:
+    """Pure check: does this entry-file body read as a generation-failure
+    stub? Fail-open — returns False on anything that doesn't clearly match.
+
+    Mirrors code_agent._is_entrypoint_stub semantics so the consistency
+    gate and the code stage agree on what "stubbed entrypoint" means.
+    """
+    if not body or not body.strip():
+        # An empty entry file renders nothing — that's a stub.
+        return True
+    for marker in _ENTRYPOINT_STUB_MARKERS:
+        if marker in body:
+            return True
+    # `export default null` (optionally the whole module is just that).
+    if _EXPORT_DEFAULT_NULL_RE.search(body):
+        return True
+    # A "Generation failed" placeholder component. Require BOTH the failure
+    # phrase AND that the body is small / has no other real JSX content, so
+    # an app that legitimately *handles* a generation-failed error state
+    # isn't mistaken for a stub.
+    if _GENERATION_FAILED_JSX_RE.search(body):
+        # Strip comments + whitespace; a real app has substantially more
+        # than the placeholder. Count JSX-ish element tags as a proxy for
+        # "actual UI".
+        tag_count = len(re.findall(r"<[A-Za-z][^>]*>", body))
+        if len(body) < 600 and tag_count <= 4:
+            return True
+    return False
+
+
+def _scan_stub_entrypoint(scaffold_dir: Path) -> List[ConsistencyIssue]:
+    """Flag App.*/main.*/page.* entrypoints that ship as
+    export-default-null / 'Generation failed' placeholders.
+
+    Sharper than the generic todo_stub: a stubbed *entrypoint* means the
+    whole app boots to nothing, so this gets its own category and an
+    error severity that routes into the targeted-fix / regen loop.
+    """
+    issues: List[ConsistencyIssue] = []
+    seen: Set[Path] = set()
+    for path in scaffold_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix not in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"):
+            continue
+        stem = path.stem.lower()
+        # Only entrypoint-shaped files; main.* / index.* only count when
+        # they live in src/ (the SPA mount point), so a leaf index.js
+        # barrel isn't mistaken for the app entry.
+        rel = path.relative_to(scaffold_dir).as_posix()
+        is_entry = False
+        if stem in ("app", "page", "layout", "root"):
+            is_entry = True
+        elif stem in ("main", "index"):
+            # entry mount lives at the project/src root, not in a server/
+            # routes subtree.
+            parts = rel.split("/")
+            if "server" not in parts and "routes" not in parts and len(parts) <= 2:
+                is_entry = True
+        if not is_entry:
+            continue
+        if path in seen:
+            continue
+        try:
+            body = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if not _is_entrypoint_stub_body(body):
+            continue
+        seen.add(path)
+        issues.append(
+            ConsistencyIssue(
+                severity="error",
+                category="stub_entrypoint",
+                file=rel,
+                message=(
+                    f"Entry file '{rel}' ships as a generation-failure stub "
+                    "(export default null / empty body / 'Generation failed' "
+                    "placeholder). The app boots to a blank screen — every "
+                    "downstream verifier passes because the stub is "
+                    "syntactically valid."
+                ),
+                suggestion=(
+                    "Regenerate the entrypoint from its plan-purpose so it "
+                    "renders the real top-level UI and imports its planned "
+                    "child components; do not ship an export-default-null "
+                    "entry."
+                ),
+            )
+        )
+    return issues
+
+
+# A src file re-defining its OWN color tokens in :root (the exact bug the
+# audit found: finance styles.css re-invents --bg / --surface instead of
+# consuming the seeded var(--brand-*)).
+_ROOT_COLOR_VAR_RE = re.compile(
+    r"--(?:[\w-]*?)(?:bg|background|surface|color|text|primary|secondary|"
+    r"accent|border|fg|foreground|brand)[\w-]*\s*:\s*"
+    r"(?:#[0-9a-fA-F]{3,8}\b|rgb|rgba|hsl|hsla)",
+    re.IGNORECASE,
+)
+_ROOT_BLOCK_RE = re.compile(r":root\s*\{([^}]*)\}", re.DOTALL)
+_BRAND_VAR_REF_RE = re.compile(r"var\(\s*--brand-[\w-]+", re.IGNORECASE)
+
+
+def _scan_design_token_contract(scaffold_dir: Path) -> List[ConsistencyIssue]:
+    """NO-OP unless tokens.css exists in the scaffold.
+
+    When tokens.css IS present, the seeded --brand-* contract is in force:
+      (a) src files MUST NOT re-define their own :root color tokens — that
+          shadows the brand palette and is the literal audit finding;
+      (b) the scaffold MUST actually reference var(--brand-*) somewhere
+          (0 references == the tokens were seeded but never consumed).
+    Both are errors so the regen/fix loop rewires the CSS to the tokens.
+    """
+    issues: List[ConsistencyIssue] = []
+
+    tokens_files = [
+        p for p in scaffold_dir.rglob("tokens.css") if p.is_file()
+    ]
+    if not tokens_files:
+        return issues  # contract not in force — nothing seeded.
+    tokens_set = {p.resolve() for p in tokens_files}
+
+    css_files = [
+        p for p in scaffold_dir.rglob("*")
+        if p.is_file() and p.suffix in (".css", ".scss")
+        and p.resolve() not in tokens_set
+    ]
+
+    total_brand_refs = 0
+    # also count refs inside tokens.css itself? No — the *consumption* must
+    # happen outside tokens.css. Scan all non-tokens CSS + UI files.
+    redefiners: List[str] = []
+    for p in css_files:
+        try:
+            text = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        total_brand_refs += len(_BRAND_VAR_REF_RE.findall(text))
+        for block_match in _ROOT_BLOCK_RE.finditer(text):
+            block = block_match.group(1)
+            if _ROOT_COLOR_VAR_RE.search(block):
+                redefiners.append(p.relative_to(scaffold_dir).as_posix())
+                break
+
+    # UI files may reference var(--brand-*) inline (style={{ }}) too.
+    for p in scaffold_dir.rglob("*"):
+        if not p.is_file() or p.suffix not in (
+            ".js", ".jsx", ".ts", ".tsx", ".html"
+        ):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        total_brand_refs += len(_BRAND_VAR_REF_RE.findall(text))
+
+    for rel in redefiners:
+        issues.append(
+            ConsistencyIssue(
+                severity="error",
+                category="design_token_contract",
+                file=rel,
+                message=(
+                    f"'{rel}' re-defines its own :root color tokens "
+                    "(--bg/--surface/--color-* etc.) while tokens.css "
+                    "already seeds the brand palette. The local re-invention "
+                    "shadows var(--brand-*) and the brand colors never reach "
+                    "the UI."
+                ),
+                suggestion=(
+                    "Delete the duplicate :root color declarations and "
+                    "reference the seeded tokens via var(--brand-bg), "
+                    "var(--brand-surface), var(--brand-primary), etc."
+                ),
+            )
+        )
+
+    if total_brand_refs == 0:
+        issues.append(
+            ConsistencyIssue(
+                severity="error",
+                category="design_token_contract",
+                file="tokens.css",
+                message=(
+                    "tokens.css was seeded with the brand palette but the "
+                    "scaffold contains 0 var(--brand-*) references — the "
+                    "design tokens are dead weight and the UI uses some "
+                    "other (likely hardcoded) palette."
+                ),
+                suggestion=(
+                    "Wire colors/radii/motion through var(--brand-*) in the "
+                    "entry stylesheet and components instead of hardcoded "
+                    "hex / a re-invented :root block."
+                ),
+            )
+        )
+
+    return issues
+
+
+# className occurrences in JSX/HTML. We only consider the SEMANTIC custom
+# class shape (kebab/camel words, not Tailwind utilities) so this scanner
+# is orthogonal to the Tailwind-without-config check.
+_CLASSNAME_ATTR_RE = re.compile(
+    r"""class(?:Name)?\s*=\s*["'`]([^"'`]+)["'`]""", re.IGNORECASE
+)
+# A token that looks like a Tailwind utility (has a `-` segment off a known
+# prefix, OR a responsive/state prefix like `md:` / `hover:`). Used to skip
+# Tailwind classes — those are the other scanner's job.
+_TAILWIND_TOKEN_RE = re.compile(
+    r"^(?:[a-z]+:)*"  # optional md: / hover: / dark: prefixes
+    r"(?:bg|text|border|ring|shadow|from|to|via|hover|focus|p|m|px|py|pt|pb|"
+    r"pl|pr|mx|my|mt|mb|ml|mr|w|h|gap|space|rounded|opacity|z|inset|top|left|"
+    r"right|bottom|flex|grid|order|col|row|justify|items|self|content|place|"
+    r"font|leading|tracking|max|min|overflow|cursor|transition|duration|"
+    r"ease|translate|scale|rotate|sr)-",
+)
+# CSS rule-selector token: `.foo` anywhere in a stylesheet.
+_CSS_CLASS_SELECTOR_RE = re.compile(r"\.([A-Za-z_][\w-]*)")
+
+
+def _scan_css_coverage_orphan_classes(scaffold_dir: Path) -> List[ConsistencyIssue]:
+    """Semantic classNames with no backing CSS rule.
+
+    A component that renders className="dashboard-grid" but no stylesheet
+    defines `.dashboard-grid` ships unstyled markup. We only fire when:
+      - the scaffold uses semantic (non-Tailwind) classNames, AND
+      - it is NOT a Tailwind project (Tailwind handles its own classes;
+        that mismatch is the other scanner's domain).
+    Severe (0 of the semantic classes are backed by ANY rule) → error;
+    a partial gap → warning.
+    """
+    issues: List[ConsistencyIssue] = []
+
+    # Gather backing CSS class names across all stylesheets.
+    backing: Set[str] = set()
+    has_css = False
+    has_tailwind_directive = False
+    for css in scaffold_dir.rglob("*"):
+        if not css.is_file() or css.suffix not in (".css", ".scss"):
+            continue
+        has_css = True
+        try:
+            text = css.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if "@tailwind" in text or "@apply" in text:
+            has_tailwind_directive = True
+        for m in _CSS_CLASS_SELECTOR_RE.finditer(text):
+            backing.add(m.group(1))
+
+    # Tailwind projects (config / directive / dep) manage classes
+    # differently — skip entirely so we don't false-fire on utilities.
+    deps = _read_package_json_deps(scaffold_dir)
+    if (
+        "tailwindcss" in deps
+        or has_tailwind_directive
+        or any(scaffold_dir.rglob("tailwind.config.*"))
+    ):
+        return issues
+
+    # External CSS frameworks ship their OWN class names (Bootstrap's `card`,
+    # Bulma's `column`, Materialize's `btn-flat`, …) that no local stylesheet
+    # defines. Treat their presence like the Tailwind skip so a legitimately
+    # styled Bootstrap/Bulma app isn't flagged as shipping orphaned markup
+    # (which would also burn a wasteful, markup-mangling targeted-fix pass).
+    _CSS_FRAMEWORK_DEPS = {
+        "bootstrap", "react-bootstrap", "bootstrap-vue",
+        "bulma", "foundation-sites", "materialize-css",
+        "semantic-ui-css", "@picocss/pico", "purecss", "tachyons",
+        "@picocss/pico", "spectre.css", "milligram",
+    }
+    if deps & _CSS_FRAMEWORK_DEPS:
+        return issues
+
+    # Collect semantic classNames used in JSX/HTML.
+    used: Dict[str, str] = {}  # class -> first file that used it (rel)
+    for path in scaffold_dir.rglob("*"):
+        if not path.is_file() or path.suffix not in (".jsx", ".tsx", ".html", ".js", ".ts"):
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        rel = path.relative_to(scaffold_dir).as_posix()
+        for m in _CLASSNAME_ATTR_RE.finditer(source):
+            raw = m.group(1)
+            # Skip template-literal interpolations we can't statically
+            # resolve (e.g. `pill-${tone}`) — too noisy.
+            if "${" in raw or "{" in raw:
+                continue
+            for tok in raw.split():
+                if not tok or "-" not in tok and len(tok) < 3:
+                    continue
+                if _TAILWIND_TOKEN_RE.match(tok):
+                    continue  # Tailwind utility, not our concern
+                # Plain single-word utility-ish tokens common in both
+                # worlds (flex/grid/container) are ambiguous — skip.
+                if tok in ("flex", "grid", "container", "row", "col", "active", "open", "show", "hide"):
+                    continue
+                used.setdefault(tok, rel)
+
+    if not used:
+        return issues
+
+    orphans = {cls: rel for cls, rel in used.items() if cls not in backing}
+    if not orphans:
+        return issues
+
+    # If there's no stylesheet at all, or none of the used semantic classes
+    # are backed, this is severe.
+    severe = (not has_css) or (len(orphans) == len(used))
+    preview = ", ".join(sorted(orphans)[:6])
+    more = f" (+{len(orphans) - 6} more)" if len(orphans) > 6 else ""
+    # Report against the first file that used an orphan class for locality.
+    first_file = next(iter(sorted(orphans.values()))) if orphans else "(frontend)"
+    issues.append(
+        ConsistencyIssue(
+            severity="error" if severe else "warning",
+            category="orphan_classname",
+            file=first_file,
+            message=(
+                f"{len(orphans)} semantic className(s) have no backing CSS "
+                f"rule ({preview}{more}). The markup renders unstyled — "
+                "no stylesheet defines these selectors."
+            ),
+            suggestion=(
+                "Add the matching CSS rules (token-driven via "
+                "var(--brand-*)) for these classes, or remove the dead "
+                "className references."
+            ),
+        )
+    )
+    return issues
+
+
+_CSS_SELECTOR_BLOCK_RE = re.compile(r"[^{}]+\{")
+
+
+def _scan_truncated_stylesheet(scaffold_dir: Path) -> List[ConsistencyIssue]:
+    """Detect a stylesheet that was cut off mid-generation.
+
+    Two signals:
+      - unbalanced braces (`{` count != `}` count) — the file was
+        truncated inside a rule, so everything after is dropped by the
+        CSS parser;
+      - a non-trivial stylesheet (the entry index/styles css) with too few
+        selector blocks to be real (looks like only the :root token block
+        survived).
+    Either → error (the CSS must be regenerated).
+    """
+    issues: List[ConsistencyIssue] = []
+    for css in scaffold_dir.rglob("*"):
+        if not css.is_file() or css.suffix not in (".css", ".scss"):
+            continue
+        # tokens.css is a pure :root block by design — never "truncated".
+        if css.name == "tokens.css":
+            continue
+        try:
+            text = css.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        rel = css.relative_to(scaffold_dir).as_posix()
+        # Strip /* ... */ comments before counting braces (comments can
+        # contain stray braces in ASCII art etc.).
+        stripped = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+        opens = stripped.count("{")
+        closes = stripped.count("}")
+        if opens != closes:
+            issues.append(
+                ConsistencyIssue(
+                    severity="error",
+                    category="truncated_stylesheet",
+                    file=rel,
+                    message=(
+                        f"'{rel}' has unbalanced braces ({opens} '{{' vs "
+                        f"{closes} '}}') — the stylesheet was almost "
+                        "certainly truncated mid-generation, so the CSS "
+                        "parser drops every rule after the break."
+                    ),
+                    suggestion="Regenerate the stylesheet so all rules are complete.",
+                )
+            )
+            continue
+        # Coverage heuristic: only for entry-shaped stylesheets that should
+        # carry real component rules (not partials / tokens).
+        if css.stem.lower() in ("index", "styles", "style", "app", "main", "global", "globals"):
+            block_count = len(_CSS_SELECTOR_BLOCK_RE.findall(stripped))
+            # Subtract the :root token block(s) — those aren't component
+            # rules.
+            root_blocks = len(_ROOT_BLOCK_RE.findall(stripped))
+            component_blocks = block_count - root_blocks
+            # A real entry stylesheet of meaningful size should have at
+            # least a couple of component rules. Tiny files (< 200 chars)
+            # are legitimately minimal — don't flag.
+            if len(stripped.strip()) > 400 and component_blocks <= 1:
+                issues.append(
+                    ConsistencyIssue(
+                        severity="error",
+                        category="truncated_stylesheet",
+                        file=rel,
+                        message=(
+                            f"'{rel}' is a sizeable entry stylesheet but "
+                            f"contains only {max(component_blocks, 0)} "
+                            "component rule(s) beyond :root — it looks "
+                            "truncated (the token block survived, the rest "
+                            "did not)."
+                        ),
+                        suggestion="Regenerate the stylesheet with the full set of component rules.",
+                    )
+                )
+    return issues
+
+
+_PLANNED_IMPORTS_SIDECAR = ".skyn3t_planned_imports.json"
+
+
+def _scan_planned_component_unused(
+    scaffold_dir: Path, planned_imports: Optional[List[str]] = None
+) -> List[ConsistencyIssue]:
+    """Flag a planned component that exists on disk but is imported by no
+    entrypoint (the 'generated then orphaned' case).
+
+    Uses the planned_imports signal the code stage emits (passed directly
+    or read from the scaffold/.skyn3t_planned_imports.json sidecar). When
+    no signal is available it returns [] — the existing orphan_export
+    heuristic already covers the general dead-code case.
+    """
+    issues: List[ConsistencyIssue] = []
+
+    if planned_imports is None:
+        sidecar = scaffold_dir / _PLANNED_IMPORTS_SIDECAR
+        if not sidecar.is_file():
+            return issues
+        try:
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return issues
+        if isinstance(data, dict):
+            data = data.get("planned_imports")
+        if not isinstance(data, list):
+            return issues
+        planned_imports = [str(x) for x in data if isinstance(x, (str,))]
+
+    if not planned_imports:
+        return issues
+
+    # Build the set of files actually imported (resolved, scaffold-relative)
+    # across every source file, so "imported by no entrypoint" = "imported
+    # by nobody we can see".
+    imported_rel: Set[str] = set()
+    for path in scaffold_dir.rglob("*"):
+        if not path.is_file() or path.suffix not in (
+            ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"
+        ):
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for src in _extract_js_imports(source):
+            if not src.startswith("."):
+                continue
+            resolved = _resolve_relative(path, src)
+            if resolved is None:
+                continue
+            try:
+                rel = resolved.relative_to(scaffold_dir).as_posix()
+            except ValueError:
+                continue
+            imported_rel.add(rel)
+            imported_rel.add(rel.rsplit(".", 1)[0])
+
+    for planned in planned_imports:
+        planned_norm = planned.lstrip("./")
+        # Resolve to a real file on disk (try extensions if extensionless).
+        candidate = scaffold_dir / planned_norm
+        on_disk: Optional[Path] = None
+        if candidate.is_file():
+            on_disk = candidate
+        elif not candidate.suffix:
+            for ext in (".jsx", ".js", ".tsx", ".ts", ".mjs", ".cjs"):
+                if candidate.with_suffix(ext).is_file():
+                    on_disk = candidate.with_suffix(ext)
+                    break
+        if on_disk is None:
+            # Planned-but-missing is a different bug (broken_import covers
+            # the import side); don't double-report here.
+            continue
+        rel = on_disk.relative_to(scaffold_dir).as_posix()
+        rel_no_ext = rel.rsplit(".", 1)[0]
+        if rel in imported_rel or rel_no_ext in imported_rel:
+            continue
+        issues.append(
+            ConsistencyIssue(
+                severity="warning",
+                category="planned_component_unused",
+                file=rel,
+                message=(
+                    f"Planned component '{rel}' was generated and exists on "
+                    "disk but is imported by no entrypoint or other file — "
+                    "it was scaffolded then orphaned."
+                ),
+                suggestion=(
+                    "Wire the component into its parent (the entrypoint was "
+                    "told to import it) or drop it from the plan."
+                ),
+            )
+        )
+    return issues
+
+
 def check_consistency(scaffold_dir: Path, brief: str = "") -> ConsistencyReport:
     """Run the full static consistency check on a scaffold directory.
 
@@ -1904,6 +2454,25 @@ def check_consistency(scaffold_dir: Path, brief: str = "") -> ConsistencyReport:
                 suggestion="Replace the placeholder with a real implementation; do not ship TODO stubs.",
             )
         )
+
+    # ── Phase 3 scanners ─────────────────────────────────────────────────
+    # Each is wrapped so a single scanner exception is swallowed (the rest
+    # of check_consistency still runs), mirroring the existing relative_to
+    # guards. They emit new categories that are additive to the issue list;
+    # error-severity findings auto-wire into the runner's existing
+    # targeted-fix loop via the same error → UnresolvedScaffoldStubError
+    # routing the todo_stub detector already uses.
+    for _scanner in (
+        _scan_stub_entrypoint,
+        _scan_design_token_contract,
+        _scan_css_coverage_orphan_classes,
+        _scan_truncated_stylesheet,
+        _scan_planned_component_unused,
+    ):
+        try:
+            issues.extend(_scanner(scaffold_dir))
+        except Exception:  # noqa: BLE001 — one bad scanner must not crash the gate
+            continue
 
     errors = [i for i in issues if i.severity == "error"]
     return ConsistencyReport(ok=len(errors) == 0, issues=issues)

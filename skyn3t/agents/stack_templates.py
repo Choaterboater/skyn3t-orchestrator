@@ -47,11 +47,138 @@ to drop in services at runtime.
 
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, cast
 
 # A file plan entry: (relative path, one-line purpose).
 FilePlan = List[Tuple[str, str]]
+
+
+# ── package.json name + filename validity (anti template-bleed) ─────────
+#
+# Two pure helpers used to (a) derive an npm-safe package.json "name"
+# from the project slug — so generated scaffolds stop shipping the
+# generic literal "scaffold"/"homelab-dashboard-server" name (template
+# bleed the audit flagged) — and (b) reject malformed planned filenames
+# like 'src/.js' / '' / paths whose stem is empty before they ever enter
+# a FilePlan and become a file the LLM tries to fill.
+
+def _package_name(slug: str, fallback: str = "app") -> str:
+    """Return an npm-safe package.json ``name`` derived from ``slug``.
+
+    npm naming rules we enforce: lowercase, URL-safe, no leading dot or
+    underscore, no spaces, length <= 214. Anything non-conforming in the
+    incoming slug collapses to a single hyphen; runs of hyphens are
+    squeezed and trimmed. Empty results fall back to ``fallback`` (also
+    sanitized), and an empty fallback yields the literal ``"app"`` so the
+    return value is always a valid npm name.
+    """
+    def _sanitize(value: str) -> str:
+        text = (value or "").strip().lower()
+        if not text:
+            return ""
+        # Map any char that isn't a-z, 0-9, '-', '_', '.' to a hyphen.
+        text = re.sub(r"[^a-z0-9._-]+", "-", text)
+        # npm forbids leading dot/underscore; strip leading separators.
+        text = text.lstrip("-._")
+        # Collapse hyphen runs and trim trailing separators.
+        text = re.sub(r"-{2,}", "-", text).strip("-._")
+        return text[:214]
+
+    name = _sanitize(slug)
+    if name:
+        return name
+    name = _sanitize(fallback)
+    return name or "app"
+
+
+def _is_valid_scaffold_filename(path: str) -> bool:
+    """True when ``path`` is a sane scaffold-relative file path.
+
+    Rejects the malformed shapes that have slipped into plans and broken
+    builds: empty/whitespace paths, paths that are only a directory
+    (trailing slash), and any path whose final component has an empty
+    *stem* — e.g. ``src/.js``, ``.jsx``, ``components/.tsx`` — where the
+    file is "just an extension" with no actual name. A dotfile WITH a
+    name (``.env.example``, ``.gitignore``) is allowed; a bare extension
+    is not. Never raises — returns False on anything unexpected so the
+    caller simply drops the spec.
+    """
+    try:
+        if not isinstance(path, str):
+            return False
+        p = path.strip().replace("\\", "/")
+        if not p or p.endswith("/"):
+            return False
+        # No empty path segments (e.g. 'src//app.js' or '/leading').
+        segments = [seg for seg in p.split("/")]
+        if any(seg == "" for seg in segments):
+            return False
+        base = segments[-1]
+        if base in {".", ".."}:
+            return False
+        # A basename that is JUST a leading dot + a known source
+        # extension ('.js', '.tsx', 'src/.css') is template bleed — there
+        # is no actual filename, only an extension. Reject it.
+        if base.lower() in _BARE_EXTENSION_BASENAMES:
+            return False
+        if "." in base:
+            stem, _, ext = base.rpartition(".")
+            # An empty stem means the basename has nothing before its
+            # final dot (e.g. '.js' caught above, or a stray '.' segment).
+            # Leading-dot config files ('.env', '.gitignore') survive
+            # because their suffix is NOT a known bare source extension
+            # and rpartition leaves a sensible name in ext.
+            if stem == "" and ("." not in base[1:]):
+                # Single-dot basename like '.env' / '.gitignore': allow
+                # (it's a named dotfile, not a bare extension — the bare
+                # extensions were already rejected above).
+                return base.startswith(".") and len(base) > 1
+            if stem == "" and not base.startswith("."):
+                # Pathological: starts with a dot only via odd input.
+                return False
+            return True
+        # No extension at all (e.g. 'README', 'Dockerfile') — allowed.
+        return True
+    except Exception:
+        return False
+
+
+# Basenames that are "just an extension" with no name — these are the
+# template-bleed artifacts we drop (e.g. a plan that emitted 'src/.js').
+_BARE_EXTENSION_BASENAMES: frozenset = frozenset({
+    ".js", ".jsx", ".ts", ".tsx", ".css", ".scss", ".json", ".html",
+    ".py", ".md", ".txt", ".yml", ".yaml", ".vue", ".svelte", ".mjs",
+    ".cjs",
+})
+
+
+def _filter_plan(plan: FilePlan) -> FilePlan:
+    """Drop malformed paths and de-duplicate case-insensitively.
+
+    De-dup is case-insensitive because macOS/Docker default filesystems treat
+    ``src/components/ui/Button.jsx`` and ``.../button.jsx`` as the SAME file —
+    shipping both in a plan maps two specs onto one physical file. Each path
+    keeps its first position but takes the LAST occurrence's content, so a
+    later, richer spec (e.g. a token-driven primitive appended after a base
+    template's lowercase shadcn file) supersedes the earlier one. Pure — never
+    raises; a rejected spec is simply omitted.
+    """
+    chosen: Dict[str, Tuple[str, str]] = {}
+    order: List[str] = []
+    for entry in plan:
+        try:
+            rel, purpose = entry
+        except (ValueError, TypeError):
+            continue
+        if not _is_valid_scaffold_filename(rel):
+            continue
+        key = rel.casefold()
+        if key not in chosen:
+            order.append(key)
+        chosen[key] = (rel, purpose)
+    return [chosen[k] for k in order]
 
 # Catalog of stack → file plan. Each plan is intentionally small (5-9
 # files) so a single sweep through CodeAgent's Phase 2 loop completes in
@@ -335,10 +462,37 @@ def plan_for_stack(
     plan: FilePlan = list(base)
     if stack in _BROWSER_FIRST_STACKS:
         backend_preference = _decisions_backend_preference(decisions)
-        if backend_preference is True or (
+        services = _detect_services(brief)
+        # Owns-its-data routing decision. The DATA backend (real CRUD +
+        # DB) takes priority over the proxy tier ONLY for a true
+        # owns-its-data app that has BOTH (a) an explicit server
+        # commitment from the architect (decisions.family=='fullstack' or
+        # a pinned Node backend → backend_preference is True) AND (b) an
+        # explicit data-ownership signal in the brief itself. Requiring
+        # the brief signal — not just the decisions pin — keeps the
+        # existing proxy-tier behavior for pinned-backend briefs with no
+        # data-ownership wording (e.g. the express habit-tracker, which
+        # still gets the proxy tier + docker-compose). Apps that want
+        # persistence in the brief but have NO sanctioned server fall
+        # through to the safe localStorage path (no backend appended) —
+        # exactly the behavior the audit confirmed already works. Games/
+        # toys never reach here (excluded in _needs_data_backend).
+        brief_data_signal = bool(brief) and any(
+            sig in brief.lower() for sig in _DATA_OWNERSHIP_SIGNALS
+        )
+        wants_data_backend = (
+            backend_preference is True
+            and not services
+            and brief_data_signal
+            and _needs_data_backend(brief, decisions=decisions)
+        )
+        if wants_data_backend:
+            entities = _detect_data_entities(brief)
+            slug = _package_name(_title_from_brief(brief), fallback="app")
+            plan = plan + _data_backend_tier_files(entities, slug=slug)
+        elif backend_preference is True or (
             backend_preference is not False and _needs_backend(brief)
         ):
-            services = _detect_services(brief)
             plan = plan + _backend_tier_files(services)
             # Configurable tier rides on backend tier — pointless to add
             # a settings UI for credentials that don't get used (there
@@ -347,14 +501,16 @@ def plan_for_stack(
                 plan = plan + _configurable_tier_files(services)
         if _needs_extensibility(brief):
             plan = plan + _extensibility_tier_files(stack, brief)
-        # Design-system primitives — every dashboard-class scaffold
-        # gets StatusPill, Sparkline, KpiTile reserved. These are
-        # deterministic-manifest-driven so the LLM never has to
-        # invent them. Triggered for any "dashboard" brief because
-        # v15-v28 all needed these and didn't get them.
+        # Design-system primitives — every dashboard-class scaffold gets
+        # the token-driven primitive library reserved. These are
+        # deterministic-manifest-driven (for the deterministic ones) so
+        # the LLM never has to invent them. Triggered for any dashboard
+        # brief because v15-v28 all needed these and didn't get them.
         if _needs_design_system(brief):
-            plan = plan + _design_system_files()
-    return plan
+            plan = plan + _ui_primitive_files()
+    # Drop any malformed planned filename (template bleed: 'src/.js', etc)
+    # and de-dupe before the plan leaves this module.
+    return _filter_plan(plan)
 
 
 def files_target_for(brief: str) -> Tuple[int, int]:
@@ -367,8 +523,13 @@ def files_target_for(brief: str) -> Tuple[int, int]:
     """
     if _needs_extensibility(brief):
         return (15, 60)
-    if _needs_backend(brief):
-        return (8, 25)
+    if _needs_design_system(brief):
+        # Design-system tier now ships a 10-primitive UI kit on top of
+        # the base + configurable + per-service tiers, so a dashboard
+        # brief legitimately wants substantially more than 25 files.
+        return (12, 50)
+    if _needs_backend(brief) or _needs_data_backend(brief):
+        return (8, 30)
     return (3, 12)
 
 
@@ -377,16 +538,21 @@ def max_files_for(brief: str) -> int:
     than this even if it asks. Default 25; ambitious briefs get 80 so
     extensibility / marketplace shapes have room.
 
-    Bumped to 40 for any dashboard brief — the design-system tier
-    adds 3 primitives + the configurable tier adds 6+, easily
-    pushing past 25. v31 hit this exact bug: plan had 28 files,
-    cap was 25, the last 3 (StatusPill / Sparkline / KpiTile) got
-    truncated and App.jsx then imported files that didn't exist.
+    Bumped to 56 for any dashboard brief — the design-system tier now
+    ships a 10-primitive UI kit (Button/Card/Modal/Input/StatusPill/
+    KpiTile/Sparkline/Skeleton/Toast/EmptyState) AND the configurable
+    tier adds 6+ AND the per-service tier adds up to 8, so a fully
+    loaded react_vite_tailwind homelab plan lands in the mid-40s. The
+    cap MUST stay comfortably above that or the last primitives get
+    truncated and App.jsx imports files that don't exist (the v31 bug,
+    line-384 truncation warning).
     """
     if _needs_extensibility(brief):
         return 80
     if _needs_design_system(brief):
-        return 40
+        return 56
+    if _needs_backend(brief) or _needs_data_backend(brief):
+        return 30
     return 25
 
 
@@ -492,6 +658,98 @@ def _needs_backend(brief: str) -> bool:
     if len(_detect_services(brief)) >= 2:
         return True
     return False
+
+
+# ── Owns-its-data backend gate (distinct from the proxy gate) ───────────
+#
+# _needs_backend (above) answers "does this brief proxy to EXTERNAL
+# services that hold secrets?". _needs_data_backend answers a different
+# question: "does this brief OWN its data and need real server-side
+# persistence (a DB / CRUD store)?". Only the latter should ship the
+# Express + better-sqlite3 CRUD tier (_data_backend_tier_files). The
+# safe default for everything else is the localStorage path the audit
+# says already works — so this gate is deliberately precise and defaults
+# to False on any uncertainty.
+
+# Explicit data-ownership phrases. A single match is enough.
+_DATA_OWNERSHIP_SIGNALS: Tuple[str, ...] = (
+    "own data", "owns its data", "own its data", "owns the data",
+    "save to a database", "save to database", "store in a database",
+    "stored in a database", "persist to a database", "persist to database",
+    "sql database", "sqlite", "postgres", "postgresql", "mysql",
+    "relational database", "real database",
+    "multi-user", "multi user", "multiple users", "shared across users",
+    "shared between users", "multi-tenant", "multi tenant",
+    "server-side persistence", "server side persistence",
+    "persistent storage on the server", "data stored on the server",
+    "rest api with a database", "crud api backed by a database",
+    "backend database", "database-backed", "database backed",
+)
+
+# Game/toy briefs NEVER get a data backend — they're self-contained and
+# the localStorage path (high score, save state) is correct. Reuses /
+# extends the static_site browser-game triggers so the two detectors
+# agree on what counts as a game.
+_GAME_TOY_SIGNALS: Tuple[str, ...] = (
+    "game", "browser game", "arcade", "platformer", "puzzle game",
+    "tic-tac-toe", "tictactoe", "tic tac toe", "snake game",
+    "snake", "tetris", "pong", "breakout", "minesweeper",
+    "solitaire", "chess", "checkers", "2048", "wordle",
+    "memory game", "card game", "dice game", "maze",
+    "clicker", "idle game", "toy", "sandbox toy",
+    "physics toy", "particle toy", "fidget", "screensaver",
+    "demo scene", "demoscene", "generative art toy",
+)
+
+
+def _is_game_or_toy(brief: str) -> bool:
+    """True when the brief describes a self-contained game or toy.
+
+    These never own server-side data — high scores / save state belong in
+    localStorage. Used to hard-exclude games/toys from the data-backend
+    gate even if they mention a stray persistence word ("save my high
+    score to the leaderboard").
+    """
+    if not brief:
+        return False
+    text = brief.lower()
+    return any(sig in text for sig in _GAME_TOY_SIGNALS)
+
+
+def _needs_data_backend(brief: str, *, decisions: Optional[Dict[str, Any]] = None) -> bool:
+    """True only when the app should OWN its data via a real DB/CRUD tier.
+
+    Precise on purpose — distinguishes "owns-its-data" (→
+    _data_backend_tier_files) from "proxy-to-external" (→
+    _backend_tier_files). Returns True when:
+
+      * decisions.family == 'fullstack', OR a pinned Node backend
+        (express / hono-node / node+port) in decisions.json, OR
+      * the brief carries an explicit data-ownership signal.
+
+    NEVER True for games/toys (the localStorage path is correct there),
+    and defaults to False on any uncertainty — the safe path the audit
+    confirms already works.
+    """
+    # Games/toys are hard-excluded regardless of any other signal.
+    if _is_game_or_toy(brief):
+        return False
+
+    # Architect decisions are the strongest signal.
+    if decisions:
+        family = str(decisions.get("family") or "").strip().lower()
+        if family == "fullstack":
+            return True
+        # An explicit web-only family forbids the data backend.
+        if family == "web":
+            return False
+        if _decisions_pin_node_backend(decisions):
+            return True
+
+    if not brief:
+        return False
+    text = brief.lower()
+    return any(sig in text for sig in _DATA_OWNERSHIP_SIGNALS)
 
 
 # Decisions-contract bundle backend slots that mean "ship a Node
@@ -743,6 +1001,179 @@ def _design_system_files() -> FilePlan:
          "Use these in the top-of-dashboard summary strip, NOT in "
          "service cards."),
     ]
+
+
+def _ui_primitive_files() -> FilePlan:
+    """The token-driven primitive library under ``src/components/ui/``.
+
+    Extends the old 3-primitive _design_system_files set into a real,
+    reusable UI kit: Button, Card, Modal, Input, StatusPill, KpiTile,
+    Sparkline, Skeleton, Toast, EmptyState. Every primitive's purpose
+    mandates the interaction-state contract (hover / focus / disabled /
+    loading), responsiveness, and that ALL colors / radii / motion come
+    from ``var(--brand-*)`` tokens — no hardcoded hex, no Tailwind
+    palette literals.
+
+    The deterministic ones (StatusPill, Sparkline, KpiTile) keep their
+    manifest generators (registered under the new ui/ paths) so CodeAgent
+    writes them with no LLM call; the rest fall through to the normal
+    per-file LLM path, guided by these mandates.
+    """
+    # Shared state contract — kept terse so each purpose stays a usable
+    # one-liner (<200 chars) for the per-file LLM prompt.
+    sr = "hover/focus/disabled/loading + responsive; colors/radii/motion via var(--brand-*), no hex."
+    return [
+        ("src/components/ui/Button.jsx",
+         f"Button (variant primary|secondary|ghost|danger; size sm|md|lg; "
+         f"loading spinner). {sr}"),
+        ("src/components/ui/Card.jsx",
+         f"Card surface: padded panel, header/body/footer slots, border+radius. {sr}"),
+        ("src/components/ui/Modal.jsx",
+         f"Modal/dialog: overlay, focus trap, Escape + click-outside close. {sr}"),
+        ("src/components/ui/Input.jsx",
+         f"Text input: label, error+helper text, optional leading icon. {sr}"),
+        ("src/components/ui/StatusPill.jsx",
+         f"Status pill: dot + uppercase label, tinted bg. tone "
+         f"(ok|warn|err|info|idle). {sr}"),
+        ("src/components/ui/KpiTile.jsx",
+         f"KPI tile: label / value+unit / optional delta, tinted left "
+         f"border. {sr}"),
+        ("src/components/ui/Sparkline.jsx",
+         f"Inline SVG sparkline (no recharts). Props values,color,height,"
+         f"width; dashed empty state. {sr}"),
+        ("src/components/ui/Skeleton.jsx",
+         f"Loading skeleton: shimmer block, width/height/radius props. {sr}"),
+        ("src/components/ui/Toast.jsx",
+         f"Toast + useToast provider: tone, auto-dismiss, stack. {sr}"),
+        ("src/components/ui/EmptyState.jsx",
+         f"Empty state: icon, title, description, optional action button. {sr}"),
+    ]
+
+
+# ── Owns-its-data backend tier (Express + better-sqlite3 + JSON fallback) ─
+#
+# Distinct from the proxy tier above. This ships a REAL CRUD backend the
+# generated app owns: an Express server, a db.js that opens
+# better-sqlite3 and degrades to a json-file store when the native module
+# can't load (so the build/boot verifiers, which may lack a C compiler,
+# still pass), and one full CRUD router per entity. Pure plan generator —
+# returns specs only, installs nothing.
+
+# Must match the deterministic Vite dev-proxy target (vite.config.js proxies
+# /api -> http://localhost:3100). A data-owning app is never also a
+# proxy-to-external app, so sharing 3100 with the proxy tier is safe and keeps
+# the frontend's /api calls from 502-ing against the wrong port.
+_DATA_BACKEND_PORT = 3100
+
+
+def _normalize_entity(name: str) -> str:
+    """Return a safe lowercase entity slug, or "" for empty/garbage input.
+
+    Used for route filenames and table names. Strips non-alphanumerics
+    (to underscores), lowercases. Returns "" when nothing usable remains
+    so the caller can drop it; the caller decides on the ``item`` default
+    only when the WHOLE list is empty. Collisions are the caller's
+    responsibility (it de-dupes).
+    """
+    return re.sub(r"[^a-z0-9]+", "_", (name or "").strip().lower()).strip("_")
+
+
+# Common data resources a CRUD app owns. Detection is a cheap keyword
+# scan over the brief; when nothing matches, _data_backend_tier_files
+# falls back to a single 'item' resource.
+_ENTITY_KEYWORDS: Tuple[str, ...] = (
+    "task", "todo", "project", "note", "user", "post", "comment",
+    "product", "order", "customer", "invoice", "expense", "transaction",
+    "event", "booking", "appointment", "contact", "message", "ticket",
+    "habit", "goal", "workout", "recipe", "ingredient", "bookmark",
+    "article", "category", "tag", "review", "item", "entry", "record",
+    "client", "lead", "deal", "subscription", "payment", "file",
+)
+
+
+def _detect_data_entities(brief: str) -> List[str]:
+    """Derive the resource entities a data-owning app should expose.
+
+    Cheap keyword scan over the brief; returns a de-duped, order-stable
+    list (capped). Empty when nothing matches — the tier generator then
+    defaults to a single ``item`` resource.
+    """
+    if not brief:
+        return []
+    text = brief.lower()
+    found: List[str] = []
+    for kw in _ENTITY_KEYWORDS:
+        # Word-ish boundary so 'task' doesn't match 'multitasking'.
+        if re.search(rf"\b{re.escape(kw)}s?\b", text) and kw not in found:
+            found.append(kw)
+    return found[:6]
+
+
+def _data_backend_tier_files(entities: List[str], *, slug: str = "") -> FilePlan:
+    """Return a REAL CRUD + persistence backend plan.
+
+    Ships an Express + better-sqlite3 backend (with a json-file fallback
+    baked into the generated ``server/db.js`` so it runs even where the
+    native module can't build):
+
+      - ``server/index.js``       — mounts routers, JSON body parsing, CORS
+      - ``server/db.js``          — better-sqlite3 open + migrate; falls
+                                    back to a json-file store on load failure
+      - ``server/routes/<e>.js``  — full GET list / GET :id / POST /
+                                    PATCH :id / DELETE :id per entity
+      - ``server/seed.js``        — idempotent seed of sample rows
+      - ``server/package.json``   — name derived from slug, deps pinned
+      - ``.env.example``          — documented PORT / CORS / DB_PATH
+
+    ``entities`` is the list of resource names the app owns (e.g.
+    ['task', 'project']); empty/garbage entries are normalized and a
+    single ``item`` entity is used as a sensible default when none
+    survive. Distinct from the proxy-to-external ``_backend_tier_files``.
+    """
+    # Normalize + drop empties + de-dupe; fall back to a single 'item'
+    # resource only when nothing usable survived.
+    norm: List[str] = []
+    for ent in (entities or []):
+        e = _normalize_entity(ent)
+        if e and e not in norm:
+            norm.append(e)
+    if not norm:
+        norm = ["item"]
+    # Cap so a noisy entity list can't explode the plan.
+    norm = norm[:8]
+
+    pkg_name = _package_name(f"{slug}-server" if slug else "", fallback="app-server")
+    entity_list = ", ".join(norm)
+
+    files: FilePlan = [
+        ("server/index.js",
+         "Express entry: express.json() body parsing, CORS for the Vite "
+         "origin, mounts each entity router under /api/<entity>, GET "
+         "/api/health, runs db.migrate() on boot. PORT env (default 3100, "
+         "matching the Vite /api proxy target). ESM (type: module)."),
+        ("server/db.js",
+         "Persistence layer. Loads better-sqlite3 (data/app.db); on ANY "
+         "load/open failure falls back to a json-file store. Same api "
+         "either way: migrate, list, get, create, update, remove. MUST "
+         "degrade so it runs without a native compiler."),
+        (".env.example",
+         "Env vars: PORT=3100, CORS_ORIGIN=http://localhost:5180, "
+         "DB_PATH=./data/app.db. Placeholders only — no real secrets."),
+        ("server/seed.js",
+         f"Idempotent seed: inserts sample rows per entity ({entity_list}) "
+         "via db.js so the UI has data on first run. Safe to re-run."),
+        ("server/package.json",
+         f"Server deps express, cors, better-sqlite3 (optional at runtime). "
+         f"type: module; name '{pkg_name}'; scripts start/dev/seed."),
+    ]
+    for ent in norm:
+        files.append((
+            f"server/routes/{ent}.js",
+            f"Express router for '{ent}'. Full CRUD on db.js: GET / (list), "
+            f"GET /:id, POST /, PATCH /:id, DELETE /:id. Validates body, "
+            f"proper status codes (404/400), never silent empty arrays.",
+        ))
+    return files
 
 
 def _backend_tier_files(services: List[str]) -> FilePlan:
@@ -1364,7 +1795,7 @@ def _manifest_node_cli(brief: str) -> str:
     # and valid. The model writes the bin name + main file but the shape
     # is fixed here.
     return _json_dumps_pretty({
-        "name": "scaffold",
+        "name": _package_name(_title_from_brief(brief), fallback="app"),
         "version": "0.1.0",
         "private": True,
         "type": "module",
@@ -1380,7 +1811,7 @@ def _manifest_node_cli(brief: str) -> str:
 
 def _manifest_react_vite(brief: str) -> str:
     return _json_dumps_pretty({
-        "name": "scaffold",
+        "name": _package_name(_title_from_brief(brief), fallback="app"),
         "version": "0.1.0",
         "private": True,
         "type": "module",
@@ -1402,7 +1833,7 @@ def _manifest_react_vite(brief: str) -> str:
 
 def _manifest_react_vite_tailwind(brief: str) -> str:
     return _json_dumps_pretty({
-        "name": "scaffold",
+        "name": _package_name(_title_from_brief(brief), fallback="app"),
         "version": "0.1.0",
         "private": True,
         "type": "module",
@@ -1830,7 +2261,7 @@ def _manifest_main_jsx(brief: str) -> str:
 
 def _manifest_next(brief: str) -> str:
     return _json_dumps_pretty({
-        "name": "scaffold",
+        "name": _package_name(_title_from_brief(brief), fallback="app"),
         "version": "0.1.0",
         "private": True,
         "scripts": {
@@ -1981,28 +2412,31 @@ def _server_package_json_for_services(brief: str) -> str:
     """Deterministic server/package.json — locks "type": "module" so
     the LLM can't ship an index.js that mixes CJS imports of ESM
     adapters (the v15 manual-fix bug). Includes the standard server
-    deps; the LLM can still extend in the per-adapter prompt."""
-    return (
-        "{\n"
-        '  "name": "homelab-dashboard-server",\n'
-        '  "version": "1.0.0",\n'
-        '  "private": true,\n'
-        '  "type": "module",\n'
-        '  "main": "index.js",\n'
-        '  "engines": {\n'
-        '    "node": ">=20.0.0"\n'
-        '  },\n'
-        '  "scripts": {\n'
-        '    "start": "node index.js",\n'
-        '    "dev": "node --watch index.js"\n'
-        '  },\n'
-        '  "dependencies": {\n'
-        '    "express": "^4.21.2",\n'
-        '    "cors": "^2.8.5",\n'
-        '    "dotenv": "^16.4.7"\n'
-        "  }\n"
-        "}\n"
+    deps; the LLM can still extend in the per-adapter prompt.
+
+    The package name is derived from the project slug (npm-safe) rather
+    than the literal ``homelab-dashboard-server`` — that hardcoded name
+    was template bleed that showed up in every non-homelab scaffold."""
+    name = _package_name(
+        f"{_title_from_brief(brief)}-server", fallback="app-server"
     )
+    return _json_dumps_pretty({
+        "name": name,
+        "version": "1.0.0",
+        "private": True,
+        "type": "module",
+        "main": "index.js",
+        "engines": {"node": ">=20.0.0"},
+        "scripts": {
+            "start": "node index.js",
+            "dev": "node --watch index.js",
+        },
+        "dependencies": {
+            "express": "^4.21.2",
+            "cors": "^2.8.5",
+            "dotenv": "^16.4.7",
+        },
+    })
 
 
 def _component_status_pill(brief: str) -> str:
@@ -2170,6 +2604,147 @@ def _component_kpi_tile(brief: str) -> str:
     )
 
 
+# ── Token-driven ui/ primitive generators ──────────────────────────────
+#
+# Deterministic bodies for the three primitives that already had locked
+# shapes, now under src/components/ui/ and sourcing colors from the
+# var(--brand-*) token contract (hex fallbacks keep them rendering even
+# before tokens.css is wired). The non-deterministic primitives (Button,
+# Card, Modal, Input, Skeleton, Toast, EmptyState) intentionally have no
+# manifest generator — they fall through to the per-file LLM path guided
+# by the _ui_primitive_files() purpose mandates.
+
+def _component_ui_status_pill(brief: str) -> str:
+    """StatusPill under ui/, colors via var(--brand-*) with hex fallback."""
+    return (
+        "// Universal status pill. Token-driven: tones map to brand vars\n"
+        "// with hex fallbacks. dot + uppercase label, rounded-full.\n"
+        "\n"
+        "const TONES = {\n"
+        "  ok:   'var(--brand-ok, #10B981)',\n"
+        "  warn: 'var(--brand-warn, #F59E0B)',\n"
+        "  err:  'var(--brand-err, #EF4444)',\n"
+        "  info: 'var(--brand-info, #3B82F6)',\n"
+        "  idle: 'var(--brand-muted, #6B7280)',\n"
+        "};\n"
+        "\n"
+        "export default function StatusPill({ tone = 'ok', children }) {\n"
+        "  const color = TONES[tone] || TONES.idle;\n"
+        "  return (\n"
+        "    <span\n"
+        "      style={{\n"
+        "        display: 'inline-flex',\n"
+        "        alignItems: 'center',\n"
+        "        gap: 6,\n"
+        "        padding: '2px 8px',\n"
+        "        borderRadius: 'var(--brand-radius-full, 9999px)',\n"
+        "        fontSize: 10,\n"
+        "        fontWeight: 500,\n"
+        "        textTransform: 'uppercase',\n"
+        "        letterSpacing: '0.05em',\n"
+        "        color,\n"
+        "        background: 'color-mix(in srgb, ' + color + ' 12%, transparent)',\n"
+        "      }}\n"
+        "    >\n"
+        "      <span style={{ width: 6, height: 6, borderRadius: '50%', background: color }} />\n"
+        "      {children}\n"
+        "    </span>\n"
+        "  );\n"
+        "}\n"
+    )
+
+
+def _component_ui_sparkline(brief: str) -> str:
+    """Sparkline under ui/ — hand-rolled SVG, color via brand var."""
+    return (
+        "// Tiny inline time-series sparkline. Hand-rolled SVG — no\n"
+        "// recharts/d3. Default color from var(--brand-accent).\n"
+        "\n"
+        "export default function Sparkline({\n"
+        "  values,\n"
+        "  color = 'var(--brand-accent, #3B82F6)',\n"
+        "  height = 24,\n"
+        "  width = 60,\n"
+        "}) {\n"
+        "  if (!Array.isArray(values) || values.length < 2) {\n"
+        "    return (\n"
+        "      <svg width={width} height={height} role=\"img\" aria-label=\"no data\">\n"
+        "        <line\n"
+        "          x1={0} y1={height / 2} x2={width} y2={height / 2}\n"
+        "          stroke=\"currentColor\" strokeWidth={1}\n"
+        "          strokeDasharray=\"3 3\" opacity={0.3}\n"
+        "        />\n"
+        "      </svg>\n"
+        "    );\n"
+        "  }\n"
+        "  const max = Math.max(...values, 1);\n"
+        "  const min = Math.min(...values, 0);\n"
+        "  const range = max - min || 1;\n"
+        "  const step = width / (values.length - 1);\n"
+        "  const points = values\n"
+        "    .map((v, i) => `${i * step},${height - ((v - min) / range) * height}`)\n"
+        "    .join(' ');\n"
+        "  return (\n"
+        "    <svg width={width} height={height} role=\"img\" aria-label=\"trend\">\n"
+        "      <polyline\n"
+        "        points={points} fill=\"none\" stroke={color}\n"
+        "        strokeWidth={1.5} strokeLinecap=\"round\" strokeLinejoin=\"round\"\n"
+        "      />\n"
+        "    </svg>\n"
+        "  );\n"
+        "}\n"
+    )
+
+
+def _component_ui_kpi_tile(brief: str) -> str:
+    """KpiTile under ui/ — surfaces + accent via var(--brand-*)."""
+    return (
+        "// KPI tile for the top-of-dashboard summary strip. Token-driven:\n"
+        "// surface/border/text/accent from var(--brand-*) with fallbacks.\n"
+        "\n"
+        "const TONES = {\n"
+        "  ok:   'var(--brand-ok, #10B981)',\n"
+        "  warn: 'var(--brand-warn, #F59E0B)',\n"
+        "  err:  'var(--brand-err, #EF4444)',\n"
+        "  info: 'var(--brand-info, #3B82F6)',\n"
+        "  idle: 'var(--brand-muted, #6B7280)',\n"
+        "};\n"
+        "\n"
+        "export default function KpiTile({ label, value, unit, delta, tone = 'ok' }) {\n"
+        "  const accent = TONES[tone] || TONES.idle;\n"
+        "  return (\n"
+        "    <div\n"
+        "      style={{\n"
+        "        background: 'var(--brand-surface, #161b22)',\n"
+        "        border: '1px solid var(--brand-border, #2a3142)',\n"
+        "        borderLeft: `2px solid ${accent}`,\n"
+        "        borderRadius: 'var(--brand-radius, 8px)',\n"
+        "        padding: 12,\n"
+        "        minWidth: 140,\n"
+        "      }}\n"
+        "    >\n"
+        "      <div style={{\n"
+        "        fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.05em',\n"
+        "        color: 'var(--brand-text-dim, #8d96a7)', marginBottom: 4,\n"
+        "      }}>{label}</div>\n"
+        "      <div style={{ display: 'flex', alignItems: 'baseline', gap: 4 }}>\n"
+        "        <span style={{\n"
+        "          fontSize: 22, fontWeight: 600, fontVariantNumeric: 'tabular-nums',\n"
+        "          color: 'var(--brand-text, #e6edf3)',\n"
+        "        }}>{value}</span>\n"
+        "        {unit && (\n"
+        "          <span style={{ fontSize: 13, color: 'var(--brand-text-dim, #8d96a7)' }}>{unit}</span>\n"
+        "        )}\n"
+        "      </div>\n"
+        "      {delta && (\n"
+        "        <div style={{ fontSize: 10, color: 'var(--brand-text-dim, #8d96a7)', marginTop: 4 }}>{delta}</div>\n"
+        "      )}\n"
+        "    </div>\n"
+        "  );\n"
+        "}\n"
+    )
+
+
 # Homelab-specific generators were factored out into stack_templates_homelab
 # but that module was deleted during the anti-leak cleanup. The lazy import
 # returns None when the module is unavailable; each generator returns None,
@@ -2319,6 +2894,10 @@ _MANIFEST_GENERATORS = {
     ("react_vite", "src/components/StatusPill.jsx"):   _component_status_pill,
     ("react_vite", "src/components/Sparkline.jsx"):    _component_sparkline,
     ("react_vite", "src/components/KpiTile.jsx"):      _component_kpi_tile,
+    # Token-driven ui/ primitives (new home; var(--brand-*) sourced).
+    ("react_vite", "src/components/ui/StatusPill.jsx"): _component_ui_status_pill,
+    ("react_vite", "src/components/ui/Sparkline.jsx"):  _component_ui_sparkline,
+    ("react_vite", "src/components/ui/KpiTile.jsx"):    _component_ui_kpi_tile,
     ("react_vite", "src/App.jsx"):                     _component_app_jsx_homelab,
     ("react_vite", "src/styles.css"):                  _component_styles_css_homelab,
     ("react_vite", "src/hooks/usePolling.js"):         _hook_use_polling,
@@ -2351,6 +2930,9 @@ _MANIFEST_GENERATORS = {
     ("react_vite_tailwind", "src/components/StatusPill.jsx"): _component_status_pill,
     ("react_vite_tailwind", "src/components/Sparkline.jsx"): _component_sparkline,
     ("react_vite_tailwind", "src/components/KpiTile.jsx"): _component_kpi_tile,
+    ("react_vite_tailwind", "src/components/ui/StatusPill.jsx"): _component_ui_status_pill,
+    ("react_vite_tailwind", "src/components/ui/Sparkline.jsx"): _component_ui_sparkline,
+    ("react_vite_tailwind", "src/components/ui/KpiTile.jsx"): _component_ui_kpi_tile,
     ("react_vite_tailwind", "src/App.jsx"): _component_app_jsx_homelab,
     ("react_vite_tailwind", "src/hooks/usePolling.js"): _hook_use_polling,
     ("react_vite_tailwind", "src/components/CommandPalette.jsx"): _component_command_palette,
@@ -2359,6 +2941,9 @@ _MANIFEST_GENERATORS = {
     ("next",       "src/components/StatusPill.jsx"):   _component_status_pill,
     ("next",       "src/components/Sparkline.jsx"):    _component_sparkline,
     ("next",       "src/components/KpiTile.jsx"):      _component_kpi_tile,
+    ("next",       "src/components/ui/StatusPill.jsx"): _component_ui_status_pill,
+    ("next",       "src/components/ui/Sparkline.jsx"):  _component_ui_sparkline,
+    ("next",       "src/components/ui/KpiTile.jsx"):    _component_ui_kpi_tile,
     ("next",       "src/hooks/usePolling.js"):         _hook_use_polling,
     ("next",       "src/components/CommandPalette.jsx"): _component_command_palette,
     ("next",       "src/components/ServiceDetail.jsx"):  _component_service_detail,

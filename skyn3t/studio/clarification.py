@@ -230,6 +230,116 @@ def merge_clarification_specs(
     return merged
 
 
+# Sensible default option ids per kickoff spec, used when auto-answering so the
+# build proceeds instead of stalling at awaiting_clarification. These reuse the
+# same option ids the chips expose and that parse_user_intent already understands.
+_AUTO_DEFAULT_OPTION_IDS: Dict[str, str] = {
+    "outcome": "runnable",
+    "platform": "web_app",
+    "audience": "just_me",
+    "category_defaults": "keep",
+}
+
+# Auto-answer modes that should synthesize defaults and proceed to code.
+_AUTO_ANSWER_MODES: frozenset[str] = frozenset({"balanced", "move_fast"})
+
+
+def _default_option_for_spec(spec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Pick a sensible default option for a multiple-choice spec.
+
+    Prefers the curated default id for known specs (outcome/platform/audience/
+    category_defaults) and falls back to the first option otherwise.
+    """
+    options = [opt for opt in (spec.get("options") or []) if isinstance(opt, dict)]
+    if not options:
+        return None
+    spec_id = str(spec.get("id") or "")
+    preferred = _AUTO_DEFAULT_OPTION_IDS.get(spec_id)
+    if preferred:
+        for option in options:
+            if str(option.get("id") or "") == preferred:
+                return option
+    return options[0]
+
+
+def _default_free_text_answer(spec: Dict[str, Any], brief: str) -> str:
+    """Synthesize a default free-text answer from the brief for open specs."""
+    text = re.sub(r"\s+", " ", (brief or "")).strip()
+    if text:
+        # Prefer the first sentence as the "one thing it must do well" hint.
+        first_sentence = re.split(r"(?<=[.!?])\s+", text)[0].strip()
+        candidate = first_sentence or text
+        return candidate[:500]
+    placeholder = str(spec.get("placeholder") or "").strip()
+    if placeholder:
+        return placeholder[:500]
+    return "Build the core experience the brief describes."
+
+
+def _default_answer_for_spec(spec: Dict[str, Any], brief: str) -> str:
+    """Return the default answer text for a single spec (label or free text)."""
+    option = _default_option_for_spec(spec)
+    if option is not None:
+        label = str(option.get("label") or "").strip()
+        if label:
+            return label
+        opt_id = str(option.get("id") or "").strip()
+        if opt_id:
+            return opt_id
+    return _default_free_text_answer(spec, brief)
+
+
+def auto_answer_specs(
+    specs: List[Dict[str, Any]],
+    brief: str,
+    *,
+    mode: str,
+) -> Dict[str, Any]:
+    """Synthesize default answers to kickoff specs so auto-* builds proceed.
+
+    Pure function (no LLM/IO): for balanced/move_fast autonomy it picks the
+    curated default option id (or first option) for each multiple-choice spec
+    and derives a free-text default from the brief, then reuses
+    parse_user_intent + format_user_intent_brief_block to build the same
+    user_intent/brief_block the interactive clarification path would.
+
+    Returns {questions, answers, user_intent, brief_block, auto_answered: True}
+    on success, or {auto_answered: False} for confirm_first / empty specs so the
+    runner leaves the existing awaiting_clarification halt intact.
+    """
+    normalized_mode = str(mode or "").strip().lower()
+    cleaned_specs = [spec for spec in (specs or []) if isinstance(spec, dict)]
+    if normalized_mode not in _AUTO_ANSWER_MODES or not cleaned_specs:
+        return {"auto_answered": False}
+
+    payload = clarification_payload(cleaned_specs)
+    question_options = payload.get("question_options") or []
+    # Build questions/answers aligned the same way clarification_payload does
+    # (skipping blank questions) so parse_user_intent maps each answer back to
+    # the right spec id via question_options.
+    questions: List[str] = []
+    answers: List[str] = []
+    for spec in cleaned_specs[:4]:
+        question = str(spec.get("question") or "").strip()
+        if not question:
+            continue
+        questions.append(question)
+        answers.append(_default_answer_for_spec(spec, brief))
+
+    if not questions:
+        return {"auto_answered": False}
+
+    user_intent = parse_user_intent(questions, answers, question_options)
+    brief_block = format_user_intent_brief_block(user_intent)
+    return {
+        "questions": questions,
+        "answers": answers,
+        "user_intent": user_intent,
+        "brief_block": brief_block,
+        "auto_answered": True,
+    }
+
+
 def parse_user_intent(
     questions: List[str],
     answers: List[str],

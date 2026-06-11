@@ -17,6 +17,22 @@ family later is one match-arm + one method.
 This PR ships the **web + server** strategies. Fullstack and the
 reviewer-scoring axis land in subsequent PRs (C-combo, D).
 
+On top of the family strategy, an additive **target-driven** layer reads
+``data['package_targets']`` (a subset of {pwa, desktop, capacitor, docker}
+the runner derives from the brief) and emits the corresponding wrappers:
+
+    pwa        → public/manifest.webmanifest + public/sw.js (+ setup doc)
+    desktop    → Tauri config (default) or Electron fallback — CONFIG ONLY
+    capacitor  → capacitor.config.ts + cap:* scripts — CONFIG ONLY
+    docker     → delegated to the server/fullstack strategy (no extra files)
+
+Desktop/Capacitor never shell out to tauri/electron/cap (frequently
+absent); they only WRITE config + scripts and document the build command,
+so missing CLIs degrade to a per-target verdict='skipped' note rather than
+failing the build. Results land in the additive ``output['targets']`` key;
+when the runner passes no targets the list is empty and legacy output is
+byte-for-byte unchanged.
+
 Feature-flagged via `extra={"packaging_enabled": False}` on the
 StudioRunner — defaults on, easy to disable per-run if it misbehaves.
 """
@@ -193,6 +209,32 @@ class PackagingAgent(BaseAgent):
                 },
             )
 
+        # Target-driven packaging (PWA / desktop / Capacitor). The runner
+        # derives the target set from the brief and passes it as
+        # data['package_targets']. When absent (the default) we run NO
+        # extra targets — exactly the legacy behavior the older tests pin.
+        targets_out: List[Dict[str, Any]] = []
+        try:
+            requested_targets = self._normalize_package_targets(data.get("package_targets"))
+            if requested_targets:
+                targets_out = await self._run_package_targets(
+                    requested_targets,
+                    artifact_dir=artifact_dir,
+                    scaffold_dir=scaffold_dir,
+                    detection=detection,
+                )
+        except Exception:  # noqa: BLE001 - target packaging is best-effort
+            logger.exception("target-driven packaging failed; emitting skipped targets")
+            targets_out = [
+                {
+                    "target": t,
+                    "verdict": "skipped",
+                    "files_written": [],
+                    "notes": ["target packaging raised; skipped"],
+                }
+                for t in self._normalize_package_targets(data.get("package_targets"))
+            ]
+
         await self.share_learning(
             f"Packaging generated {len(result.files_written)} file(s) for "
             f"{result.strategy} family; verified={result.verified}.",
@@ -212,8 +254,397 @@ class PackagingAgent(BaseAgent):
                 "verified": result.verified,
                 "verifier_skipped": result.verifier_skipped,
                 "notes": result.notes,
+                "targets": targets_out,
             },
         )
+
+    # ------------------------------------------------------------------
+    # Target-driven packaging (PWA / desktop / Capacitor)
+    # ------------------------------------------------------------------
+
+    # The valid target identifiers the runner may request. Anything outside
+    # this set is dropped (defensive: a stray brief-derived string never
+    # crashes packaging).
+    _VALID_TARGETS = ("pwa", "desktop", "capacitor", "docker")
+
+    @classmethod
+    def _normalize_package_targets(cls, raw: Any) -> List[str]:
+        """Coerce data['package_targets'] into a clean, ordered target list.
+
+        Accepts a list/tuple/set of strings (or a single string). Unknown
+        targets are dropped, duplicates collapsed, order preserved. Returns
+        ``[]`` for anything unparseable — the legacy "no extra targets"
+        behavior every existing test relies on.
+        """
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            candidates = [raw]
+        elif isinstance(raw, (list, tuple, set)):
+            candidates = [str(x) for x in raw]
+        else:
+            return []
+        out: List[str] = []
+        for c in candidates:
+            t = c.strip().lower()
+            if t in cls._VALID_TARGETS and t not in out:
+                out.append(t)
+        return out
+
+    async def _run_package_targets(
+        self,
+        targets: List[str],
+        *,
+        artifact_dir: Path,
+        scaffold_dir: Path,
+        detection: StackDetection,
+    ) -> List[Dict[str, Any]]:
+        """Run each requested sub-target independently, best-effort.
+
+        Each sub-target is isolated in its own try/except so one failing
+        target (e.g. no scaffold dir for PWA) never blocks the others or
+        the build. Desktop/Capacitor only WRITE config + scripts — no CLI
+        is ever executed, so a missing tauri/electron/cap binary degrades
+        to a 'skipped' verdict with a documentation note, never a crash.
+        """
+        app_name = _infer_app_name(detection, artifact_dir)
+        # The frontend for SPA-shaped projects lives under scaffold/; fall
+        # back to the artifact root if scaffold/ isn't there.
+        front_dir = scaffold_dir if scaffold_dir.is_dir() else artifact_dir
+        results: List[Dict[str, Any]] = []
+        for target in targets:
+            try:
+                if target == "pwa":
+                    res = self._package_pwa(front_dir, app_name, artifact_dir=artifact_dir)
+                elif target == "desktop":
+                    res = self._package_desktop(front_dir, app_name, artifact_dir=artifact_dir)
+                elif target == "capacitor":
+                    res = self._package_capacitor(front_dir, app_name, artifact_dir=artifact_dir)
+                elif target == "docker":
+                    # 'docker' is already covered by _package_server/_fullstack.
+                    # When requested as an explicit target we report it as
+                    # delegated rather than re-emitting Docker files.
+                    res = {
+                        "target": "docker",
+                        "verdict": "skipped",
+                        "files_written": [],
+                        "notes": [
+                            "docker packaging is handled by the server/fullstack "
+                            "strategy; no extra files emitted for this target"
+                        ],
+                    }
+                else:  # pragma: no cover - guarded by _normalize_package_targets
+                    continue
+            except Exception as e:  # noqa: BLE001 - isolate per-target failure
+                logger.exception("package target %s failed", target)
+                res = {
+                    "target": target,
+                    "verdict": "skipped",
+                    "files_written": [],
+                    "notes": [f"{target} packaging raised: {e}"],
+                }
+            results.append(res)
+        return results
+
+    @staticmethod
+    def _target_rel(path: Path, artifact_dir: Path) -> str:
+        """Report a written path relative to artifact_dir when possible."""
+        try:
+            return str(path.relative_to(artifact_dir))
+        except ValueError:
+            return str(path)
+
+    # ------------------------------------------------------------------
+    # Target: PWA (manifest + service worker) — pure file emission
+    # ------------------------------------------------------------------
+
+    def _package_pwa(
+        self,
+        scaffold_dir: Path,
+        app_name: str,
+        *,
+        artifact_dir: Path,
+    ) -> Dict[str, Any]:
+        """Emit a web app manifest + service worker + a wiring snippet.
+
+        Pure file emission — no tool required. Writes:
+          - public/manifest.webmanifest
+          - public/sw.js (offline-first cache-then-network shell)
+          - PWA_SETUP.md (the <link rel="manifest"> + SW registration
+            snippet the entry HTML/JS must include).
+
+        Degrades to verdict='skipped' when there's no frontend dir to
+        attach a manifest to.
+        """
+        notes: List[str] = []
+        files_written: List[str] = []
+
+        if not scaffold_dir.is_dir():
+            return {
+                "target": "pwa",
+                "verdict": "skipped",
+                "files_written": [],
+                "notes": ["no frontend dir found — PWA manifest not emitted"],
+            }
+
+        # Prefer a conventional public/ dir (vite/CRA serve it at web root).
+        public_dir = scaffold_dir / "public"
+        public_dir.mkdir(parents=True, exist_ok=True)
+
+        short_name = (app_name[:12] or "App").strip()
+        manifest_path = public_dir / "manifest.webmanifest"
+        if manifest_path.is_file():
+            notes.append("manifest.webmanifest already exists — left in place")
+        else:
+            manifest_path.write_text(
+                _render_pwa_manifest(app_name=app_name, short_name=short_name),
+                encoding="utf-8",
+            )
+            files_written.append(self._target_rel(manifest_path, artifact_dir))
+
+        sw_path = public_dir / "sw.js"
+        if sw_path.is_file():
+            notes.append("sw.js already exists — left in place")
+        else:
+            sw_path.write_text(_PWA_SERVICE_WORKER, encoding="utf-8")
+            files_written.append(self._target_rel(sw_path, artifact_dir))
+
+        setup_path = scaffold_dir / "PWA_SETUP.md"
+        if not setup_path.is_file():
+            setup_path.write_text(_PWA_SETUP_MD, encoding="utf-8")
+            files_written.append(self._target_rel(setup_path, artifact_dir))
+
+        notes.append(
+            "PWA manifest + service worker emitted. Add the <link rel=\"manifest\"> "
+            "tag and SW registration from PWA_SETUP.md to your entry HTML."
+        )
+        return {
+            "target": "pwa",
+            "verdict": "ok" if files_written else "skipped",
+            "files_written": files_written,
+            "notes": notes,
+        }
+
+    # ------------------------------------------------------------------
+    # Target: desktop (Tauri default, Electron fallback) — config only
+    # ------------------------------------------------------------------
+
+    def _package_desktop(
+        self,
+        scaffold_dir: Path,
+        app_name: str,
+        *,
+        artifact_dir: Path,
+    ) -> Dict[str, Any]:
+        """Emit a desktop wrapper config. Tauri by default, Electron fallback.
+
+        WRITE config + scripts ONLY — never shells out to tauri/electron
+        (often absent). The build command is documented in DESKTOP_SETUP.md.
+        Picks Electron only when a tauri toolchain clearly isn't viable
+        (no rust hint AND electron already in deps); otherwise Tauri, since
+        it produces the smallest, most native wrapper.
+        """
+        notes: List[str] = []
+        files_written: List[str] = []
+
+        if not scaffold_dir.is_dir():
+            return {
+                "target": "desktop",
+                "verdict": "skipped",
+                "files_written": [],
+                "notes": ["no frontend dir found — desktop wrapper not emitted"],
+            }
+
+        framework = self._choose_desktop_framework(scaffold_dir)
+
+        if framework == "electron":
+            # Electron fallback: main process + electron-builder config.
+            electron_dir = scaffold_dir / "electron"
+            electron_dir.mkdir(parents=True, exist_ok=True)
+            main_path = electron_dir / "main.js"
+            if not main_path.is_file():
+                main_path.write_text(
+                    _render_electron_main(app_name=app_name), encoding="utf-8",
+                )
+                files_written.append(self._target_rel(main_path, artifact_dir))
+            builder_path = scaffold_dir / "electron-builder.json"
+            if not builder_path.is_file():
+                builder_path.write_text(
+                    _render_electron_builder(app_name=app_name), encoding="utf-8",
+                )
+                files_written.append(self._target_rel(builder_path, artifact_dir))
+            notes.append(
+                "Electron wrapper config emitted (config-only). Install electron + "
+                "electron-builder and run the documented build command — no CLI was executed."
+            )
+        else:
+            # Tauri default: src-tauri/tauri.conf.json + a Cargo.toml stub
+            # + a minimal main.rs so `cargo tauri build` has an entry point.
+            tauri_dir = scaffold_dir / "src-tauri"
+            (tauri_dir / "src").mkdir(parents=True, exist_ok=True)
+            conf_path = tauri_dir / "tauri.conf.json"
+            if not conf_path.is_file():
+                conf_path.write_text(
+                    _render_tauri_conf(app_name=app_name), encoding="utf-8",
+                )
+                files_written.append(self._target_rel(conf_path, artifact_dir))
+            cargo_path = tauri_dir / "Cargo.toml"
+            if not cargo_path.is_file():
+                cargo_path.write_text(
+                    _render_tauri_cargo(app_name=app_name), encoding="utf-8",
+                )
+                files_written.append(self._target_rel(cargo_path, artifact_dir))
+            main_rs = tauri_dir / "src" / "main.rs"
+            if not main_rs.is_file():
+                main_rs.write_text(_TAURI_MAIN_RS, encoding="utf-8")
+                files_written.append(self._target_rel(main_rs, artifact_dir))
+            notes.append(
+                "Tauri wrapper config emitted (config-only). Install the Rust "
+                "toolchain + tauri-cli and run the documented build command — "
+                "no CLI was executed."
+            )
+
+        setup_path = scaffold_dir / "DESKTOP_SETUP.md"
+        if not setup_path.is_file():
+            setup_path.write_text(
+                _render_desktop_setup_md(framework=framework, app_name=app_name),
+                encoding="utf-8",
+            )
+            files_written.append(self._target_rel(setup_path, artifact_dir))
+
+        return {
+            "target": "desktop",
+            "verdict": "ok" if files_written else "skipped",
+            "files_written": files_written,
+            "notes": notes,
+        }
+
+    @staticmethod
+    def _choose_desktop_framework(scaffold_dir: Path) -> str:
+        """Return 'tauri' (default) or 'electron' (fallback).
+
+        Tauri is preferred for size/nativeness. We only fall back to
+        Electron when the project already declares electron as a dep —
+        i.e. the author signalled an Electron preference — since we never
+        execute a CLI to verify a Rust toolchain is present.
+        """
+        pkg = scaffold_dir / "package.json"
+        if pkg.is_file():
+            try:
+                import json as _json
+                data = _json.loads(pkg.read_text(encoding="utf-8"))
+                deps = {
+                    **(data.get("dependencies") or {}),
+                    **(data.get("devDependencies") or {}),
+                }
+                if any(k == "electron" or k.startswith("electron-") for k in deps):
+                    return "electron"
+            except (OSError, ValueError):
+                pass
+        return "tauri"
+
+    # ------------------------------------------------------------------
+    # Target: Capacitor (full native iOS + Android wrap) — config only
+    # ------------------------------------------------------------------
+
+    def _package_capacitor(
+        self,
+        scaffold_dir: Path,
+        app_name: str,
+        *,
+        artifact_dir: Path,
+    ) -> Dict[str, Any]:
+        """Emit a Capacitor config + npm scripts for a full native wrap.
+
+        WRITE config/scripts ONLY — `npx cap add ios/android` etc. are
+        documented in CAPACITOR_SETUP.md, never executed (cap CLI is often
+        absent). Patches package.json with cap:* scripts when present.
+        """
+        notes: List[str] = []
+        files_written: List[str] = []
+
+        if not scaffold_dir.is_dir():
+            return {
+                "target": "capacitor",
+                "verdict": "skipped",
+                "files_written": [],
+                "notes": ["no frontend dir found — Capacitor config not emitted"],
+            }
+
+        app_id = _capacitor_app_id(app_name)
+        web_dir = _detect_web_dir(scaffold_dir)
+
+        conf_path = scaffold_dir / "capacitor.config.ts"
+        if conf_path.is_file():
+            notes.append("capacitor.config.ts already exists — left in place")
+        else:
+            conf_path.write_text(
+                _render_capacitor_config(
+                    app_id=app_id, app_name=app_name, web_dir=web_dir,
+                ),
+                encoding="utf-8",
+            )
+            files_written.append(self._target_rel(conf_path, artifact_dir))
+
+        # Best-effort: add cap:* scripts to package.json so `npm run cap:sync`
+        # etc. are discoverable. Never fail packaging if the file is odd.
+        scripts_added = self._add_capacitor_scripts(scaffold_dir)
+        if scripts_added:
+            notes.append("cap:* npm scripts added to package.json")
+
+        setup_path = scaffold_dir / "CAPACITOR_SETUP.md"
+        if not setup_path.is_file():
+            setup_path.write_text(
+                _render_capacitor_setup_md(app_id=app_id, app_name=app_name),
+                encoding="utf-8",
+            )
+            files_written.append(self._target_rel(setup_path, artifact_dir))
+
+        notes.append(
+            "Capacitor config emitted (config-only). Run the documented "
+            "`npx cap add ios` / `npx cap add android` commands to add native "
+            "projects — no CLI was executed."
+        )
+        return {
+            "target": "capacitor",
+            "verdict": "ok" if files_written else "skipped",
+            "files_written": files_written,
+            "notes": notes,
+        }
+
+    @staticmethod
+    def _add_capacitor_scripts(scaffold_dir: Path) -> bool:
+        """Add cap:* scripts to package.json. Idempotent; never raises fatally."""
+        pkg = scaffold_dir / "package.json"
+        if not pkg.is_file():
+            return False
+        try:
+            import json as _json
+            data = _json.loads(pkg.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        scripts = data.get("scripts")
+        if not isinstance(scripts, dict):
+            scripts = {}
+        wanted = {
+            "cap:sync": "cap sync",
+            "cap:ios": "cap open ios",
+            "cap:android": "cap open android",
+        }
+        changed = False
+        for k, v in wanted.items():
+            if k not in scripts:
+                scripts[k] = v
+                changed = True
+        if not changed:
+            return False
+        data["scripts"] = scripts
+        try:
+            import json as _json
+            pkg.write_text(_json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            return False
+        return True
 
     # ==================================================================
     # Strategy: web
@@ -1801,6 +2232,405 @@ docker compose down -v
 
 ---
 *Generated by SkyN3t PackagingAgent (fullstack strategy).*
+"""
+
+
+# ---------------------------------------------------------------------------
+# Target-driven packaging helpers (PWA / desktop / Capacitor)
+# ---------------------------------------------------------------------------
+
+def _npm_safe_name(value: str, fallback: str = "app") -> str:
+    """Slugify a name to an npm-safe identifier (lowercase, hyphenated)."""
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    slug = re.sub(r"-{2,}", "-", slug)
+    return slug or fallback
+
+
+def _capacitor_app_id(app_name: str) -> str:
+    """Derive a reverse-DNS-ish appId, e.g. 'My App' → 'com.skyn3t.myapp'."""
+    bare = re.sub(r"[^a-z0-9]", "", app_name.lower()) or "app"
+    return f"com.skyn3t.{bare}"
+
+
+def _detect_web_dir(scaffold_dir: Path) -> str:
+    """Best-effort static build output dir for Capacitor's webDir.
+
+    Vite/most React tooling builds to ``dist``; CRA builds to ``build``;
+    Next static export to ``out``. We can't run the build, so we infer
+    from manifest hints and default to ``dist`` (the common SkyN3t shape).
+    """
+    pkg = scaffold_dir / "package.json"
+    if pkg.is_file():
+        try:
+            import json as _json
+            data = _json.loads(pkg.read_text(encoding="utf-8"))
+            deps = {
+                **(data.get("dependencies") or {}),
+                **(data.get("devDependencies") or {}),
+            }
+            scripts = data.get("scripts") or {}
+            build_script = str(scripts.get("build") or "")
+            if "react-scripts" in deps or "react-scripts" in build_script:
+                return "build"
+            if "next" in deps:
+                return "out"
+        except (OSError, ValueError):
+            pass
+    return "dist"
+
+
+def _render_pwa_manifest(*, app_name: str, short_name: str) -> str:
+    """Render a minimal-but-valid web app manifest (no binary icons)."""
+    import json as _json
+    manifest = {
+        "name": app_name,
+        "short_name": short_name,
+        "description": f"{app_name} — installable web app.",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "orientation": "portrait",
+        "background_color": "#ffffff",
+        "theme_color": "#0066cc",
+        # Icons reference common public/ paths. The build pipeline can drop
+        # real PNGs at these paths; absent icons just mean a default badge.
+        "icons": [
+            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
+            {
+                "src": "/icon-512.png",
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "maskable",
+            },
+        ],
+    }
+    return _json.dumps(manifest, indent=2) + "\n"
+
+
+_PWA_SERVICE_WORKER = """\
+// Generated by SkyN3t PackagingAgent — offline-capable service worker.
+//
+// Strategy: cache the app shell on install, serve cache-first for
+// navigations/static assets, and fall back to the network. Bump
+// CACHE_VERSION whenever you ship a new build to invalidate the shell.
+
+const CACHE_VERSION = "skyn3t-v1";
+const APP_SHELL = ["/", "/index.html", "/manifest.webmanifest"];
+
+self.addEventListener("install", (event) => {
+  event.waitUntil(
+    caches.open(CACHE_VERSION).then((cache) => cache.addAll(APP_SHELL)).catch(() => {})
+  );
+  self.skipWaiting();
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    caches.keys().then((keys) =>
+      Promise.all(keys.filter((k) => k !== CACHE_VERSION).map((k) => caches.delete(k)))
+    )
+  );
+  self.clients.claim();
+});
+
+self.addEventListener("fetch", (event) => {
+  const { request } = event;
+  if (request.method !== "GET") return;
+  event.respondWith(
+    caches.match(request).then((cached) => {
+      const network = fetch(request)
+        .then((response) => {
+          if (response && response.status === 200 && response.type === "basic") {
+            const copy = response.clone();
+            caches.open(CACHE_VERSION).then((cache) => cache.put(request, copy)).catch(() => {});
+          }
+          return response;
+        })
+        .catch(() => cached);
+      return cached || network;
+    })
+  );
+});
+"""
+
+
+_PWA_SETUP_MD = """\
+# PWA setup
+
+This project was packaged as an installable Progressive Web App by the
+SkyN3t PackagingAgent. Two files were emitted under `public/`:
+
+- `public/manifest.webmanifest` — app name, theme color, icons.
+- `public/sw.js` — an offline-first service worker.
+
+## 1. Link the manifest
+
+Add this inside `<head>` of your entry HTML (e.g. `index.html`):
+
+```html
+<link rel="manifest" href="/manifest.webmanifest" />
+<meta name="theme-color" content="#0066cc" />
+```
+
+## 2. Register the service worker
+
+Add this to your entry JS/TS (e.g. `src/main.jsx`), guarded so it only
+runs in production-capable browsers:
+
+```js
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js").catch(() => {});
+  });
+}
+```
+
+## 3. (Optional) Add icons
+
+Drop `public/icon-192.png` and `public/icon-512.png` for a polished
+install prompt. Without them the browser uses a default badge.
+
+After `npm run build`, the app is installable from the browser's
+"Install app" affordance and works offline for the cached shell.
+"""
+
+
+def _render_tauri_conf(*, app_name: str) -> str:
+    """Render a Tauri v2 tauri.conf.json (config only — never built here)."""
+    import json as _json
+    identifier = _capacitor_app_id(app_name)  # reuse reverse-DNS derivation
+    conf = {
+        "$schema": "https://schema.tauri.app/config/2",
+        "productName": app_name,
+        "version": "0.1.0",
+        "identifier": identifier,
+        "build": {
+            # The frontend dev/build commands the wrapper drives. Adjust to
+            # your scaffold's actual scripts if they differ.
+            "beforeDevCommand": "npm run dev",
+            "devUrl": "http://localhost:5173",
+            "beforeBuildCommand": "npm run build",
+            "frontendDist": "../dist",
+        },
+        "app": {
+            "windows": [
+                {
+                    "title": app_name,
+                    "width": 1280,
+                    "height": 800,
+                    "resizable": True,
+                }
+            ],
+            "security": {"csp": None},
+        },
+        "bundle": {
+            "active": True,
+            "targets": "all",
+            "icon": [
+                "icons/32x32.png",
+                "icons/128x128.png",
+                "icons/icon.icns",
+                "icons/icon.ico",
+            ],
+        },
+    }
+    return _json.dumps(conf, indent=2) + "\n"
+
+
+def _render_tauri_cargo(*, app_name: str) -> str:
+    """Render a Cargo.toml stub for the Tauri wrapper crate."""
+    crate = _npm_safe_name(app_name, "app").replace("-", "_") + "_desktop"
+    return f"""\
+# Generated by SkyN3t PackagingAgent (config-only stub).
+# Run `cargo tauri build` after installing the Rust toolchain + tauri-cli.
+
+[package]
+name = "{crate}"
+version = "0.1.0"
+description = "{app_name} desktop wrapper"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = {{ version = "2", features = [] }}
+
+[dependencies]
+tauri = {{ version = "2", features = [] }}
+serde = {{ version = "1", features = ["derive"] }}
+serde_json = "1"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+"""
+
+
+_TAURI_MAIN_RS = """\
+// Generated by SkyN3t PackagingAgent (config-only stub).
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+fn main() {
+    tauri::Builder::default()
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+"""
+
+
+def _render_electron_main(*, app_name: str) -> str:
+    """Render an Electron main-process entry that loads the built frontend."""
+    return f"""\
+// Generated by SkyN3t PackagingAgent (config-only) — Electron main process.
+// Loads the static build from ./dist. Run the documented build command;
+// no Electron CLI is executed by packaging.
+
+const {{ app, BrowserWindow }} = require("electron");
+const path = require("path");
+
+function createWindow() {{
+  const win = new BrowserWindow({{
+    width: 1280,
+    height: 800,
+    title: {app_name!r},
+    webPreferences: {{ contextIsolation: true }},
+  }});
+  win.loadFile(path.join(__dirname, "..", "dist", "index.html"));
+}}
+
+app.whenReady().then(() => {{
+  createWindow();
+  app.on("activate", () => {{
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  }});
+}});
+
+app.on("window-all-closed", () => {{
+  if (process.platform !== "darwin") app.quit();
+}});
+"""
+
+
+def _render_electron_builder(*, app_name: str) -> str:
+    """Render an electron-builder config (config only)."""
+    import json as _json
+    cfg = {
+        "appId": _capacitor_app_id(app_name),
+        "productName": app_name,
+        "directories": {"output": "release"},
+        "files": ["dist/**/*", "electron/**/*"],
+        "mac": {"target": "dmg"},
+        "win": {"target": "nsis"},
+        "linux": {"target": "AppImage"},
+    }
+    return _json.dumps(cfg, indent=2) + "\n"
+
+
+def _render_desktop_setup_md(*, framework: str, app_name: str) -> str:
+    """Render DESKTOP_SETUP.md documenting the (un-run) build command."""
+    if framework == "electron":
+        return f"""\
+# Desktop setup ({app_name}) — Electron
+
+This project was packaged as an Electron desktop app (config-only). No
+Electron CLI was executed during packaging.
+
+## Files emitted
+- `electron/main.js` — main process; loads the static `dist/` build.
+- `electron-builder.json` — packaging config (dmg / nsis / AppImage).
+
+## Build it
+
+```bash
+npm install --save-dev electron electron-builder
+npm run build                      # produce dist/
+npx electron .                     # run locally
+npx electron-builder --config electron-builder.json   # produce installers
+```
+
+> The packaging step never runs these commands — it only writes config so
+> the build is reproducible wherever the Electron toolchain is installed.
+"""
+    return f"""\
+# Desktop setup ({app_name}) — Tauri
+
+This project was packaged as a Tauri desktop app (config-only). No Tauri
+CLI or Rust toolchain was executed during packaging.
+
+## Files emitted
+- `src-tauri/tauri.conf.json` — Tauri v2 config.
+- `src-tauri/Cargo.toml` — wrapper crate manifest (stub).
+- `src-tauri/src/main.rs` — minimal Tauri entry point.
+
+## Build it
+
+```bash
+# 1. Install the Rust toolchain: https://rustup.rs
+# 2. Install the Tauri CLI:
+npm install --save-dev @tauri-apps/cli
+# 3. Dev / build:
+npx tauri dev
+npx tauri build
+```
+
+> The packaging step never runs these commands — it only writes config so
+> the build is reproducible wherever the Rust + Tauri toolchain exists.
+> Drop real icons under `src-tauri/icons/` before a release build.
+"""
+
+
+def _render_capacitor_config(*, app_id: str, app_name: str, web_dir: str) -> str:
+    """Render capacitor.config.ts for a full native iOS + Android wrap."""
+    return f"""\
+// Generated by SkyN3t PackagingAgent (config-only) — Capacitor.
+import type {{ CapacitorConfig }} from "@capacitor/cli";
+
+const config: CapacitorConfig = {{
+  appId: {app_id!r},
+  appName: {app_name!r},
+  webDir: {web_dir!r},
+  server: {{
+    androidScheme: "https",
+  }},
+}};
+
+export default config;
+"""
+
+
+def _render_capacitor_setup_md(*, app_id: str, app_name: str) -> str:
+    """Render CAPACITOR_SETUP.md documenting the (un-run) native wrap steps."""
+    return f"""\
+# Native app setup ({app_name}) — Capacitor
+
+This project was packaged for a full native iOS + Android wrap with
+Capacitor (config-only). No Capacitor CLI was executed during packaging.
+
+- **appId:** `{app_id}`
+- **Config:** `capacitor.config.ts`
+- **npm scripts:** `cap:sync`, `cap:ios`, `cap:android`
+
+## Add native platforms
+
+```bash
+npm install @capacitor/core
+npm install --save-dev @capacitor/cli
+npm install @capacitor/ios @capacitor/android
+
+npm run build            # produce the web build (webDir)
+npx cap add ios          # creates ios/ native project
+npx cap add android      # creates android/ native project
+npx cap sync             # copy web assets + plugins into native
+```
+
+## Open in native IDEs
+
+```bash
+npm run cap:ios          # opens Xcode
+npm run cap:android      # opens Android Studio
+```
+
+> The packaging step never runs `npx cap add` — it only writes config and
+> scripts so the native wrap is reproducible wherever the Capacitor CLI,
+> Xcode, and Android Studio are installed.
 """
 
 
