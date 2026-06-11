@@ -96,11 +96,11 @@ _DEFAULT_STAGE_POLICY: Dict[str, str] = {
     "architect":          "or_strong",
     "architecture":       "or_strong",
     # Code-stage planning still uses the agent-level route before
-    # per-file specialization kicks in. Keep it on the HTTP path, but
-    # use a code-focused model instead of the ultra-cheap general tier.
-    "code":               "or_backend",
-    "code_agent":         "or_backend",
-    "code_improver":      "or_backend",
+    # per-file specialization kicks in. Studio builds prioritize
+    # shippable quality over marginal cost — use the strong tier.
+    "code":               "or_strong",
+    "code_agent":         "or_strong",
+    "code_improver":      "or_strong",
     "reviewer":           "or_strong",
     "contract_verifier":  "or_strong",
     "consistency_reviewer": "or_strong",
@@ -163,6 +163,32 @@ def _load_env_overrides() -> Dict[str, str]:
     return _load_override_file(path)
 
 
+_CODE_STAGE_NAMES: frozenset[str] = frozenset(
+    {"code", "code_agent", "code_improver"},
+)
+
+
+def _load_code_tier_override() -> Optional[str]:
+    """Optional operator knob for cheaper code generation.
+
+    ``SKYN3T_CODE_TIER`` overrides the default ``or_strong`` code-stage
+    policy (and per-file UI/backend specialization) without editing
+    ``SKYN3T_MODEL_ROUTING`` or the persisted routing store.
+    """
+    raw = os.environ.get("SKYN3T_CODE_TIER", "").strip()
+    if not raw:
+        return None
+    tier = raw.lower()
+    if tier not in _TIERS:
+        logger.warning(
+            "SKYN3T_CODE_TIER=%s is not a valid tier (valid: %s) — ignoring",
+            raw,
+            list(_TIERS),
+        )
+        return None
+    return tier
+
+
 def _load_persisted_overrides() -> Dict[str, Dict[str, Optional[str]]]:
     try:
         from skyn3t.config.model_routing import get_model_routing_store
@@ -193,22 +219,42 @@ def _load_persisted_overrides() -> Dict[str, Dict[str, Optional[str]]]:
     return out
 
 
+def _tier_backend_model(tier_name: str) -> Tuple[str, Optional[str]]:
+    """Return (backend, model) for a tier, validating OpenRouter ids."""
+    backend, model = _TIERS.get(tier_name, _TIERS["cheap"])
+    if backend == "openrouter" and model:
+        try:
+            from skyn3t.core.openrouter_catalog import resolve_openrouter_model
+
+            model = resolve_openrouter_model(tier_name, model)
+        except Exception:
+            logger.debug("openrouter tier validation skipped", exc_info=True)
+    return backend, model
+
+
 def available_tiers() -> List[Dict[str, Optional[str]]]:
-    return [
-        {"name": name, "backend": backend, "model": model}
-        for name, (backend, model) in _TIERS.items()
-    ]
+    out: List[Dict[str, Optional[str]]] = []
+    for name in _TIERS:
+        backend, model = _tier_backend_model(name)
+        out.append({"name": name, "backend": backend, "model": model})
+    return out
 
 
 def tier_details(tier_name: str) -> Tuple[Optional[str], Optional[str]]:
-    backend, model = _TIERS.get(tier_name, (None, None))
-    return backend, model
+    if tier_name not in _TIERS:
+        return None, None
+    return _tier_backend_model(tier_name)
 
 
 def default_tier_for_stage(stage_name: Optional[str]) -> Optional[str]:
     if not stage_name:
         return None
     return _DEFAULT_STAGE_POLICY.get(str(stage_name).strip().lower())
+
+
+def studio_quality_policies() -> Dict[str, str]:
+    """Default per-stage tier map for Project Studio (init wizard preset)."""
+    return dict(_DEFAULT_STAGE_POLICY)
 
 
 def tier_for_backend_model(backend: str, model: Optional[str]) -> Optional[str]:
@@ -237,7 +283,7 @@ def _route_for_stage(stage_name: Optional[str]) -> Dict[str, Optional[str]]:
     persisted = _load_persisted_overrides()
     if stage in persisted:
         tier = str(persisted[stage].get("tier") or "")
-        backend, model = _TIERS.get(tier, _TIERS["cheap"])
+        backend, model = _tier_backend_model(tier)
         return {
             "stage": stage,
             "tier": tier,
@@ -249,7 +295,7 @@ def _route_for_stage(stage_name: Optional[str]) -> Dict[str, Optional[str]]:
     env = _load_env_overrides()
     if stage in env:
         tier = env[stage]
-        backend, model = _TIERS.get(tier, _TIERS["cheap"])
+        backend, model = _tier_backend_model(tier)
         return {
             "stage": stage,
             "tier": tier,
@@ -258,9 +304,20 @@ def _route_for_stage(stage_name: Optional[str]) -> Dict[str, Optional[str]]:
             "source": "env",
             "persisted_via": None,
         }
+    code_tier = _load_code_tier_override()
+    if code_tier and stage in _CODE_STAGE_NAMES:
+        backend, model = _tier_backend_model(code_tier)
+        return {
+            "stage": stage,
+            "tier": code_tier,
+            "backend": backend,
+            "model": model,
+            "source": "env_code_tier",
+            "persisted_via": None,
+        }
     if stage in _DEFAULT_STAGE_POLICY:
         tier = _DEFAULT_STAGE_POLICY[stage]
-        backend, model = _TIERS.get(tier, _TIERS["cheap"])
+        backend, model = _tier_backend_model(tier)
         return {
             "stage": stage,
             "tier": tier,
@@ -719,6 +776,9 @@ def _resolve_static(
 ) -> Tuple[str, Optional[str]]:
     """The pure-static decision (split out so it's unit-testable and
     so the adaptive path can call it without recursion)."""
+    code_tier = _load_code_tier_override()
+    if code_tier:
+        return _tier_backend_model(code_tier)
     if not rel_path:
         return resolve_model(stage_name)
     rl = rel_path.lower().replace("\\", "/")
@@ -729,21 +789,21 @@ def _resolve_static(
     # server/index.js) — now routed to an HTTP backend with a
     # 120s timeout instead of the 240s CLI idle.
     if rl.endswith(("app.jsx", "app.tsx", "main.jsx", "main.tsx")):
-        return _TIERS["or_ui"]       # openrouter + xiaomi/mimo-v2-flash
+        return _tier_backend_model("or_ui")
 
     # Frontend by path hint OR extension → OpenRouter UI specialist.
     if any(h in rl for h in _FRONTEND_PATH_HINTS):
-        return _TIERS["or_ui"]
+        return _tier_backend_model("or_ui")
     if rl.endswith(_FRONTEND_EXTS):
-        return _TIERS["or_ui"]
+        return _tier_backend_model("or_ui")
     if rl.endswith(".css") and "/server/" not in rl:
-        return _TIERS["or_ui"]
+        return _tier_backend_model("or_ui")
     if rl.endswith(".html"):
-        return _TIERS["or_ui"]
+        return _tier_backend_model("or_ui")
 
     # Backend by path hint → OpenRouter code specialist (qwen3-coder).
     if any(h in rl for h in _BACKEND_PATH_HINTS):
-        return _TIERS["or_backend"]  # openrouter + qwen/qwen3-coder
+        return _tier_backend_model("or_backend")
 
     # Default to the stage-level tier.
     return resolve_model(stage_name)

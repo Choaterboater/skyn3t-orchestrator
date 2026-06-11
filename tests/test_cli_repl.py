@@ -262,6 +262,14 @@ def test_resolve_status_query_slug_uses_active_build():
     assert repl._resolve_status_query_slug(state, "what is the status of my build") == "demo-build"
 
 
+def test_match_studio_slug_hint_prefix():
+    full = "build-choatelab-a-self-hosted-homelab-dashboard-inspired-by-a08c90"
+    projects = [{"slug": full}, {"slug": "other-project-abc123"}]
+    assert repl._match_studio_slug_hint("build-choatelab", projects) == full
+    assert repl._match_studio_slug_hint("other-project", projects) == "other-project-abc123"
+    assert repl._match_studio_slug_hint("missing", projects) is None
+
+
 def test_show_project_status_in_repl_attaches_sidebar(monkeypatch):
     state = repl.ReplState()
     paints = []
@@ -969,3 +977,73 @@ def test_run_project_command_watches_and_submits_clarifications(monkeypatch):
     assert any("project queued: demo" in str(item) for item in state.transcript)
     assert any("clarifications sent. Resuming build" in str(item) for item in state.transcript)
     assert getattr(state.transcript[-1], "title", None) == "Project finished"
+
+
+def test_parse_studio_approval_plain():
+    assert repl._parse_studio_approval_plain("approve") == ("a", "", "")
+    assert repl._parse_studio_approval_plain("approve with edits") == ("e", "", "")
+    assert repl._parse_studio_approval_plain("reject use SQLite") == (
+        "r",
+        "use SQLite",
+        "",
+    )
+    assert repl._parse_studio_approval_plain("yes") is None
+    assert repl._parse_studio_approval_plain("hello world") is None
+
+
+def test_handle_studio_clarification_reply_collects_and_posts(monkeypatch):
+    state = repl.ReplState(studio_slug="demo")
+    state.studio_clarification_questions = ("Who is this for?", "What matters most?")
+    posts: list[dict] = []
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, path, json=None):
+            posts.append({"path": path, "json": json})
+            return type(
+                "Resp",
+                (),
+                {
+                    "raise_for_status": lambda self: None,
+                    "json": lambda self: {"ok": True},
+                },
+            )()
+
+    monkeypatch.setattr(repl.httpx, "Client", lambda *a, **k: FakeClient())
+
+    assert repl._handle_studio_clarification_reply(state, "builders") is True
+    assert state.studio_clarification_answers == ["builders"]
+    assert repl._handle_studio_clarification_reply(state, "streaks") is True
+    assert posts == [
+        {
+            "path": "/api/studio/projects/demo/clarify",
+            "json": {"answers": ["builders", "streaks"]},
+        }
+    ]
+    assert state.studio_clarification_questions is None
+
+
+def test_emit_studio_approval_prompt_once(monkeypatch):
+    state = repl.ReplState(studio_slug="demo")
+    project = {
+        "slug": "demo",
+        "status": "awaiting_approval",
+        "awaiting_approval_for": {"stage": "architect", "agent": "architect"},
+    }
+
+    class FakeClient:
+        pass
+
+    monkeypatch.setattr(
+        repl,
+        "fetch_approval_document",
+        lambda client, slug: "# Architecture\n",
+    )
+    assert repl._emit_studio_approval_prompt(state, project, client=FakeClient()) is True
+    assert len(state.transcript) == 2
+    assert repl._emit_studio_approval_prompt(state, project, client=FakeClient()) is False
