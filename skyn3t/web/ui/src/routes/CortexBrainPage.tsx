@@ -1,11 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, lazy, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import { api } from "../api/client";
 import { useSwarm } from "../context/SwarmProvider";
 import type { GraphNodeSeed } from "../components/cortex/AgentGraph";
-import AgentGraph from "../components/cortex/AgentGraph";
 import CognitionStream from "../components/cortex/CognitionStream";
+
+// Lazy so Three.js (~250KB gz) only loads when the Brain page is opened,
+// keeping the rest of the dashboard bundle light.
+const CortexBrain3D = lazy(() => import("../components/cortex/CortexBrain3D"));
 import MemoryCore from "../components/cortex/MemoryCore";
 
 // ============================================================
@@ -115,15 +118,25 @@ export default function CortexBrainPage() {
                   <span className="text-accent">Swarm Constellation</span>
                 </h2>
                 <p className="text-text-secondary text-sm mt-1">
-                  Agents orbit; links pulse as messages travel between them.
+                  A 3D neural field — agents orbit the memory core; pulses
+                  travel the edges as messages move between them.
                 </p>
               </div>
               <span className="text-[0.6rem] font-mono uppercase tracking-wider text-text-dim shrink-0">
-                {seeds.length} nodes
+                {seeds.length} nodes · 3D
               </span>
             </div>
             <div className="flex-1 min-h-[320px] p-2">
-              <AgentGraph seeds={seeds} className="h-full" />
+              <Suspense
+                fallback={
+                  <div className="h-full min-h-[320px] flex items-center justify-center text-text-dim text-xs font-mono">
+                    <i className="fa-solid fa-circle-notch fa-spin mr-2" aria-hidden />
+                    loading 3D neural field…
+                  </div>
+                }
+              >
+                <CortexBrain3D seeds={seeds} className="h-full" />
+              </Suspense>
             </div>
           </section>
 

@@ -67,14 +67,16 @@ logger = logging.getLogger("skyn3t.core.model_router")
 _TIERS: Dict[str, Tuple[str, Optional[str]]] = {
     # OpenRouter-first tiers (HTTP-based; no 240s CLI idle-timeout cliff).
     # Capability-routed per file type — see _resolve_static below.
-    # FREE OpenRouter models so autonomous builds cost ~$0. Verified live on
-    # OpenRouter /models (pricing prompt+completion == 0) on 2026-06-11. The
-    # SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD cap is the hard backstop for any
-    # incidental paid usage (debate diversity, model-evolution, CLI fallback).
-    "or_cheap":   ("openrouter", "meta-llama/llama-3.3-70b-instruct:free"),
-    "or_ui":      ("openrouter", "nvidia/nemotron-3-super-120b-a12b:free"),
-    "or_backend": ("openrouter", "qwen/qwen3-coder:free"),
-    "or_strong":  ("openrouter", "qwen/qwen3-coder:free"),
+    # CHEAP + RELIABLE OpenRouter models. Free-only (the :free variants) was
+    # heavily rate-limited, which forced constant failover and made the swarm
+    # feel dead; these dirt-cheap models (≈$0.02–0.05/build, ~$1–2/day for 50
+    # builds, hard-capped at SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD=$20) are
+    # the same set the model-evolution engine converged to on this account —
+    # minus the expensive Opus pick that's now disabled. or_docs stays free.
+    "or_cheap":   ("openrouter", "google/gemini-2.5-flash-lite-preview-09-2025"),
+    "or_ui":      ("openrouter", "qwen/qwen3.5-flash-02-23"),
+    "or_backend": ("openrouter", "qwen/qwen3-coder"),
+    "or_strong":  ("openrouter", "qwen/qwen3-coder"),
     "or_docs":    ("openrouter", "openai/gpt-oss-120b:free"),
     # Local-CLI tiers — kept as safety net via _BACKEND_ALTERNATIVES.
     "cheap":    ("kimi_cli",    None),
@@ -660,12 +662,17 @@ _BACKEND_PATH_HINTS: Tuple[str, ...] = (
 # tiers: visual specialist demotes to code specialist (and vice versa);
 # strong reasoner demotes back to code specialist.
 _BACKEND_ALTERNATIVES: Dict[str, Tuple[str, Optional[str]]] = {
-    # OpenRouter demotes to local CLIs only when the scoreboard shows
-    # OR losing on a given stack — keeps the safety net intact.
-    "openrouter":  ("copilot_cli", None),
-    "kimi_cli":    ("copilot_cli", None),
-    "copilot_cli": ("claude_cli",  "opus"),
-    "claude_cli":  ("copilot_cli", None),
+    # Everything degrades to OpenRouter — the API-keyed backend that is
+    # always available. We deliberately do NOT fail over INTO the
+    # subscription CLIs: they may be logged out (e.g. copilot_cli with no
+    # /login), which turns a transient error into a slow retry loop that
+    # bogs the whole server. OpenRouter itself has no cross-backend
+    # alternative (it retries in-backend), so a rate-limit never cascades
+    # into a dead CLI.
+    "kimi_cli":    ("openrouter", None),
+    "copilot_cli": ("openrouter", None),
+    "claude_cli":  ("openrouter", None),
+    "openai_cli":  ("openrouter", None),
 }
 
 # Static cost tiers per backend. Values are relative (1.0 = cheap

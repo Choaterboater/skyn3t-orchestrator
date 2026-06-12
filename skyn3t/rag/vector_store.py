@@ -167,30 +167,46 @@ class VectorStore:
         return documents
 
     def all_documents(self) -> List[Dict[str, Any]]:
-        """Return the full corpus for hybrid indexing."""
+        """Return the full corpus for hybrid indexing.
+
+        Paginated with limit/offset: a single full-collection ``get()`` hits
+        SQLite's "too many SQL variables" limit once the store is large (the
+        experience RAG is hundreds of MB), which previously returned [] and
+        silently broke hybrid recall while spamming warnings.
+        """
         if not self._initialized:
             return []
         collection = self.collection
         if collection is None:
             return []
 
-        try:
-            results = collection.get(include=["documents", "metadatas"])
-        except Exception as e:
-            _logger.warning("chroma get failed: %s", e)
-            return []
-
-        ids = results.get("ids") or []
-        documents = results.get("documents") or []
-        metadatas = results.get("metadatas") or []
         corpus: List[Dict[str, Any]] = []
-
-        for index, doc_id in enumerate(ids):
-            corpus.append({
-                "id": doc_id,
-                "content": documents[index] if index < len(documents) else "",
-                "metadata": metadatas[index] if index < len(metadatas) else {},
-            })
+        batch = 500
+        offset = 0
+        while True:
+            try:
+                results = collection.get(
+                    include=["documents", "metadatas"],
+                    limit=batch,
+                    offset=offset,
+                )
+            except Exception as e:
+                _logger.warning("chroma get failed (offset=%s): %s", offset, e)
+                break
+            ids = results.get("ids") or []
+            if not ids:
+                break
+            documents = results.get("documents") or []
+            metadatas = results.get("metadatas") or []
+            for index, doc_id in enumerate(ids):
+                corpus.append({
+                    "id": doc_id,
+                    "content": documents[index] if index < len(documents) else "",
+                    "metadata": metadatas[index] if index < len(metadatas) else {},
+                })
+            if len(ids) < batch:
+                break
+            offset += batch
 
         return corpus
 
