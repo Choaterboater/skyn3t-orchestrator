@@ -1,6 +1,7 @@
 """Scheduler Agent - schedules tasks, manages cron-like jobs, and sends reminders."""
 
 import asyncio
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -522,6 +523,17 @@ class SchedulerAgent(BaseAgent):
 
     async def _scheduler_loop(self) -> None:
         """Background loop that checks and triggers scheduled jobs and reminders."""
+        # Boot grace: jobs that came due while the server was down (e.g.
+        # the daily repo scout) used to fire on the FIRST tick — during
+        # roster registration — and the ingest/embedding grind starved
+        # the event loop for 80-90s before the port even bound. Let the
+        # server come up and serve before any overdue job runs.
+        try:
+            grace = float(os.environ.get("SKYN3T_SCHEDULER_BOOT_GRACE_S", "90"))
+        except ValueError:
+            grace = 90.0
+        if grace > 0:
+            await asyncio.sleep(grace)
         while self._scheduler_loop_running:
             try:
                 now = datetime.now(timezone.utc)

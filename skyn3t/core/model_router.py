@@ -84,13 +84,13 @@ _TIERS: Dict[str, Tuple[str, Optional[str]]] = {
     # the same set the model-evolution engine converged to on this account —
     # minus the expensive Opus pick that's now disabled. or_docs stays free.
     "or_cheap":   ("openrouter", "google/gemini-2.5-flash-lite-preview-09-2025"),
-    # Code tiers run gpt-5.3-codex (owner, 2026-06-11): the same model
-    # that produced the best builds via the old copilot CLI ("codex was
-    # getting better results with network tools", v15 dashboard 100/100).
-    # ~$1.75/M in, $14/M out — the daily budget cap still bounds spend.
-    "or_ui":      ("openrouter", "openai/gpt-5.3-codex"),
-    "or_backend": ("openrouter", "openai/gpt-5.3-codex"),
-    "or_strong":  ("openrouter", "openai/gpt-5.3-codex"),
+    # Code tiers: qwen specialists, PINNED (no silent :free/cheap swaps
+    # by the evolution or catalog pickers — see _PINNED_CODE_TIERS).
+    # Cheap-first codegen (flash-lite) is opt-in via
+    # SKYN3T_CHEAP_FIRST_CODE; default path is the real coder models.
+    "or_ui":      ("openrouter", "qwen/qwen3.5-flash-02-23"),
+    "or_backend": ("openrouter", "qwen/qwen3-coder"),
+    "or_strong":  ("openrouter", "qwen/qwen3-coder"),
     "or_docs":    ("openrouter", "openai/gpt-oss-120b:free"),
     # Legacy tier names. 'cheap' is the hardcoded fallback for unmapped
     # stages (planner, decomposer, …) — it MUST stay HTTP-based so an
