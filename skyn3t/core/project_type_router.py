@@ -36,9 +36,12 @@ from typing import Sequence, Tuple
 class RoutingProfile:
     """A named project type and the model ladder we route it to.
 
-    The ladder is ordered cheapest → most expensive. The CodeAgent
-    fourth-tier retry walks the ladder until a model returns valid
-    output. Most calls land on the free model at the top.
+    The ladder is ordered QUALITY-FIRST (owner, 2026-06-12: build output
+    quality over marginal cost — the old cheapest-first ladders meant
+    "most calls land on the free model", which is exactly how output
+    stayed flat). Free models remain as tail fallbacks for rate-limit
+    escapes. The CodeAgent fourth-tier retry walks the ladder until a
+    model returns valid output.
     """
     project_type: str
     ladder: Tuple[str, ...]
@@ -48,10 +51,10 @@ class RoutingProfile:
 UI_HEAVY = RoutingProfile(
     project_type="ui_heavy",
     ladder=(
-        "openrouter/owl-alpha",
-        "xiaomi/mimo-v2-flash",
+        "qwen/qwen3.5-flash-02-23",
+        "qwen/qwen3-coder",
         "deepseek/deepseek-v3.2",
-        "xiaomi/mimo-v2.5-pro",
+        "openrouter/owl-alpha",
     ),
     notes="React/Vue/Svelte SPAs, dashboards, visual-first apps",
 )
@@ -59,10 +62,10 @@ UI_HEAVY = RoutingProfile(
 BACKEND = RoutingProfile(
     project_type="backend",
     ladder=(
-        "openrouter/owl-alpha",
         "qwen/qwen3-coder",
         "deepseek/deepseek-v3.2",
         "openai/gpt-5-mini",
+        "openrouter/owl-alpha",
     ),
     notes="Express/FastAPI/CLI/scripts, types and error handling matter",
 )
@@ -70,9 +73,10 @@ BACKEND = RoutingProfile(
 DATA_VIZ = RoutingProfile(
     project_type="data_viz",
     ladder=(
-        "openrouter/owl-alpha",
-        "xiaomi/mimo-v2.5-pro",
+        "qwen/qwen3.5-flash-02-23",
+        "qwen/qwen3-coder",
         "deepseek/deepseek-v3.2",
+        "openrouter/owl-alpha",
     ),
     notes="Charts, dashboards w/ live data, analytics views",
 )
@@ -80,9 +84,10 @@ DATA_VIZ = RoutingProfile(
 GAME = RoutingProfile(
     project_type="game",
     ladder=(
-        "openrouter/owl-alpha",
+        "qwen/qwen3-coder",
+        "deepseek/deepseek-v3.2",
         "tencent/hy3-preview",
-        "xiaomi/mimo-v2-flash",
+        "openrouter/owl-alpha",
     ),
     notes="Canvas games, state machines, event-loop heavy",
 )
@@ -90,9 +95,9 @@ GAME = RoutingProfile(
 DOCS = RoutingProfile(
     project_type="docs",
     ladder=(
-        "openrouter/owl-alpha",
         "openai/gpt-oss-120b:free",
         "deepseek/deepseek-v3.2",
+        "openrouter/owl-alpha",
     ),
     notes="READMEs, docs sites, markdown content, blog-style copy",
 )
@@ -100,10 +105,10 @@ DOCS = RoutingProfile(
 GENERIC = RoutingProfile(
     project_type="generic",
     ladder=(
-        "openrouter/owl-alpha",
-        "xiaomi/mimo-v2-flash",
+        "qwen/qwen3-coder",
+        "qwen/qwen3.5-flash-02-23",
         "deepseek/deepseek-v3.2",
-        "xiaomi/mimo-v2.5-pro",
+        "openrouter/owl-alpha",
     ),
     notes="Default ladder when project type isn't classified",
 )

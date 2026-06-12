@@ -262,7 +262,9 @@ function Scene({ seeds, reduced }: { seeds: GraphNodeSeed[]; reduced: boolean })
       const to = (e.to ?? "").trim();
       const known = [from, to].filter((id) => id && positions.has(id));
       if (!known.length) return;
-      const stamp = Date.now() + 5000;
+      // 12s window: build events arrive in bursts with gaps between
+      // file writes — a 5s window flickered off mid-build.
+      const stamp = Date.now() + 12000;
       known.forEach((id) => {
         activeUntil.current[id] = stamp;
       });
