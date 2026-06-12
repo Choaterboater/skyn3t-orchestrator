@@ -210,6 +210,63 @@ class VectorStore:
 
         return corpus
 
+    def recent_documents(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Return the newest ``limit`` docs by metadata timestamp.
+
+        Cheap variant of ``all_documents`` for dashboard polling: scans
+        metadatas only (pulling 59k full document bodies per poll froze
+        the event loop), then fetches bodies for just the winners.
+        """
+        if not self._initialized or self.collection is None:
+            return []
+        collection = self.collection
+
+        stamped: List[tuple[str, str]] = []  # (timestamp, id), newest first
+        batch = 2000
+        offset = 0
+        while True:
+            try:
+                results = collection.get(
+                    include=["metadatas"], limit=batch, offset=offset,
+                )
+            except Exception as e:
+                _logger.warning(
+                    "chroma metadata scan failed (offset=%s): %s", offset, e,
+                )
+                break
+            ids = results.get("ids") or []
+            if not ids:
+                break
+            metadatas = results.get("metadatas") or []
+            for index, doc_id in enumerate(ids):
+                meta = metadatas[index] if index < len(metadatas) else {}
+                stamped.append((str((meta or {}).get("timestamp") or ""), doc_id))
+            if len(ids) < batch:
+                break
+            offset += batch
+
+        stamped.sort(reverse=True)
+        newest = [doc_id for _ts, doc_id in stamped[: max(1, int(limit))]]
+        if not newest:
+            return []
+        try:
+            results = collection.get(
+                ids=newest, include=["documents", "metadatas"],
+            )
+        except Exception as e:
+            _logger.warning("chroma recent fetch failed: %s", e)
+            return []
+        documents = results.get("documents") or []
+        metadatas = results.get("metadatas") or []
+        by_id: Dict[str, Dict[str, Any]] = {}
+        for index, doc_id in enumerate(results.get("ids") or []):
+            by_id[doc_id] = {
+                "id": doc_id,
+                "content": documents[index] if index < len(documents) else "",
+                "metadata": metadatas[index] if index < len(metadatas) else {},
+            }
+        return [by_id[i] for i in newest if i in by_id]
+
     async def delete(self, ids: List[str]) -> None:
         """Delete documents by ID."""
         if not self._initialized:

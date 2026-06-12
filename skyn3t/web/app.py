@@ -6,6 +6,7 @@ import ipaddress
 import json
 import logging
 import mimetypes
+import time
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -2110,30 +2111,40 @@ async def rag_stats(request: Request):
     return await engine.get_stats()
 
 
+# /api/rag/recent is polled by the dashboard. Re-scanning the corpus on
+# every poll froze the event loop once the store hit ~59k docs, so the
+# result is cached and refreshed at most once a minute, off the loop.
+_RAG_RECENT_CACHE: Dict[str, Any] = {"ts": 0.0, "rows": []}
+_RAG_RECENT_TTL_S = 60.0
+
+
 @app.get("/api/rag/recent")
 async def rag_recent(request: Request, limit: int = 8):
     """List recent knowledge chunks for the dashboard."""
     engine = await _get_rag_engine(request)
-    corpus = engine.vector_store.all_documents()
-    rows: List[Dict[str, Any]] = []
-    for doc in corpus:
-        metadata = doc.get("metadata") or {}
-        content = str(doc.get("content") or "")
-        rows.append(
-            {
-                "id": doc.get("id"),
-                "title": metadata.get("title") or "Untitled",
-                "source": metadata.get("source") or "",
-                "doc_type": metadata.get("doc_type") or "text",
-                "timestamp": metadata.get("timestamp"),
-                "chunk_index": metadata.get("chunk_index"),
-                "total_chunks": metadata.get("total_chunks"),
-                "preview": content[:180],
-            }
-        )
-    rows.sort(key=lambda row: str(row.get("timestamp") or ""), reverse=True)
+    now = time.monotonic()
+    if now - _RAG_RECENT_CACHE["ts"] > _RAG_RECENT_TTL_S or not _RAG_RECENT_CACHE["rows"]:
+        corpus = await asyncio.to_thread(engine.vector_store.recent_documents, 50)
+        rows: List[Dict[str, Any]] = []
+        for doc in corpus:
+            metadata = doc.get("metadata") or {}
+            content = str(doc.get("content") or "")
+            rows.append(
+                {
+                    "id": doc.get("id"),
+                    "title": metadata.get("title") or "Untitled",
+                    "source": metadata.get("source") or "",
+                    "doc_type": metadata.get("doc_type") or "text",
+                    "timestamp": metadata.get("timestamp"),
+                    "chunk_index": metadata.get("chunk_index"),
+                    "total_chunks": metadata.get("total_chunks"),
+                    "preview": content[:180],
+                }
+            )
+        _RAG_RECENT_CACHE["rows"] = rows
+        _RAG_RECENT_CACHE["ts"] = now
     safe_limit = max(1, min(int(limit), 50))
-    return {"documents": rows[:safe_limit]}
+    return {"documents": _RAG_RECENT_CACHE["rows"][:safe_limit]}
 
 
 @app.post("/api/rag/add")

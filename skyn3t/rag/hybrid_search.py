@@ -8,6 +8,7 @@ Top-k from each is fused via RRF (k=60 standard) and returned.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import re
@@ -107,6 +108,7 @@ class HybridSearch:
         self.top_k_each = top_k_each
         self.bm25 = BM25Index()
         self._indexed = False
+        self._index_lock = asyncio.Lock()
 
     def reindex(self) -> None:
         """Rebuild the BM25 index from the underlying vector store's documents."""
@@ -131,7 +133,13 @@ class HybridSearch:
                      **kwargs) -> List[Dict[str, Any]]:
         """Hybrid retrieval. Returns merged top_k results."""
         if not self._indexed:
-            self.reindex()
+            # reindex() walks the ENTIRE vector store (59k+ docs) and
+            # builds BM25 — minutes of CPU. Run it off the event loop,
+            # behind a lock so concurrent first queries don't each
+            # rebuild; the server stays responsive while it warms up.
+            async with self._index_lock:
+                if not self._indexed:
+                    await asyncio.to_thread(self.reindex)
 
         # Vector arm
         vec_hits: List[Dict[str, Any]] = []

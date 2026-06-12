@@ -86,6 +86,16 @@ if [[ "$DO_PIP" -eq 1 ]]; then
     fi
 fi
 
+# Skip HuggingFace Hub phone-home when the embedding model is already
+# cached — the per-file etag checks block startup for minutes on a slow
+# network even though the weights load from disk in <1s. Only set when
+# the cache exists so a fresh box can still download the model.
+export HF_HUB_DISABLE_TELEMETRY=1
+if ls "$HOME/.cache/huggingface/hub" 2>/dev/null | grep -q "sentence-transformers"; then
+    export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+    echo "[restart] HF model cached → offline mode (no Hub checks at boot)"
+fi
+
 echo "[restart] starting skyn3t on $HOST:$PORT (log → $LOG)"
 nohup skyn3t start --host "$HOST" --port "$PORT" > "$LOG" 2>&1 &
 NEW_PID=$!
