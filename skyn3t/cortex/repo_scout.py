@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -11,6 +13,16 @@ import httpx
 from skyn3t.cortex import get_store
 
 logger = logging.getLogger("skyn3t.cortex.repo_scout")
+
+# Process-age reference for the scout boot grace (module import ≈ boot).
+_MODULE_T0 = time.monotonic()
+
+
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
 
 _DEFAULT_FIT_QUERIES = [
     "multi agent orchestrator cli memory rag",
@@ -108,6 +120,22 @@ class MultiSourceRepoScout:
                 "error": "repo scout already running",
                 "status": self.get_run_status(),
             }
+        # Several cortex schedulers (bootstrap, continuous improvement,
+        # scheduled job) each request a run at boot — three back-to-back
+        # ~70s scout runs blocked the event loop for minutes. One run per
+        # min-interval is plenty.
+        min_interval = _env_seconds("SKYN3T_SCOUT_MIN_INTERVAL_S", 1800.0)
+        last_done = getattr(self, "_last_run_finished_at", None)
+        if last_done is not None and (time.monotonic() - last_done) < min_interval:
+            return {
+                "ok": False,
+                "started": False,
+                "error": (
+                    f"repo scout ran {int(time.monotonic() - last_done)}s ago "
+                    f"(min interval {int(min_interval)}s)"
+                ),
+                "status": self.get_run_status(),
+            }
         cfg = dict(config or {})
         self._run_state = "running"
         self._run_task = asyncio.create_task(self._run_once_guarded(cfg))
@@ -116,10 +144,20 @@ class MultiSourceRepoScout:
 
     def _clear_run_task(self, task: asyncio.Task) -> None:
         self._run_task = None
+        self._last_run_finished_at = time.monotonic()
         if self._run_state == "running":
             self._run_state = "completed" if not task.cancelled() else "cancelled"
 
     async def _run_once_guarded(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        # Boot grace: a scout run blocks the loop in long synchronous
+        # stretches (ingest/embedding). Never let one start before the
+        # server has had time to bind and serve.
+        grace_left = _env_seconds("SKYN3T_SCOUT_BOOT_GRACE_S", 120.0) - (
+            time.monotonic() - _MODULE_T0
+        )
+        if grace_left > 0:
+            logger.info("repo scout deferring %.0fs (boot grace)", grace_left)
+            await asyncio.sleep(grace_left)
         timeout = 300
         try:
             from skyn3t.config.settings import get_settings
