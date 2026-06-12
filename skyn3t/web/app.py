@@ -404,7 +404,29 @@ async def lifespan(app: FastAPI):
     app.state.proposal_triage = {"auto_approved": 0, "auto_rejected": 0, "status": "deferred"}
 
     async def _deferred_autonomy_boot() -> None:
-        await asyncio.sleep(5.0)  # let uvicorn bind + serve first
+        # Wait until uvicorn is ACTUALLY serving before requeuing the
+        # backlog — a fixed sleep fired mid-roster and the embedding
+        # threads starved the rest of boot for GIL time (SchedulerAgent
+        # registration alone took 80s).
+        import httpx
+
+        host = settings.web_host
+        if host in ("0.0.0.0", "::", ""):
+            host = "127.0.0.1"
+        url = f"http://{host}:{settings.web_port}/api/status"
+        deadline = time.monotonic() + 180.0
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                while time.monotonic() < deadline:
+                    try:
+                        if (await client.get(url)).status_code == 200:
+                            break
+                    except Exception:
+                        pass
+                    await asyncio.sleep(2.0)
+        except Exception:
+            logger.exception("autonomy boot self-poll failed; proceeding")
+        await asyncio.sleep(3.0)  # small grace after first 200
         try:
             app.state.proposal_recovery = await _resume_cortex_proposals()
         except Exception:
