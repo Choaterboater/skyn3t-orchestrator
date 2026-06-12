@@ -28,12 +28,18 @@ Stages today (in order of "cheap is fine" → "strong matters"):
   build_verifier / boot_verifier / integration_verifier — local subprocess,
                no LLM call.
 
-Tier name → CLI backend mapping:
-  cheap   → kimi_cli  (free, fast, "good enough" for fan-out)
-  strong  → claude_cli (Opus — high reasoning quality, free on
-            subscription, slower)
-  balanced → copilot_cli (GPT-class via Copilot subscription —
-            middle ground)
+Tier name → backend mapping:
+  cheap    → openrouter flash-lite (HTTP, fast — safe fallback for
+             unmapped stages; never a CLI)
+  balanced → claude_cli sonnet (Claude Code subscription — zero
+             marginal cost, strong coder)
+  strong   → claude_cli opus (subscription — highest reasoning
+             quality, slower)
+
+claude_cli is the ONLY CLI we route to: it is the one CLI reliably
+authenticated on this box. kimi_cli / copilot_cli are not logged in
+here — routing to them produced multi-minute timeout stalls (including
+blocking server startup) — so no tier points at them.
 
 Stage-level routing is intentionally a SHALLOW policy. Per-call
 routing (e.g. "this specific file is critical, use strong") stays
@@ -78,11 +84,16 @@ _TIERS: Dict[str, Tuple[str, Optional[str]]] = {
     "or_backend": ("openrouter", "qwen/qwen3-coder"),
     "or_strong":  ("openrouter", "qwen/qwen3-coder"),
     "or_docs":    ("openrouter", "openai/gpt-oss-120b:free"),
-    # Local-CLI tiers — kept as safety net via _BACKEND_ALTERNATIVES.
-    "cheap":    ("kimi_cli",    None),
-    "balanced": ("copilot_cli", None),
-    "strong":   ("claude_cli",  "opus"),
-    "ui":       ("copilot_cli", "gpt-5.3-codex"),
+    # Legacy tier names. 'cheap' is the hardcoded fallback for unmapped
+    # stages (planner, decomposer, …) — it MUST stay HTTP-based so an
+    # unknown stage can never stall on a dead CLI. balanced/strong/ui
+    # ride the Claude Code subscription (zero marginal cost); kimi_cli
+    # and copilot_cli are not authenticated here and are unreachable
+    # from every default path.
+    "cheap":    ("openrouter", "google/gemini-2.5-flash-lite-preview-09-2025"),
+    "balanced": ("claude_cli", "sonnet"),
+    "strong":   ("claude_cli", "opus"),
+    "ui":       ("claude_cli", "sonnet"),
 }
 
 
@@ -98,19 +109,25 @@ _DEFAULT_STAGE_POLICY: Dict[str, str] = {
     "marketer":           "or_cheap",
     "business_analyst":   "or_cheap",
 
-    # system-shape decisions — still prefer a stronger model, but on
-    # OpenRouter rather than a CLI-backed Claude default.
-    "architect":          "or_strong",
-    "architecture":       "or_strong",
+    # Heavy stages ride the Claude Code subscription (claude_cli):
+    # zero marginal cost vs metered OpenRouter, and quality matters
+    # most here. Opus where one mistake cascades (architecture,
+    # judging); sonnet where throughput matters (code-gen, planning,
+    # contract checks) — sonnet answers in seconds, opus can take a
+    # minute.
+    "planner":            "balanced",
+    "plan":               "balanced",
+    "architect":          "strong",
+    "architecture":       "strong",
     # Code-stage planning still uses the agent-level route before
-    # per-file specialization kicks in. Studio builds prioritize
-    # shippable quality over marginal cost — use the strong tier.
-    "code":               "or_strong",
-    "code_agent":         "or_strong",
-    "code_improver":      "or_strong",
-    "reviewer":           "or_strong",
-    "contract_verifier":  "or_strong",
-    "consistency_reviewer": "or_strong",
+    # per-file specialization kicks in (UI/backend files go to the
+    # OpenRouter specialists in _resolve_static).
+    "code":               "balanced",
+    "code_agent":         "balanced",
+    "code_improver":      "balanced",
+    "reviewer":           "strong",
+    "contract_verifier":  "balanced",
+    "consistency_reviewer": "balanced",
     "packaging_agent":    "or_cheap",
     "verifier":           "or_cheap",
     "docs":               "or_docs",
@@ -175,12 +192,16 @@ _CODE_STAGE_NAMES: frozenset[str] = frozenset(
 )
 
 # Escalation map: when cheap-first fails, bump to the next tier up.
+# Escalations land on the Claude subscription (balanced/strong) rather
+# than a pricier OpenRouter model — retries are exactly the "heavier
+# stuff" the subscription should absorb. 'strong' itself escalates to
+# or_strong via the default, as a cross-backend escape hatch.
 _TIER_ESCALATION: Dict[str, str] = {
-    "or_cheap": "or_strong",
-    "or_ui": "or_strong",
-    "or_backend": "or_strong",
+    "or_cheap": "balanced",
+    "or_ui": "balanced",
+    "or_backend": "balanced",
     "or_docs": "or_cheap",
-    "cheap": "strong",
+    "cheap": "balanced",
     "balanced": "strong",
 }
 
@@ -682,10 +703,12 @@ _BACKEND_ALTERNATIVES: Dict[str, Tuple[str, Optional[str]]] = {
 # spend over the project history; tune via ``SKYN3T_ROUTER_BACKEND_COSTS``
 # env var (JSON dict ``{"backend": cost}``) if these drift.
 _BACKEND_COST: Dict[str, float] = {
-    "openrouter":  0.5,     # default model is openrouter/owl-alpha (free)
-    "kimi_cli":    1.0,     # subscription-backed CLI, effectively free per call
-    "copilot_cli": 1.0,     # GitHub Copilot CLI, included in subscription
-    "claude_cli":  3.0,     # Anthropic API per-token, strong model
+    "openrouter":  0.5,     # metered API — dirt cheap but real money
+    "claude_cli":  0.4,     # Claude Code subscription — zero marginal cost;
+                            # kept just below openrouter so cost-demotion
+                            # never moves heavy work onto the metered API
+    "kimi_cli":    5.0,     # NOT authenticated on this box — pessimistic
+    "copilot_cli": 5.0,     # so adaptive routing never prefers them
     "openai_cli":  2.5,     # OpenAI API per-token
 }
 
