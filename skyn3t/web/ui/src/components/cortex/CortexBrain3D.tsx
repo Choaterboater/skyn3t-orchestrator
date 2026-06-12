@@ -215,6 +215,8 @@ function TravelingPulse({ pulse, onDone, duration }: { pulse: Pulse; onDone: (id
   );
 }
 
+const CORE_POS = new THREE.Vector3(0, 0, 0);
+
 function Scene({ seeds, reduced }: { seeds: GraphNodeSeed[]; reduced: boolean }) {
   const { subscribe } = useSwarm();
   const group = useRef<THREE.Group>(null);
@@ -222,6 +224,16 @@ function Scene({ seeds, reduced }: { seeds: GraphNodeSeed[]; reduced: boolean })
   const [edges, setEdges] = useState<Record<string, [string, string]>>({});
   const [activity, setActivity] = useState(0);
   const pulseId = useRef(0);
+  // Live-activity window per agent: any event naming an agent keeps its
+  // node lit amber for a few seconds. The 6s snapshot's `state` field
+  // misses most cortex work (scout, critiques, ingest never flip an
+  // agent to "busy"), so the brain looked asleep while working.
+  const activeUntil = useRef<Record<string, number>>({});
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const t = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, []);
 
   // Stable node positions (sorted for determinism), id -> Vector3.
   const positions = useMemo(() => {
@@ -233,24 +245,43 @@ function Scene({ seeds, reduced }: { seeds: GraphNodeSeed[]; reduced: boolean })
     return map;
   }, [seeds]);
 
-  // Live wiring: every directed hop adds/refreshes an edge + (unless reduced)
-  // spawns a traveling pulse. Bumps the activity meter that brightens the core.
+  // Live wiring. Two-agent events (from+to) add an edge + a node-to-node
+  // pulse. Single-agent events — the overwhelming majority (thoughts, LLM
+  // exchanges, task starts only carry `from`) — light that agent amber
+  // and fire a core->agent pulse so the brain visibly works.
   useEffect(() => {
-    const off = subscribe("*", (e: SwarmEvent) => {
-      const obs = edgeFromEvent(e);
-      if (!obs) return;
-      const a = positions.get(obs.from);
-      const b = positions.get(obs.to);
-      if (!a || !b) return;
-      const key = `${obs.from}->${obs.to}`;
-      setEdges((prev) => (prev[key] ? prev : { ...prev, [key]: [obs.from, obs.to] }));
-      setActivity((v) => Math.min(1.5, v + 0.35));
-      if (reduced) return;
+    const spawnPulse = (a: THREE.Vector3, b: THREE.Vector3) => {
       setPulses((prev) => {
         const next = prev.length > 28 ? prev.slice(prev.length - 28) : prev;
         pulseId.current += 1;
         return [...next, { id: pulseId.current, from: a, to: b, color: C.cyanStrong }];
       });
+    };
+    const off = subscribe("*", (e: SwarmEvent) => {
+      const from = (e.from ?? "").trim();
+      const to = (e.to ?? "").trim();
+      const known = [from, to].filter((id) => id && positions.has(id));
+      if (!known.length) return;
+      const stamp = Date.now() + 5000;
+      known.forEach((id) => {
+        activeUntil.current[id] = stamp;
+      });
+      setActivity((v) => Math.min(1.5, v + 0.35));
+      const obs = edgeFromEvent(e);
+      if (obs) {
+        const a = positions.get(obs.from);
+        const b = positions.get(obs.to);
+        if (a && b) {
+          const key = `${obs.from}->${obs.to}`;
+          setEdges((prev) => (prev[key] ? prev : { ...prev, [key]: [obs.from, obs.to] }));
+          if (!reduced) spawnPulse(a, b);
+          return;
+        }
+      }
+      if (!reduced) {
+        const p = positions.get(known[0]);
+        if (p) spawnPulse(CORE_POS, p);
+      }
     });
     return off;
   }, [subscribe, positions, reduced]);
@@ -317,16 +348,20 @@ function Scene({ seeds, reduced }: { seeds: GraphNodeSeed[]; reduced: boolean })
           );
         })}
 
-        {/* agent nodes */}
+        {/* agent nodes — lit amber by snapshot state OR live event activity */}
         {seeds.map((s) => {
           const p = positions.get(s.id);
           if (!p) return null;
-          const busy = (s.state || "").toLowerCase().includes("busy") || !!s.current_task;
+          const liveActive = (activeUntil.current[s.id] ?? 0) > nowMs;
+          const busy =
+            liveActive ||
+            (s.state || "").toLowerCase().includes("busy") ||
+            !!s.current_task;
           return (
             <AgentNode
               key={s.id}
               pos={p}
-              color={stateColor(s.state)}
+              color={busy ? C.amber : stateColor(s.state)}
               label={s.label || s.id}
               busy={busy}
               weight={nodeWeights[s.id] || 0}
@@ -341,11 +376,12 @@ function Scene({ seeds, reduced }: { seeds: GraphNodeSeed[]; reduced: boolean })
         ))}
       </group>
 
+      {/* Zoom disabled: the canvas swallowing wheel/pinch events made the
+          page hard to scroll and trackpad pinch fell through to BROWSER
+          zoom — confusing. Drag still orbits; camera framing is fixed. */}
       <OrbitControls
         enablePan={false}
-        enableZoom
-        minDistance={4}
-        maxDistance={16}
+        enableZoom={false}
         autoRotate={!reduced}
         autoRotateSpeed={0.12}
         rotateSpeed={0.6}
@@ -401,8 +437,8 @@ export default function CortexBrain3D({
         }}
       >
         <span><span style={{ color: C.cyan }}>●</span> idle</span>
-        <span><span style={{ color: C.amber }}>●</span> busy</span>
-        <span style={{ opacity: 0.7 }}>drag to orbit · scroll to zoom</span>
+        <span><span style={{ color: C.amber }}>●</span> active</span>
+        <span style={{ opacity: 0.7 }}>drag to orbit</span>
       </div>
     </div>
   );
