@@ -33,24 +33,15 @@ def client():
 
 
 # ── /api/backends ─────────────────────────────────────────────────────────
-def test_backends_status_lists_registered_with_availability(client):
+def test_backends_status_reports_remote_backends_removed(client):
     resp = client.get("/api/backends")
     assert resp.status_code == 200
     body = resp.json()
-    assert isinstance(body.get("backends"), list)
-    assert isinstance(body.get("available"), list)
-    names = {b["name"] for b in body["backends"]}
-    # The four adapters register at import; none should be available with no creds.
-    assert {"ssh", "modal", "daytona", "e2b"}.issubset(names)
-    assert body["available"] == []
-    for entry in body["backends"]:
-        assert set(entry) >= {"name", "available", "hibernates"}
-        assert entry["available"] is False
-    by_name = {b["name"]: b for b in body["backends"]}
-    assert by_name["modal"]["hibernates"] is True
-    assert by_name["daytona"]["hibernates"] is True
-    assert by_name["e2b"]["hibernates"] is False
-    assert by_name["ssh"]["hibernates"] is False
+    # C11: the standalone remote execution adapters were production-dead,
+    # so they were removed. The endpoint now returns an empty list.
+    assert body.get("backends") == []
+    assert body.get("available") == []
+    assert "removed" in body.get("note", "")
 
 
 # ── /api/channels ─────────────────────────────────────────────────────────

@@ -6,6 +6,7 @@ import ipaddress
 import json
 import logging
 import mimetypes
+import os
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -351,6 +352,22 @@ async def lifespan(app: FastAPI):
     global orchestrator, event_bus, trajectory_logger
 
     settings = get_settings()
+
+    # Single-leader guard: the event bus, fleet, and consciousness are
+    # in-memory singletons. Running multiple uvicorn workers against the
+    # same data directory will split-brain.
+    _worker_count = os.environ.get("WEB_CONCURRENCY") or os.environ.get("UVICORN_WORKERS")
+    if _worker_count:
+        try:
+            if int(_worker_count) > 1:
+                logger.error(
+                    "Detected %s uvicorn workers. SkyN3t is a single-leader "
+                    "process; do not run more than one worker against the same "
+                    "DATA_DIR (see docs/SINGLE_LEADER_AND_WATCHDOG.md).",
+                    _worker_count,
+                )
+        except ValueError:
+            pass
 
     _boot_t0 = time.monotonic()
 
@@ -4392,43 +4409,15 @@ async def studio_project_delete(slug: str):
 # enforce_web_access middleware like every other /api/ route).
 # ─────────────────────────────────────────────────────────────────────────
 
-# Remote backends that hibernate their session between runs (serverless,
-# pay-per-use) rather than tearing it down. Used purely to annotate the
-# /api/backends status payload; the authoritative flag is the per-run
-# BackendResult.hibernated.
-_HIBERNATING_BACKENDS = frozenset({"modal", "daytona"})
-
-
 @app.get("/api/backends")
 async def remote_backends_status():
-    """List remote execution backends and their availability.
+    """Remote execution backends status.
 
-    Sourced from skyn3t.intelligence.backends. ``hibernates`` is a static
-    hint (modal/daytona suspend the sandbox between runs); the live flag is
-    BackendResult.hibernated. Defensive: a missing optional backend SDK can
-    never 500 this endpoint."""
-    try:
-        from skyn3t.intelligence.backends import (
-            available_backends,
-            registered_backends,
-        )
-
-        registered = registered_backends()
-        available = available_backends()
-    except Exception as exc:
-        logger.debug("backends status probe failed: %s", exc)
-        return {"backends": [], "available": [], "error": str(exc)}
-
-    avail_set = set(available)
-    backends = [
-        {
-            "name": name,
-            "available": name in avail_set,
-            "hibernates": name in _HIBERNATING_BACKENDS,
-        }
-        for name in registered
-    ]
-    return {"backends": backends, "available": available}
+    The standalone remote backend adapters (modal/daytona/e2b/ssh) were
+    production-dead code with no runtime callers, so they were removed.
+    The code sandbox continues to support ``inline`` and ``docker`` via
+    ``/api/execution/backend`` and ``/api/exec``."""
+    return {"backends": [], "available": [], "note": "remote backends removed"}
 
 
 # The Phase 5B channel adapters that ship as separate modules. The default

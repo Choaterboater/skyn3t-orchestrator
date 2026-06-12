@@ -365,21 +365,23 @@ class ResearchAgent(BaseAgent):
         except Exception:
             logger.exception("research LLM call failed")
 
-        # Placeholder fallback if LLM gave nothing real to record. NOTE:
-        # for integration briefs, `notes` is the spec text — preserve it
-        # even if we're entering the fallback for `results`. The previous
-        # code overwrote `notes` with bullet placeholders here, wiping
-        # the spec.
-        if not results:
-            for i in range(min(num_results, 5)):
-                results.append({"title": f"Consider angle {i+1} for '{query[:40]}'",
-                                "snippet": f"Placeholder finding {i+1}.",
-                                "source": "placeholder"})
-            if not notes:
-                notes = "\n".join(f"- {r['snippet']}" for r in results)
-
         # Write research.md to artifact_dir for downstream stages
-        files_written = []
+        files_written: list[str] = []
+
+        # C14: Never ship placeholder findings as real research. If the LLM
+        # produced nothing real, fail the stage so downstream code generation
+        # cannot build on synthetic "Placeholder finding N" bullets.
+        if not results:
+            return {
+                "success": False,
+                "query": query,
+                "results": [],
+                "total_results": 0,
+                "files": files_written,
+                "error": "LLM produced no real research findings",
+                "summary": f"No real research findings for '{query[:60]}'",
+            }
+
         if artifact_dir:
             try:
                 ad = Path(artifact_dir)

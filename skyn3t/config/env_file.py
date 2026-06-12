@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+import stat
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def env_file_path() -> Path:
@@ -31,3 +35,21 @@ def upsert_env_setting(path: Path, key: str, value: str) -> None:
         out.append(f"{key}={value}")
     text = "\n".join(out).rstrip("\n") + "\n"
     path.write_text(text, encoding="utf-8")
+
+
+def warn_env_file_permissions() -> None:
+    """Log a security warning if ``.env`` is readable by group or others."""
+    path = env_file_path()
+    if not path.is_file():
+        return
+    try:
+        mode = path.stat().st_mode
+        perms = stat.S_IMODE(mode)
+        if perms & 0o044:
+            logger.warning(
+                ".env is readable by group or others (mode %04o). "
+                "Run `chmod 600 .env` and rotate any exposed credentials.",
+                perms,
+            )
+    except Exception:
+        logger.debug("could not check .env permissions", exc_info=True)

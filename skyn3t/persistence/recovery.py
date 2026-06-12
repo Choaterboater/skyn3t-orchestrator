@@ -1,8 +1,9 @@
 """Crash recovery system."""
 
 import logging
+from dataclasses import asdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from skyn3t.core.events import EventBus
 from skyn3t.persistence.checkpoint import CheckpointManager
@@ -110,6 +111,58 @@ class RecoveryManager:
         )
 
         return recovery_report
+
+    def create_checkpoint(self, orchestrator: Any) -> Optional[str]:
+        """Persist the current orchestrator state and return the checkpoint id.
+
+        Best-effort: any exception is logged and ``None`` is returned so a
+        checkpoint failure does not crash the monitor loop or shutdown path.
+        """
+        try:
+            agent_states = []
+            for name, agent in getattr(orchestrator, "agents", {}).items():
+                try:
+                    state: Dict[str, Any] = {"name": name}
+                    if hasattr(agent, "metadata"):
+                        state["metadata"] = dict(agent.metadata)
+                    if hasattr(agent, "get_stats"):
+                        state["stats"] = agent.get_stats()
+                    agent_states.append(state)
+                except Exception:
+                    _logger.debug("failed to serialize agent state for %s", name, exc_info=True)
+
+            task_states = []
+            for task_id, task in getattr(orchestrator, "running_tasks", {}).items():
+                try:
+                    task_states.append(
+                        {
+                            "task_id": task_id,
+                            "task": asdict(task) if hasattr(task, "__dataclass_fields__") else dict(getattr(task, "__dict__", {})),
+                        }
+                    )
+                except Exception:
+                    _logger.debug("failed to serialize task state for %s", task_id, exc_info=True)
+
+            pipeline_states = []
+            for pipeline_id, pipeline in getattr(orchestrator, "_pipelines", {}).items():
+                try:
+                    pipeline_states.append(
+                        {
+                            "pipeline_id": pipeline_id,
+                            "pipeline": dict(getattr(pipeline, "__dict__", {})),
+                        }
+                    )
+                except Exception:
+                    _logger.debug("failed to serialize pipeline state for %s", pipeline_id, exc_info=True)
+
+            return self.checkpoint_manager.save(
+                agent_states=agent_states,
+                task_states=task_states,
+                pipeline_states=pipeline_states,
+            )
+        except Exception:
+            _logger.exception("recovery checkpoint creation failed")
+            return None
 
     def get_recovery_log(self) -> List[Dict[str, Any]]:
         """Get recovery history."""

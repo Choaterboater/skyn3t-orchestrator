@@ -9,6 +9,8 @@ from typing import Any, List, Optional
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from skyn3t.config.env_file import warn_env_file_permissions
+
 logger = logging.getLogger(__name__)
 
 _SECRET_KEY_PLACEHOLDER = "change-me-in-production"
@@ -398,4 +400,5 @@ def get_settings() -> Settings:
             "SECRET_KEY is empty or set to the default placeholder; "
             "set a strong SECRET_KEY before running in production."
         )
+    warn_env_file_permissions()
     return settings

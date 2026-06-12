@@ -27,6 +27,7 @@ from skyn3t.memory.meta_agent import MetaAgent
 from skyn3t.memory.store import MemoryStore
 from skyn3t.memory.tuner import SelfTuningEngine
 from skyn3t.persistence.consciousness_snapshot import ConsciousnessSnapshot
+from skyn3t.persistence.recovery import RecoveryManager
 
 logger = logging.getLogger("skyn3t.core.orchestrator")
 
@@ -169,7 +170,11 @@ class Orchestrator:
         self._snapshot_helper: Optional[Any] = None
         self._last_snapshot_at: float = 0.0
 
+        # Crash-recovery manager (lazy-initialized in start()).
+        self._recovery_manager: Optional[RecoveryManager] = None
+
         # Subscribe to system events
+        self.event_bus.subscribe(self._on_task_created, EventType.TASK_CREATED)
         self.event_bus.subscribe(self._on_task_completed, EventType.TASK_COMPLETED)
         self.event_bus.subscribe(self._on_task_failed, EventType.TASK_FAILED)
         self.event_bus.subscribe(self._on_agent_error, EventType.AGENT_ERROR)
@@ -177,6 +182,11 @@ class Orchestrator:
         self.event_bus.subscribe(self._on_collective_insight, EventType.COLLECTIVE_INSIGHT)
         self.event_bus.subscribe(self._on_self_heal_triggered, EventType.SELF_HEAL_TRIGGERED)
         self.event_bus.subscribe(self._on_system_alert, EventType.SYSTEM_ALERT)
+
+        # Track channel reply routing for tasks spawned from inbound messages
+        # (telegram/discord/slack/etc.) so TASK_COMPLETED can route the answer
+        # back through MessagingRouter.reply().
+        self._messaging_reply_context: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Intelligence layer configuration
@@ -408,6 +418,34 @@ class Orchestrator:
         except Exception:
             logger.exception("default roster registration failed")
 
+        # Boot-time crash recovery: restore agent metadata from the latest
+        # checkpoint after the roster is populated.
+        try:
+            from skyn3t.config.settings import get_settings
+            from skyn3t.persistence.checkpoint import CheckpointManager
+
+            settings = get_settings()
+            cm = CheckpointManager(
+                checkpoint_dir=str(settings.data_dir / "checkpoints"),
+                auto_interval_seconds=60,
+                max_checkpoints=10,
+            )
+            self._recovery_manager = RecoveryManager(cm, self.event_bus)
+            report = await self._recovery_manager.recover(self)
+            _mark("recovery")
+            if report.get("recovered"):
+                logger.info(
+                    "recovery completed from %s: %s agents, %s tasks, %s pipelines",
+                    report.get("checkpoint_id"),
+                    report.get("agents_recovered"),
+                    report.get("tasks_recovered"),
+                    report.get("pipelines_recovered"),
+                )
+            else:
+                logger.info("recovery: %s", report.get("reason"))
+        except Exception:
+            logger.exception("recovery manager boot failed")
+
         import time as _time
 
         self._booted_at = _time.time()
@@ -458,6 +496,14 @@ class Orchestrator:
             )
 
         await self._create_consciousness_snapshot(reason="shutdown")
+
+        if self._recovery_manager is not None:
+            try:
+                checkpoint_id = self._recovery_manager.create_checkpoint(self)
+                if checkpoint_id:
+                    logger.info("shutdown recovery checkpoint created: %s", checkpoint_id)
+            except Exception:
+                logger.exception("shutdown recovery checkpoint failed")
 
         self.event_bus.publish(
             Event(
@@ -2096,6 +2142,81 @@ class Orchestrator:
                 )
             )
 
+    def _on_task_created(self, event: Event) -> None:
+        """Route inbound channel messages (telegram/discord/slack/...) into
+        agent tasks and remember how to reply when they complete."""
+        payload = event.payload or {}
+        # Internal orchestrator retries publish TASK_CREATED too; only bridge
+        # external channel ingest events.
+        if event.source in ("orchestrator", "studio"):
+            return
+        platform = str(payload.get("platform") or "").lower()
+        message = str(payload.get("message") or "").strip()
+        if not platform or not message:
+            return
+        # Normalize legacy Discord/Slack shapes to reply_channel/reply_thread.
+        reply_channel = (
+            payload.get("reply_channel")
+            or payload.get("channel")
+            or payload.get("channel_id")
+        )
+        reply_thread = (
+            payload.get("reply_thread")
+            or payload.get("thread")
+            or payload.get("thread_ts")
+            or payload.get("message_id")
+        )
+        if not reply_channel:
+            return
+
+        task = TaskRequest(
+            title=f"{platform} message",
+            description=message[:500],
+            input_data={
+                "platform": platform,
+                "channel": reply_channel,
+                "sender": payload.get("sender"),
+                "thread": reply_thread,
+            },
+        )
+
+        async def _route() -> None:
+            try:
+                task_id = await self.submit_task(task)
+                self._messaging_reply_context[task_id] = {
+                    "platform": platform,
+                    "reply_channel": reply_channel,
+                    "reply_thread": reply_thread,
+                }
+            except Exception:
+                logger.exception("messaging task routing failed for %s", platform)
+
+        try:
+            asyncio.create_task(_route())
+        except RuntimeError:
+            # No running loop (synchronous tests) — fire-and-forget is fine.
+            pass
+
+    def _reply_to_channel(self, task_id: str, text: str) -> None:
+        """Send a task result back to the originating messaging channel."""
+        ctx = self._messaging_reply_context.pop(task_id, None)
+        if not ctx:
+            return
+        try:
+            from skyn3t.integrations.messaging import get_default_router
+
+            router = get_default_router()
+            asyncio.create_task(
+                router.reply(
+                    ctx["platform"],
+                    ctx["reply_channel"],
+                    text,
+                    thread=ctx.get("reply_thread"),
+                )
+            )
+        except Exception:
+            logger.exception("channel reply failed for task %s", task_id)
+
     def _on_task_completed(self, event: Event) -> None:
         """Handle task completion."""
         task_id = event.payload.get("task_id")
@@ -2106,6 +2227,7 @@ class Orchestrator:
             self.running_tasks.pop(task_id, None)
             self._failed_agents_by_task.pop(task_id, None)
             self._handling_task_failures.discard(task_id)
+            self._messaging_reply_context.pop(task_id, None)
             return
         agent_name = event.source
         existing_result = self.task_results.get(task_id)
@@ -2137,6 +2259,15 @@ class Orchestrator:
         self._task_result_completed_at[task_id] = datetime.now(timezone.utc)
         self._persist_terminal_task_state(task, agent_name, result, status="completed")
         self._signal_task_done(task_id)
+
+        # If this task originated from an inbound channel message, route the
+        # answer back out through the messaging router.
+        if task_id in self._messaging_reply_context:
+            try:
+                reply_text = str(result.output) if result.output else "Done."
+            except Exception:
+                reply_text = "Done."
+            self._reply_to_channel(task_id, reply_text)
 
     def _on_task_failed(self, event: Event) -> None:
         """Handle task failure with fallback to other agents."""
@@ -2373,6 +2504,8 @@ class Orchestrator:
         self._handling_task_failures.discard(task.task_id)
         self._task_result_completed_at[task.task_id] = datetime.now(timezone.utc)
         self._signal_task_done(task.task_id)
+        if task.task_id in self._messaging_reply_context:
+            self._reply_to_channel(task.task_id, f"Task failed: {error}")
 
     def _get_fallback_agent(
         self,
@@ -2619,6 +2752,14 @@ class Orchestrator:
                 self._compact_idempotency_keys()
                 await self._terminate_idle_auto_agents()
                 await self._maybe_periodic_snapshot()
+
+                if self._recovery_manager is not None:
+                    try:
+                        checkpoint_id = self._recovery_manager.create_checkpoint(self)
+                        if checkpoint_id:
+                            logger.debug("recovery checkpoint created: %s", checkpoint_id)
+                    except Exception:
+                        logger.exception("recovery checkpoint failed")
 
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
