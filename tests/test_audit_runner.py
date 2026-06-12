@@ -226,3 +226,30 @@ async def test_intentional_bail_respects_auto_retry_disabled(tmp_path, monkeypat
 
     # SKYN3T_AUTO_RETRY=0 must suppress the retry, matching the success path.
     assert retried == []
+
+
+# ─── Phase 3 critical security regressions (runner path traversal) ────────
+
+def test_validate_slug_rejects_traversal(tmp_path):
+    runner = _make_runner(tmp_path)
+    for bad in ("../evil", "foo/../bar", "/absolute", "..", ".hidden"):
+        with pytest.raises(ValueError):
+            runner._validate_slug(bad)
+
+
+def test_validate_slug_accepts_single_name(tmp_path):
+    runner = _make_runner(tmp_path)
+    path = runner._validate_slug("my-project_123")
+    assert path == runner.projects_root / "my-project_123"
+
+
+def test_get_project_rejects_traversal_slug(tmp_path):
+    runner = _make_runner(tmp_path)
+    with pytest.raises(ValueError, match="invalid project slug"):
+        runner.get_project("../evil")
+
+
+def test_export_zip_rejects_traversal_slug(tmp_path):
+    runner = _make_runner(tmp_path)
+    with pytest.raises(ValueError, match="invalid project slug"):
+        runner.export_zip("../evil")

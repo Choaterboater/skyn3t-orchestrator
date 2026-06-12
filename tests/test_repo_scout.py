@@ -224,6 +224,9 @@ async def test_repo_scout_dedupes_across_external_learning(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_repo_scout_scheduled_trigger_parses_prompt_and_runs(monkeypatch):
+    # Disable the production boot grace so the scheduled run executes
+    # promptly in this unit test.
+    monkeypatch.setenv("SKYN3T_SCOUT_BOOT_GRACE_S", "0")
     ran = {}
     orch = SimpleNamespace(agents={})
     scout = GitHubRepoScout(orchestrator=orch, event_bus=SimpleNamespace())

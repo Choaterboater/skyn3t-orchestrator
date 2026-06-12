@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi.testclient import TestClient
 
 import skyn3t.web.app as web_app
 from skyn3t.config.agent_overrides import AgentOverrideStore
@@ -1971,3 +1972,59 @@ def test_non_project_system_alert_does_not_project_into_swarm_feed():
     )
 
     assert projected is None
+
+
+# ─── Phase 3 critical security regressions ───────────────────────────────
+
+@pytest.mark.asyncio
+async def test_execution_backend_patch_rejects_inline_without_optin(monkeypatch):
+    """C1: PATCH /api/execution/backend must refuse to persist inline unless
+    SKYN3T_ALLOW_INLINE_EXEC is set."""
+    monkeypatch.delenv("SKYN3T_ALLOW_INLINE_EXEC", raising=False)
+    get_settings.cache_clear()
+
+    result = await web_app.execution_backend_patch({"backend": "inline"})
+
+    assert isinstance(result, web_app.JSONResponse)
+    assert result.status_code == 403
+    body = json.loads(result.body)
+    assert "disabled" in body["error"].lower()
+
+
+def test_exec_endpoint_rejects_inline_without_optin(monkeypatch):
+    """C1: POST /api/exec must not run in-process when inline is not opted in."""
+    monkeypatch.setenv("SKYN3T_EXECUTION_BACKEND", "inline")
+    monkeypatch.delenv("SKYN3T_ALLOW_INLINE_EXEC", raising=False)
+    monkeypatch.setenv("SKYN3T_ALLOW_UNAUTHENTICATED_LOOPBACK", "1")
+    get_settings.cache_clear()
+
+    client = TestClient(web_app.app)
+    response = client.post(
+        "/api/exec",
+        json={"code": "print(1)", "language": "python", "timeout": 10},
+    )
+
+    assert response.status_code == 403
+    assert "disabled" in response.json()["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_studio_start_rejects_path_traversal_slug(monkeypatch):
+    """C2: A caller-supplied slug that escapes projects_root must be rejected."""
+    calls = {}
+
+    class FakeRunner:
+        def reserve_project(self, *args, **kwargs):
+            calls["reserve"] = kwargs.get("slug")
+            raise ValueError("project slug escapes projects root: ../evil")
+
+    monkeypatch.setattr(web_app, "_get_studio_runner", lambda _app: FakeRunner())
+    web_app.app.state.studio_tasks = set()
+
+    result = await web_app.studio_start(
+        {"template": "auto", "brief": "x", "slug": "../evil"}
+    )
+
+    assert isinstance(result, web_app.JSONResponse)
+    assert result.status_code == 400
+    assert "escapes" in json.loads(result.body)["error"]

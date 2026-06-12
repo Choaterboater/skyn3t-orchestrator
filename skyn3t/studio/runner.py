@@ -226,7 +226,7 @@ class StudioRunner:
     ) -> dict:
         """Execute the named template against ``brief`` and return the manifest."""
         slug = slug or self._slugify(brief or template_key)
-        artifact_dir = self.projects_root / slug
+        artifact_dir = self._validate_slug(slug)
         artifact_dir.mkdir(parents=True, exist_ok=True)
         extra = dict(extra or {})
         manifest = self.get_project(slug)
@@ -3581,6 +3581,7 @@ class StudioRunner:
 
     def get_project(self, slug: str) -> Optional[dict]:
         """Return the manifest for ``slug`` or ``None`` if it does not exist."""
+        self._validate_slug(slug)
         mf = self.projects_root / slug / "project.json"
         if not mf.exists():
             return None
@@ -3594,7 +3595,8 @@ class StudioRunner:
         """Bundle a project directory into a zip file and return its path."""
         import shutil
 
-        src = self.projects_root / slug
+        artifact_dir = self._validate_slug(slug)
+        src = artifact_dir
         if not src.exists():
             raise FileNotFoundError(slug)
         zip_path = self.projects_root / f"{slug}.zip"

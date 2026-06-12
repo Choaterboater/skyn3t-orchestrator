@@ -450,6 +450,16 @@ async def lifespan(app: FastAPI):
     await _init_integrations(orchestrator, event_bus, settings)
     _boot_mark("integrations")
 
+    # Scheduled-delivery bridge: consumes SYSTEM_ALERT events from the
+    # scheduler/cron subsystem and forwards them through DeliveryGateway.
+    try:
+        from skyn3t.integrations.gateway import register_scheduled_delivery_bridge
+
+        app.state.scheduled_delivery_bridge = register_scheduled_delivery_bridge(event_bus)
+        _boot_mark("scheduled_delivery_bridge")
+    except Exception:
+        logger.exception("scheduled delivery bridge registration failed")
+
     # Singleton RAG engine
     try:
         from skyn3t.rag.rag_engine import RAGEngine
@@ -468,6 +478,12 @@ async def lifespan(app: FastAPI):
     # Shutdown
     if orchestrator:
         await orchestrator.stop()
+    bridge = getattr(app.state, "scheduled_delivery_bridge", None)
+    if bridge and event_bus:
+        try:
+            event_bus.unsubscribe(bridge, EventType.SYSTEM_ALERT)
+        except Exception:
+            logger.debug("scheduled delivery bridge unsubscribe failed", exc_info=True)
     # Cleanup loky/joblib semaphores to suppress leak warnings
     try:
         from loky import get_reusable_executor
