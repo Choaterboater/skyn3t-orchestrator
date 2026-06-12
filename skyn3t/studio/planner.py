@@ -13,9 +13,23 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from skyn3t.studio.clarification import apply_user_intent_plan, skip_force_code_for_intent
+
+# Consumes ReflectionPlannerHook (intelligence.reflection.RetryDirective). The
+# import is defensive: M3_reflection owns reflection.py and may add
+# RetryDirective concurrently. We never want a half-applied edit there to break
+# the planner's import (and thus the whole suite), so we degrade to a runtime
+# fallback when the symbol isn't importable yet. plan_pipeline accepts the
+# directive structurally (duck-typed) so behavior is identical either way.
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from skyn3t.intelligence.reflection import RetryDirective
+else:  # pragma: no cover - import guard
+    try:
+        from skyn3t.intelligence.reflection import RetryDirective  # noqa: F401
+    except Exception:  # reflection.py mid-edit or symbol not yet present
+        RetryDirective = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger("skyn3t.studio.planner")
 _TARGET_FILE_PATTERN = re.compile(
@@ -129,36 +143,67 @@ async def plan_pipeline(
     brief: str,
     llm_client=None,
     user_intent: Optional[Dict[str, Any]] = None,
+    reflection: "RetryDirective | None" = None,
 ) -> List[PlannedStage]:
     """Pick stages relevant to this brief. Brainstorm first + Reviewer last
-    are always included; in-between is dynamic."""
+    are always included; in-between is dynamic.
+
+    ``reflection`` (ReflectionPlannerHook) is an optional ``RetryDirective``
+    produced by ``intelligence.reflection.build_retry_directive`` on a retry.
+    When supplied it makes the plan *reason about WHY the prior attempt
+    failed* instead of blindly replanning:
+
+      * ``augmented_brief`` is merged into the brief used for stage selection
+        (so failure-aware cues influence which agents are chosen).
+      * Failure ``signatures`` that indicate stub/entrypoint problems force a
+        ``CodeAgent`` stage and bias toward a ``ReviewerAgent`` quality gate.
+      * ``prompt_patches`` are threaded into the affected stages' rationales
+        and expected artifacts so downstream agents actually see them.
+
+    When ``reflection`` is ``None`` (the default, and the non-retry path) the
+    behavior is byte-for-byte identical to before — this is a pure superset.
+    """
+    # Reflection-aware brief: stage selection (heuristic + LLM) keys off the
+    # brief text, so merging the directive's augmented brief here is what lets
+    # the WHY of the failure bias agent choice. The original brief is kept for
+    # rationale/reporting clarity.
+    planning_brief = _merge_reflection_brief(brief, reflection)
+
     chosen_agents: List[str] = []
     expected_artifacts: List[str] = []
     rationales: Dict[str, str] = {}
 
     if llm_client is not None:
         try:
-            chosen_agents, expected_artifacts, rationales = await _llm_plan(brief, llm_client)
+            chosen_agents, expected_artifacts, rationales = await _llm_plan(planning_brief, llm_client)
         except Exception:
             logger.exception("LLM planner failed; falling back to heuristic")
 
     if not chosen_agents:
-        chosen_agents, expected_artifacts, rationales = _heuristic_plan(brief)
+        chosen_agents, expected_artifacts, rationales = _heuristic_plan(planning_brief)
 
     # Safety net: even if the LLM planner ignored the integration cue,
     # post-process the plan to add ResearchAgent for briefs that name
     # third-party APIs/services the code must talk to. Without research,
     # CodeAgent will fabricate fake demo data for those integrations.
     chosen_agents, expected_artifacts, rationales = _ensure_research_for_integrations(
-        brief, chosen_agents, expected_artifacts, rationales,
+        planning_brief, chosen_agents, expected_artifacts, rationales,
     )
 
     chosen_agents, expected_artifacts, rationales = _ensure_code_stage(
-        brief,
+        planning_brief,
         chosen_agents,
         expected_artifacts,
         rationales,
         user_intent=user_intent,
+    )
+
+    # ReflectionPlannerHook: bias agent selection from the retry directive
+    # (force code stage / stronger reviewer for stub/entrypoint failures,
+    # thread prompt patches into rationales + expected artifacts). Inert
+    # no-op when reflection is None.
+    chosen_agents, expected_artifacts, rationales = _apply_reflection_bias(
+        reflection, chosen_agents, expected_artifacts, rationales,
     )
 
     # Strip DesignerAgent when the brief ALREADY locks the visual
@@ -168,7 +213,7 @@ async def plan_pipeline(
     # rounded-cards + dark-theme, designer just rephrases the brief in
     # JSON tokens — costing 3-5 min for redundant output.
     chosen_agents, expected_artifacts, rationales = _strip_redundant_designer(
-        brief, chosen_agents, expected_artifacts, rationales,
+        planning_brief, chosen_agents, expected_artifacts, rationales,
     )
 
     chosen_agents, expected_artifacts, rationales = apply_user_intent_plan(
@@ -179,7 +224,7 @@ async def plan_pipeline(
     )
 
     chosen_agents, expected_artifacts, rationales = _strip_optional_marketing_agents(
-        brief,
+        planning_brief,
         chosen_agents,
         expected_artifacts,
         rationales,
@@ -238,6 +283,189 @@ async def plan_pipeline(
     for i in range(len(stages) - 1):
         stages[i].handoff_to = stages[i + 1].agent
     return stages
+
+
+# --- ReflectionPlannerHook integration -----------------------------------
+# Signature fragments that mean "the build produced an empty/stub module or a
+# missing/broken entrypoint." When the prior failure carries one of these, the
+# right move is to (re)run a real CodeAgent build and tighten the review gate —
+# NOT to settle for a docs/spec plan. Matched case-insensitively against the
+# directive's signatures + rationale.
+_STUB_ENTRYPOINT_SIGNATURE_PATTERN = re.compile(
+    r"stub|placeholder|not.?implemented|todo|"
+    r"empty\s+(?:file|module|scaffold)|no\s+(?:source|code|files?)|"
+    r"entry.?point|entrypoint|missing\s+main|"
+    r"importerror|modulenotfound|cannot\s+import|no\s+module\s+named|"
+    r"won'?t\s+(?:start|run|launch)|fail(?:ed|s)?\s+to\s+(?:start|launch|boot)",
+    re.IGNORECASE,
+)
+
+
+def _reflection_str_list(value: Any) -> List[str]:
+    """Coerce a directive list-ish field into a clean list of strings.
+
+    Duck-typed: works whether RetryDirective is the real dataclass or any
+    stand-in object, and tolerates None / scalars / mixed iterables.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    try:
+        items = list(value)
+    except TypeError:
+        return [str(value)]
+    return [str(item) for item in items if str(item).strip()]
+
+
+def _merge_reflection_brief(brief: str, reflection: Any) -> str:
+    """Return the brief to plan against, merging the directive's augmented brief.
+
+    No-op (returns the original brief) when reflection is None or carries no
+    augmented brief. The augmented brief from build_retry_directive already
+    encodes the original brief plus failure-aware guidance, so when present we
+    plan against it directly; we only fall back to concatenation if it somehow
+    doesn't contain the original text (defensive).
+    """
+    if reflection is None:
+        return brief
+    augmented = getattr(reflection, "augmented_brief", None)
+    if not augmented or not str(augmented).strip():
+        return brief
+    augmented = str(augmented)
+    base = str(brief or "")
+    if base and base.strip() and base.strip() not in augmented:
+        return f"{base}\n\n{augmented}"
+    return augmented
+
+
+def _apply_reflection_bias(
+    reflection: Any,
+    chosen_agents: List[str],
+    expected_artifacts: List[str],
+    rationales: Dict[str, str],
+) -> tuple[List[str], List[str], Dict[str, str]]:
+    """Bias the plan from a RetryDirective. Inert no-op when reflection is None.
+
+    1. Stub/entrypoint failure signatures -> force a CodeAgent stage (a real
+       build, not docs) and guarantee a ReviewerAgent quality gate (it is
+       re-appended at the end of plan_pipeline anyway, but we seed a stronger
+       rationale so the dashboard explains the tightened review).
+    2. forced_stage_tier -> recorded in the relevant stage rationale so the
+       downstream selector/runner can honor the tier hint.
+    3. prompt_patches -> threaded into the rationales of the build/review
+       stages AND appended to their expected_artifacts, so downstream agents
+       (and the dashboard) actually see the corrective guidance.
+    """
+    if reflection is None:
+        return chosen_agents, expected_artifacts, rationales
+
+    signatures = _reflection_str_list(getattr(reflection, "signatures", None))
+    rationale_text = str(getattr(reflection, "rationale", "") or "")
+    prompt_patches = _reflection_str_list(getattr(reflection, "prompt_patches", None))
+    forced_tier = getattr(reflection, "forced_stage_tier", None)
+    if not isinstance(forced_tier, dict):
+        forced_tier = {}
+
+    haystack = " \n ".join(signatures + [rationale_text])
+    stub_or_entrypoint = bool(
+        haystack.strip() and _STUB_ENTRYPOINT_SIGNATURE_PATTERN.search(haystack)
+    )
+
+    # 1. Stub/entrypoint failures: force a real build + stronger review.
+    if stub_or_entrypoint:
+        has_code = "CodeAgent" in chosen_agents or "CodeImproverAgent" in chosen_agents
+        if not has_code:
+            _insert_code_stage(chosen_agents, "CodeAgent")
+            _insert_expected_artifact(expected_artifacts, "(source files)")
+        # Build a precise rationale; signatures (if any) make the WHY explicit.
+        sig_note = f" (signatures: {', '.join(signatures[:3])})" if signatures else ""
+        code_target = "CodeAgent" if "CodeAgent" in chosen_agents else "CodeImproverAgent"
+        rationales[code_target] = (
+            "reflective retry: prior attempt produced a stub/empty scaffold or a "
+            f"missing entrypoint, so the plan forces a real code build{sig_note}"
+        ).strip()
+        rationales["ReviewerAgent"] = (
+            "reflective retry: stronger review gate — prior build failed on a "
+            "stub/entrypoint issue, so reviewer must confirm a runnable entrypoint "
+            "and non-empty source before passing"
+        )
+
+    # 2. Surface forced tier hints in the affected stages' rationales.
+    for stage_name, tier in forced_tier.items():
+        agent_name = _reflection_stage_to_agent(str(stage_name), chosen_agents)
+        if not agent_name:
+            continue
+        note = f"reflective retry: forced tier '{tier}' for stage '{stage_name}'"
+        existing = rationales.get(agent_name, "")
+        rationales[agent_name] = f"{existing} | {note}".strip(" |") if existing else note
+
+    # 3. Thread prompt patches into the build/review stages so downstream
+    #    agents see them. We write into the ``rationales`` dict keyed by agent
+    #    name — that dict is consulted when stages are materialized later in
+    #    plan_pipeline, so targeting an agent that isn't in chosen_agents yet
+    #    (notably ReviewerAgent, which is *always* re-appended at the end)
+    #    still surfaces the patch on its stage.
+    if prompt_patches:
+        patch_blob = "; ".join(prompt_patches)
+        patch_note = f"reflection patches: {patch_blob}"
+        # ReviewerAgent is always present in the final plan; the code agents
+        # are present whenever this build produces code. Target the canonical
+        # downstream consumers regardless of current membership.
+        targets = ["CodeAgent", "CodeImproverAgent", "ReviewerAgent"]
+        present_code = {a for a in ("CodeAgent", "CodeImproverAgent") if a in chosen_agents}
+        for agent_name in targets:
+            # Skip a code agent that isn't (and won't be) in this plan, so we
+            # don't seed an orphan rationale for a stage that never runs.
+            if agent_name in ("CodeAgent", "CodeImproverAgent") and agent_name not in present_code:
+                continue
+            existing = rationales.get(agent_name, "")
+            rationales[agent_name] = (
+                f"{existing} | {patch_note}".strip(" |") if existing else patch_note
+            )
+        # Record the patches once on a private channel too, so they are
+        # visible even when no canonical target ran.
+        rationales.setdefault("_reflection_prompt_patches", patch_blob)
+
+    return chosen_agents, expected_artifacts, rationales
+
+
+def _reflection_stage_to_agent(
+    stage_name: str, chosen_agents: List[str]
+) -> Optional[str]:
+    """Map a directive stage key (e.g. 'code', 'reviewer', 'architect') to a
+    chosen agent class name. Returns None when no chosen agent matches."""
+    key = re.sub(r"agent$", "", stage_name.strip().lower())
+    if not key:
+        return None
+    # ReviewerAgent is always re-appended to the final plan, so resolve tier
+    # hints for it even before it appears in chosen_agents (its rationale is
+    # keyed by name and picked up at stage-build time).
+    always_present = {"ReviewerAgent"}
+    # Direct: 'codeagent' style or exact agent-name match.
+    for agent in chosen_agents:
+        if re.sub(r"agent$", "", agent.lower()) == key:
+            return agent
+    # Aliases for common stage keys -> agent class names.
+    aliases = {
+        "code": "CodeAgent",
+        "codegen": "CodeAgent",
+        "build": "CodeAgent",
+        "improver": "CodeImproverAgent",
+        "patch": "CodeImproverAgent",
+        "review": "ReviewerAgent",
+        "reviewer": "ReviewerAgent",
+        "qa": "ReviewerAgent",
+        "architect": "ArchitectAgent",
+        "design": "DesignerAgent",
+        "designer": "DesignerAgent",
+        "research": "ResearchAgent",
+        "writer": "WriterAgent",
+    }
+    candidate = aliases.get(key)
+    if candidate and (candidate in chosen_agents or candidate in always_present):
+        return candidate
+    return None
 
 
 def _heuristic_plan(brief: str) -> tuple[List[str], List[str], Dict[str, str]]:

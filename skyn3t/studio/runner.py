@@ -100,6 +100,11 @@ class StudioRunner:
         self.event_bus = event_bus
         self.rag = rag
         self._retry_tasks: Set[asyncio.Task[Any]] = set()
+        # Phase 5A ReflectionPlannerHook: a RetryDirective stashed by
+        # _maybe_auto_retry keyed by retry-slug, consumed once at the
+        # plan_pipeline call sites so the reflective re-plan biases agent
+        # selection + injects prompt patches. Empty on the non-retry path.
+        self._pending_reflection: Dict[str, Any] = {}
         configured_root = projects_root if projects_root is not None else get_settings().projects_dir
         self.projects_root = Path(configured_root).expanduser()
         self.projects_root.mkdir(parents=True, exist_ok=True)
@@ -293,6 +298,7 @@ class StudioRunner:
                     brief=effective_brief,
                     llm_client=llm_client,
                     user_intent=(manifest or {}).get("user_intent") if manifest else None,
+                    reflection=self._pending_reflection.pop(slug, None),
                 )
                 # Belt-and-braces guard: if the brief asks for runnable
                 # software but no code-producing agent made it into the
@@ -589,6 +595,7 @@ class StudioRunner:
                     brief=effective_brief,
                     llm_client=llm_client,
                     user_intent=user_intent or manifest.get("user_intent"),
+                    reflection=self._pending_reflection.pop(slug, None),
                 )
                 template = Template(key="auto", title="Auto-planned",
                                     description=f"Re-planned after clarification: {new_brief[:80]}",
@@ -988,6 +995,7 @@ class StudioRunner:
                 brief=manifest["brief"],
                 llm_client=llm_client,
                 user_intent=manifest.get("user_intent"),
+                reflection=self._pending_reflection.pop(slug, None),
             )
             template = Template(
                 key="auto",
@@ -1184,6 +1192,26 @@ class StudioRunner:
                     "limit": token_budget_limit,
                     "used": self._project_token_total(slug),
                 }
+
+            # ── Phase 5A ConversationLoopAPI ─────────────────────────────
+            # When SKYN3T_A2A_CONVERSATION is on and the plan spans the
+            # Designer/Reviewer/CodeAgent triad, run a bounded A2A
+            # request/response conversation (orchestrator.converse) to let
+            # those agents align BEFORE the linear stage loop produces
+            # artifacts. Advisory + non-blocking: the linear stages remain the
+            # source of truth; the conversation seeds prior_summaries with a
+            # converged plan when it succeeds. Flag off ⇒ pure linear loop.
+            try:
+                await self._maybe_a2a_conversation(
+                    stages=stages,
+                    brief=brief,
+                    artifact_dir=artifact_dir,
+                    manifest=manifest,
+                    prior_summaries=prior_summaries,
+                )
+            except Exception:
+                logger.debug("A2A conversation pre-pass failed; continuing linear", exc_info=True)
+
             for stage_idx, stage in enumerate(stages):
                 if stage_idx < (_start_from_index or 0):
                     continue
@@ -2329,6 +2357,24 @@ class StudioRunner:
                 except Exception:
                     logger.debug("stage-complete thread post failed", exc_info=True)
 
+                # ── Phase 5A AssetAgentAPI ────────────────────────────────
+                # After the designer stage, when SKYN3T_ASSET_GEN is on and the
+                # brief implies a visual UI, run the AssetAgent to produce
+                # brand assets (logo/icon) + optional design-token import.
+                # Non-blocking + graceful: without REPLICATE_API_TOKEN it emits
+                # skipped=True entries and never blocks the build. Flag off ⇒
+                # entirely skipped.
+                if stage.name == "designer" or stage.agent == "DesignerAgent":
+                    try:
+                        await self._maybe_run_asset_agent(
+                            brief=brief,
+                            artifact_dir=artifact_dir,
+                            manifest=manifest,
+                            prior_summaries=prior_summaries,
+                        )
+                    except Exception:
+                        logger.debug("asset agent stage failed; continuing", exc_info=True)
+
                 # Reviewer-driven targeted fixes (#130). When the reviewer
                 # came back with go-with-fixes, parse review.md for
                 # specific file complaints and ask OpenRouter to
@@ -3152,6 +3198,291 @@ class StudioRunner:
                 clear_project_context(slug)
             except Exception:
                 logger.debug("cheap_smart context cleanup failed", exc_info=True)
+
+    @staticmethod
+    def _resolve_stage_route(
+        stage_name: str,
+        *,
+        brief: Optional[str] = None,
+    ) -> Tuple[str, Optional[str]]:
+        """Resolve ``(backend, model)`` for a stage's LLM selection.
+
+        Phase 5A PredictiveRoutingSelector integration. When
+        ``SKYN3T_AUTO_ROUTE`` is on, prefers
+        ``core.model_router.select_best_model`` (which consults recorded
+        routing observations + the cheap-model tournament and breaks ties
+        toward cheaper backends) and threads brief/stack/features through.
+        Falls back to the static ``resolve_model`` otherwise and on any
+        failure — never forces an expensive backend, never blocks.
+        """
+        stack: Optional[str] = None
+        features: Optional[List[str]] = None
+        if brief:
+            try:
+                from skyn3t.agents.stack_templates import (
+                    _detect_feature_tiers,
+                    detect_stack,
+                )
+
+                stack = detect_stack(brief)
+                features = _detect_feature_tiers(brief) or None
+            except Exception:
+                stack = None
+                features = None
+        # Prefer the predictive selector when auto-route is enabled.
+        try:
+            from skyn3t.core.model_router import select_best_model
+
+            choice = select_best_model(
+                stage_name,
+                brief=brief,
+                stack=stack,
+                features=features,
+                prefer="auto",
+            )
+            if getattr(choice, "backend", ""):
+                return choice.backend, getattr(choice, "model", None)
+        except Exception:
+            logger.debug("select_best_model failed; static fallback", exc_info=True)
+        # Static fallback (also the path when auto-route is off — the
+        # selector returns the static route wrapped, but this keeps the
+        # contract explicit and resilient to selector import errors).
+        try:
+            from skyn3t.core.model_router import resolve_model
+
+            return resolve_model(stage_name, brief=brief)
+        except Exception:
+            logger.debug("resolve_model fallback failed", exc_info=True)
+            return "", None
+
+    async def _maybe_a2a_conversation(
+        self,
+        *,
+        stages: List[Any],
+        brief: str,
+        artifact_dir: Path,
+        manifest: Dict[str, Any],
+        prior_summaries: Dict[str, str],
+    ) -> None:
+        """Phase 5A ConversationLoopAPI: bounded A2A conversation pre-pass.
+
+        Flag-gated (``SKYN3T_A2A_CONVERSATION``, default off). When off this is
+        a no-op and the pipeline stays purely linear. When on AND the plan
+        includes the Designer/Reviewer/CodeAgent triad, it builds an
+        Orchestrator, registers the participating agents (which starts their
+        inbox pumps so MessageBus request/response is drained), and runs a
+        bounded ``converse()`` so the agents can align before artifact
+        production. Advisory: the result is recorded into the manifest and the
+        converged payload seeded into ``prior_summaries['a2a_conversation']``;
+        the linear stages still produce the real artifacts. Never raises into
+        the build (caller wraps in try/except) and degrades gracefully when an
+        agent is missing or converse fails.
+        """
+        try:
+            from skyn3t.core.orchestrator import (
+                Orchestrator,
+                a2a_conversation_enabled,
+            )
+        except Exception:
+            logger.debug("orchestrator unavailable for A2A conversation", exc_info=True)
+            return
+        if not a2a_conversation_enabled():
+            return
+
+        # Map planned stages → the agent triad we drive over A2A.
+        triad = {
+            "DesignerAgent": "designer",
+            "ReviewerAgent": "reviewer",
+            "CodeAgent": "code_agent",
+        }
+        present_agents = {str(getattr(s, "agent", "")) for s in stages}
+        participant_classes = [c for c in triad if c in present_agents]
+        if len(participant_classes) < 2:
+            # Not enough of the triad in the plan to make a conversation
+            # meaningful — stay linear.
+            return
+
+        orchestrator = Orchestrator(event_bus=self.event_bus)
+        participant_names: List[str] = []
+        for cls_name in participant_classes:
+            try:
+                agent = get_agent(cls_name, event_bus=self.event_bus, rag=self.rag)
+                if hasattr(agent, "initialize"):
+                    maybe = agent.initialize()
+                    if hasattr(maybe, "__await__"):
+                        await maybe
+                # register_agent starts the inbox pump (running loop present).
+                orchestrator.register_agent(agent)
+                participant_names.append(getattr(agent, "name", cls_name))
+            except Exception:
+                logger.debug("A2A participant %s setup failed", cls_name, exc_info=True)
+        if len(participant_names) < 2:
+            return
+
+        try:
+            result = await orchestrator.converse(
+                participants=participant_names,
+                topic=f"Align on the build plan for: {brief[:400]}",
+                context={
+                    "brief": brief,
+                    "artifact_dir": str(artifact_dir),
+                    "slug": manifest.get("slug"),
+                },
+                max_rounds=4,
+            )
+        except Exception:
+            logger.debug("orchestrator.converse failed; staying linear", exc_info=True)
+            return
+        finally:
+            # Always stop the pumps we started so no inbox drainer leaks.
+            for name in participant_names:
+                agent = orchestrator.agents.get(name)
+                if agent is None:
+                    continue
+                try:
+                    await agent.stop_inbox_pump()
+                except Exception:
+                    logger.debug("stop_inbox_pump failed for %s", name, exc_info=True)
+
+        try:
+            manifest["a2a_conversation"] = {
+                "participants": participant_names,
+                "converged": bool(getattr(result, "converged", False)),
+                "rounds_used": int(getattr(result, "rounds_used", 0) or 0),
+                "turns": len(getattr(result, "turns", []) or []),
+            }
+            self._append_history(
+                manifest,
+                "A2A_CONVERSATION_DONE",
+                status="running",
+                message=(
+                    f"A2A conversation over {participant_names}: "
+                    f"converged={getattr(result, 'converged', False)} "
+                    f"in {getattr(result, 'rounds_used', 0)} round(s)."
+                ),
+            )
+        except Exception:
+            logger.debug("A2A conversation manifest record failed", exc_info=True)
+
+        # Seed an advisory summary for downstream stages (capped).
+        try:
+            payload = getattr(result, "final_payload", None) or {}
+            summary = str(
+                payload.get("summary")
+                or payload.get("response")
+                or payload.get("content")
+                or ""
+            ).strip()
+            if summary:
+                prior_summaries["a2a_conversation"] = self._bound_essential_summary(summary)
+        except Exception:
+            logger.debug("A2A conversation summary seed failed", exc_info=True)
+
+    async def _maybe_run_asset_agent(
+        self,
+        *,
+        brief: str,
+        artifact_dir: Path,
+        manifest: Dict[str, Any],
+        prior_summaries: Dict[str, str],
+    ) -> None:
+        """Phase 5A AssetAgentAPI: run the AssetAgent after the designer stage.
+
+        Flag-gated (``SKYN3T_ASSET_GEN``, default off). When off this is a
+        no-op. When on AND the brief implies a visual UI, instantiates the
+        AssetAgent directly (imported from ``skyn3t.agents.asset_agent``) and
+        runs it to produce brand assets + optional design-token import.
+
+        Non-blocking + graceful: without a provider key the agent emits
+        ``skipped=True`` entries and the build proceeds; any failure is
+        swallowed (caller also wraps in try/except). Records produced assets
+        into the manifest so packaging/reviewer stages can see them.
+        """
+        try:
+            from skyn3t.agents.asset_agent import AssetAgent, asset_gen_enabled
+        except Exception:
+            logger.debug("asset_agent unavailable", exc_info=True)
+            return
+        if not asset_gen_enabled():
+            return
+        if not self._brief_implies_visual_ui(brief, artifact_dir):
+            return
+
+        # Minimal default brand-asset lineup; the AssetAgent skips gracefully
+        # (skipped=True) when no provider key is configured.
+        asset_specs = [
+            {
+                "kind": "logo",
+                "prompt": f"Minimal brand logo for: {brief[:200]}",
+                "out_path": "assets/logo.png",
+                "w": 512,
+                "h": 512,
+            },
+            {
+                "kind": "icon",
+                "prompt": f"App icon for: {brief[:200]}",
+                "out_path": "assets/icon.png",
+                "w": 256,
+                "h": 256,
+            },
+        ]
+        # Thread a design import only when a design source artifact exists.
+        design_import = None
+        for candidate in ("design.png", "design.jpg", "mockup.png"):
+            p = artifact_dir / candidate
+            if p.is_file():
+                design_import = {"source": "image", "path": str(p)}
+                break
+
+        try:
+            agent = AssetAgent(name="asset", event_bus=self.event_bus)
+            if hasattr(agent, "initialize"):
+                maybe = agent.initialize()
+                if hasattr(maybe, "__await__"):
+                    await maybe
+            task = TaskRequest(
+                title="asset:generate",
+                input_data={
+                    "brief": brief,
+                    "artifact_dir": str(artifact_dir),
+                    "asset_specs": asset_specs,
+                    "design_import": design_import,
+                },
+            )
+            result = await asyncio.wait_for(agent.execute(task), timeout=180.0)
+        except asyncio.TimeoutError:
+            logger.debug("asset agent timed out; continuing", exc_info=True)
+            return
+        except Exception:
+            logger.debug("asset agent execute failed; continuing", exc_info=True)
+            return
+
+        output = getattr(result, "output", None) or {}
+        assets = output.get("assets") or []
+        generated = sum(1 for a in assets if not a.get("skipped"))
+        manifest["assets"] = {
+            "generated": generated,
+            "total": len(assets),
+            "tokens_imported": bool(output.get("tokens")),
+            "entries": assets,
+        }
+        try:
+            self._append_history(
+                manifest,
+                "ASSETS_GENERATED",
+                status="running",
+                stage="designer",
+                message=(
+                    f"AssetAgent: {generated}/{len(assets)} asset(s) produced"
+                    + ("; tokens imported" if output.get("tokens") else "")
+                    + ("." if assets else "; none requested."),
+                ),
+            )
+        except Exception:
+            logger.debug("asset manifest history append failed", exc_info=True)
+        summary = str(output.get("summary") or "").strip()
+        if summary:
+            prior_summaries["assets"] = self._bound_essential_summary(summary)
 
     def _maybe_escalate_cheap_smart(
         self,
@@ -4237,6 +4568,123 @@ class StudioRunner:
         # for per-file regeneration, so code-stage critique is enabled.
     }
 
+    async def _maybe_debate_critique(
+        self,
+        *,
+        stage: Any,
+        brief: str,
+        artifact_dir: Path,
+        rounds: int,
+        timeout_s: float,
+        proposer_summary: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Run a cheap/free cross-model debate as the critique step.
+
+        Phase 5A DebateAPI integration. Returns a critique-shaped dict
+        ``{has_issues, issues, critique_text}`` compatible with the existing
+        revision loop, or ``None`` when the debate is disabled / skipped /
+        fails so the caller transparently falls back to ReviewerAgent.
+
+        Fully non-blocking + graceful: a missing key, an absent backend, or
+        fewer than two usable models degrades to ``None`` (ReviewerAgent
+        fallback). The debate itself records one ModelTrial per participant so
+        routing/tournament learn which cheap models win (M1 is the writer).
+        """
+        try:
+            from skyn3t.agents import debate as _debate
+        except Exception:
+            logger.debug("debate module unavailable for critique", exc_info=True)
+            return None
+        try:
+            if not _debate.debate_enabled(stage.name):
+                return None
+        except Exception:
+            logger.debug("debate_enabled check failed", exc_info=True)
+            return None
+
+        try:
+            result = await asyncio.wait_for(
+                _debate.run_debate(
+                    stage_name=stage.name,
+                    brief=brief,
+                    proposer_outputs={"proposer": proposer_summary} if proposer_summary else None,
+                    artifact_dir=artifact_dir,
+                    event_bus=self.event_bus,
+                    models=None,  # default CHEAP/FREE lineup
+                    max_models=3,
+                    rounds=max(1, int(rounds)),
+                    record=True,
+                    timeout_s=timeout_s,
+                ),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("debate critique timed out for %s; using reviewer fallback", stage.name)
+            return None
+        except Exception:
+            logger.warning("debate critique failed for %s; using reviewer fallback", stage.name, exc_info=True)
+            return None
+
+        # Graceful degrade: insufficient models / skip → reviewer fallback.
+        if getattr(result, "skipped_reason", None):
+            logger.info(
+                "debate skipped for %s (%s); using reviewer fallback",
+                stage.name,
+                result.skipped_reason,
+            )
+            return None
+
+        # Map the debate outcome onto the critique_result contract. Each
+        # losing model's cross-examination is a structured "issue"; a strong
+        # consensus winner means no blockers (clean pass). We never invent file
+        # paths the targeted-fix path can't resolve — issues carry the model's
+        # critique text so the reviser has guidance even without a file anchor.
+        issues: List[Dict[str, Any]] = []
+        try:
+            consensus = float(getattr(result, "consensus_score", 0.0) or 0.0)
+        except Exception:
+            consensus = 0.0
+        winner_model = getattr(result, "winner_model", "") or ""
+        for verdict in getattr(result, "per_model", []) or []:
+            vmodel = getattr(verdict, "model", "") or getattr(verdict, "backend", "")
+            if vmodel == winner_model:
+                continue
+            for crit in getattr(verdict, "critiques", []) or []:
+                text = str(crit or "").strip()
+                if not text:
+                    continue
+                # Only treat an explicit blocker-style critique as an issue;
+                # confirmations ("looks sound") are not actionable.
+                try:
+                    is_blocker = not _debate._critique_passed(text)
+                except Exception:
+                    is_blocker = True
+                if not is_blocker:
+                    continue
+                issues.append(
+                    {
+                        "file": "(unknown)",
+                        "issue": text[:1000],
+                        "severity": "blocker",
+                        "source": f"debate:{vmodel}",
+                    }
+                )
+
+        has_issues = bool(issues)
+        critique_text = (
+            f"Cross-model debate winner: {winner_model} "
+            f"(consensus {consensus:.2f}). "
+            + (f"{len(issues)} unresolved cross-model blocker(s)." if has_issues else "No blockers.")
+        )
+        return {
+            "has_issues": has_issues,
+            "issues": issues,
+            "critique_text": critique_text,
+            "debate": True,
+            "winner_model": winner_model,
+            "consensus_score": consensus,
+        }
+
     async def _critique_and_revise(
         self,
         *,
@@ -4307,7 +4755,12 @@ class StudioRunner:
                 producer_backend, _ = resolve_model(producer_key, brief=brief)
             except Exception:
                 producer_backend = ""
-            reviewer_backend, reviewer_model = resolve_model("reviewer", brief=brief)
+            # Phase 5A PredictiveRoutingSelector: prefer the auto-route winner
+            # for the reviewer model when SKYN3T_AUTO_ROUTE is on (static
+            # otherwise). brief/stack/features flow through the helper.
+            reviewer_backend, reviewer_model = self._resolve_stage_route(
+                "reviewer", brief=brief
+            )
             reviewer_config: Dict[str, Any] = {}
             if reviewer_backend:
                 reviewer_config["backend"] = reviewer_backend
@@ -4372,17 +4825,37 @@ class StudioRunner:
                 critique_produced_files = stage_files
             critique_timeout_seconds = 180.0
             try:
-                critique_result = await asyncio.wait_for(
-                    reviewer.critique(
+                # ── Phase 5A DebateAPI ────────────────────────────────────
+                # On high-stakes stages (architect/reviewer/code, gated by
+                # SKYN3T_DEBATE) the cross-model critique runs through a
+                # cheap/free multi-model debate instead of the single
+                # ReviewerAgent pass. The debate's per-model cross-examination
+                # surfaces blockers + records one ModelTrial per participant so
+                # routing learns which cheap models win. The ReviewerAgent path
+                # remains the graceful-degrade fallback when the debate skips
+                # (fewer than two usable models / no keys) or raises.
+                critique_result = None
+                if round_num == 1:
+                    critique_result = await self._maybe_debate_critique(
+                        stage=stage,
                         brief=brief,
-                        artifact_dir=critique_artifact_dir,
-                        stage_name=stage.name,
-                        produced_files=[str(f) for f in critique_produced_files]
-                        if critique_produced_files
-                        else None,
-                    ),
-                    timeout=critique_timeout_seconds,
-                )
+                        artifact_dir=artifact_dir,
+                        rounds=max_rounds,
+                        timeout_s=critique_timeout_seconds,
+                        proposer_summary=summary,
+                    )
+                if critique_result is None:
+                    critique_result = await asyncio.wait_for(
+                        reviewer.critique(
+                            brief=brief,
+                            artifact_dir=critique_artifact_dir,
+                            stage_name=stage.name,
+                            produced_files=[str(f) for f in critique_produced_files]
+                            if critique_produced_files
+                            else None,
+                        ),
+                        timeout=critique_timeout_seconds,
+                    )
             except asyncio.TimeoutError:
                 logger.warning(
                     "ReviewerAgent critique timed out for %s round %s",
@@ -5578,9 +6051,10 @@ class StudioRunner:
         if not design_bits and len(app_source) < 400:
             return
         from skyn3t.adapters import LLMClient
-        from skyn3t.core.model_router import resolve_model
 
-        backend, model = resolve_model("reviewer")
+        # Phase 5A PredictiveRoutingSelector: auto-route winner when enabled,
+        # static reviewer route otherwise; brief informs stack/feature ranking.
+        backend, model = self._resolve_stage_route("reviewer", brief=brief)
         client = LLMClient(
             default_model=model,
             backend=backend,
@@ -7477,34 +7951,9 @@ class StudioRunner:
             prior_backend = (bv.get("backend") or manifest.get("_used_backend") or "").strip()
         except Exception:
             prior_backend = ""
-        debate_note = ""
-        if prior_backend:
-            debate_note = (
-                f"\n\nPrior attempt was generated by '{prior_backend}'. "
-                f"For the retry, prefer a DIFFERENT model so a second "
-                f"perspective gets a shot at the problem."
-            )
-        if build_hint:
-            lesson_block = (
-                "\n\nPrior attempt failed during build verification. "
-                "Use this as a constraint when picking the next shape:\n"
-                f"{build_hint}\n"
-                "Fix the specific error above. "
-                "Keep the same stack and file structure unless the error is "
-                "fundamentally unfixable in this ecosystem."
-                f"{debate_note}"
-            )
-        else:
-            lesson_block = (
-                f"\n\nPrior attempt ({original_template}) failed at stages "
-                f"{failed_stages or '?'}: {error_summary}\n"
-                f"Try a different shape — pick alternative agents or a simpler stack."
-                f"{debate_note}"
-            )
-        # Phase-3 (change #4): stub/entrypoint failures get a STRONGER model on
-        # retry. Detect a stub/entrypoint failure from the gate flag or the
-        # error text, append an explicit escalation directive, and pre-escalate
-        # the retry slug's code stage to the strong tier via cheap_smart.
+        # Phase-3 stub/entrypoint detection retained for the escalation reason
+        # text; the actual brief rewrite + tier escalation now flow through the
+        # reflection layer's structured RetryDirective (Phase 5A).
         _err_blob = (
             f"{manifest.get('error') or ''} {manifest.get('next_action') or ''} "
             f"{build_hint}"
@@ -7513,27 +7962,110 @@ class StudioRunner:
             tok in _err_blob
             for tok in ("stub", "entrypoint", "code generation failed", "skyn3t-backfill")
         )
-        escalation_note = ""
-        if is_stub_failure:
-            escalation_note = (
-                "\n\nThe prior attempt's ENTRYPOINT (App/main/page) or a core "
-                "file shipped as a generation-failure stub. This retry MUST "
-                "generate a complete, runnable entrypoint that imports and "
-                "renders the real components — no placeholders, no "
-                "'export default null', no 'Generation failed' JSX. Use the "
-                "strongest available model for the code stage."
-            )
-        retry_brief = (brief or "").rstrip() + lesson_block + escalation_note
         retry_slug = f"{slug}-retry"
-        if is_stub_failure:
-            try:
-                self._maybe_escalate_cheap_smart(
-                    slug=retry_slug,
-                    stage_name="code",
-                    reason="prior attempt shipped an entrypoint/core stub",
+
+        # ── Phase 5A ReflectionPlannerHook ────────────────────────────────
+        # Replace the hand-rolled lesson_block/debate_note/escalation_note with
+        # intelligence.reflection.build_retry_directive(), which reasons about
+        # WHY the attempt failed (error signatures + prompt suggestions) and
+        # emits a structured directive: an augmented brief, prompt patches,
+        # forced stage tiers, and backends to avoid. The directive is threaded
+        # into plan_pipeline(reflection=...) via self._pending_reflection and
+        # its forced tiers applied through _maybe_escalate_cheap_smart.
+        # Flag-gated (SKYN3T_REFLECTIVE_RETRY, default on); when the flag is off
+        # or there is no failure context we fall back to a minimal lesson block
+        # so retries still carry forward what went wrong.
+        directive = None
+        try:
+            from skyn3t.intelligence.reflection import (
+                build_retry_directive,
+                reflective_retry_enabled,
+            )
+
+            if reflective_retry_enabled():
+                directive = build_retry_directive(
+                    brief=brief or "",
+                    error=error_summary or None,
+                    build_hint=build_hint or None,
+                    blockers=None,
+                    prior_backend=prior_backend or None,
+                    failed_stages=failed_stages or None,
                 )
-            except Exception:
-                logger.debug("retry stub escalation failed", exc_info=True)
+        except Exception:
+            logger.debug("reflective retry directive build failed", exc_info=True)
+            directive = None
+
+        if directive is not None:
+            retry_brief = directive.augmented_brief or (brief or "").rstrip()
+            # Apply the directive's per-stage tier escalations. Only 'strong'
+            # tiers escalate via cheap_smart (it never forces cheaper stages
+            # up); cheaper/balanced hints are advisory and ride the brief.
+            for stage_name, tier in (directive.forced_stage_tier or {}).items():
+                if str(tier).strip().lower() == "strong":
+                    try:
+                        self._maybe_escalate_cheap_smart(
+                            slug=retry_slug,
+                            stage_name=stage_name,
+                            reason=(
+                                directive.rationale
+                                or "reflection: prior attempt warranted escalation"
+                            ),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "reflective tier escalation failed for %s",
+                            stage_name,
+                            exc_info=True,
+                        )
+            # Stash for the retry's plan_pipeline call (consumed once).
+            self._pending_reflection[retry_slug] = directive
+        else:
+            # Legacy fallback (flag off or directive unavailable): keep a
+            # compact lesson so the retry brief still carries the failure.
+            debate_note = ""
+            if prior_backend:
+                debate_note = (
+                    f"\n\nPrior attempt was generated by '{prior_backend}'. "
+                    f"For the retry, prefer a DIFFERENT model so a second "
+                    f"perspective gets a shot at the problem."
+                )
+            if build_hint:
+                lesson_block = (
+                    "\n\nPrior attempt failed during build verification. "
+                    "Use this as a constraint when picking the next shape:\n"
+                    f"{build_hint}\n"
+                    "Fix the specific error above. "
+                    "Keep the same stack and file structure unless the error is "
+                    "fundamentally unfixable in this ecosystem."
+                    f"{debate_note}"
+                )
+            else:
+                lesson_block = (
+                    f"\n\nPrior attempt ({original_template}) failed at stages "
+                    f"{failed_stages or '?'}: {error_summary}\n"
+                    f"Try a different shape — pick alternative agents or a simpler stack."
+                    f"{debate_note}"
+                )
+            escalation_note = ""
+            if is_stub_failure:
+                escalation_note = (
+                    "\n\nThe prior attempt's ENTRYPOINT (App/main/page) or a core "
+                    "file shipped as a generation-failure stub. This retry MUST "
+                    "generate a complete, runnable entrypoint that imports and "
+                    "renders the real components — no placeholders, no "
+                    "'export default null', no 'Generation failed' JSX. Use the "
+                    "strongest available model for the code stage."
+                )
+            retry_brief = (brief or "").rstrip() + lesson_block + escalation_note
+            if is_stub_failure:
+                try:
+                    self._maybe_escalate_cheap_smart(
+                        slug=retry_slug,
+                        stage_name="code",
+                        reason="prior attempt shipped an entrypoint/core stub",
+                    )
+                except Exception:
+                    logger.debug("retry stub escalation failed", exc_info=True)
         try:
             self._publish(
                 "PROJECT_RETRY_LAUNCHED",

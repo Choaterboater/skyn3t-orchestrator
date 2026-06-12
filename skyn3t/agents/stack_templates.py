@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import re
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 # A file plan entry: (relative path, one-line purpose).
 FilePlan = List[Tuple[str, str]]
@@ -490,6 +490,11 @@ def plan_for_stack(
             entities = _detect_data_entities(brief)
             slug = _package_name(_title_from_brief(brief), fallback="app")
             plan = plan + _data_backend_tier_files(entities, slug=slug)
+            # Owns-its-data apps also get auth/payments/email tiers when the
+            # brief signals them — the data backend is a real server.
+            feature_tiers = _detect_feature_tiers(brief)
+            if feature_tiers:
+                plan = plan + _feature_tier_files(feature_tiers)
         elif backend_preference is True or (
             backend_preference is not False and _needs_backend(brief)
         ):
@@ -499,6 +504,12 @@ def plan_for_stack(
             # IS no backend).
             if _needs_configurable_ui(brief):
                 plan = plan + _configurable_tier_files(services)
+            # Feature tiers (auth / payments / email) ride on the backend
+            # tier too — they need a server to hold secrets and run flows.
+            # Emitted only when the brief signals them; pluggable per-tier.
+            feature_tiers = _detect_feature_tiers(brief)
+            if feature_tiers:
+                plan = plan + _feature_tier_files(feature_tiers)
         if _needs_extensibility(brief):
             plan = plan + _extensibility_tier_files(stack, brief)
         # Design-system primitives — every dashboard-class scaffold gets
@@ -1367,6 +1378,146 @@ def _configurable_tier_files(services: List[str]) -> FilePlan:
          "refreshes the cache. testConnection POSTs with optional "
          "patch (so user can test before saving)."),
     ]
+
+
+# ── Feature-tier detection (auth / payments / email) ────────────────────
+#
+# Some product briefs need cross-cutting feature scaffolds that the
+# generic backend proxy doesn't cover: user authentication, payments, and
+# transactional email. These ride on top of the backend tier (they need a
+# server to hold secrets and run flows) and are emitted ONLY when the brief
+# signals them. Each tier is a small, pluggable file set keyed off a phrase
+# match — additive to the plan, never replacing existing tiers.
+
+_AUTH_SIGNALS: Tuple[str, ...] = (
+    "auth", "authentication", "authenticate",
+    "login", "log in", "log-in", "sign in", "sign-in", "signin",
+    "signup", "sign up", "sign-up", "register", "registration",
+    "user account", "user accounts", "accounts",
+    "jwt", "session", "oauth", "sso", "single sign-on",
+    "magic link", "magic-link", "password reset", "forgot password",
+    "role-based", "rbac", "permissions",
+)
+
+_PAYMENT_SIGNALS: Tuple[str, ...] = (
+    "payment", "payments", "checkout", "billing",
+    "stripe", "paddle", "lemon squeezy", "lemonsqueezy",
+    "subscription billing", "subscriptions", "paywall",
+    "credit card", "pricing tier", "pricing plan", "plan upgrade",
+    "purchase", "buy now", "shopping cart", "e-commerce", "ecommerce",
+    "invoice", "invoicing",
+)
+
+_EMAIL_SIGNALS: Tuple[str, ...] = (
+    "email notification", "transactional email", "send email",
+    "send emails", "sends email", "email the user", "notify by email",
+    "smtp", "sendgrid", "mailgun", "postmark", "resend",
+    "welcome email", "confirmation email", "verification email",
+    "email verification", "newsletter", "email digest",
+)
+
+
+def _detect_feature_tiers(brief: str) -> List[str]:
+    """Return which cross-cutting feature tiers the brief signals.
+
+    Output is a stable, de-duplicated subset of
+    ``['auth', 'payments', 'email']``. Empty when none match — in which
+    case ``plan_for_stack`` appends nothing (existing behavior).
+    """
+    if not brief:
+        return []
+    text = brief.lower()
+    found: List[str] = []
+    if any(sig in text for sig in _AUTH_SIGNALS):
+        found.append("auth")
+    if any(sig in text for sig in _PAYMENT_SIGNALS):
+        found.append("payments")
+    if any(sig in text for sig in _EMAIL_SIGNALS):
+        found.append("email")
+    return found
+
+
+# Pluggable per-tier file builders. Keyed by tier name so adding a new
+# tier later is a one-line registry edit. Each returns a small FilePlan.
+def _auth_tier_files() -> FilePlan:
+    return [
+        ("server/auth/auth-routes.js",
+         "Express router for auth: POST /api/auth/register, /login, /logout, "
+         "/me. Hashes passwords with bcrypt, issues a signed JWT (secret from "
+         "env JWT_SECRET), sets it as an httpOnly cookie. ESM module exporting "
+         "the router. No plaintext passwords; validate inputs."),
+        ("server/auth/middleware.js",
+         "requireAuth middleware: reads the JWT from the httpOnly cookie (or "
+         "Authorization: Bearer header), verifies it with JWT_SECRET, attaches "
+         "req.user. Returns 401 on missing/invalid token. ESM export."),
+        ("src/hooks/useAuth.js",
+         "React hook + context provider. Exposes {user, isLoading, login(creds), "
+         "register(creds), logout()}. Calls /api/auth/* with credentials: "
+         "'include'. Caches the current user; refreshes from /api/auth/me on "
+         "mount."),
+        ("src/components/LoginForm.jsx",
+         "Email + password form posting to useAuth().login. Inline error "
+         "display, disabled-while-submitting state, link to register. Styled "
+         "with CSS variables (var(--brand-*)), not Tailwind."),
+    ]
+
+
+def _payments_tier_files() -> FilePlan:
+    return [
+        ("server/payments/payment-routes.js",
+         "Express router for payments behind a pluggable provider (Stripe by "
+         "default). POST /api/payments/create-checkout-session creates a "
+         "checkout session; reads the secret key from env (e.g. "
+         "STRIPE_SECRET_KEY). POST /api/payments/webhook verifies the signature "
+         "and updates order/subscription state. ESM. Never logs secrets."),
+        ("server/payments/provider.js",
+         "Thin payment-provider abstraction: createCheckout(opts), "
+         "verifyWebhook(rawBody, signature), getSubscription(id). Default impl "
+         "wraps Stripe (key from env); the interface lets another provider drop "
+         "in without touching the routes. No-ops with a clear error when the "
+         "key is absent."),
+        ("src/components/CheckoutButton.jsx",
+         "Button that POSTs to /api/payments/create-checkout-session and "
+         "redirects the browser to the returned checkout URL. Disabled + "
+         "spinner while the request is in flight. CSS-variable styling."),
+    ]
+
+
+def _email_tier_files() -> FilePlan:
+    return [
+        ("server/email/mailer.js",
+         "Transactional-email module behind a pluggable provider. Exports "
+         "sendEmail({to, subject, html, text}). Default transport uses SMTP "
+         "(nodemailer) with host/port/user/pass from env; a provider env switch "
+         "(e.g. EMAIL_PROVIDER=sendgrid) can select an HTTP API instead. Returns "
+         "{ok, id, error}; never throws into the request path."),
+        ("server/email/templates.js",
+         "Plain-function email templates returning {subject, html, text}: "
+         "welcomeEmail(user), verifyEmail(user, link), resetPassword(user, "
+         "link). Keep them dependency-free so they're trivially testable."),
+    ]
+
+
+_FEATURE_TIER_BUILDERS: Dict[str, Callable[[], FilePlan]] = {
+    "auth": _auth_tier_files,
+    "payments": _payments_tier_files,
+    "email": _email_tier_files,
+}
+
+
+def _feature_tier_files(tiers: List[str]) -> FilePlan:
+    """Assemble the file plan for the requested feature tiers.
+
+    Pluggable via ``_FEATURE_TIER_BUILDERS`` — unknown tier names are
+    ignored. Returns an empty list when ``tiers`` is empty so callers can
+    unconditionally concatenate the result.
+    """
+    files: FilePlan = []
+    for tier in tiers:
+        builder = _FEATURE_TIER_BUILDERS.get(tier)
+        if builder is not None:
+            files = files + builder()
+    return files
 
 
 def _needs_extensibility(brief: str) -> bool:

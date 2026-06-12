@@ -2,6 +2,7 @@
 
 from skyn3t.adapters import ClaudeCLIAgent, CLIAgent, CopilotCLIAgent, KimiCLIAgent
 from skyn3t.agents.architect import ArchitectAgent
+from skyn3t.agents.asset_agent import AssetAgent
 from skyn3t.agents.brainstorm import BrainstormAgent
 from skyn3t.agents.build_verifier import BuildVerifierAgent
 from skyn3t.agents.business_analyst import BusinessAnalystAgent
@@ -27,6 +28,7 @@ from skyn3t.agents.writer import WriterAgent
 
 __all__ = [
     "ArchitectAgent",
+    "AssetAgent",
     "BrainstormAgent",
     "BuildVerifierAgent",
     "BusinessAnalystAgent",

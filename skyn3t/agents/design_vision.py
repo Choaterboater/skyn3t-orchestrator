@@ -378,6 +378,96 @@ def load_by_sha(sha: str) -> Optional[DesignReference]:
     return _cached(sha)
 
 
+# ── Non-photo design-source seam (Figma / Penpot exports) ───────────────
+# extract() above is the photo/image path and is left untouched. Imported
+# design sources (Figma/Penpot) carry palette + typography as STRUCTURED
+# data, not pixels — so they don't need vision-CLI inference. This seam
+# normalizes such an export into the same DesignReference shape the rest of
+# the designer pipeline already consumes. When the source IS a flat image,
+# we just delegate to extract(); when it's a structured token export, we
+# coerce it directly (no CLI call, no key).
+
+# Roles we recognize in a Figma/Penpot variable/style export. Anything
+# else is kept verbatim so we don't lose direction.
+_TOKEN_PALETTE_ROLES = {"bg", "surface", "accent", "text", "muted", "status", "primary"}
+
+
+def design_reference_from_tokens(
+    tokens: dict, *, source_label: str = "design-export"
+) -> Optional[DesignReference]:
+    """Coerce a structured token export (Figma/Penpot variables) into a
+    ``DesignReference``. Returns ``None`` when there's no usable palette.
+
+    Expected (loose) shape::
+
+        {"palette": [{"name","hex","role"}, ...],
+         "typography_vibe": str, "layout_density": str,
+         "mood": [str], "forbidden_words": [str]}
+
+    Tolerant of partial input — missing fields default empty.
+    """
+    if not isinstance(tokens, dict):
+        return None
+    raw_palette = tokens.get("palette") or []
+    palette: List[PaletteEntry] = []
+    for entry in raw_palette:
+        if not isinstance(entry, dict):
+            continue
+        hex_code = str(entry.get("hex") or "").strip()
+        if not hex_code:
+            continue
+        role = str(entry.get("role") or "accent").strip().lower()
+        palette.append(
+            PaletteEntry(
+                name=str(entry.get("name") or role or "color"),
+                hex=hex_code,
+                role=role if role in _TOKEN_PALETTE_ROLES else "accent",
+            )
+        )
+    if not palette:
+        return None
+    return DesignReference(
+        image_path=f"<{source_label}>",
+        image_sha="",
+        palette=palette,
+        typography_vibe=str(tokens.get("typography_vibe") or ""),
+        layout_density=str(tokens.get("layout_density") or ""),
+        mood=[str(x) for x in (tokens.get("mood") or []) if x],
+        notable_elements=[str(x) for x in (tokens.get("notable_elements") or []) if x],
+        forbidden_words=[str(x).lower() for x in (tokens.get("forbidden_words") or []) if x],
+        verdict_one_liner=str(tokens.get("verdict_one_liner") or ""),
+        extracted_at=time.time(),
+    )
+
+
+async def extract_design_source(
+    *, source: str, ref: "str | Path", tokens: Optional[dict] = None
+) -> Optional[DesignReference]:
+    """Unified design-import seam over heterogeneous sources.
+
+    * ``source='image'`` (or ``'photo'``/``'screenshot'``) → delegate to
+      the unchanged :func:`extract` image path.
+    * ``source in ('figma','penpot','tokens','export')`` → coerce the
+      already-fetched ``tokens`` dict (provided by the AssetAgent's
+      provider hook) into a ``DesignReference`` with no CLI call.
+
+    Returns ``None`` on any failure so callers degrade gracefully. The
+    image path keeps its exact prior behavior.
+    """
+    src = (source or "").strip().lower()
+    if src in ("image", "photo", "screenshot", ""):
+        return await extract(Path(ref))
+    if src in ("figma", "penpot", "tokens", "export"):
+        if not isinstance(tokens, dict):
+            logger.info(
+                "extract_design_source(%s): no tokens payload supplied; skipping", src
+            )
+            return None
+        return design_reference_from_tokens(tokens, source_label=src)
+    logger.info("extract_design_source: unknown source %r", source)
+    return None
+
+
 # ── Screenshot scoring rubric ───────────────────────────────────────────
 # build_verifier's visual gate renders the generated app, screenshots it,
 # and (optionally) calls score_screenshot for a 0-100 design-quality

@@ -130,6 +130,36 @@ def signature_for_build_issues(
     return None
 
 
+def signatures_for_blockers(
+    blockers: List[Any],
+    *,
+    source: str = "reviewer",
+) -> List[str]:
+    """Bucket a list of reviewer/contract blockers into stable signatures.
+
+    Thin wrapper used by intelligence.reflection.build_retry_directive: where
+    ``signature_for_findings`` collapses a finding list to ONE dominant
+    signature, the reflective-retry directive wants the full set so the
+    experience index / routing can correlate every distinct failure bucket a
+    retry was reacting to.
+
+    Returns an order-preserving, de-duplicated list (empty when nothing is
+    classifiable — never poisons callers with ``unknown`` buckets).
+    """
+    if not blockers:
+        return []
+    out: List[str] = []
+    seen = set()
+    for blocker in blockers:
+        if not isinstance(blocker, dict):
+            continue
+        sig = signature_for_finding(blocker, source=source)
+        if sig and sig not in seen:
+            seen.add(sig)
+            out.append(sig)
+    return out
+
+
 def signature_for_findings(
     findings: List[Any],
     *,

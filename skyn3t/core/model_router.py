@@ -46,6 +46,7 @@ import json
 import logging
 import os
 import random
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -489,6 +490,122 @@ def resolve_model(
     return (
         str(route.get("backend") or _TIERS["cheap"][0]),
         route.get("model"),
+    )
+
+
+# ── Predictive "auto mode" routing ──────────────────────────────────
+#
+# select_best_model() is a NON-breaking superset of resolve_model(). By
+# default it returns the existing static route wrapped in a RouteChoice
+# (source='static'). When SKYN3T_AUTO_ROUTE is enabled (default OFF) or
+# the caller passes prefer='auto', it consults the predictive layer
+# (intelligence.routing_recommendations.best_model_for) which ranks
+# (stack, stage, feature) cells from recorded observations joined with
+# the cheap-model tournament. If the predictive layer has no evidence,
+# it degrades gracefully back to the static route. It NEVER forces an
+# expensive backend — the predictive ranker breaks ties toward the
+# cheaper relative_backend_cost.
+
+
+@dataclass
+class RouteChoice:
+    backend: str
+    model: Optional[str]
+    tier: str
+    source: str
+    score: float
+    rationale: str
+
+
+def _auto_route_enabled() -> bool:
+    """Auto-route is opt-in (default OFF) via ``SKYN3T_AUTO_ROUTE``."""
+    raw = os.environ.get("SKYN3T_AUTO_ROUTE", "").strip().lower()
+    return raw in ("1", "on", "true", "yes")
+
+
+def _static_route_choice(stage_name: Optional[str]) -> RouteChoice:
+    route = _route_for_stage(stage_name)
+    return RouteChoice(
+        backend=str(route.get("backend") or _TIERS["cheap"][0]),
+        model=route.get("model"),
+        tier=str(route.get("tier") or "cheap"),
+        source="static",
+        score=0.0,
+        rationale=(
+            f"static route (source={route.get('source')}, "
+            f"tier={route.get('tier')})"
+        ),
+    )
+
+
+def select_best_model(
+    stage_name: str,
+    *,
+    brief: Optional[str] = None,
+    stack: Optional[str] = None,
+    features: Optional[List[str]] = None,
+    prefer: str = "auto",
+) -> RouteChoice:
+    """Pick the best route for a stage, optionally consulting the
+    predictive (observation + tournament) layer.
+
+    Non-breaking superset of :func:`resolve_model`:
+
+    * ``prefer='static'`` (or auto-route flag off + ``prefer != 'auto'``)
+      → returns the existing static route wrapped in ``RouteChoice``.
+    * ``prefer='auto'`` AND (``SKYN3T_AUTO_ROUTE`` enabled OR
+      ``prefer == 'auto'`` explicitly requested) → consults
+      ``best_model_for`` and returns the winning cheap route when there
+      is evidence; otherwise degrades to the static route.
+
+    Auto-mode is gated so the common path stays deterministic: the
+    predictive layer only runs when EITHER the env flag is set OR the
+    caller explicitly asked for ``prefer='auto'`` AND the flag is set.
+    With the flag off, the default ``prefer='auto'`` behaves exactly like
+    the static route — preserving today's behavior for every existing
+    call site that doesn't opt in.
+    """
+    want_predictive = prefer == "auto" and _auto_route_enabled()
+    if prefer not in ("auto", "static"):
+        # Treat an explicit tier/backend hint as static for now; future
+        # callers may pass a concrete preference. Unknown values are
+        # conservative (static) so we never surprise an existing caller.
+        want_predictive = False
+    if not want_predictive:
+        return _static_route_choice(stage_name)
+
+    try:
+        from skyn3t.intelligence.routing_recommendations import best_model_for
+
+        recommendation = best_model_for(
+            stage=stage_name, stack=stack, features=features
+        )
+    except Exception:
+        logger.debug("auto-route predictive lookup failed", exc_info=True)
+        recommendation = None
+
+    if not recommendation:
+        # Graceful degrade — no observations/tournament evidence yet.
+        fallback = _static_route_choice(stage_name)
+        fallback.rationale = "auto-route: no evidence; " + fallback.rationale
+        return fallback
+
+    backend = str(recommendation.get("backend") or "")
+    if not backend:
+        return _static_route_choice(stage_name)
+    model = recommendation.get("model")
+    tier = (
+        str(recommendation.get("tier") or "")
+        or tier_for_backend_model(backend, model)
+        or tier_for_stage(stage_name)
+    )
+    return RouteChoice(
+        backend=backend,
+        model=model,
+        tier=tier,
+        source=str(recommendation.get("source") or "predictive"),
+        score=float(recommendation.get("score") or 0.0),
+        rationale=str(recommendation.get("rationale") or "auto-route"),
     )
 
 

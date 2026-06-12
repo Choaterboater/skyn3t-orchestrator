@@ -290,3 +290,38 @@ def brand_kit_markdown(slugs: List[str]) -> str:
 
 def known_slugs() -> List[str]:
     return sorted(_BRAND_CATALOG.keys())
+
+
+def generated_assets_markdown(assets: Optional[List[dict]]) -> str:
+    """Render a markdown block referencing AssetAgent-generated assets.
+
+    ``assets`` is the ``output['assets']`` list from
+    :class:`skyn3t.agents.asset_agent.AssetAgent` — each entry is
+    ``{kind, path, provider, skipped, ...}``. Only entries that were
+    actually written (``skipped`` is falsey) are referenced, so the
+    generated UI never points at a missing file.
+
+    Additive: returns ``""`` when there are no usable generated assets, so
+    callers that always append this block are unaffected when asset
+    generation is off / skipped.
+    """
+    if not assets:
+        return ""
+    usable = [a for a in assets if isinstance(a, dict) and not a.get("skipped") and a.get("path")]
+    if not usable:
+        return ""
+    blocks: List[str] = [
+        "## Generated brand assets\n",
+        "These assets were generated for this project. Reference them by "
+        "their relative path instead of hand-rolling inline SVG or using "
+        "emoji placeholders.\n",
+    ]
+    for a in usable:
+        kind = str(a.get("kind") or "asset")
+        path = str(a.get("path") or "")
+        provider = str(a.get("provider") or "generated")
+        blocks.append(
+            f"- **{kind}** — `{path}` (via {provider}); "
+            f"render with `<img src=\"{path}\" alt=\"{kind}\" />`."
+        )
+    return "\n".join(blocks) + "\n"

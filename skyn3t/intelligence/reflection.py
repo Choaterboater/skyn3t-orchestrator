@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -11,6 +12,11 @@ from uuid import uuid4
 
 from skyn3t.core.agent import TaskResult
 from skyn3t.core.events import Event, EventBus, EventType
+from skyn3t.intelligence.error_signatures import (
+    signature_for_build_issues,
+    signature_for_findings,
+    signatures_for_blockers,
+)
 
 logger = logging.getLogger("skyn3t.intelligence.reflection")
 
@@ -595,3 +601,304 @@ class ReflectionEngine:
             "lessons_count": len(self.lessons._lessons),
             "agents_with_adjustments": list(self.tuner._adjustments.keys()),
         }
+
+
+# ---------------------------------------------------------------------------
+# ReflectionPlannerHook — planner-facing reflective-retry directive
+# ---------------------------------------------------------------------------
+#
+# Today the retry "lesson" is hand-rolled inline in studio/runner.py
+# (_maybe_auto_retry): it builds a lesson_block / debate_note / escalation_note
+# by string-concatenation and re-launches `start("auto", ...)` blindly. That
+# logic reasons about the failure ad-hoc and can't feed the planner anything
+# structured.
+#
+# build_retry_directive() centralizes that reasoning. It is PURE and SYNC — no
+# I/O, no LLM calls, no event bus — so the planner (studio/planner.py) and the
+# runner can both consult it deterministically. It reuses the existing failure
+# vocabulary (FailurePatternAnalyzer + PromptSuggestionEngine) and the stable
+# error-signature derivation (error_signatures.*) so the retry biases the next
+# plan/prompt toward WHY the prior attempt failed instead of a blind re-run.
+#
+# Flag: SKYN3T_REFLECTIVE_RETRY (default ON). Consumers check it; when there is
+# no failure context the directive is a graceful no-op (augmented_brief == brief).
+
+
+# Canonical model_router tier names (see core/model_router.py _TIERS).
+_TIER_CHEAP = "cheap"
+_TIER_BALANCED = "balanced"
+_TIER_STRONG = "strong"
+
+
+def reflective_retry_enabled() -> bool:
+    """SKYN3T_REFLECTIVE_RETRY gate (default ON).
+
+    Consumers (planner/runner) call this to decide whether to apply a
+    directive. build_retry_directive itself is always safe to call; this
+    just lets callers degrade to legacy blind-retry behavior if the flag
+    is explicitly turned off.
+    """
+    raw = os.getenv("SKYN3T_REFLECTIVE_RETRY")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+@dataclass
+class RetryDirective:
+    """Structured guidance for re-planning after a failed build attempt.
+
+    Pure data — produced by build_retry_directive() and consumed by
+    studio/planner.plan_pipeline() (to bias agent selection + inject prompt
+    patches) and studio/runner (to escalate tiers / avoid backends).
+
+    Fields:
+        augmented_brief:   original brief + an actionable "prior attempt
+                           failed because X" constraint block. Equals the
+                           input brief verbatim when there is no failure
+                           context (graceful no-op).
+        prompt_patches:    short imperative instructions to append to stage
+                           prompts (derived from PromptSuggestionEngine).
+        forced_stage_tier: {stage_name: tier} overrides ('cheap'/'balanced'/
+                           'strong') — e.g. escalate 'code' to 'strong' on a
+                           stub/entrypoint failure. Never forces expensive
+                           tiers without a concrete justification.
+        avoid_backends:    backends to prefer NOT re-using (the prior backend
+                           that produced the failing scaffold), so the auto
+                           chain falls through to a fresh perspective.
+        rationale:         human-readable one-liner(s) explaining the choices.
+        signatures:        stable error signatures (error_signatures.*) so the
+                           experience index / routing can correlate retries.
+    """
+
+    augmented_brief: str
+    prompt_patches: List[str] = field(default_factory=list)
+    forced_stage_tier: Dict[str, str] = field(default_factory=dict)
+    avoid_backends: List[str] = field(default_factory=list)
+    rationale: str = ""
+    signatures: List[str] = field(default_factory=list)
+
+
+def _dedupe_preserve(items: List[str]) -> List[str]:
+    """Order-preserving de-dup; drops empties. Pure helper."""
+    seen: Set[str] = set()
+    out: List[str] = []
+    for item in items:
+        if not item:
+            continue
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _is_stub_failure(blob: str) -> bool:
+    """Heuristic mirror of runner._maybe_auto_retry's stub/entrypoint gate."""
+    low = blob.lower()
+    return any(
+        tok in low
+        for tok in (
+            "stub",
+            "entrypoint",
+            "code generation failed",
+            "skyn3t-backfill",
+            "export default null",
+            "generation failed",
+        )
+    )
+
+
+def build_retry_directive(
+    *,
+    brief: str,
+    error: Optional[str] = None,
+    build_hint: Optional[str] = None,
+    blockers: Optional[List[Dict[str, Any]]] = None,
+    prior_backend: Optional[str] = None,
+    failed_stages: Optional[List[str]] = None,
+) -> RetryDirective:
+    """Reason about WHY a build attempt failed and emit a structured retry
+    directive the planner/runner can apply (instead of blind re-run).
+
+    PURE + SYNC: no I/O, no LLM calls, no event bus. Safe to call from the
+    planner. Idempotent — same inputs always yield an equal directive.
+
+    Graceful no-op: when there is no usable failure context (no error,
+    build_hint, blockers, prior_backend, or failed_stages), returns a
+    directive whose augmented_brief == brief, with empty patches/signatures.
+
+    Args mirror the ReflectionPlannerHook contract:
+        brief:          the original brief to augment.
+        error:          terminal error summary (manifest['error'] / next_action).
+        build_hint:     compact build-log tail (manifest['_retry_hint']).
+        blockers:       reviewer/contract findings (list of dicts with
+                        'category'/'severity'/'file' etc).
+        prior_backend:  backend that produced the failing scaffold.
+        failed_stages:  stage names that failed in the prior attempt.
+    """
+    base_brief = brief or ""
+    blockers = blockers or []
+    failed_stages = [s for s in (failed_stages or []) if s]
+    prior_backend = (prior_backend or "").strip()
+    error = (error or "").strip()
+    build_hint = (build_hint or "").strip()
+
+    has_context = bool(error or build_hint or blockers or prior_backend or failed_stages)
+    if not has_context:
+        # No failure to reason about — pure pass-through (graceful no-op).
+        return RetryDirective(augmented_brief=base_brief)
+
+    # --- 1. Stable error signatures (error_signatures.*) ------------------
+    signatures: List[str] = []
+    if blockers:
+        signatures.extend(signatures_for_blockers(blockers))
+        # signature_for_findings prefers severity=='blocker' and returns the
+        # single dominant signature — keep it too so the experience index has
+        # a canonical "the one that mattered" entry alongside the per-blocker
+        # bucket list.
+        dominant = signature_for_findings(blockers, source="reviewer")
+        if dominant:
+            signatures.append(dominant)
+    if build_hint:
+        # Build-log tail: feed it as a single pseudo-issue dict so we reuse the
+        # build-error classifier without I/O.
+        build_sig = signature_for_build_issues([{"error_message": build_hint}])
+        if build_sig:
+            signatures.append(build_sig)
+    signatures = _dedupe_preserve(signatures)
+
+    # --- 2. Failure patterns + prompt patches ------------------------------
+    # Reuse the existing detectors. A fresh analyzer instance keeps this pure
+    # (no shared mutable state across calls / no occurrence_count leakage into
+    # the module-level DEFAULT_PATTERNS singletons would be wrong — but
+    # FailurePatternAnalyzer reuses DEFAULT_PATTERNS by reference, so we pass
+    # COPIES to avoid mutating shared state across retries).
+    analyzer = FailurePatternAnalyzer(
+        custom_patterns=[
+            FailurePattern(
+                name=p.name,
+                regex=p.regex,
+                description=p.description,
+                suggested_fix=p.suggested_fix,
+            )
+            for p in FailurePatternAnalyzer.DEFAULT_PATTERNS
+        ]
+    )
+    # The copies above are PREPENDED, so they win; but analyzer still appends
+    # the shared DEFAULT_PATTERNS. To guarantee we never touch the singletons,
+    # restrict matching to just our copies.
+    analyzer.patterns = analyzer.patterns[: len(FailurePatternAnalyzer.DEFAULT_PATTERNS)]
+
+    error_blob = " ".join(
+        part
+        for part in (
+            error,
+            build_hint,
+            " ".join(
+                str(b.get("message") or b.get("detail") or b.get("category") or "")
+                for b in blockers
+                if isinstance(b, dict)
+            ),
+        )
+        if part
+    ).strip()
+
+    matched_patterns: List[FailurePattern] = []
+    if error_blob:
+        matched_patterns = analyzer.analyze("retry", error_blob)
+
+    suggestion_engine = PromptSuggestionEngine()
+    suggestions = suggestion_engine.suggest(matched_patterns, current_prompt=base_brief)
+    prompt_patches: List[str] = []
+    for s in suggestions:
+        if s.get("type") == "patch" and s.get("patch"):
+            prompt_patches.append(str(s["patch"]))
+        elif s.get("advice"):
+            prompt_patches.append(str(s["advice"]))
+
+    # --- 3. Tier escalation (forced_stage_tier) ----------------------------
+    forced_stage_tier: Dict[str, str] = {}
+    pattern_names = {p.name for p in matched_patterns}
+    stub_failure = _is_stub_failure(f"{error} {build_hint}")
+    rationale_bits: List[str] = []
+
+    if stub_failure:
+        # Entrypoint/core stub → the code stage needs a stronger model.
+        forced_stage_tier["code"] = _TIER_STRONG
+        rationale_bits.append("prior attempt shipped an entrypoint/core stub; escalating code→strong")
+    if "syntax_error" in pattern_names:
+        # Syntax errors mean the generator botched output — escalate code a
+        # notch (balanced) rather than all the way to strong (cost-aware).
+        forced_stage_tier.setdefault("code", _TIER_BALANCED)
+        rationale_bits.append("syntax errors in prior output; escalating code→balanced")
+    if "hallucination" in pattern_names:
+        forced_stage_tier.setdefault("reviewer", _TIER_BALANCED)
+        rationale_bits.append("hallucination signals; escalating reviewer→balanced")
+    if "context_length" in pattern_names:
+        # Context overflow won't be fixed by a stronger model — leave tiers,
+        # the prompt patch (summarize/larger context) handles it.
+        rationale_bits.append("context-length overflow; relying on prompt patch not tier bump")
+    # rate_limit / auth / timeout are environmental — never escalate tier for
+    # those (would just burn budget). The prompt patches already advise on them.
+
+    # --- 4. Backends to avoid ---------------------------------------------
+    avoid_backends: List[str] = []
+    if prior_backend:
+        avoid_backends.append(prior_backend)
+        rationale_bits.append(
+            f"prior backend '{prior_backend}' produced the failing scaffold; "
+            f"prefer a different model for a fresh perspective"
+        )
+    avoid_backends = _dedupe_preserve(avoid_backends)
+
+    # --- 5. Augmented brief -----------------------------------------------
+    constraint_lines: List[str] = ["Prior attempt failed. Use this as a hard constraint for the retry:"]
+    if build_hint:
+        constraint_lines.append(f"- Build verification failed with:\n{build_hint}")
+        constraint_lines.append(
+            "  Fix the specific error above. Keep the same stack and file "
+            "structure unless the error is fundamentally unfixable in this ecosystem."
+        )
+    if failed_stages:
+        constraint_lines.append(f"- Stages that failed: {', '.join(failed_stages)}.")
+    if error and not build_hint:
+        constraint_lines.append(f"- Error: {error[:500]}")
+    if stub_failure:
+        constraint_lines.append(
+            "- The entrypoint (App/main/page) or a core file shipped as a "
+            "generation-failure stub. The retry MUST generate a complete, "
+            "runnable entrypoint that imports and renders the real components "
+            "— no placeholders, no 'export default null', no 'Generation failed' JSX."
+        )
+    if prior_backend:
+        constraint_lines.append(
+            f"- The prior scaffold was generated by '{prior_backend}'. Prefer a "
+            f"DIFFERENT model so a second perspective gets a shot at the problem."
+        )
+    if blockers:
+        labels = _dedupe_preserve(
+            [
+                str(b.get("category") or b.get("rule") or b.get("kind") or "")
+                for b in blockers
+                if isinstance(b, dict)
+            ]
+        )
+        if labels:
+            constraint_lines.append(f"- Reviewer blockers to resolve: {', '.join(labels)}.")
+    for patch in prompt_patches:
+        constraint_lines.append(f"- {patch}")
+
+    constraint_block = "\n".join(constraint_lines)
+    augmented_brief = (base_brief.rstrip() + "\n\n" + constraint_block) if base_brief else constraint_block
+
+    rationale = "; ".join(rationale_bits) if rationale_bits else "reflective retry: applied prior-failure constraints to brief"
+
+    return RetryDirective(
+        augmented_brief=augmented_brief,
+        prompt_patches=_dedupe_preserve(prompt_patches),
+        forced_stage_tier=forced_stage_tier,
+        avoid_backends=avoid_backends,
+        rationale=rationale,
+        signatures=signatures,
+    )

@@ -111,6 +111,11 @@ class BaseAgent(ABC):
         self._results_max = 200
         self._enabled: bool = True
         self._llm = None
+        # A2A inbox-pump task (Phase 5A ConversationLoopAPI). Lazily started
+        # by start_inbox_pump(); drains the shared MessageBus inbox and
+        # dispatches to on_message. None when no pump is running.
+        self._inbox_pump_task: Optional[asyncio.Task] = None
+        self._inbox_pumping: bool = False
 
     @property
     def _task_queue(self) -> "asyncio.Queue[TaskRequest]":
@@ -147,6 +152,11 @@ class BaseAgent(ABC):
     async def shutdown(self) -> None:
         """Shutdown the agent gracefully."""
         self._running = False
+        # Stop the A2A inbox pump so its background task doesn't outlive us.
+        try:
+            await self.stop_inbox_pump()
+        except Exception:
+            pass
         # Wake the processor immediately so it observes _running=False
         # without waiting for a queue item or timeout.
         try:
@@ -525,9 +535,144 @@ class BaseAgent(ABC):
         Subclasses may override this to respond to ``request`` messages.
         The default implementation returns ``None`` (no auto-response).
         If a non-None message is returned, it is sent back as a response
-        via the MessageBus.
+        via the MessageBus. ``on_message`` may also be a coroutine in
+        subclasses; ``pump_inbox`` awaits it transparently.
         """
         return None
+
+    # ------------------------------------------------------------------
+    # A2A inbox pump (Phase 5A ConversationLoopAPI)
+    # ------------------------------------------------------------------
+    async def pump_inbox(
+        self, *, once: bool = False, timeout: Optional[float] = None
+    ) -> int:
+        """Drain this agent's MessageBus inbox and dispatch to on_message.
+
+        Pulls AgentMessages off ``get_default_bus(self.event_bus).recv`` and
+        hands each to ``on_message``. When ``on_message`` returns a message
+        for a ``request``-kind incoming message, that return is sent back as
+        the response (auto-respond), closing the request/response loop the
+        MessageBus correlates. If ``on_message`` returns ``None`` for a
+        request, an empty acknowledgement response is still sent so the
+        requester's ``request()`` future resolves instead of timing out.
+
+        Args:
+            once: When True, processes exactly one message (or returns 0 on
+                timeout) and returns. When False, loops until the inbox is
+                drained for ``timeout`` (or, with ``timeout=None``, until
+                ``stop_inbox_pump`` flips ``_inbox_pumping`` off).
+            timeout: Per-recv wait. ``None`` blocks until a message arrives
+                (used by the background pump). A float bounds each recv so a
+                synchronous ``once``/drain call can return.
+
+        Returns:
+            The number of messages processed.
+        """
+        from skyn3t.core.messaging import get_default_bus
+
+        bus = get_default_bus(self.event_bus)
+        processed = 0
+        # For a bounded drain (timeout set, not the background pump) we keep
+        # going until a recv times out; for the background pump (timeout None)
+        # we loop while pumping is requested.
+        while True:
+            recv_timeout = timeout
+            if not once and timeout is None:
+                # Background pump: bounded recv so we can observe stop signals.
+                recv_timeout = 0.5
+            try:
+                msg = await bus.recv(self.name, timeout=recv_timeout)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — recv must never crash the pump
+                logger.debug("pump_inbox recv failed for %s", self.name, exc_info=True)
+                msg = None
+
+            if msg is None:
+                # Timed out with nothing to do.
+                if once:
+                    return processed
+                if timeout is None:
+                    # Background pump tick: respect stop signal then keep going.
+                    if not self._inbox_pumping:
+                        return processed
+                    continue
+                # Bounded drain finished.
+                return processed
+
+            await self._dispatch_message(bus, msg)
+            processed += 1
+            if once:
+                return processed
+            if timeout is None and not self._inbox_pumping:
+                return processed
+
+    async def _dispatch_message(self, bus: Any, msg: "AgentMessage") -> None:
+        """Invoke on_message and auto-respond to request-kind messages."""
+        self.last_active_at = datetime.now(timezone.utc)
+        reply: Optional["AgentMessage"] = None
+        try:
+            result = self.on_message(msg)
+            if inspect.isawaitable(result):
+                result = await result
+            reply = result  # type: ignore[assignment]
+        except Exception:  # noqa: BLE001 — a handler must not break the pump
+            logger.debug("on_message failed for %s", self.name, exc_info=True)
+            reply = None
+
+        if msg.kind != "request":
+            return
+
+        # Auto-respond so the requester's future always resolves.
+        if reply is not None:
+            content = getattr(reply, "content", "") or ""
+            payload = getattr(reply, "payload", None) or {}
+        else:
+            content = ""
+            payload = {}
+        try:
+            await bus.respond(msg, content=content, payload=payload)
+        except Exception:  # noqa: BLE001
+            logger.debug("auto-respond failed for %s", self.name, exc_info=True)
+
+    def start_inbox_pump(self) -> None:
+        """Start a background task that continuously drains this agent's inbox.
+
+        Idempotent: a second call while a pump is running is a no-op. Requires
+        a running event loop (call from within ``orchestrator.start()`` /
+        ``spawn_subordinate``).
+        """
+        if self._inbox_pumping and self._inbox_pump_task and not self._inbox_pump_task.done():
+            return
+        self._inbox_pumping = True
+        try:
+            self._inbox_pump_task = asyncio.create_task(self._inbox_pump_loop())
+        except RuntimeError:
+            # No running loop — degrade gracefully (caller can pump manually).
+            self._inbox_pumping = False
+            self._inbox_pump_task = None
+
+    async def _inbox_pump_loop(self) -> None:
+        try:
+            await self.pump_inbox(once=False, timeout=None)
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001
+            logger.debug("inbox pump loop crashed for %s", self.name, exc_info=True)
+
+    async def stop_inbox_pump(self) -> None:
+        """Stop the background inbox pump if running."""
+        self._inbox_pumping = False
+        task = self._inbox_pump_task
+        self._inbox_pump_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001
+                pass
 
     def resolve_artifact_dir(self, raw: Any) -> "Path":
         """Centralized artifact-dir resolution to stop leaks into the repo root.

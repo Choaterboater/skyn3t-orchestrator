@@ -387,6 +387,25 @@ class DesignerAgent(BaseAgent):
             str(logo_svg_path), str(readme_path),
         ]
 
+        # ── Generated assets + imported design tokens (flag-guarded) ────
+        # Optional, additive, and OFF by default. When SKYN3T_ASSET_GEN is
+        # off (or no provider key/hook), this is a complete no-op and the
+        # designer's behavior is exactly as before. When on, we ask the
+        # AssetAgent for generated assets (logo/hero/sprite) and consume any
+        # imported design tokens supplied by the caller. Best-effort: any
+        # failure here is swallowed so it can never block the brand pack.
+        generated_assets: list = []
+        imported_tokens = None
+        try:
+            generated_assets, imported_tokens = await self._maybe_generate_assets(
+                brief=brief, mood=mood, artifact_dir=artifact_dir, data=data
+            )
+            for entry in generated_assets:
+                if not entry.get("skipped") and entry.get("path"):
+                    files.append(str(entry["path"]))
+        except Exception:
+            logger.exception("designer asset hook failed (non-fatal)")
+
         if next_agent:
             try:
                 await asyncio.wait_for(
@@ -431,9 +450,74 @@ class DesignerAgent(BaseAgent):
                 "palette": palette_json,
                 "mood": mood,
                 "entry_css": str(entry_css_path) if entry_css_path else None,
+                # Additive keys — present only when the asset hook ran.
+                # Existing consumers of the output dict are unaffected.
+                "generated_assets": generated_assets,
+                "imported_tokens": imported_tokens,
                 "summary": f"Brand pack written ({len(files)} files).",
             },
         )
+
+    # ------------------------------------------------------------------
+    # Generated-asset / imported-token hook (flag-guarded, additive)
+    # ------------------------------------------------------------------
+    async def _maybe_generate_assets(
+        self,
+        *,
+        brief: str,
+        mood: str,
+        artifact_dir: Path,
+        data: Dict[str, Any],
+    ) -> Tuple[list, Optional[dict]]:
+        """Request generated assets + imported tokens from AssetAgent.
+
+        Returns ``(assets, tokens)``. Completely inert (``([], None)``)
+        unless ``SKYN3T_ASSET_GEN`` is on — so the default designer
+        behavior is unchanged. Even when enabled, AssetAgent itself
+        degrades to skipped entries when no provider key/hook is present,
+        so this never blocks or performs network I/O in the default path.
+        """
+        try:
+            from skyn3t.agents.asset_agent import AssetAgent, asset_gen_enabled
+        except Exception:  # noqa: BLE001
+            return [], None
+        if not asset_gen_enabled():
+            return [], None
+
+        # Asset specs: caller may pass explicit ones; otherwise seed a
+        # small, sensible default set (logo + hero) keyed off the brief.
+        asset_specs = list(data.get("asset_specs") or [])
+        if not asset_specs:
+            asset_specs = [
+                {
+                    "kind": "logo",
+                    "prompt": f"Minimal vector logo for: {brief} (mood: {mood})",
+                    "out_path": "assets/logo.png",
+                },
+                {
+                    "kind": "image",
+                    "prompt": f"Hero banner for: {brief} (mood: {mood})",
+                    "out_path": "assets/hero.png",
+                },
+            ]
+        design_import = data.get("design_import")
+
+        agent = AssetAgent(event_bus=self.event_bus, config=self.config)
+        await agent.initialize()
+        task = TaskRequest(
+            title="designer-asset-hook",
+            input_data={
+                "brief": brief,
+                "artifact_dir": str(artifact_dir),
+                "asset_specs": asset_specs,
+                "design_import": design_import,
+            },
+        )
+        result = await agent.execute(task)
+        if not result.success:
+            return [], None
+        out = result.output or {}
+        return list(out.get("assets") or []), out.get("tokens")
 
     # ------------------------------------------------------------------
     # LLM helper

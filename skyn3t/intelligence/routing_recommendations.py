@@ -139,6 +139,203 @@ def _compute_stage_recommendations() -> List[Dict[str, Any]]:
     return rows
 
 
+def best_model_for(
+    *,
+    stage: str,
+    stack: Optional[str],
+    features: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Rank (stack, stage, feature) routing cells for predictive auto-route.
+
+    Joins per-stage ``route_stats`` (from ``routing_observations.snapshot()``)
+    — narrowed to the matching (stack, feature) cells when present — with
+    ``ModelTournamentStore.rankings()`` filtered by vendor (backend) + domain
+    (stage/stack/feature) tags written by the debate tournament recorder.
+
+    Returns a dict ``{backend, model, tier, score, source, rationale,
+    samples}`` for the best/cheapest winning route, or ``None`` when there
+    is no observation/tournament evidence (the caller then degrades to the
+    static route). Never forces an expensive backend: ties and near-ties
+    break toward the lower ``relative_backend_cost``.
+    """
+    stage_key = str(stage or "").strip().lower()
+    if not stage_key:
+        return None
+    stack_key = str(stack or "").strip().lower() or None
+    feature_keys = [
+        str(f or "").strip().lower() for f in (features or []) if str(f or "").strip()
+    ]
+
+    try:
+        from skyn3t.intelligence.routing_observations import snapshot
+    except Exception:
+        return None
+    try:
+        observations = snapshot()
+    except Exception:
+        return None
+
+    stage_row = observations.get(stage_key) if isinstance(observations, dict) else None
+    route_stats = stage_row.get("route_stats", {}) if isinstance(stage_row, dict) else {}
+    if not isinstance(route_stats, dict) or not route_stats:
+        return None
+
+    from skyn3t.core.model_router import relative_backend_cost
+
+    tournament = _tournament_rankings(
+        stage=stage_key, stack=stack_key, features=feature_keys
+    )
+
+    scored: List[Dict[str, Any]] = []
+    for tier_name, stat in route_stats.items():
+        if not isinstance(stat, dict):
+            continue
+        backend = str(stat.get("backend") or "")
+        if not backend:
+            continue
+        model = stat.get("model")
+        rate, samples = _cell_rate_and_samples(
+            stat, stack=stack_key, features=feature_keys
+        )
+        if rate is None or samples < _AUTO_ROUTE_MIN_SAMPLES:
+            continue
+        cost = relative_backend_cost(backend)
+        # Efficiency = observed win-rate per relative cost; tournament
+        # quality (when the cheap model has won debates) nudges the score
+        # up without ever forcing a pricier backend.
+        efficiency = _efficiency_score(rate, cost)
+        tournament_boost = _tournament_boost(tournament, model)
+        score = efficiency * (1.0 + tournament_boost)
+        scored.append(
+            {
+                "tier": tier_name,
+                "backend": backend,
+                "model": model,
+                "rate": rate,
+                "samples": samples,
+                "cost": cost,
+                "score": round(score, 6),
+                "tournament_boost": round(tournament_boost, 4),
+            }
+        )
+
+    if not scored:
+        return None
+
+    # Best score wins; cheaper backend breaks ties so we never drift to a
+    # pricier option on equal evidence.
+    scored.sort(
+        key=lambda item: (item["score"], -item["cost"], item["samples"]),
+        reverse=True,
+    )
+    best = scored[0]
+    rationale = (
+        f"auto-route: {best['backend']} won (stack={stack_key or 'any'}, "
+        f"stage={stage_key}, win_rate={best['rate']:.2f}, "
+        f"samples={best['samples']}, cost={best['cost']:.2f})"
+    )
+    if best["tournament_boost"] > 0:
+        rationale += f", tournament_boost={best['tournament_boost']:.2f}"
+    return {
+        "backend": best["backend"],
+        "model": best["model"],
+        "tier": best["tier"],
+        "score": best["score"],
+        "samples": best["samples"],
+        "success_rate": round(float(best["rate"]), 3),
+        "cost": best["cost"],
+        "source": "predictive",
+        "rationale": rationale,
+    }
+
+
+# Minimum graded samples in a cell before auto-route trusts it.
+_AUTO_ROUTE_MIN_SAMPLES = 3
+
+
+def _cell_rate_and_samples(
+    stat: Dict[str, Any],
+    *,
+    stack: Optional[str],
+    features: List[str],
+) -> tuple[Optional[float], int]:
+    """Pick the most specific (stack, feature) cell for a route stat.
+
+    Falls back to the stage-level aggregate when no matching cell exists,
+    so the auto-router still works on bare-stage observations (which is
+    the common case before the stack/feature dimension fills in).
+    """
+    cells = stat.get("cells")
+    if isinstance(cells, dict) and (stack or features):
+        candidates: List[str] = []
+        if stack and features:
+            candidates.extend(f"{stack}::{f}" for f in features)
+        if stack:
+            candidates.append(f"{stack}::")
+        if features:
+            candidates.extend(f"::{f}" for f in features)
+        for key in candidates:
+            cell = cells.get(key)
+            if isinstance(cell, dict) and int(cell.get("samples") or 0) > 0:
+                return (
+                    float(cell.get("success_rate") or 0.0),
+                    int(cell.get("samples") or 0),
+                )
+    samples = int(stat.get("samples") or 0)
+    if samples <= 0:
+        return None, 0
+    return float(stat.get("success_rate") or 0.0), samples
+
+
+def _tournament_rankings(
+    *,
+    stage: str,
+    stack: Optional[str],
+    features: List[str],
+) -> Dict[str, Any]:
+    """Return {model_id: ModelRanking-like dict} from the tournament store.
+
+    Domain tags mirror the debate recorder convention (stage + stack +
+    features); vendor tags are left open so any backend that has won cheap
+    debates can boost. Graceful empty dict on any error / no data.
+    """
+    domain_tags = [t for t in [stage, stack, *features] if t]
+    try:
+        from skyn3t.intelligence.model_tournament import get_default_tournament_store
+
+        rankings = get_default_tournament_store().rankings(
+            domain_tags=domain_tags, min_trials=1
+        )
+    except Exception:
+        return {}
+    out: Dict[str, Any] = {}
+    for ranking in rankings:
+        try:
+            out[str(ranking.model_id).strip().lower()] = ranking
+        except Exception:
+            continue
+    return out
+
+
+def _tournament_boost(tournament: Dict[str, Any], model: Optional[str]) -> float:
+    """Map a model's tournament pass_rate into a small bounded boost [0, 0.5].
+
+    Only rewards cheap winners — it scales the observed efficiency score,
+    it never substitutes a pricier model. Returns 0 when the model has no
+    tournament record.
+    """
+    if not model:
+        return 0.0
+    ranking = tournament.get(str(model).strip().lower())
+    if ranking is None:
+        return 0.0
+    try:
+        pass_rate = float(getattr(ranking, "pass_rate", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(0.5, pass_rate * 0.5))
+
+
 def _evidence_backed_recommendation(
     *,
     current_tier: str,

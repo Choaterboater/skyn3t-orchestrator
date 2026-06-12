@@ -99,6 +99,72 @@ def _warm_from_trajectories(*, trajectory_dir: Optional[Path] = None) -> Dict[st
     return out
 
 
+def _normalize_features(values: Any) -> List[str]:
+    """Lowercase + de-dup a feature tag list from a trajectory record."""
+    out: List[str] = []
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, (list, tuple, set)):
+        return out
+    for value in values:
+        tag = str(value or "").strip().lower()
+        if tag and tag not in out:
+            out.append(tag)
+    return out
+
+
+def _record_stack_feature_cells(
+    stat: Dict[str, Any],
+    *,
+    stack: str,
+    features: List[str],
+    success: bool,
+    failure: bool,
+    tokens: int,
+) -> None:
+    """Accumulate per-(stack, feature) sub-stats on an existing route stat.
+
+    Stored under the new ``cells`` key so existing snapshot() readers
+    (stage-keyed ``route_stats``) keep working unchanged — they simply
+    ignore the extra key. ``best_model_for`` consumes these cells to
+    rank (stack, stage, feature) routes.
+    """
+    if not stack and not features:
+        return
+    cells = stat.setdefault("cells", {})
+    # One cell per (stack, feature) pair; an empty feature is recorded as
+    # the bare stack cell so stack-only routing still learns.
+    keys: List[str] = []
+    if features:
+        for feature in features:
+            keys.append(f"{stack}::{feature}" if stack else f"::{feature}")
+    elif stack:
+        keys.append(f"{stack}::")
+    for key in keys:
+        cell = cells.setdefault(
+            key,
+            {
+                "stack": stack or None,
+                "feature": key.split("::", 1)[1] or None,
+                "samples": 0,
+                "successes": 0,
+                "failures": 0,
+                "success_rate": 0.0,
+                "total_tokens": 0,
+            },
+        )
+        cell["samples"] = int(cell.get("samples") or 0) + 1
+        cell["total_tokens"] = int(cell.get("total_tokens") or 0) + tokens
+        if success:
+            cell["successes"] = int(cell.get("successes") or 0) + 1
+        elif failure:
+            cell["failures"] = int(cell.get("failures") or 0) + 1
+        n = int(cell.get("samples") or 0)
+        cell["success_rate"] = (
+            float(cell.get("successes") or 0) / n if n else 0.0
+        )
+
+
 def _apply_trajectory(summary: Dict[str, Dict[str, Any]], record: Dict[str, Any]) -> None:
     from skyn3t.core.model_router import tier_for_backend_model
 
@@ -109,6 +175,8 @@ def _apply_trajectory(summary: Dict[str, Dict[str, Any]], record: Dict[str, Any]
     ]
     if not llm_events:
         return
+    record_stack = _normalize_stage(record.get("stack"))
+    record_features = _normalize_features(record.get("features"))
     top_level_stage = _normalize_stage(record.get("stage"))
     stage_groups: DefaultDict[str, List[Dict[str, Any]]] = defaultdict(list)
     for event in llm_events:
@@ -162,13 +230,23 @@ def _apply_trajectory(summary: Dict[str, Dict[str, Any]], record: Dict[str, Any]
         )
         stat["samples"] = int(stat.get("samples") or 0) + 1
         stat["total_tokens"] = int(stat.get("total_tokens") or 0) + tokens
-        if record.get("outcome") == "success":
+        outcome_success = record.get("outcome") == "success"
+        outcome_failure = record.get("outcome") == "failure"
+        if outcome_success:
             stat["successes"] = int(stat.get("successes") or 0) + 1
-        elif record.get("outcome") == "failure":
+        elif outcome_failure:
             stat["failures"] = int(stat.get("failures") or 0) + 1
         samples = int(stat.get("samples") or 0)
         stat["success_rate"] = (
             float(stat.get("successes") or 0) / samples if samples else 0.0
+        )
+        _record_stack_feature_cells(
+            stat,
+            stack=record_stack,
+            features=record_features,
+            success=outcome_success,
+            failure=outcome_failure,
+            tokens=tokens,
         )
 
 

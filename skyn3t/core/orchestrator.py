@@ -4,7 +4,9 @@ import asyncio
 import importlib
 import inspect
 import logging
+import os
 import threading
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, cast
 from uuid import uuid4
@@ -26,6 +28,65 @@ from skyn3t.memory.store import MemoryStore
 from skyn3t.memory.tuner import SelfTuningEngine
 
 logger = logging.getLogger("skyn3t.core.orchestrator")
+
+
+# ----------------------------------------------------------------------
+# A2A conversation loop (Phase 5A ConversationLoopAPI)
+# ----------------------------------------------------------------------
+@dataclass
+class ConversationTurn:
+    """A single request/response exchange in an A2A conversation."""
+
+    round: int
+    from_agent: str
+    to_agent: str
+    kind: str  # "request" | "response" | "info"
+    content: str
+    payload: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ConversationResult:
+    """Outcome of an A2A conversation loop."""
+
+    turns: List[ConversationTurn] = field(default_factory=list)
+    converged: bool = False
+    rounds_used: int = 0
+    final_payload: Dict[str, Any] = field(default_factory=dict)
+
+
+def a2a_conversation_enabled() -> bool:
+    """Whether the A2A request/response conversation loop is active.
+
+    Flag-gated by ``SKYN3T_A2A_CONVERSATION`` (default off). When off,
+    ``converse`` degrades to a linear handoff over ``execute``.
+    """
+    raw = os.getenv("SKYN3T_A2A_CONVERSATION", "")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _default_convergence(turns: List[ConversationTurn]) -> bool:
+    """Default convergence: reviewer reports no blockers.
+
+    Looks at the most recent response turn from a reviewer-like participant
+    and treats an empty ``blockers`` list (or an explicit approval flag) as
+    convergence. Conservative: returns False when it cannot tell.
+    """
+    for turn in reversed(turns):
+        if turn.kind != "response":
+            continue
+        name = (turn.from_agent or "").lower()
+        if "review" not in name and turn.payload.get("role") != "reviewer":
+            continue
+        payload = turn.payload or {}
+        if payload.get("approved") is True:
+            return True
+        if "blockers" in payload:
+            blockers = payload.get("blockers") or []
+            return len(blockers) == 0
+        # No structured signal from the reviewer — cannot confirm.
+        return False
+    return False
 
 
 class Orchestrator:
@@ -284,6 +345,13 @@ class Orchestrator:
         self._running = True
         self._monitor_task = asyncio.create_task(self._monitor_loop())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        # Activate the A2A layer for any agents registered before the loop
+        # existed (start_inbox_pump is idempotent for those already pumping).
+        for agent in list(self.agents.values()):
+            try:
+                agent.start_inbox_pump()
+            except Exception:
+                logger.debug("start_inbox_pump failed for %s", agent.name, exc_info=True)
         await self._self_healing.start()
 
         if self._reflection:
@@ -500,6 +568,15 @@ class Orchestrator:
     def register_agent(self, agent: BaseAgent) -> None:
         """Register an agent with the orchestrator."""
         self.agents[agent.name] = agent
+        # Activate the A2A layer: drain this agent's MessageBus inbox so
+        # request/response (converse) works. Idempotent and only when a
+        # running loop exists; start_inbox_pump degrades to a no-op
+        # otherwise (e.g. registration from sync code with no loop).
+        try:
+            asyncio.get_running_loop()
+            agent.start_inbox_pump()
+        except RuntimeError:
+            pass
         self.agent_registry[agent.name] = {
             "id": agent.id,
             "name": agent.name,
@@ -1272,6 +1349,302 @@ class Orchestrator:
                     current_message = entry["response"]
 
         return conversation
+
+    # ------------------------------------------------------------------
+    # A2A conversation loop (Phase 5A ConversationLoopAPI)
+    # ------------------------------------------------------------------
+    async def converse(
+        self,
+        *,
+        participants: List[str],
+        topic: str,
+        context: Dict[str, Any],
+        max_rounds: int = 4,
+        convergence: Optional[Callable[[List["ConversationTurn"]], bool]] = None,
+        round_timeout_s: float = 180.0,
+    ) -> "ConversationResult":
+        """Run a bounded A2A request/response loop over participant inboxes.
+
+        Each round, the orchestrator sends a ``request`` to every participant
+        in turn (over the shared MessageBus) and awaits its response, threading
+        the prior response forward (Designer -> Reviewer -> CodeAgent style).
+        Convergence is checked after each round; the loop stops early when the
+        callback (default: reviewer reports no blockers) returns True, or when
+        ``max_rounds`` is reached.
+
+        Non-blocking + graceful degrade:
+          * When ``SKYN3T_A2A_CONVERSATION`` is off, falls back to a linear
+            ``execute`` handoff (no request/response, no inbox dependency).
+          * A missing named participant is auto-spawned via
+            ``spawn_subordinate`` only when a manager can be inferred;
+            otherwise that participant is skipped for the round.
+          * A timed-out request never raises — that turn is recorded with an
+            empty response and the loop proceeds.
+
+        Emits AGENT_CONVERSATION_STARTED / _TURN / _ENDED on the event bus.
+        Reuses MessageBus.request/respond (drained by each agent's inbox pump).
+        """
+        convergence = convergence or _default_convergence
+        conv_id = str(uuid4())
+
+        self.event_bus.publish(
+            Event(
+                event_type=EventType.AGENT_CONVERSATION_STARTED,
+                source="orchestrator",
+                payload={
+                    "conversation_id": conv_id,
+                    "participants": list(participants),
+                    "topic": topic,
+                    "max_rounds": max_rounds,
+                    "mode": "a2a" if a2a_conversation_enabled() else "linear",
+                },
+                correlation_id=conv_id,
+            )
+        )
+
+        if not a2a_conversation_enabled():
+            result = await self._converse_linear(
+                conv_id=conv_id,
+                participants=participants,
+                topic=topic,
+                context=context,
+                max_rounds=max_rounds,
+                convergence=convergence,
+            )
+        else:
+            result = await self._converse_a2a(
+                conv_id=conv_id,
+                participants=participants,
+                topic=topic,
+                context=context,
+                max_rounds=max_rounds,
+                convergence=convergence,
+                round_timeout_s=round_timeout_s,
+            )
+
+        self.event_bus.publish(
+            Event(
+                event_type=EventType.AGENT_CONVERSATION_ENDED,
+                source="orchestrator",
+                payload={
+                    "conversation_id": conv_id,
+                    "converged": result.converged,
+                    "rounds_used": result.rounds_used,
+                    "turns": len(result.turns),
+                },
+                correlation_id=conv_id,
+            )
+        )
+        return result
+
+    def _emit_conversation_turn(self, conv_id: str, turn: "ConversationTurn") -> None:
+        self.event_bus.publish(
+            Event(
+                event_type=EventType.AGENT_CONVERSATION_TURN,
+                source=turn.from_agent,
+                target=turn.to_agent,
+                payload={
+                    "conversation_id": conv_id,
+                    "round": turn.round,
+                    "kind": turn.kind,
+                    "content": turn.content,
+                    "payload": turn.payload,
+                },
+                correlation_id=conv_id,
+            )
+        )
+
+    async def _ensure_participant(
+        self, name: str
+    ) -> Optional[BaseAgent]:
+        """Return the named agent, spawning it as a subordinate if absent.
+
+        Only spawns when a manager can be inferred (an existing agent that
+        the name reports to, or any registered agent to host it). Returns
+        None when the participant cannot be obtained — the caller skips it.
+        """
+        agent = self.agents.get(name)
+        if agent is not None:
+            return agent
+        # Try to spawn only if we have at least one manager to attach under.
+        manager = next(iter(self.agents.keys()), None)
+        if manager is None:
+            return None
+        spawned = await self.spawn_subordinate(
+            manager_name=manager,
+            agent_type=name,
+            role=name,
+        )
+        return spawned
+
+    async def _converse_a2a(
+        self,
+        *,
+        conv_id: str,
+        participants: List[str],
+        topic: str,
+        context: Dict[str, Any],
+        max_rounds: int,
+        convergence: Callable[[List["ConversationTurn"]], bool],
+        round_timeout_s: float,
+    ) -> "ConversationResult":
+        from skyn3t.core.messaging import get_default_bus
+
+        bus = get_default_bus(self.event_bus)
+        turns: List[ConversationTurn] = []
+        last_payload: Dict[str, Any] = dict(context)
+        last_content = topic
+        converged = False
+        rounds_used = 0
+
+        for round_idx in range(1, max(1, max_rounds) + 1):
+            rounds_used = round_idx
+            for name in participants:
+                agent = await self._ensure_participant(name)
+                if agent is None:
+                    logger.debug("converse: participant %s absent, skipping", name)
+                    continue
+
+                req_payload = {
+                    "conversation_id": conv_id,
+                    "round": round_idx,
+                    "topic": topic,
+                    "context": context,
+                    "prior_content": last_content,
+                    "prior_payload": last_payload,
+                }
+                req_turn = ConversationTurn(
+                    round=round_idx,
+                    from_agent="orchestrator",
+                    to_agent=name,
+                    kind="request",
+                    content=last_content,
+                    payload=req_payload,
+                )
+                turns.append(req_turn)
+                self._emit_conversation_turn(conv_id, req_turn)
+
+                response = None
+                try:
+                    response = await bus.request(
+                        from_agent="orchestrator",
+                        to_agent=name,
+                        content=last_content,
+                        payload=req_payload,
+                        timeout=round_timeout_s,
+                    )
+                except Exception:  # noqa: BLE001 — a turn must never crash the loop
+                    logger.debug("converse: request to %s failed", name, exc_info=True)
+
+                resp_content = response.content if response is not None else ""
+                resp_payload = (response.payload if response is not None else {}) or {}
+                resp_turn = ConversationTurn(
+                    round=round_idx,
+                    from_agent=name,
+                    to_agent="orchestrator",
+                    kind="response",
+                    content=resp_content,
+                    payload=resp_payload,
+                )
+                turns.append(resp_turn)
+                self._emit_conversation_turn(conv_id, resp_turn)
+
+                if response is not None:
+                    last_content = resp_content or last_content
+                    last_payload = resp_payload or last_payload
+
+            try:
+                if convergence(turns):
+                    converged = True
+                    break
+            except Exception:  # noqa: BLE001 — bad callback must not crash loop
+                logger.debug("converse: convergence callback raised", exc_info=True)
+
+        return ConversationResult(
+            turns=turns,
+            converged=converged,
+            rounds_used=rounds_used,
+            final_payload=last_payload,
+        )
+
+    async def _converse_linear(
+        self,
+        *,
+        conv_id: str,
+        participants: List[str],
+        topic: str,
+        context: Dict[str, Any],
+        max_rounds: int,
+        convergence: Callable[[List["ConversationTurn"]], bool],
+    ) -> "ConversationResult":
+        """Graceful-degrade path: linear execute() handoff, no MessageBus.
+
+        Used when SKYN3T_A2A_CONVERSATION is off. Preserves the turn record /
+        convergence contract so callers behave identically regardless of flag.
+        """
+        turns: List[ConversationTurn] = []
+        last_payload: Dict[str, Any] = dict(context)
+        last_content = topic
+        converged = False
+        rounds_used = 0
+
+        for round_idx in range(1, max(1, max_rounds) + 1):
+            rounds_used = round_idx
+            for name in participants:
+                agent = self.agents.get(name)
+                if agent is None:
+                    continue
+                task = TaskRequest(
+                    title=f"converse round {round_idx}",
+                    description=last_content,
+                    input_data={
+                        "message": last_content,
+                        "context": context,
+                        "prior_payload": last_payload,
+                        "round": round_idx,
+                        "conversation_id": conv_id,
+                    },
+                )
+                agent.last_active_at = datetime.now(timezone.utc)
+                try:
+                    result = await agent.execute(task)
+                except Exception:  # noqa: BLE001
+                    logger.debug("converse(linear): %s execute failed", name, exc_info=True)
+                    continue
+                resp_content = ""
+                resp_payload: Dict[str, Any] = {}
+                if result is not None:
+                    out = result.output or {}
+                    resp_content = out.get("response") or out.get("content") or ""
+                    resp_payload = out if isinstance(out, dict) else {}
+                turn = ConversationTurn(
+                    round=round_idx,
+                    from_agent=name,
+                    to_agent="orchestrator",
+                    kind="response",
+                    content=resp_content,
+                    payload=resp_payload,
+                )
+                turns.append(turn)
+                self._emit_conversation_turn(conv_id, turn)
+                if resp_content:
+                    last_content = resp_content
+                if resp_payload:
+                    last_payload = resp_payload
+
+            try:
+                if convergence(turns):
+                    converged = True
+                    break
+            except Exception:  # noqa: BLE001
+                logger.debug("converse(linear): convergence raised", exc_info=True)
+
+        return ConversationResult(
+            turns=turns,
+            converged=converged,
+            rounds_used=rounds_used,
+            final_payload=last_payload,
+        )
 
     # ------------------------------------------------------------------
     # Pipelines
