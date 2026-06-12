@@ -52,12 +52,52 @@ Next: decide whether to commit generated candidate apps into an examples/project
 
 ## Next priorities (ordered)
 
-1. Commit and push this implementation to `main`.
-2. Decide whether generated candidate apps should be copied into a tracked examples repo or left under `/Users/stephenchoate/Documents/Skyn3t/Projects`.
-3. Make strong/Opus routing explicitly opt-in if desired; currently data overrides were used locally, not a default code-policy change.
-4. Add real live-read credential flows for selected candidates only after explicit approval.
-5. Continue feeding `GOLD:` / `WEAK:` repos to expand the corpus beyond networking.
-6. Close/reconcile stale PRs #45–#53 if they are superseded by main.
+> **RECONCILED 2026-06-11 (later session).** Most of the original list is DONE —
+> see "## STATUS 2026-06-11 (Phases 0–5 + cost work)" just below. Remaining live
+> items: (a) examples-repo decision, (b) approval-gated live-read credential
+> flows, (c) keep feeding GOLD/WEAK repos (scout now auto-pulls general repos).
+
+1. ~~Commit and push to `main`.~~ **DONE** — Phases 0–5 + cost work on `origin/main`.
+2. Decide: copy generated candidate apps into a tracked examples repo vs. leave
+   under `/Users/stephenchoate/Documents/Skyn3t/Projects`. *(open)*
+3. ~~Make strong/Opus routing explicitly opt-in.~~ **DONE** — cost-blind model-tier
+   evolution DISABLED (`SKYN3T_MODEL_EVOLUTION=0`, premium blocked); all tiers
+   default to FREE OpenRouter models; cost-aware Phase-5 `SKYN3T_AUTO_ROUTE`
+   handles "smarter over time".
+4. Add approval-gated live-read credential flows for selected candidates. *(open)*
+5. Keep feeding `GOLD:`/`WEAK:` repos. *(ongoing — scout auto-discovers + files
+   general repos daily; no longer networking-only.)*
+6. ~~Close/reconcile stale PRs #45–#53.~~ **DONE** — all 9 closed as superseded by
+   main (#45's starlette pin was already present).
+
+---
+
+## STATUS 2026-06-11 (Phases 0–5 + cost work)
+
+Full audit → fix → upgrade cycle landed on `origin/main`:
+
+- **Phase 0/1** — 2 criticals + ~19 high bugs (worktree empty-scaffold, RCE-by-
+  default, silent verifier no-ops, seatbelt regression) fixed + tested.
+- **Phase 2** — self-learning loops closed (lessons→prompt, skills graded on
+  verdict, unified stack buckets, threshold pattern-graduation, GitHub ingestion).
+- **Phase 3** — generated-app quality + world-class UI gates + Capacitor/PWA/
+  desktop packaging (stub hard-gate, real CRUD backend, functional + visual gates,
+  design-token contract).
+- **Phase 4** — living "cortex" command-center dashboard (shared WS, live build
+  streaming, brain viz, install/settings wizard, charts).
+- **Phase 5** — 10x: multi-LLM debate (cheap/free), A2A agent conversations,
+  reflective self-correction, cost-aware auto-routing, asset-gen/Figma; + parity:
+  remote/serverless backends (ssh/modal/daytona/e2b), 7 messaging channels, NL
+  cron + gateway, browser automation. (A2A + asset-gen wired but OFF by default.)
+
+**Runtime (cost-sensitive owner):** all OpenRouter tiers → FREE models; cost-blind
+evolution OFF; debate/reflection/auto-route ON; Docker exec; caps 50 builds/day +
+$20 ceiling → real spend ≈ $0 (the `daily_spend_usd` estimator was ~10x inflated
+and is now fixed). The autonomous fleet runs UNATTENDED: agent_fleet dispatch
+(30s) + never_stop replenish + curiosity/scout brief generation. Full forward
+plan: `SKYN3T_10X_PLAN.md`. Start: `nohup skyn3t start --host 127.0.0.1 --port
+6660` (framework Python 3.13, editable install); `load_dotenv` applies `.env`
+flags on start.
 
 ---
 
