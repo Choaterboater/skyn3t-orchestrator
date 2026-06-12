@@ -344,8 +344,16 @@ async def lifespan(app: FastAPI):
 
     settings = get_settings()
 
+    _boot_t0 = time.monotonic()
+
+    def _boot_mark(step: str) -> None:
+        # Timed boot trail — answers "why is the port not up yet"
+        # without needing py-spy/root on the box.
+        logger.warning("[boot] %-26s +%.1fs", step, time.monotonic() - _boot_t0)
+
     # Initialize database
     await init_db()
+    _boot_mark("init_db")
 
     # Create event bus and orchestrator
     event_bus = EventBus()
@@ -376,7 +384,9 @@ async def lifespan(app: FastAPI):
     orchestrator.enable_self_tuning()
     orchestrator.enable_meta_agent()
     orchestrator.set_studio_runner_getter(lambda: _get_studio_runner(app))
+    _boot_mark("pre orchestrator.start")
     await orchestrator.start()
+    _boot_mark("orchestrator.start")
     try:
         from skyn3t.core.model_evolution import set_evolution_event_bus
         from skyn3t.core.openrouter_catalog import schedule_background_sync
@@ -408,6 +418,7 @@ async def lifespan(app: FastAPI):
 
     # Initialize integration agents if configured
     await _init_integrations(orchestrator, event_bus, settings)
+    _boot_mark("integrations")
 
     # Singleton RAG engine
     try:
@@ -418,6 +429,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"RAGEngine initialization warning: {e}")
         app.state.rag_engine = None
+    _boot_mark("rag_engine")
 
     print(f"🚀 SkyN3t Orchestrator started on {settings.web_host}:{settings.web_port}")
 

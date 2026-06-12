@@ -352,22 +352,34 @@ class Orchestrator:
                 agent.start_inbox_pump()
             except Exception:
                 logger.debug("start_inbox_pump failed for %s", agent.name, exc_info=True)
+        import time as _time
+        _t0 = _time.monotonic()
+
+        def _mark(step: str) -> None:
+            logger.warning("[boot] orch.%-20s +%.1fs", step, _time.monotonic() - _t0)
+
         await self._self_healing.start()
+        _mark("self_healing")
 
         if self._reflection:
             await self._reflection.start()
+            _mark("reflection")
         if self._planner:
             await self._planner.start()
+            _mark("planner")
         if self._ingestor:
             await self._ingestor.initialize()
+            _mark("ingestor")
             # Share the experience ingestor's RAG engine with agents
             # (github_ingestor, docs_ingestor, …) registered below.
             if getattr(self._ingestor, "rag", None) is not None:
                 self._rag = self._ingestor.rag
         if self._meta_agent:
             await self._meta_agent.start()
+            _mark("meta_agent")
 
         await self._boot_cortex()
+        _mark("boot_cortex")
 
         try:
             from skyn3t.core.model_evolution import set_evolution_event_bus
@@ -382,6 +394,7 @@ class Orchestrator:
             from skyn3t.registry import register_default_roster
             roster = await register_default_roster(self)
             self._wire_rag_agents()
+            _mark("roster")
             logger.info("default roster: registered=%s skipped=%s",
                         roster.get("registered"), roster.get("skipped"))
         except Exception:
