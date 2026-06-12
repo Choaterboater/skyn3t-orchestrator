@@ -76,12 +76,22 @@ async def register_default_roster(orchestrator) -> Dict[str, Any]:
             skipped.append({"name": class_name, "reason": "class not found"})
             continue
         _t0 = _time.monotonic()
+        _phase = {"t": _t0}
+
+        def _mark_phase(label: str, _phase=_phase, _class=class_name) -> None:
+            now = _time.monotonic()
+            dt = now - _phase["t"]
+            _phase["t"] = now
+            if dt > 0.5:
+                logger.warning("[boot] roster %s.%s %.1fs", _class, label, dt)
+
         try:
             kwargs = kwargs_factory(orchestrator)
             # filter to params the constructor accepts
             sig = inspect.signature(cls)
             kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
             agent = cls(**kwargs)
+            _mark_phase("construct")
             # Apply persisted overrides BEFORE register so disable/config
             # take effect from the first task.
             try:
@@ -105,7 +115,9 @@ async def register_default_roster(orchestrator) -> Dict[str, Any]:
                 init = agent.initialize()
                 if inspect.iscoroutine(init):
                     await init
+            _mark_phase("initialize")
             orchestrator.register_agent(agent)
+            _mark_phase("register")
             registered.append(agent.name)
             _dt = _time.monotonic() - _t0
             if _dt > 0.5:
