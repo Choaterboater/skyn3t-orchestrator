@@ -68,11 +68,14 @@ async def register_default_roster(orchestrator) -> Dict[str, Any]:
     registered: List[str] = []
     skipped: List[Dict[str, str]] = []
 
+    import time as _time
+
     for class_name, kwargs_factory in DEFAULT_ROSTER:
         cls = getattr(mod, class_name, None)
         if cls is None:
             skipped.append({"name": class_name, "reason": "class not found"})
             continue
+        _t0 = _time.monotonic()
         try:
             kwargs = kwargs_factory(orchestrator)
             # filter to params the constructor accepts
@@ -104,6 +107,9 @@ async def register_default_roster(orchestrator) -> Dict[str, Any]:
                     await init
             orchestrator.register_agent(agent)
             registered.append(agent.name)
+            _dt = _time.monotonic() - _t0
+            if _dt > 0.5:
+                logger.warning("[boot] roster %-24s %.1fs", class_name, _dt)
         except Exception as e:
             logger.exception("failed to register %s", class_name)
             skipped.append({"name": class_name, "reason": str(e)[:200]})
