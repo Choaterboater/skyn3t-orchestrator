@@ -385,16 +385,26 @@ async def lifespan(app: FastAPI):
         schedule_background_sync()
     except Exception:
         logger.exception("openrouter catalog sync schedule failed")
-    try:
-        app.state.proposal_recovery = await _resume_cortex_proposals()
-    except Exception:
-        logger.exception("proposal recovery boot failed")
-        app.state.proposal_recovery = {"requeued": 0, "failed_no_handler": 0}
-    try:
-        app.state.proposal_triage = await _retriage_cortex_proposals()
-    except Exception:
-        logger.exception("proposal triage boot failed")
-        app.state.proposal_triage = {"auto_approved": 0, "auto_rejected": 0}
+    # Proposal recovery requeues the cortex backlog (auto-scout ingest,
+    # builds, …) which immediately starts embedding into chroma. Doing
+    # that inline here kept uvicorn from binding for minutes — the rest
+    # of this lifespan competed with a saturated loop/GIL. Defer it to a
+    # background task that starts shortly AFTER the port is up.
+    app.state.proposal_recovery = {"requeued": 0, "failed_no_handler": 0, "status": "deferred"}
+    app.state.proposal_triage = {"auto_approved": 0, "auto_rejected": 0, "status": "deferred"}
+
+    async def _deferred_autonomy_boot() -> None:
+        await asyncio.sleep(5.0)  # let uvicorn bind + serve first
+        try:
+            app.state.proposal_recovery = await _resume_cortex_proposals()
+        except Exception:
+            logger.exception("proposal recovery boot failed")
+        try:
+            app.state.proposal_triage = await _retriage_cortex_proposals()
+        except Exception:
+            logger.exception("proposal triage boot failed")
+
+    app.state.autonomy_boot_task = asyncio.create_task(_deferred_autonomy_boot())
 
     # Initialize integration agents if configured
     await _init_integrations(orchestrator, event_bus, settings)
