@@ -108,9 +108,9 @@ export default function CortexBrainPage() {
 
       {/* Main triptych */}
       <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_360px] gap-4 items-stretch">
-        {/* Left column: graph on top, memory core below */}
-        <div className="grid grid-rows-[minmax(360px,1fr)_minmax(0,auto)] gap-4 min-w-0">
-          <section className="panel-card flex flex-col min-h-0">
+        {/* Left column: graph on top (the hero), memory core below */}
+        <div className="grid grid-rows-[minmax(0,auto)_minmax(0,auto)] gap-4 min-w-0">
+          <section className="panel-card flex flex-col min-h-[560px] xl:min-h-[68vh]">
             <div className="panel-header">
               <div className="min-w-0">
                 <h2 className="display text-lg flex items-center gap-2">
@@ -126,10 +126,10 @@ export default function CortexBrainPage() {
                 {seeds.length} nodes · 3D
               </span>
             </div>
-            <div className="flex-1 min-h-[320px] p-2">
+            <div className="flex-1 min-h-[480px] p-2">
               <Suspense
                 fallback={
-                  <div className="h-full min-h-[320px] flex items-center justify-center text-text-dim text-xs font-mono">
+                  <div className="h-full min-h-[480px] flex items-center justify-center text-text-dim text-xs font-mono">
                     <i className="fa-solid fa-circle-notch fa-spin mr-2" aria-hidden />
                     loading 3D neural field…
                   </div>
@@ -140,7 +140,7 @@ export default function CortexBrainPage() {
             </div>
           </section>
 
-          <section className="panel-card flex flex-col min-h-[420px] xl:min-h-[460px]">
+          <section className="panel-card flex flex-col min-h-[280px]">
             <MemoryCore className="h-full" />
           </section>
         </div>

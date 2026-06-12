@@ -146,7 +146,7 @@ function AgentNode({
   reduced: boolean;
 }) {
   const halo = useRef<THREE.Mesh>(null);
-  const r = 0.13 + Math.min(0.12, weight * 0.012);
+  const r = 0.18 + Math.min(0.14, weight * 0.014);
   useFrame(({ clock }) => {
     if (halo.current && !reduced) {
       const t = clock.elapsedTime;
@@ -258,7 +258,9 @@ function Scene({ seeds, reduced }: { seeds: GraphNodeSeed[]; reduced: boolean })
   // Activity decays toward 0 so the core calms when the swarm is quiet.
   useFrame((_s, delta) => {
     if (activity > 0) setActivityThrottled(setActivity, delta);
-    if (group.current && !reduced) group.current.rotation.y += delta * 0.05;
+    // Barely-perceptible drift — the orbit autoRotate below already
+    // moves the camera; both compounding read as "spinning too fast".
+    if (group.current && !reduced) group.current.rotation.y += delta * 0.008;
   });
 
   const removePulse = (id: number) => setPulses((prev) => prev.filter((p) => p.id !== id));
@@ -275,7 +277,7 @@ function Scene({ seeds, reduced }: { seeds: GraphNodeSeed[]; reduced: boolean })
   return (
     <>
       <color attach="background" args={[C.bg]} />
-      <fog attach="fog" args={[C.bg, 8, 22]} />
+      <fog attach="fog" args={[C.bg, 9, 26]} />
       <ambientLight intensity={0.35} />
       <Stars radius={40} depth={30} count={1200} factor={3} saturation={0} fade speed={reduced ? 0 : 0.4} />
 
@@ -342,10 +344,10 @@ function Scene({ seeds, reduced }: { seeds: GraphNodeSeed[]; reduced: boolean })
       <OrbitControls
         enablePan={false}
         enableZoom
-        minDistance={5}
-        maxDistance={18}
+        minDistance={4}
+        maxDistance={16}
         autoRotate={!reduced}
-        autoRotateSpeed={0.5}
+        autoRotateSpeed={0.12}
         rotateSpeed={0.6}
       />
     </>
@@ -374,9 +376,9 @@ export default function CortexBrain3D({
   if (!webgl) return <AgentGraph seeds={seeds} className={className} />;
 
   return (
-    <div className={className} style={{ position: "relative", minHeight: 320 }}>
+    <div className={className} style={{ position: "relative", minHeight: 480 }}>
       <Canvas
-        camera={{ position: [0, 1.5, 11], fov: 50 }}
+        camera={{ position: [0, 1.1, 8.2], fov: 50 }}
         dpr={[1, 2]}
         gl={{ antialias: true, alpha: false }}
         style={{ borderRadius: 8 }}
