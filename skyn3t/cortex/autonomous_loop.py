@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -561,9 +562,35 @@ class AutonomousCoordinator:
             logger.info("seeded %d startup brief(s); queue_depth=%d", added, self._pending.qsize())
         return added
 
+    @staticmethod
+    def _augment_brief_text(text: str) -> str:
+        """Apply the owner's standing domain + deployability requirements.
+
+        Single choke point for every autonomous brief (scout, build
+        patterns, competitive, never-stop synthetics). Owner directives
+        2026-06-11: builds target the networking domain (Aruba / Juniper
+        / HPE, compared against the scouted reference repos) and ship as
+        FULLY deployed apps with configuration in the frontend — not
+        minimal stubs.
+        """
+        parts = [text.strip()]
+        domain = os.environ.get("SKYN3T_AUTONOMOUS_BRIEF_DOMAIN", "").strip()
+        if domain and domain.lower()[:24] not in text.lower():
+            parts.append(f"Domain focus: {domain}.")
+        parts.append(
+            "Ship a FULLY DEPLOYED app, not a stub: it must pass build and "
+            "boot verification, include a README with a one-command run, and "
+            "expose all runtime configuration (API base URL / controller "
+            "address, tokens, site or org IDs) in an in-app settings panel "
+            "persisted client-side — plus a mock-data mode so every screen "
+            "is demonstrable without live credentials."
+        )
+        return "\n\n".join(parts)
+
     async def _offer_brief(self, item: AutonomousBrief) -> bool:
         if not item.brief.strip():
             return False
+        item.brief = self._augment_brief_text(item.brief)
         h = _brief_hash(item.brief)
         if h in self.state.recent_brief_hashes:
             return False
