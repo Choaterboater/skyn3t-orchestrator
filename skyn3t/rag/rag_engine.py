@@ -301,7 +301,7 @@ class RAGEngine:
                 candidate = await llm_provider.complete(
                     prompt,
                     system=system,
-                    max_tokens=900,
+                    max_tokens=4000,
                     temperature=0.2,
                 )
                 answer = candidate.strip()

@@ -178,3 +178,34 @@ class EventBus:
         """Clear event history."""
         with self._lock:
             self._history.clear()
+
+    def to_snapshot(self, limit: int = 250) -> List[Dict[str, Any]]:
+        """Serialize the most recent events for forensic replay."""
+        with self._lock:
+            return [e.to_dict() for e in list(self._history)[-limit:]]
+
+    def restore_snapshot(self, events: List[Dict[str, Any]]) -> None:
+        """Hydrate the recent event history ring buffer.
+
+        Subscribers are intentionally not restored; they re-subscribe during
+        normal boot so snapshot loading never replays callbacks.
+        """
+        with self._lock:
+            self._history.clear()
+            for raw in events[-self._max_history :]:
+                try:
+                    raw_event_id = raw.get("event_id")
+                    event_id = UUID(str(raw_event_id)) if raw_event_id else uuid4()
+                    event = Event(
+                        event_type=EventType[raw["event_type"]],
+                        source=raw.get("source", "unknown"),
+                        payload=raw.get("payload") or {},
+                        event_id=event_id,
+                        timestamp=datetime.fromisoformat(raw["timestamp"]),
+                        target=raw.get("target"),
+                        correlation_id=raw.get("correlation_id"),
+                        priority=int(raw.get("priority") or 0),
+                    )
+                    self._history.append(event)
+                except Exception:
+                    logger.debug("failed to restore event from snapshot: %s", raw, exc_info=True)

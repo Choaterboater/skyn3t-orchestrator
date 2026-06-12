@@ -713,6 +713,35 @@ class MetaAgent:
             )
         )
 
+    def to_snapshot(self) -> Dict[str, Any]:
+        """Serialize threshold-watch state and recent observations."""
+        return {
+            "actions": list(self._actions),
+            "observation_window": list(self._observation_window),
+            "agent_failures": {
+                k: list(v) for k, v in self._agent_failures.items()
+            },
+            "project_retries": dict(self._project_retries),
+            "review_scores": list(self._review_scores),
+            "proposal_last_filed": dict(self._proposal_last_filed),
+            "graduation_last_fired": dict(self._graduation_last_fired),
+        }
+
+    def restore_snapshot(self, data: Dict[str, Any]) -> None:
+        """Restore threshold-watch state from a snapshot."""
+        self._actions = list(data.get("actions") or [])[-self._max_actions :]
+        self._observation_window = list(data.get("observation_window") or [])[-self._max_window :]
+        self._agent_failures = {
+            k: deque(v, maxlen=REVIEW_SCORE_WINDOW)
+            for k, v in (data.get("agent_failures") or {}).items()
+        }
+        self._project_retries = dict(data.get("project_retries") or {})
+        self._review_scores = deque(
+            data.get("review_scores") or [], maxlen=REVIEW_SCORE_WINDOW
+        )
+        self._proposal_last_filed = dict(data.get("proposal_last_filed") or {})
+        self._graduation_last_fired = dict(data.get("graduation_last_fired") or {})
+
     def get_status(self) -> Dict[str, Any]:
         """Get meta-agent status."""
         return {

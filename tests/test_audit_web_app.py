@@ -39,7 +39,7 @@ def test_chunked_oversized_body_short_circuits_before_side_effects(monkeypatch):
     expensive dependency (_get_rag_engine) is never invoked.
     """
     # No web token so the request isn't blocked by the auth gate first.
-    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token=None))
+    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token=None, allow_unauthenticated_loopback=True))
 
     called = {"engine": False}
 
@@ -67,7 +67,7 @@ def test_chunked_oversized_body_short_circuits_before_side_effects(monkeypatch):
 # ─── 2. Normal-sized chunked body still passes the size middleware ───────
 def test_normal_chunked_body_passes_size_middleware(monkeypatch):
     """The hard abort must not break legitimate chunked uploads under the cap."""
-    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token=None))
+    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token=None, allow_unauthenticated_loopback=True))
 
     client = TestClient(web_app.app)
     small = b'{"idea": "small chunked body"}'
@@ -89,7 +89,7 @@ def test_discord_interactions_exempt_from_web_token_gate(monkeypatch):
     monkeypatch.setattr(
         web_app,
         "get_settings",
-        lambda: SimpleNamespace(web_token="secret-web-token", discord_public_key=None),
+        lambda: SimpleNamespace(web_token="secret-web-token", allow_unauthenticated_loopback=True, discord_public_key=None),
     )
 
     client = TestClient(web_app.app)
@@ -110,7 +110,7 @@ def test_other_api_routes_still_gated(monkeypatch):
     monkeypatch.setattr(
         web_app,
         "get_settings",
-        lambda: SimpleNamespace(web_token="secret-web-token"),
+        lambda: SimpleNamespace(web_token="secret-web-token", allow_unauthenticated_loopback=True),
     )
 
     client = TestClient(web_app.app)

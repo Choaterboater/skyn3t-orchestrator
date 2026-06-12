@@ -15,7 +15,15 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, WebSocketException
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+    WebSocketException,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
     FileResponse,
@@ -644,16 +652,29 @@ def _set_session_cookie(response: RedirectResponse, token: str, *, secure: bool)
 
 
 def _authorize_http_request(request: Request) -> tuple[bool, str, bool]:
+    import hmac
+
     current_settings = get_settings()
     expected_token = current_settings.web_token
     provided_token = _extract_http_token(request)
     if expected_token:
-        if provided_token != expected_token:
+        if not hmac.compare_digest(provided_token or "", expected_token):
             return False, _dashboard_token_hint(), False
         if not _http_origin_allowed(request):
             return False, "Cross-origin browser access denied.", False
         should_issue_cookie = request.url.path == "/" and request.query_params.get("token") == expected_token
         return True, "", should_issue_cookie
+    # SECURITY: token-less loopback access is no longer the default. The
+    # operator must explicitly opt in via SKYN3T_ALLOW_UNAUTHENTICATED_LOOPBACK=1
+    # or set SKYN3T_WEB_TOKEN. This prevents any process on the host from
+    # reaching the arbitrary-code-execution surface by default.
+    if not getattr(current_settings, "allow_unauthenticated_loopback", False):
+        return (
+            False,
+            "SkyN3t requires SKYN3T_WEB_TOKEN for remote access. "
+            "For trusted local-only development, set SKYN3T_ALLOW_UNAUTHENTICATED_LOOPBACK=1.",
+            False,
+        )
     client_host = request.client.host if request.client else None
     if not _is_loopback_host(client_host):
         return False, _dashboard_token_hint(), False
@@ -675,11 +696,13 @@ def _http_auth_response(request: Request, detail: str) -> HTMLResponse | JSONRes
 
 
 def _authorize_websocket(websocket: WebSocket) -> None:
+    import hmac
+
     current_settings = get_settings()
     expected_token = current_settings.web_token
     provided_token = _extract_websocket_token(websocket)
     if expected_token:
-        if provided_token != expected_token:
+        if not hmac.compare_digest(provided_token or "", expected_token):
             raise WebSocketException(
                 code=starlette_status.WS_1008_POLICY_VIOLATION,
                 reason="Missing or invalid auth token.",
@@ -690,6 +713,14 @@ def _authorize_websocket(websocket: WebSocket) -> None:
                 reason="Cross-origin browser access denied.",
             )
         return
+    if not getattr(current_settings, "allow_unauthenticated_loopback", False):
+        raise WebSocketException(
+            code=starlette_status.WS_1008_POLICY_VIOLATION,
+            reason=(
+                "SkyN3t requires SKYN3T_WEB_TOKEN. "
+                "Set SKYN3T_ALLOW_UNAUTHENTICATED_LOOPBACK=1 for trusted local-only dev."
+            ),
+        )
     client_host = websocket.client.host if websocket.client else None
     if not _is_loopback_host(client_host):
         raise WebSocketException(
@@ -789,6 +820,7 @@ async def enforce_web_access(request: Request, call_next):
         request.method == "OPTIONS"
         or path.startswith("/webhooks/")
         or path == "/api/discord/interactions"
+        or path in ("/health", "/metrics")
     ):
         return await call_next(request)
     allowed, detail, should_issue_cookie = _authorize_http_request(request)
@@ -1534,6 +1566,22 @@ async def execution_backend_patch(payload: Dict[str, Any]):
                 "valid_backends": sorted(_VALID_EXECUTION_BACKENDS),
             },
             status_code=400,
+        )
+    # SECURITY: refuse to persist the in-process inline backend unless the
+    # operator has explicitly opted in. Without this guard, a token holder can
+    # downgrade execution to host RCE via exec() in the orchestrator process.
+    if backend == "inline" and os.getenv("SKYN3T_ALLOW_INLINE_EXEC", "").strip() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return JSONResponse(
+            {
+                "error": "Inline backend is disabled by default.",
+                "hint": "Set SKYN3T_ALLOW_INLINE_EXEC=1 to opt in to trusted-only in-process execution, or use Docker.",
+            },
+            status_code=403,
         )
     if backend in {"docker", "docker-pool"} and not await DockerPoolBackend().available():
         return JSONResponse(
@@ -2516,6 +2564,61 @@ async def query_experiences(request: Request, query: str = "", limit: int = 10):
     return result
 
 
+@app.get("/api/memory/lessons")
+async def query_lessons(request: Request, query: str = "", limit: int = 10):
+    """Semantic search over captured lessons via RAG."""
+    engine = await _get_rag_engine(request)
+    limit = _clamp_limit(limit, default=10, hi=100)
+    result = await engine.query(query, n_results=limit, filter_dict={"doc_type": "lesson"})
+    return result
+
+
+@app.post("/api/snapshots")
+async def create_snapshot():
+    """Create an on-demand consciousness snapshot."""
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    helper = orchestrator._get_snapshot_helper()
+    checkpoint_id = await helper.create(orchestrator)
+    return {"id": checkpoint_id, "status": "created"}
+
+
+@app.get("/api/snapshots")
+async def list_snapshots():
+    """List available consciousness snapshots."""
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    helper = orchestrator._get_snapshot_helper()
+    return {"snapshots": helper.list()}
+
+
+@app.post("/api/snapshots/{checkpoint_id}/restore")
+async def restore_snapshot(checkpoint_id: str):
+    """Restore a consciousness snapshot by id."""
+    if not orchestrator:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    from skyn3t.persistence.checkpoint import Checkpoint, CheckpointManager
+
+    helper = orchestrator._get_snapshot_helper()
+    manager = CheckpointManager(checkpoint_dir=str(helper.manager.checkpoint_dir))
+    all_checkpoints = manager.list_checkpoints()
+    target = next((c for c in all_checkpoints if c["id"] == checkpoint_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    checkpoint = manager.load_latest()
+    # load_latest returns newest; if the requested id is not newest, walk files.
+    if checkpoint is None or checkpoint.checkpoint_id != checkpoint_id:
+        from pathlib import Path
+
+        path = Path(manager.checkpoint_dir) / f"{checkpoint_id}.cp"
+        if path.exists():
+            checkpoint = Checkpoint.from_bytes(path.read_bytes())
+        else:
+            raise HTTPException(status_code=404, detail="Snapshot file not found")
+    result = await helper.restore_into_orchestrator(orchestrator, checkpoint)
+    return {"id": checkpoint_id, "restored": result.get("restored", []), "skipped": result.get("skipped", [])}
+
+
 @app.get("/api/memory/tuning")
 async def get_tuning_status():
     """Get self-tuning engine status."""
@@ -2696,6 +2799,13 @@ async def exec_code(request: Request):
     try:
         settings = get_settings()
         backend = await get_backend(settings.execution_backend)
+    except RuntimeError as e:
+        # Backend selection can fail for security reasons (e.g. inline disabled).
+        return JSONResponse(
+            {"error": f"Execution backend unavailable: {e}"},
+            status_code=403,
+        )
+    try:
         result = await backend.execute(
             code,
             language=language,
@@ -3964,6 +4074,8 @@ async def studio_project_zip(slug: str):
     runner = _get_studio_runner(app)
     try:
         zip_path = runner.export_zip(slug)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     except FileNotFoundError:
         return JSONResponse({"error": "not found"}, status_code=404)
     return FileResponse(str(zip_path), media_type="application/zip", filename=f"{slug}.zip")

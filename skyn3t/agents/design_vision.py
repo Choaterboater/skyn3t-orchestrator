@@ -534,6 +534,9 @@ def _coerce_score_payload(data: dict) -> Optional[dict]:
     if not isinstance(data, dict):
         return None
     raw_score = data.get("score")
+    if raw_score is None:
+        return None
+    assert raw_score is not None
     try:
         score = int(round(float(raw_score)))
     except (TypeError, ValueError):

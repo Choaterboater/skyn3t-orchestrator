@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from unittest.mock import AsyncMock
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -101,7 +104,7 @@ class TestDockerPoolBackend:
     @pytest.mark.asyncio
     async def test_unsupported_language(self) -> None:
         backend = DockerPoolBackend()
-        backend._available = True
+        backend.available = AsyncMock(return_value=True)  # type: ignore[method-assign]
         result = await backend.execute("code", language="fortran")
         assert result.success is False
         assert "does not support language" in result.error
@@ -115,9 +118,16 @@ class TestDockerPoolBackend:
 
 class TestGetBackend:
     @pytest.mark.asyncio
-    async def test_inline_name(self) -> None:
+    async def test_inline_name(self, monkeypatch) -> None:
+        monkeypatch.setenv("SKYN3T_ALLOW_INLINE_EXEC", "1")
         backend = await get_backend("inline")
         assert isinstance(backend, InlineBackend)
+
+    @pytest.mark.asyncio
+    async def test_inline_disabled_without_optin(self, monkeypatch) -> None:
+        monkeypatch.delenv("SKYN3T_ALLOW_INLINE_EXEC", raising=False)
+        with pytest.raises(RuntimeError, match="InlineBackend is disabled"):
+            await get_backend("inline")
 
     @pytest.mark.asyncio
     async def test_auto_raises_when_docker_missing_and_inline_not_allowed(self, monkeypatch) -> None:
@@ -155,6 +165,7 @@ class TestGetBackend:
 class TestExecEndpoint:
     def test_exec_python_inline(self, monkeypatch) -> None:
         monkeypatch.setenv("SKYN3T_EXECUTION_BACKEND", "inline")
+        monkeypatch.setenv("SKYN3T_ALLOW_INLINE_EXEC", "1")
         from skyn3t.config.settings import get_settings
 
         get_settings.cache_clear()
@@ -184,3 +195,93 @@ class TestExecEndpoint:
             headers={"Content-Type": "application/json"},
         )
         assert response.status_code == 400
+
+
+class TestDockerHardening:
+    @pytest.mark.asyncio
+    async def test_backend_adds_hardening_flags(self, monkeypatch) -> None:
+        captured: list[list[str]] = []
+
+        async def _fake_create(*cmd, **kwargs):
+            captured.append(list(cmd))
+            proc = AsyncMock()
+            proc.communicate = AsyncMock(return_value=(b"ok", b""))
+            proc.returncode = 0
+            return proc
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create)
+        monkeypatch.setattr("os.chmod", lambda _path, _mode: None)
+        monkeypatch.setenv("SKYN3T_DOCKER_HARDENING", "1")
+        from skyn3t.config.settings import get_settings
+
+        get_settings.cache_clear()
+
+        backend = DockerBackend()
+        backend._available = True
+        result = await backend.execute("print(1)")
+        assert result.success is True
+        cmd = captured[-1]
+        assert "--user" in cmd
+        assert "65534:65534" in cmd
+        assert "--cap-drop" in cmd
+        assert "ALL" in cmd
+        assert "--security-opt" in cmd
+        assert "no-new-privileges=true" in cmd
+        assert "--cpus" in cmd
+        assert "--pids-limit" in cmd
+        assert "/tmp:noexec,nosuid,size=50m,mode=1777" in cmd
+
+    @pytest.mark.asyncio
+    async def test_backend_hardening_can_be_disabled(self, monkeypatch) -> None:
+        captured: list[list[str]] = []
+
+        async def _fake_create(*cmd, **kwargs):
+            captured.append(list(cmd))
+            proc = AsyncMock()
+            proc.communicate = AsyncMock(return_value=(b"ok", b""))
+            proc.returncode = 0
+            return proc
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create)
+        monkeypatch.setattr("os.chmod", lambda _path, _mode: None)
+        monkeypatch.setenv("SKYN3T_DOCKER_HARDENING", "0")
+        from skyn3t.config.settings import get_settings
+
+        get_settings.cache_clear()
+
+        backend = DockerBackend()
+        backend._available = True
+        result = await backend.execute("print(1)")
+        assert result.success is True
+        cmd = captured[-1]
+        assert "--user" not in cmd
+        assert "--cap-drop" not in cmd
+        assert "--security-opt" not in cmd
+
+    @pytest.mark.asyncio
+    async def test_pool_applies_hardening_flags(self, monkeypatch) -> None:
+        captured: list[list[str]] = []
+
+        async def _fake_create(*cmd, **kwargs):
+            captured.append(list(cmd))
+            proc = AsyncMock()
+            proc.communicate = AsyncMock(return_value=(b"", b""))
+            proc.wait = AsyncMock(return_value=0)
+            return proc
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create)
+        monkeypatch.setenv("SKYN3T_DOCKER_HARDENING", "1")
+        from skyn3t.config.settings import get_settings
+
+        get_settings.cache_clear()
+
+        backend = DockerPoolBackend(pool_size=1)
+        backend.available = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        await backend.execute("print(1)")
+        # _ensure_pool is called inside execute; we only inspect the run cmd.
+        run_cmd = next(
+            (c for c in captured if len(c) > 3 and c[1] == "run"),
+            [],
+        )
+        assert "--user" in run_cmd
+        assert "--cap-drop" in run_cmd

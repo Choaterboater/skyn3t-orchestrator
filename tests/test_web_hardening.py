@@ -33,7 +33,7 @@ def _reset_runtime_state(monkeypatch, tmp_path):
     """
     web_app._RATE_BUCKETS.clear()
     gh_webhook._seen_deliveries.clear()
-    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token=None))
+    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token=None, allow_unauthenticated_loopback=True))
     store = ProposalStore(root=tmp_path / "proposals")
     monkeypatch.setattr(cortex_mod, "get_store", lambda: store)
     monkeypatch.setattr("skyn3t.cortex.proposals._store", store)
@@ -146,7 +146,15 @@ def test_ws_rejects_invalid_json():
 
 
 # ─── 9. Rate limit on /api/proposals/feature ─────────────────────────
-def test_proposals_feature_rate_limit_returns_429():
+def test_proposals_feature_rate_limit_returns_429(monkeypatch):
+    # The endpoint calls FeatureSuggester, which can be slow; stub it so the
+    # rate limiter is the only thing under test.
+    class FastSuggester:
+        def file_user_idea(self, idea, source):
+            return "proposal-1"
+
+    monkeypatch.setattr(web_app, "orchestrator", SimpleNamespace(_feature_suggester=FastSuggester()))
+
     client = TestClient(web_app.app)
     seen_429 = False
     for _ in range(15):

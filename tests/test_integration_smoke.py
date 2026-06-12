@@ -382,7 +382,7 @@ def test_studio_file_endpoint_rejects_path_traversal(monkeypatch, tmp_path):
     monkeypatch.setattr(
         web_app,
         "get_settings",
-        lambda: SimpleNamespace(web_token=None),
+        lambda: SimpleNamespace(web_token=None, allow_unauthenticated_loopback=True),
     )
 
     client = TestClient(web_app.app)

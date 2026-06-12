@@ -39,6 +39,10 @@ def isolate_runtime_state(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "")
     # Force inline execution backend so tests don't pull Docker images.
     monkeypatch.setenv("SKYN3T_EXECUTION_BACKEND", "inline")
+    # Tests run in isolated temp dirs; opt in to the execution backend and
+    # loopback auth that the production code now requires by default.
+    monkeypatch.setenv("SKYN3T_ALLOW_INLINE_EXEC", "1")
+    monkeypatch.setenv("SKYN3T_ALLOW_UNAUTHENTICATED_LOOPBACK", "1")
     monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILDS", "0")
     monkeypatch.setenv("SKYN3T_AUTO_APPROVE", "0")
     monkeypatch.setenv("SKYN3T_NO_APPROVAL", "0")

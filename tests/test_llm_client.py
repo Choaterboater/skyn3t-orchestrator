@@ -44,6 +44,11 @@ async def test_llm_client_auto_mode_tries_all_local_clis_before_api_keys(monkeyp
         return False
 
     monkeypatch.setattr(LLMClient, "_try_cli", fake_try_cli)
+    monkeypatch.setattr(
+        LLMClient,
+        "_auto_cli_order",
+        lambda self: ["copilot_cli", "claude_cli", "kimi_cli", "openai_cli"],
+    )
 
     client = LLMClient(backend="auto")
     client._anthropic_key = None
@@ -67,6 +72,11 @@ async def test_llm_client_design_hint_uses_copilot_first(monkeypatch):
         return False
 
     monkeypatch.setattr(LLMClient, "_try_cli", fake_try_cli)
+    monkeypatch.setattr(
+        LLMClient,
+        "_auto_cli_order",
+        lambda self: ["copilot_cli", "claude_cli", "kimi_cli", "openai_cli"],
+    )
 
     client = LLMClient(backend="auto", caller_name="designer")
     client._anthropic_key = None
@@ -87,6 +97,11 @@ async def test_llm_client_code_hint_uses_copilot_first(monkeypatch):
         return False
 
     monkeypatch.setattr(LLMClient, "_try_cli", fake_try_cli)
+    monkeypatch.setattr(
+        LLMClient,
+        "_auto_cli_order",
+        lambda self: ["copilot_cli", "claude_cli", "kimi_cli", "openai_cli"],
+    )
 
     client = LLMClient(backend="auto", caller_name="build_fix")
     client._anthropic_key = None
@@ -111,6 +126,11 @@ async def test_policy_backend_falls_through_to_auto_chain(monkeypatch):
         return False
 
     monkeypatch.setattr(LLMClient, "_try_cli", fake_try_cli)
+    monkeypatch.setattr(
+        LLMClient,
+        "_auto_cli_order",
+        lambda self: ["copilot_cli", "claude_cli", "kimi_cli", "openai_cli"],
+    )
 
     client = LLMClient(
         backend="kimi_cli",

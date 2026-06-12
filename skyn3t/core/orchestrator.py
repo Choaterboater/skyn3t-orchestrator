@@ -26,6 +26,7 @@ from skyn3t.memory.ingestor import ExperienceIngestor
 from skyn3t.memory.meta_agent import MetaAgent
 from skyn3t.memory.store import MemoryStore
 from skyn3t.memory.tuner import SelfTuningEngine
+from skyn3t.persistence.consciousness_snapshot import ConsciousnessSnapshot
 
 logger = logging.getLogger("skyn3t.core.orchestrator")
 
@@ -163,6 +164,10 @@ class Orchestrator:
         self._agent_fleet_coordinator: Optional[Any] = None
         self._continuous_improvement: Optional[Any] = None
         self._never_stop_watchdog: Optional[Any] = None
+
+        # Consciousness snapshot helper (lazy-initialized on first use).
+        self._snapshot_helper: Optional[Any] = None
+        self._last_snapshot_at: float = 0.0
 
         # Subscribe to system events
         self.event_bus.subscribe(self._on_task_completed, EventType.TASK_COMPLETED)
@@ -381,6 +386,9 @@ class Orchestrator:
         await self._boot_cortex()
         _mark("boot_cortex")
 
+        await self._maybe_restore_consciousness()
+        _mark("consciousness_restore")
+
         try:
             from skyn3t.core.model_evolution import set_evolution_event_bus
             from skyn3t.core.openrouter_catalog import schedule_background_sync
@@ -449,6 +457,8 @@ class Orchestrator:
                 return_exceptions=True,
             )
 
+        await self._create_consciousness_snapshot(reason="shutdown")
+
         self.event_bus.publish(
             Event(
                 event_type=EventType.SYSTEM_ALERT,
@@ -456,6 +466,75 @@ class Orchestrator:
                 payload={"status": "stopped"},
             )
         )
+
+    # ------------------------------------------------------------------
+    # Consciousness snapshots
+    # ------------------------------------------------------------------
+
+    def _get_snapshot_helper(self) -> ConsciousnessSnapshot:
+        if self._snapshot_helper is None:
+            from skyn3t.config.settings import get_settings
+
+            settings = get_settings()
+            from skyn3t.persistence.checkpoint import CheckpointManager
+
+            self._snapshot_helper = ConsciousnessSnapshot(
+                CheckpointManager(
+                    checkpoint_dir=str(settings.snapshot_dir),
+                    max_checkpoints=settings.snapshot_max_kept,
+                )
+            )
+        return self._snapshot_helper
+
+    async def _maybe_restore_consciousness(self) -> None:
+        """Restore the latest compatible consciousness snapshot on boot."""
+        from skyn3t.config.settings import get_settings
+
+        settings = get_settings()
+        if not getattr(settings, "restore_on_boot", True):
+            return
+        try:
+            helper = self._get_snapshot_helper()
+            result = await helper.restore_latest(self)
+            if result is not None:
+                logger.info(
+                    "consciousness restored: %s; skipped: %s",
+                    result.get("restored"),
+                    result.get("skipped"),
+                )
+        except Exception:
+            logger.exception("consciousness restore failed")
+
+    async def _maybe_periodic_snapshot(self) -> None:
+        from skyn3t.config.settings import get_settings
+
+        settings = get_settings()
+        if not getattr(settings, "snapshot_enabled", True):
+            return
+        interval = getattr(settings, "snapshot_interval_seconds", 300)
+        if interval <= 0:
+            return
+        if __import__("time").time() - self._last_snapshot_at < interval:
+            return
+        asyncio.create_task(self._create_consciousness_snapshot(reason="periodic"))
+
+    async def _create_consciousness_snapshot(self, reason: str = "periodic") -> None:
+        from skyn3t.config.settings import get_settings
+
+        settings = get_settings()
+        if not getattr(settings, "snapshot_enabled", True):
+            return
+        try:
+            helper = self._get_snapshot_helper()
+            checkpoint_id = await helper.create(self)
+            self._last_snapshot_at = __import__("time").time()
+            logger.info(
+                "consciousness snapshot created (%s): %s",
+                reason,
+                checkpoint_id,
+            )
+        except Exception:
+            logger.exception("consciousness snapshot creation failed")
 
     # ------------------------------------------------------------------
     # Autonomy cortex (self-healing, reflection, learning, meta, tuning)
@@ -2539,6 +2618,7 @@ class Orchestrator:
                 self._compact_terminal_state()
                 self._compact_idempotency_keys()
                 await self._terminate_idle_auto_agents()
+                await self._maybe_periodic_snapshot()
 
                 await asyncio.sleep(30)
             except asyncio.CancelledError:

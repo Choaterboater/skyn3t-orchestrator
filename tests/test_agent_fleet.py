@@ -202,7 +202,9 @@ async def test_pop_highest_priority_brief_order(fake_autonomous):
     )
     chosen = coord.pop_highest_priority_brief()
     assert chosen is not None
-    assert chosen.brief == "High priority"
+    # The coordinator augments the brief with domain focus / deployment
+    # requirements; the original text is still at the front.
+    assert chosen.brief.startswith("High priority")
 
 
 @pytest.mark.asyncio

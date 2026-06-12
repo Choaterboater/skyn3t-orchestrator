@@ -648,6 +648,29 @@ class InlineBackend(ExecutionBackend):
             sys.stderr = old_stderr
 
 
+def _docker_hardening_flags(settings: Any) -> List[str]:
+    """Return extra `docker run` flags based on current settings."""
+    flags: List[str] = []
+    if not getattr(settings, "docker_hardening", True):
+        return flags
+    user = getattr(settings, "docker_user", "65534:65534")
+    if user:
+        flags.extend(["--user", user])
+    if getattr(settings, "docker_cap_drop_all", True):
+        flags.extend(["--cap-drop", "ALL"])
+    if getattr(settings, "docker_no_new_privs", True):
+        flags.extend(["--security-opt", "no-new-privileges=true"])
+    cpus = getattr(settings, "docker_cpus", 1.0)
+    if cpus > 0:
+        flags.extend(["--cpus", str(cpus)])
+    pids = getattr(settings, "docker_pids_limit", 64)
+    if pids > 0:
+        flags.extend(["--pids-limit", str(pids)])
+    # Scrub orchestrator env from the container; keep a minimal PATH.
+    flags.extend(["-e", "PATH=/usr/local/bin:/usr/bin:/bin"])
+    return flags
+
+
 class DockerBackend(ExecutionBackend):
     """Run code inside a short-lived Docker container.
 
@@ -731,6 +754,16 @@ class DockerBackend(ExecutionBackend):
             fh.write(code)
             code_path = fh.name
 
+        # The chosen container user must be able to read the bind-mounted code.
+        try:
+            os.chmod(code_path, 0o644)
+        except Exception:
+            pass
+
+        from skyn3t.config.settings import get_settings
+
+        settings = get_settings()
+
         # Deterministic container name so we can forcibly kill it on timeout.
         import uuid
 
@@ -745,7 +778,8 @@ class DockerBackend(ExecutionBackend):
             "--memory", f"{memory_mb}m",
             "--memory-swap", f"{memory_mb}m",
             "--read-only",
-            "--tmpfs", "/tmp:noexec,nosuid,size=50m",
+            "--tmpfs", "/tmp:noexec,nosuid,size=50m,mode=1777",
+            *(_docker_hardening_flags(settings)),
             "-v", f"{code_path}:/sandbox/code{suffix}:ro",
             "-w", "/tmp",
             image,
@@ -833,6 +867,7 @@ class DockerPoolBackend(ExecutionBackend):
         self._containers: Dict[str, List[str]] = {}
         self._locks: Dict[str, asyncio.Lock] = {}
         self._initialized: Dict[str, bool] = {}
+        self._exec_counts: Dict[str, int] = {}
         self._shutdown = False
 
     async def available(self) -> bool:
@@ -842,9 +877,35 @@ class DockerPoolBackend(ExecutionBackend):
     async def _ensure_pool(self, language: str) -> None:
         if self._initialized.get(language):
             return
+        from skyn3t.config.settings import get_settings
+
+        settings = get_settings()
         image = self._IMAGES.get(language)
         if not image:
             return
+        # Tear down stale containers before recreating (e.g., after recycle).
+        for old_name in self._containers.get(language, []):
+            try:
+                stop_proc = await asyncio.create_subprocess_exec(
+                    self.docker_path, "stop", "-t", "2", old_name,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await stop_proc.wait()
+            except Exception:
+                pass
+            try:
+                rm_proc = await asyncio.create_subprocess_exec(
+                    self.docker_path, "rm", old_name,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await rm_proc.wait()
+            except Exception:
+                pass
+            self._locks.pop(old_name, None)
+            self._exec_counts.pop(old_name, None)
+        self._containers[language] = []
         containers: List[str] = []
         for i in range(self.pool_size):
             name = f"skyn3t-pool-{language}-{i}-{os.getpid()}"
@@ -861,7 +922,8 @@ class DockerPoolBackend(ExecutionBackend):
                 "512m",
                 "--read-only",
                 "--tmpfs",
-                "/tmp:noexec,nosuid,size=50m",
+                "/tmp:noexec,nosuid,size=50m,mode=1777",
+                *(_docker_hardening_flags(settings)),
                 image,
                 "sleep",
                 "infinity",
@@ -871,6 +933,7 @@ class DockerPoolBackend(ExecutionBackend):
             await proc.wait()
             containers.append(name)
             self._locks[name] = asyncio.Lock()
+            self._exec_counts[name] = 0
         self._containers[language] = containers
         self._initialized[language] = True
         logger.info(
@@ -935,6 +998,11 @@ class DockerPoolBackend(ExecutionBackend):
             fh.write(code)
             local_path = fh.name
 
+        try:
+            os.chmod(local_path, 0o644)
+        except Exception:
+            pass
+
         remote_path = f"/tmp/code-{uuid.uuid4().hex}{suffix}"
 
         run_cmds: Dict[str, List[str]] = {
@@ -948,6 +1016,14 @@ class DockerPoolBackend(ExecutionBackend):
         }
 
         try:
+            from skyn3t.config.settings import get_settings
+
+            settings = get_settings()
+
+            # Wipe leftover code artifacts from previous runs before streaming
+            # new code into the pooled container.
+            await self._clean_tmp_in_container(name)
+
             # Stream code into container via docker exec + cat (avoids
             # docker cp failing on read-only rootfs containers).
             with open(local_path, "rb") as fh:
@@ -981,8 +1057,13 @@ class DockerPoolBackend(ExecutionBackend):
             communicate_task = asyncio.create_task(proc.communicate())
             stdout_data, stderr_data = await asyncio.wait_for(communicate_task, timeout=timeout)
 
-            # Clean up remote file
+            # Clean up remote file and bump execution counter.
             asyncio.create_task(self._rm_in_container(name, remote_path))
+            self._exec_counts[name] = self._exec_counts.get(name, 0) + 1
+            recycle_after = getattr(settings, "docker_pool_recycle_after", 50)
+            if recycle_after > 0 and self._exec_counts[name] >= recycle_after:
+                self._initialized[language] = False
+                self._exec_counts[name] = 0
 
             return ExecutionResult(
                 success=proc.returncode == 0,
@@ -1039,6 +1120,23 @@ class DockerPoolBackend(ExecutionBackend):
         except Exception:
             pass
 
+    async def _clean_tmp_in_container(self, name: str) -> None:
+        """Best-effort cleanup of streamed code files inside a pooled container."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.docker_path,
+                "exec",
+                name,
+                "sh",
+                "-c",
+                "rm -f /tmp/code-* /tmp/code-*.* /tmp/out 2>/dev/null",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        except Exception:
+            pass
+
     async def shutdown(self) -> None:
         """Stop and remove all pooled containers."""
         self._shutdown = True
@@ -1072,7 +1170,18 @@ async def get_backend(name: str = "auto") -> ExecutionBackend:
     """
     name = name.lower().strip()
     if name == "inline":
-        return InlineBackend()
+        # SECURITY: in-process exec() is trivially escapable to host RCE.
+        # Require explicit opt-in even for explicit "inline" requests.
+        if os.getenv("SKYN3T_ALLOW_INLINE_EXEC", "").strip() in ("1", "true", "yes", "on"):
+            logger.warning(
+                "SECURITY: InlineBackend selected explicitly. "
+                "Running untrusted code IN-PROCESS is NOT a real sandbox."
+            )
+            return InlineBackend()
+        raise RuntimeError(
+            "InlineBackend is disabled. Set SKYN3T_ALLOW_INLINE_EXEC=1 to opt in to "
+            "trusted-only in-process execution, or use Docker for real isolation."
+        )
     if name == "docker":
         docker_backend = DockerBackend()
         if not await docker_backend.available():

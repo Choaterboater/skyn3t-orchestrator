@@ -118,3 +118,15 @@ def test_resume_interrupted_uses_checkpoint(tmp_path, runner, monkeypatch):
 
     asyncio.run(runner.resume_interrupted(slug))
     assert captured["start_index"] == 1
+
+
+def test_record_pipeline_checkpoint_resume_override(runner):
+    manifest: dict = {}
+    runner._record_pipeline_checkpoint(
+        manifest,
+        stage_index=2,
+        stage_name="code",
+        resume_index=2,
+    )
+    assert manifest["pipeline_checkpoint"]["last_completed_stage"] == "code"
+    assert manifest["pipeline_checkpoint"]["resume_index"] == 2

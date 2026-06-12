@@ -127,6 +127,57 @@ class TestBaseAgent:
         assert errors
         assert errors[-1].payload["context"]["phase"] == "start"
 
+    async def test_task_completed_payload_includes_experience_fields(self, event_bus):
+        agent = MockTestAgent("exp_agent", event_bus)
+        await agent.start()
+
+        task = TaskRequest(
+            title="Experience task",
+            input_data={
+                "stack": "react_vite",
+                "stage": "code",
+                "brief_shape": "todo_app",
+            },
+        )
+        await agent.submit_task(task)
+        await asyncio.sleep(0.3)
+
+        events = event_bus.get_history(EventType.TASK_COMPLETED)
+        assert events
+        payload = events[-1].payload
+        assert payload.get("stack") == "react_vite"
+        assert payload.get("stage") == "code"
+        assert payload.get("brief_shape") == "todo_app"
+        await agent.shutdown()
+
+    async def test_task_failed_payload_includes_experience_fields(self, event_bus):
+        class FailingAgent(MockTestAgent):
+            async def execute(self, task):
+                return TaskResult(
+                    task_id=task.task_id,
+                    success=False,
+                    error="mount missing",
+                    metadata={"error_signature": "missing_mount"},
+                )
+
+        agent = FailingAgent("fail_agent", event_bus)
+        await agent.start()
+
+        task = TaskRequest(
+            title="Failing task",
+            input_data={"stack": "react_vite", "stage": "code"},
+        )
+        await agent.submit_task(task)
+        await asyncio.sleep(0.3)
+
+        events = event_bus.get_history(EventType.TASK_FAILED)
+        assert events
+        payload = events[-1].payload
+        assert payload.get("stack") == "react_vite"
+        assert payload.get("stage") == "code"
+        assert payload.get("error_signature") == "missing_mount"
+        await agent.shutdown()
+
     async def test_callback_failure_records_agent_error(self, event_bus):
         agent = MockTestAgent("callback_agent", event_bus)
         await agent.start()
@@ -467,7 +518,7 @@ class TestOrgChart:
         assert view["config"]["backend"] is None
         assert view["config"]["model"] is None
         assert view["effective_backend"] == "openrouter"
-        assert view["effective_model"] == "xiaomi/mimo-v2.5-pro"
+        assert view["effective_model"] == "qwen/qwen3-coder-plus"
         assert view["effective_source"] == "policy"
 
     async def test_get_config_view_can_resolve_policy_from_agent_type(self, event_bus):
@@ -477,7 +528,7 @@ class TestOrgChart:
         view = agent.get_config_view()
 
         assert view["effective_backend"] == "openrouter"
-        assert view["effective_model"] == "openrouter/owl-alpha"
+        assert view["effective_model"] == "google/gemini-3.1-flash-lite"
         assert view["effective_source"] == "policy"
 
     async def test_llm_can_resolve_policy_from_agent_type(self, event_bus):
@@ -488,7 +539,7 @@ class TestOrgChart:
 
         assert client is not None
         assert client._backend_name == "openrouter"
-        assert client.default_model == "openrouter/owl-alpha"
+        assert client.default_model == "google/gemini-3.1-flash-lite"
 
     async def test_clear_override_only_removes_requested_keys(self, event_bus):
         agent = MockTestAgent("reviewer", event_bus)

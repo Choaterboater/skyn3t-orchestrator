@@ -40,10 +40,6 @@ class Settings(BaseSettings):
     )
     vector_db_path: str = Field(default="./data/vector_db", alias="VECTOR_DB_PATH")
 
-    # Redis / Message Bus
-    redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
-    use_redis: bool = Field(default=False, alias="USE_REDIS")
-
     # API Keys
     openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
     anthropic_api_key: Optional[str] = Field(default=None, alias="ANTHROPIC_API_KEY")
@@ -189,6 +185,12 @@ class Settings(BaseSettings):
     autonomous_quality_retry: bool = Field(
         default=True, alias="SKYN3T_AUTONOMOUS_QUALITY_RETRY"
     )
+    autonomous_build_max_retries: int = Field(
+        default=3, alias="SKYN3T_AUTONOMOUS_BUILD_MAX_RETRIES"
+    )
+    autonomous_resume_interrupted: bool = Field(
+        default=True, alias="SKYN3T_AUTONOMOUS_RESUME_INTERRUPTED"
+    )
     # Parallel agent fleet — concurrent autonomous learn + build workers
     agent_fleet_size: int = Field(default=0, alias="SKYN3T_AGENT_FLEET_SIZE")
     agent_fleet_learning: int = Field(default=1, alias="SKYN3T_AGENT_FLEET_LEARNING")
@@ -234,6 +236,15 @@ class Settings(BaseSettings):
     # SKYN3T_AUTO_APPROVE_STUDIO=1.
     auto_approve: bool = Field(default=False, alias="SKYN3T_AUTO_APPROVE")
 
+    # Consciousness snapshots — durable orchestrator state
+    snapshot_enabled: bool = Field(default=True, alias="SKYN3T_SNAPSHOT_ENABLED")
+    snapshot_interval_seconds: int = Field(
+        default=300, alias="SKYN3T_SNAPSHOT_INTERVAL_SECONDS"
+    )
+    snapshot_max_kept: int = Field(default=10, alias="SKYN3T_SNAPSHOT_MAX_KEPT")
+    restore_on_boot: bool = Field(default=True, alias="SKYN3T_RESTORE_ON_BOOT")
+    snapshot_dir: Path = Field(default=Path("./data/checkpoints"), alias="SKYN3T_SNAPSHOT_DIR")
+
     # Studio per-project token budget (estimated chars/4). 0 = disabled.
     # Inspired by Forge cost caps — stops runaway LLM spend mid-pipeline.
     studio_token_budget: int = Field(default=0, alias="SKYN3T_STUDIO_TOKEN_BUDGET")
@@ -241,6 +252,15 @@ class Settings(BaseSettings):
     # CodeAgent Python execution: auto (Docker pool when available, else inline),
     # inline, docker, or docker-pool.
     execution_backend: str = Field(default="auto", alias="SKYN3T_EXECUTION_BACKEND")
+
+    # Docker sandbox hardening (defense-in-depth for code execution)
+    docker_hardening: bool = Field(default=True, alias="SKYN3T_DOCKER_HARDENING")
+    docker_user: str = Field(default="65534:65534", alias="SKYN3T_DOCKER_USER")
+    docker_cpus: float = Field(default=1.0, alias="SKYN3T_DOCKER_CPUS")
+    docker_pids_limit: int = Field(default=64, alias="SKYN3T_DOCKER_PIDS_LIMIT")
+    docker_no_new_privs: bool = Field(default=True, alias="SKYN3T_DOCKER_NO_NEW_PRIVS")
+    docker_cap_drop_all: bool = Field(default=True, alias="SKYN3T_DOCKER_CAP_DROP_ALL")
+    docker_pool_recycle_after: int = Field(default=50, alias="SKYN3T_DOCKER_POOL_RECYCLE_AFTER")
 
     # Public URL — used in notification embeds (Discord etc.) so users can
     # click through to the dashboard. Leave unset to fall back to
@@ -254,9 +274,15 @@ class Settings(BaseSettings):
     web_port: int = Field(default=6660, alias="WEB_PORT")
     cors_origins: List[str] = Field(default=["*"], alias="CORS_ORIGINS")
     web_token: Optional[str] = Field(default=None, alias="SKYN3T_WEB_TOKEN")
+    # SECURITY: by default the web control plane requires SKYN3T_WEB_TOKEN.
+    # Setting this to true restores the legacy loopback-only behavior. It is
+    # convenient for local development but dangerous if the host is shared or
+    # the dashboard is ever exposed beyond localhost.
+    allow_unauthenticated_loopback: bool = Field(
+        default=False, alias="SKYN3T_ALLOW_UNAUTHENTICATED_LOOPBACK"
+    )
 
     # Security
-    security_enabled: bool = Field(default=True, alias="SECURITY_ENABLED")
     master_key: Optional[str] = Field(default=None, alias="SKYN3T_MASTER_KEY")
     allow_ephemeral_master_key: bool = Field(
         default=False,
@@ -271,7 +297,6 @@ class Settings(BaseSettings):
     sandbox_default_memory_mb: int = Field(default=512, alias="SANDBOX_DEFAULT_MEMORY_MB")
     sandbox_default_file_size_mb: int = Field(default=128, alias="SANDBOX_DEFAULT_FILE_SIZE_MB")
     sandbox_default_timeout: float = Field(default=300.0, alias="SANDBOX_DEFAULT_TIMEOUT")
-    sandbox_capture_syscalls: bool = Field(default=False, alias="SANDBOX_CAPTURE_SYSCALLS")
     sandbox_cleanup_temp: bool = Field(default=True, alias="SANDBOX_CLEANUP_TEMP")
 
     @field_validator("cors_origins", mode="before")

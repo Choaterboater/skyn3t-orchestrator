@@ -1226,6 +1226,13 @@ async def test_rag_stats_and_recent_surface_engine_state(monkeypatch):
                 },
             ]
 
+        def recent_documents(self, limit: int):
+            docs = self.all_documents()
+            docs.sort(
+                key=lambda d: d["metadata"].get("timestamp", ""), reverse=True
+            )
+            return docs[:limit]
+
     class FakeEngine:
         def __init__(self):
             self.vector_store = FakeVectorStore()
@@ -1384,7 +1391,7 @@ async def test_list_agents_includes_catalog_metadata(monkeypatch):
     assert result["agents"][0]["recommended_backend"] == "claude_cli"
     assert result["agents"][0]["config"]["backend"] is None
     assert result["agents"][0]["effective_backend"] == "openrouter"
-    assert result["agents"][0]["effective_model"] == "openrouter/owl-alpha"
+    assert result["agents"][0]["effective_model"] == "google/gemini-3.1-flash-lite"
 
 
 @pytest.mark.asyncio
@@ -1414,9 +1421,9 @@ async def test_list_agents_surfaces_effective_policy_route(monkeypatch):
     result = await web_app.list_agents()
 
     assert result["agents"][0]["backend"] == "openrouter"
-    assert result["agents"][0]["model"] == "xiaomi/mimo-v2.5-pro"
+    assert result["agents"][0]["model"] == "qwen/qwen3-coder-plus"
     assert result["agents"][0]["effective_backend"] == "openrouter"
-    assert result["agents"][0]["effective_model"] == "xiaomi/mimo-v2.5-pro"
+    assert result["agents"][0]["effective_model"] == "qwen/qwen3-coder-plus"
 
 
 @pytest.mark.asyncio
@@ -1494,7 +1501,7 @@ async def test_routing_policy_patch_invalidates_live_agent_llm(monkeypatch, tmp_
     assert agent._llm is None
     after = agent.llm
     assert after is not None
-    assert after._backend_name == "copilot_cli"
+    assert after._backend_name == "claude_cli"
 
 
 @pytest.mark.asyncio
@@ -1544,7 +1551,7 @@ async def test_routing_preset_studio_quality_applies_policies(monkeypatch, tmp_p
     result = await web_app.routing_preset_studio_quality()
 
     assert result["ok"] is True
-    assert store.entries()["reviewer"]["tier"] == "or_strong"
+    assert store.entries()["reviewer"]["tier"] == "strong"
     reviewer = next(route for route in result["routes"] if route["stage"] == "reviewer")
     assert reviewer["source"] == "persisted"
 

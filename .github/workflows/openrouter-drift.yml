@@ -1,0 +1,18 @@
+name: OpenRouter Model Drift Check
+
+on:
+  schedule:
+    # Daily at 08:00 UTC
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Check tracked models against OpenRouter
+        run: python scripts/check_openrouter_changes.py

@@ -16,7 +16,7 @@ logger = logging.getLogger("skyn3t.persistence.checkpoint")
 # Bump when the on-disk Checkpoint shape changes in a non-additive way.
 # from_bytes refuses to load schema versions newer than CURRENT_SCHEMA_VERSION
 # rather than silently dropping fields it doesn't understand.
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -31,6 +31,12 @@ class Checkpoint:
     event_position: int = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
     schema_version: int = CURRENT_SCHEMA_VERSION
+    consciousness_state: Dict[str, Any] = field(default_factory=dict)
+    token_tracker_state: Dict[str, Any] = field(default_factory=dict)
+    autonomous_loop_state: Dict[str, Any] = field(default_factory=dict)
+    meta_agent_state: Dict[str, Any] = field(default_factory=dict)
+    event_bus_history: List[Dict[str, Any]] = field(default_factory=list)
+    orchestrator_metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_bytes(self) -> bytes:
         """Serialize to compressed bytes."""
@@ -82,6 +88,13 @@ class CheckpointManager:
         task_states: List[Dict[str, Any]],
         pipeline_states: Optional[List[Dict[str, Any]]] = None,
         event_position: int = 0,
+        *,
+        consciousness_state: Optional[Dict[str, Any]] = None,
+        token_tracker_state: Optional[Dict[str, Any]] = None,
+        autonomous_loop_state: Optional[Dict[str, Any]] = None,
+        meta_agent_state: Optional[Dict[str, Any]] = None,
+        event_bus_history: Optional[List[Dict[str, Any]]] = None,
+        orchestrator_metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Save a new checkpoint."""
         checkpoint = Checkpoint(
@@ -91,6 +104,12 @@ class CheckpointManager:
             task_states=task_states,
             pipeline_states=pipeline_states or [],
             event_position=event_position,
+            consciousness_state=consciousness_state or {},
+            token_tracker_state=token_tracker_state or {},
+            autonomous_loop_state=autonomous_loop_state or {},
+            meta_agent_state=meta_agent_state or {},
+            event_bus_history=event_bus_history or [],
+            orchestrator_metadata=orchestrator_metadata or {},
         )
 
         path = self.checkpoint_dir / f"{checkpoint.checkpoint_id}.cp"
@@ -143,6 +162,11 @@ class CheckpointManager:
                     "tasks": len(cp.task_states),
                     "pipelines": len(cp.pipeline_states),
                     "event_position": cp.event_position,
+                    "consciousness_keys": len(cp.consciousness_state),
+                    "token_tracker_agents": len(
+                        (cp.token_tracker_state or {}).get("by_agent", {})
+                    ),
+                    "schema_version": cp.schema_version,
                 }
             )
         return checkpoints

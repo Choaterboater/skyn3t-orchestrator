@@ -417,6 +417,7 @@ github_app = typer.Typer(help="GitHub exploration commands", no_args_is_help=Tru
 scout_app = typer.Typer(help="External repo scout commands", no_args_is_help=True)
 proposal_app = typer.Typer(help="Self-update proposal review", no_args_is_help=True)
 export_app = typer.Typer(help="Export data for analysis or training", no_args_is_help=True)
+snapshot_app = typer.Typer(help="Consciousness snapshot management", no_args_is_help=True)
 user_app = typer.Typer(help="User profile management", no_args_is_help=True)
 schedule_app = typer.Typer(help="Schedule recurring tasks", no_args_is_help=True)
 memory_app = typer.Typer(help="Memory inspection commands", no_args_is_help=True)
@@ -432,7 +433,76 @@ app.add_typer(rag_app, name="rag")
 app.add_typer(github_app, name="github")
 app.add_typer(scout_app, name="scout")
 app.add_typer(proposal_app, name="proposal")
+@snapshot_app.command("create")
+def snapshot_create() -> None:
+    """Create an on-demand consciousness snapshot."""
+    try:
+        with _client() as client:
+            resp = client.post("/api/snapshots")
+            resp.raise_for_status()
+            data = resp.json()
+            _success(f"Snapshot created: {data.get('id')}")
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+
+@snapshot_app.command("list")
+def snapshot_list() -> None:
+    """List available consciousness snapshots."""
+    try:
+        with _client() as client:
+            resp = client.get("/api/snapshots")
+            resp.raise_for_status()
+            data = resp.json()
+            snaps = data.get("snapshots", [])
+            if not snaps:
+                console.print("[dim]No snapshots found.[/dim]")
+                return
+            for snap in snaps:
+                console.print(
+                    f"[bold]{snap.get('id')}[/bold] "
+                    f"({snap.get('timestamp')}) — "
+                    f"agents={snap.get('agents', 0)} "
+                    f"token_agents={snap.get('token_tracker_agents', 0)}"
+                )
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+
+@snapshot_app.command("restore")
+def snapshot_restore(
+    checkpoint_id: str = typer.Argument(..., help="Checkpoint id to restore"),
+) -> None:
+    """Restore a consciousness snapshot."""
+    try:
+        with _client() as client:
+            resp = client.post(f"/api/snapshots/{checkpoint_id}/restore")
+            resp.raise_for_status()
+            data = resp.json()
+            restored = data.get("restored", [])
+            skipped = data.get("skipped", [])
+            _success(
+                f"Restored {len(restored)} subsystem(s): {', '.join(restored)}"
+                + (f" (skipped: {', '.join(skipped)})" if skipped else "")
+            )
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+
 app.add_typer(export_app, name="export")
+app.add_typer(snapshot_app, name="snapshot")
 app.add_typer(user_app, name="user")
 app.add_typer(schedule_app, name="schedule")
 app.add_typer(memory_app, name="memory")

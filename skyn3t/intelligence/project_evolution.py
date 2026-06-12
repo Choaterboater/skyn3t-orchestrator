@@ -189,4 +189,6 @@ def propose_verified_improvement(
         requires_approval=True,
         force_requires_approval=True,
     )
-    return proposal.to_public() if hasattr(proposal, "to_public") else dict(proposal)
+    if hasattr(proposal, "to_public"):
+        return proposal.to_public()
+    return dict(proposal)  # type: ignore[arg-type]

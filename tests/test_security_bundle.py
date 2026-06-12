@@ -14,7 +14,7 @@ from skyn3t.security.secrets import SecretStore
 
 
 def test_http_auth_requires_token_when_configured(monkeypatch):
-    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token="secret-token"))
+    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token="secret-token", allow_unauthenticated_loopback=True))
     client = TestClient(web_app.app)
 
     response = client.get("/api/status")
@@ -24,7 +24,7 @@ def test_http_auth_requires_token_when_configured(monkeypatch):
 
 
 def test_root_token_bootstrap_sets_cookie_and_redirects(monkeypatch):
-    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token="secret-token"))
+    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token="secret-token", allow_unauthenticated_loopback=True))
     client = TestClient(web_app.app)
 
     response = client.get("/?token=secret-token", follow_redirects=False)
@@ -38,7 +38,7 @@ def test_root_token_bootstrap_sets_cookie_and_redirects(monkeypatch):
 
 
 def test_header_auth_allows_api_access(monkeypatch):
-    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token="secret-token"))
+    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token="secret-token", allow_unauthenticated_loopback=True))
     client = TestClient(web_app.app)
 
     response = client.get("/api/status", headers={"Authorization": "Bearer secret-token"})
@@ -47,7 +47,7 @@ def test_header_auth_allows_api_access(monkeypatch):
 
 
 def test_localhost_fallback_allows_testclient_without_token(monkeypatch):
-    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token=None))
+    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token=None, allow_unauthenticated_loopback=True))
     client = TestClient(web_app.app)
 
     response = client.get("/api/status")
@@ -56,7 +56,7 @@ def test_localhost_fallback_allows_testclient_without_token(monkeypatch):
 
 
 def test_remote_requests_require_token_when_no_token_configured(monkeypatch):
-    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token=None))
+    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token=None, allow_unauthenticated_loopback=True))
     monkeypatch.setattr(web_app, "_is_loopback_host", lambda _host: False)
     client = TestClient(web_app.app)
 
@@ -67,7 +67,7 @@ def test_remote_requests_require_token_when_no_token_configured(monkeypatch):
 
 
 def test_websocket_auth_rejects_missing_token(monkeypatch):
-    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token="secret-token"))
+    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token="secret-token", allow_unauthenticated_loopback=True))
 
     fake_ws = SimpleNamespace(
         headers={},
@@ -82,7 +82,7 @@ def test_websocket_auth_rejects_missing_token(monkeypatch):
 
 
 def test_websocket_auth_accepts_query_token(monkeypatch):
-    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token="secret-token"))
+    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token="secret-token", allow_unauthenticated_loopback=True))
 
     fake_ws = SimpleNamespace(
         headers={"origin": "http://testserver"},
@@ -191,7 +191,7 @@ def test_studio_project_preview_sets_iframe_safe_csp(monkeypatch, tmp_path):
     monkeypatch.setattr(
         web_app,
         "get_settings",
-        lambda: SimpleNamespace(web_token=None),
+        lambda: SimpleNamespace(web_token=None, allow_unauthenticated_loopback=True),
     )
 
     client = TestClient(web_app.app)

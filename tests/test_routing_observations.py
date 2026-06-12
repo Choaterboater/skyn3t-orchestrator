@@ -23,7 +23,7 @@ def test_record_trajectory_updates_stage_route_stats(monkeypatch, tmp_path):
                     "type": "llm_call",
                     "project_stage": "reviewer",
                     "backend": "openrouter",
-                    "model": "xiaomi/mimo-v2.5-pro",
+                    "model": "qwen/qwen3-coder-plus",
                     "total_tokens": 2000,
                 }
             ],
@@ -55,7 +55,7 @@ def test_snapshot_warms_from_existing_trajectory_files(monkeypatch, tmp_path):
                         "type": "llm_call",
                         "project_stage": "brainstorm",
                         "backend": "openrouter",
-                        "model": "openrouter/owl-alpha",
+                        "model": "google/gemini-3.1-flash-lite",
                         "total_tokens": 900,
                     }
                 ],

@@ -49,7 +49,9 @@ def test_cheap_smart_disabled_with_zero(monkeypatch):
 
 
 def test_code_stage_routes_cheap_when_cheap_smart_on(monkeypatch):
+    # Cheap-first code routing is now gated by BOTH flags.
     monkeypatch.setenv("SKYN3T_CHEAP_SMART", "1")
+    monkeypatch.setenv("SKYN3T_CHEAP_FIRST_CODE", "1")
 
     route = describe_stage_route("code")
 

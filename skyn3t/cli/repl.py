@@ -1636,7 +1636,7 @@ async def _cmd_studio_reject(state: ReplState, rest: str) -> None:
         slug = state.studio_slug
         feedback = parts[1].strip() if len(parts) > 1 else ""
     else:
-        slug = state.studio_slug
+        slug = state.studio_slug or ""
         feedback = rest.strip()
     if not slug:
         _add_transcript(

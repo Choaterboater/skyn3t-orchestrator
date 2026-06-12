@@ -106,7 +106,7 @@ def test_apply_studio_quality_wizard_writes_openrouter_and_policies(tmp_path, mo
     assert "SKYN3T_EXECUTION_BACKEND=auto" in text
     assert result["routing_applied"] is True
     assert store.entries()["code"]["tier"] == "or_strong"
-    assert store.entries()["reviewer"]["tier"] == "or_strong"
+    assert store.entries()["reviewer"]["tier"] == "strong"
     assert store.entries()["designer"]["tier"] == "or_ui"
 
 

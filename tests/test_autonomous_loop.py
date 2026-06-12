@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -220,3 +221,87 @@ def test_reset_daily_counters():
     _reset_daily_counters(state)
     assert state.daily_builds == 0
     assert state.daily_spend_usd == 0.0
+
+
+class _FailingRunner:
+    MAX_CONCURRENT_PROJECTS = 3
+
+    def __init__(self):
+        self.started: list[dict] = []
+        self.fail_count = 0
+
+    def list_projects(self):
+        return []
+
+    async def start(self, template, brief, **kwargs):
+        self.fail_count += 1
+        raise RuntimeError("studio start failed")
+
+
+class _InterruptionRunner:
+    MAX_CONCURRENT_PROJECTS = 3
+
+    def __init__(self):
+        self.resumed: list[str] = []
+        self.started: list[dict] = []
+
+    def list_projects(self):
+        return [{"slug": "crashed-1", "status": "interrupted"}]
+
+    async def resume_interrupted(self, slug: str):
+        self.resumed.append(slug)
+
+    async def start(self, template, brief, **kwargs):
+        self.started.append({"template": template, "brief": brief, **kwargs})
+        return {"slug": kwargs.get("slug") or "auto-test", "status": "running"}
+
+
+@pytest.mark.asyncio
+async def test_autonomous_build_retries_then_drops(monkeypatch):
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILDS", "1")
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILD_MAX_RETRIES", "2")
+    get_settings.cache_clear()
+
+    runner = _FailingRunner()
+    orch = SimpleNamespace(
+        memory_store=_FakeMemory(),
+        running_tasks={},
+        get_studio_runner=lambda: runner,
+        _repo_scout=None,
+    )
+    coord = AutonomousCoordinator(orch, MagicMock())
+    brief = AutonomousBrief(brief="Build a retryable app.", source="test")
+    await coord._pending.put(brief)
+
+    skip1 = await coord._maybe_start_build()
+    assert "retry 1/2" in skip1
+    assert coord._pending.qsize() == 1
+
+    skip2 = await coord._maybe_start_build()
+    assert "retry 2/2" in skip2
+    assert coord._pending.qsize() == 1
+
+    skip3 = await coord._maybe_start_build()
+    assert "after 3 attempts" in skip3
+    assert coord._pending.qsize() == 0
+
+
+@pytest.mark.asyncio
+async def test_autonomous_start_resumes_interrupted_projects(monkeypatch):
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILDS", "1")
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_RESUME_INTERRUPTED", "1")
+    get_settings.cache_clear()
+
+    runner = _InterruptionRunner()
+    orch = SimpleNamespace(
+        memory_store=_FakeMemory(),
+        running_tasks={},
+        get_studio_runner=lambda: runner,
+        _repo_scout=None,
+    )
+    coord = AutonomousCoordinator(orch, MagicMock())
+    await coord.start()
+    # Allow the background resume task to be scheduled.
+    await asyncio.sleep(0)
+    assert "crashed-1" in runner.resumed
+    await coord.stop()

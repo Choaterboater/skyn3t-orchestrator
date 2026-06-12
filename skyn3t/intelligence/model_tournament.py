@@ -163,7 +163,8 @@ class ModelTournamentStore:
 
 
 def estimate_model_cost_usd(model_meta: Dict[str, Any], *, tokens: int = 12_000) -> float:
-    pricing = model_meta.get("pricing") if isinstance(model_meta.get("pricing"), dict) else {}
+    raw_pricing = model_meta.get("pricing")
+    pricing: Dict[str, Any] = raw_pricing if isinstance(raw_pricing, dict) else {}
     raw_prompt = pricing.get("prompt") or pricing.get("input") or 0
     raw_completion = pricing.get("completion") or pricing.get("output") or 0
     try:

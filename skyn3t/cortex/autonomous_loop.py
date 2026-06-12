@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
+from skyn3t.config.settings import get_settings
+
 logger = logging.getLogger("skyn3t.cortex.autonomous_loop")
 
 STATE_PATH = Path("data/autonomous_loop_state.json")
@@ -40,6 +42,7 @@ class AutonomousBrief:
     trigger: str = ""
     priority: int = 0
     created_at: float = field(default_factory=time.time)
+    attempt_count: int = 0
 
 
 @dataclass
@@ -252,6 +255,7 @@ class AutonomousCoordinator:
                     trigger=str(item.get("trigger") or ""),
                     priority=int(item.get("priority") or 0),
                     created_at=float(item.get("created_at") or time.time()),
+                    attempt_count=int(item.get("attempt_count") or 0),
                 )
                 if brief.brief.strip():
                     await self._pending.put(brief)
@@ -259,6 +263,7 @@ class AutonomousCoordinator:
                 continue
         self.state.queue = []
         _save_state(self.state)
+        await self._resume_interrupted_projects()
         self._task = asyncio.create_task(self._loop())
         self._publish_alert("autonomous_builds_started", scout=self._scout_boot)
 
@@ -933,8 +938,8 @@ class AutonomousCoordinator:
         try:
             from skyn3t.observability.token_tracker import get_default_tracker
 
-            row = get_default_tracker().project_summary(slug)
-            return max(0, int(row.get("total_tokens") or 0))
+            row = get_default_tracker().for_project(slug)
+            return max(0, int((row or {}).get("total_tokens") or 0))
         except Exception:
             logger.debug("token tracker project lookup failed", exc_info=True)
             return 0
@@ -1018,8 +1023,88 @@ class AutonomousCoordinator:
             return None
         except Exception as exc:
             logger.exception("autonomous build start failed")
-            await self._pending.put(chosen)
-            return f"start failed: {exc}"
+            chosen.attempt_count += 1
+            max_retries = getattr(
+                get_settings(),
+                "autonomous_build_max_retries",
+                3,
+            )
+            if chosen.attempt_count <= max_retries:
+                await self._pending.put(chosen)
+                self._publish_alert(
+                    "autonomous_build_retry",
+                    brief=chosen.brief[:120],
+                    attempt=chosen.attempt_count,
+                    max_retries=max_retries,
+                    error=str(exc)[:200],
+                )
+                return f"start failed (retry {chosen.attempt_count}/{max_retries}): {exc}"
+            self._publish_alert(
+                "autonomous_build_dropped",
+                brief=chosen.brief[:120],
+                attempts=chosen.attempt_count,
+                error=str(exc)[:200],
+            )
+            return f"start failed after {chosen.attempt_count} attempts: {exc}"
+
+    async def _resume_interrupted_projects(self) -> None:
+        """Resume Studio projects left ``interrupted`` after a prior crash."""
+        from skyn3t.config.settings import get_settings
+
+        settings = get_settings()
+        if not getattr(settings, "autonomous_resume_interrupted", True):
+            return
+        runner = self._get_runner()
+        if runner is None:
+            return
+        try:
+            projects = runner.list_projects()
+        except Exception:
+            logger.debug("failed to list projects for resume", exc_info=True)
+            return
+        for project in projects:
+            if str(project.get("status") or "").lower() != "interrupted":
+                continue
+            slug = str(project.get("slug") or "")
+            if not slug:
+                continue
+            try:
+                resume = getattr(runner, "resume_interrupted", None)
+                if resume is None:
+                    continue
+                asyncio.create_task(resume(slug))
+                self._publish_alert(
+                    "autonomous_resumed_interrupted",
+                    slug=slug,
+                    reason="crash recovery",
+                )
+            except Exception:
+                logger.debug("failed to resume interrupted project %s", slug, exc_info=True)
+
+    def to_snapshot(self) -> Dict[str, Any]:
+        """Serialize the autonomous loop's durable state."""
+        return self.state.to_dict()
+
+    def restore_snapshot(self, data: Dict[str, Any]) -> None:
+        """Restore the autonomous loop's durable state.
+
+        We rebuild the LoopState so field defaults survive schema drift.
+        """
+        self.state = LoopState(
+            today_date=str(data.get("today_date") or ""),
+            daily_builds=int(data.get("daily_builds") or 0),
+            daily_spend_usd=float(data.get("daily_spend_usd") or 0.0),
+            recent_brief_hashes=list(data.get("recent_brief_hashes") or []),
+            queue=list(data.get("queue") or []),
+            last_tick_at=float(data.get("last_tick_at") or 0.0),
+            last_build_slug=data.get("last_build_slug"),
+            last_skip_reason=data.get("last_skip_reason"),
+            last_proof_slug=data.get("last_proof_slug"),
+            last_proof_ok=data.get("last_proof_ok"),
+            last_proof_summary=data.get("last_proof_summary"),
+            last_proof_at=float(data.get("last_proof_at") or 0.0),
+        )
+        _save_state(self.state)
 
     def _get_runner(self) -> Any:
         getter = getattr(self.orchestrator, "get_studio_runner", None)

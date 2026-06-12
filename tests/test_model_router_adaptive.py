@@ -36,7 +36,8 @@ def scoreboard(tmp_path: Path) -> BuildPatternScoreboard:
 
 @pytest.fixture(autouse=True)
 def _stable_router_env(monkeypatch):
-    """Lock the env knobs to defaults; clear adaptive disable."""
+    """Lock the env knobs to defaults; clear adaptive disable and
+    persisted routing overrides so static picks are deterministic."""
     for key in (
         "SKYN3T_ROUTER_ADAPTIVE",
         "SKYN3T_ROUTER_DEMOTE_BELOW",
@@ -47,6 +48,10 @@ def _stable_router_env(monkeypatch):
     # Disable epsilon-greedy exploration for determinism in tests that
     # don't explicitly toggle it.
     monkeypatch.setenv("SKYN3T_ROUTER_EXPLORATION_EPS", "0")
+    monkeypatch.setattr(
+        "skyn3t.core.model_router._load_persisted_overrides",
+        lambda: {},
+    )
 
 
 def _seed_backend_outcomes(
@@ -101,13 +106,16 @@ def test_returns_static_when_adaptive_disabled(monkeypatch, scoreboard):
 
 
 def test_demotes_when_static_choice_keeps_losing(scoreboard):
-    # Static pick for src/components/*.jsx is openrouter (or_ui tier).
+    # Static pick for an architect-stage markdown file is claude_cli (strong tier).
     # Seed enough losses to drop its rate well below the 0.4 default.
-    _seed_backend_outcomes(scoreboard, "react_vite", "openrouter", wins=1, losses=9)
+    rel_path = "review.md"
+    stage_name = "reviewer"
+    static = resolve_model_for_file(rel_path, stage_name=stage_name)
+    _seed_backend_outcomes(scoreboard, "react_vite", static[0], wins=1, losses=9)
     out = resolve_model_for_file(
-        "src/components/X.jsx", stack="react_vite", scoreboard=scoreboard,
+        rel_path, stage_name=stage_name, stack="react_vite", scoreboard=scoreboard,
     )
-    assert out == _BACKEND_ALTERNATIVES["openrouter"]
+    assert out == _BACKEND_ALTERNATIVES[static[0]]
 
 
 def test_no_demotion_below_min_samples(scoreboard):
@@ -143,26 +151,32 @@ def test_no_demotion_when_alternative_also_losing(scoreboard):
 def test_threshold_env_var_tightens_demotion(monkeypatch, scoreboard):
     # With default 0.4, a 5/10 = 0.5 win rate stays static. Tighten to
     # 0.6 and the same data triggers a demote.
-    _seed_backend_outcomes(scoreboard, "react_vite", "openrouter", wins=5, losses=5)
+    rel_path = "review.md"
+    stage_name = "reviewer"
+    static = resolve_model_for_file(rel_path, stage_name=stage_name)
+    _seed_backend_outcomes(scoreboard, "react_vite", static[0], wins=5, losses=5)
     assert resolve_model_for_file(
-        "src/components/X.jsx", stack="react_vite", scoreboard=scoreboard,
-    ) == _resolve_static("src/components/X.jsx")
+        rel_path, stage_name=stage_name, stack="react_vite", scoreboard=scoreboard,
+    ) == static
 
     monkeypatch.setenv("SKYN3T_ROUTER_DEMOTE_BELOW", "0.6")
     assert resolve_model_for_file(
-        "src/components/X.jsx", stack="react_vite", scoreboard=scoreboard,
-    ) == _BACKEND_ALTERNATIVES["openrouter"]
+        rel_path, stage_name=stage_name, stack="react_vite", scoreboard=scoreboard,
+    ) == _BACKEND_ALTERNATIVES[static[0]]
 
 
 def test_min_samples_env_var_lowers_floor(monkeypatch, scoreboard):
     # Defaults require 5 graded attempts; with 2 losses we'd normally
     # leave the static pick alone. Drop the floor to 1 and the demotion fires.
-    _seed_backend_outcomes(scoreboard, "react_vite", "openrouter", wins=0, losses=2)
+    rel_path = "review.md"
+    stage_name = "reviewer"
+    static = resolve_model_for_file(rel_path, stage_name=stage_name)
+    _seed_backend_outcomes(scoreboard, "react_vite", static[0], wins=0, losses=2)
     monkeypatch.setenv("SKYN3T_ROUTER_DEMOTE_AFTER", "1")
     out = resolve_model_for_file(
-        "src/components/X.jsx", stack="react_vite", scoreboard=scoreboard,
+        rel_path, stage_name=stage_name, stack="react_vite", scoreboard=scoreboard,
     )
-    assert out == _BACKEND_ALTERNATIVES["openrouter"]
+    assert out == _BACKEND_ALTERNATIVES[static[0]]
 
 
 # ---------------------------------------------------------------------
@@ -184,20 +198,23 @@ def test_exploration_overrides_demotion_when_coin_lands(monkeypatch, scoreboard)
 def test_exploration_seeded_for_partial_eps(monkeypatch, scoreboard):
     """With ε=0.5 and a controlled random seed, the outcome is stable
     across runs — verifies we're actually consulting ``random.random``."""
-    _seed_backend_outcomes(scoreboard, "react_vite", "openrouter", wins=1, losses=9)
+    rel_path = "review.md"
+    stage_name = "reviewer"
+    static = resolve_model_for_file(rel_path, stage_name=stage_name)
+    _seed_backend_outcomes(scoreboard, "react_vite", static[0], wins=1, losses=9)
     monkeypatch.setenv("SKYN3T_ROUTER_EXPLORATION_EPS", "0.5")
 
     # Force the RNG to "exploit" (no exploration) — random.random() == 0.99 > 0.5
     monkeypatch.setattr(random, "random", lambda: 0.99)
     assert resolve_model_for_file(
-        "src/components/X.jsx", stack="react_vite", scoreboard=scoreboard,
-    ) == _BACKEND_ALTERNATIVES["openrouter"]
+        rel_path, stage_name=stage_name, stack="react_vite", scoreboard=scoreboard,
+    ) == _BACKEND_ALTERNATIVES[static[0]]
 
     # Force the RNG to "explore" — random.random() == 0.01 < 0.5
     monkeypatch.setattr(random, "random", lambda: 0.01)
     assert resolve_model_for_file(
-        "src/components/X.jsx", stack="react_vite", scoreboard=scoreboard,
-    ) == _resolve_static("src/components/X.jsx")
+        rel_path, stage_name=stage_name, stack="react_vite", scoreboard=scoreboard,
+    ) == static
 
 
 # ---------------------------------------------------------------------

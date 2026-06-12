@@ -23,7 +23,7 @@ def _loopback_no_token(monkeypatch):
     """Force the loopback fallback (no web_token) so TestClient — which
     connects from 127.0.0.1 — can reach every route without a session
     cookie, mirroring tests/test_web_hardening.py."""
-    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token=None))
+    monkeypatch.setattr(web_app, "get_settings", lambda: SimpleNamespace(web_token=None, allow_unauthenticated_loopback=True))
     yield
 
 

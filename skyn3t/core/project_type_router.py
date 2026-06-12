@@ -51,8 +51,8 @@ class RoutingProfile:
 UI_HEAVY = RoutingProfile(
     project_type="ui_heavy",
     ladder=(
-        "qwen/qwen3.5-flash-02-23",
-        "qwen/qwen3-coder",
+        "qwen/qwen3.6-flash",
+        "qwen/qwen3-coder-next",
         "deepseek/deepseek-v3.2",
         "openrouter/owl-alpha",
     ),
@@ -62,7 +62,7 @@ UI_HEAVY = RoutingProfile(
 BACKEND = RoutingProfile(
     project_type="backend",
     ladder=(
-        "qwen/qwen3-coder",
+        "qwen/qwen3-coder-next",
         "deepseek/deepseek-v3.2",
         "openai/gpt-5-mini",
         "openrouter/owl-alpha",
@@ -73,8 +73,8 @@ BACKEND = RoutingProfile(
 DATA_VIZ = RoutingProfile(
     project_type="data_viz",
     ladder=(
-        "qwen/qwen3.5-flash-02-23",
-        "qwen/qwen3-coder",
+        "qwen/qwen3.6-flash",
+        "qwen/qwen3-coder-next",
         "deepseek/deepseek-v3.2",
         "openrouter/owl-alpha",
     ),
@@ -84,7 +84,7 @@ DATA_VIZ = RoutingProfile(
 GAME = RoutingProfile(
     project_type="game",
     ladder=(
-        "qwen/qwen3-coder",
+        "qwen/qwen3-coder-next",
         "deepseek/deepseek-v3.2",
         "tencent/hy3-preview",
         "openrouter/owl-alpha",
@@ -105,8 +105,8 @@ DOCS = RoutingProfile(
 GENERIC = RoutingProfile(
     project_type="generic",
     ladder=(
-        "qwen/qwen3-coder",
-        "qwen/qwen3.5-flash-02-23",
+        "qwen/qwen3-coder-next",
+        "qwen/qwen3.6-flash",
         "deepseek/deepseek-v3.2",
         "openrouter/owl-alpha",
     ),

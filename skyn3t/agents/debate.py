@@ -174,9 +174,10 @@ def _parse_model_spec(spec: str) -> Tuple[str, Optional[str]]:
     if not text:
         return "", None
     if ":" in text:
-        backend, model = text.split(":", 1)
+        backend, model_text = text.split(":", 1)
         backend = backend.strip()
-        model = model.strip() or None
+        model_part = model_text.strip()
+        model: Optional[str] = model_part if model_part else None
         # A bare provider-qualified id (e.g. "openrouter/owl-alpha") has no
         # backend prefix — treat the whole thing as a model on openrouter.
         if backend and model is None and "/" in backend:
@@ -493,7 +494,7 @@ async def run_debate(
                 timeout_s=timeout_s,
             )
             produced = text is not None and bool(str(text).strip())
-            proposal = text if produced else (seed or "")
+            proposal: str = text if produced and text is not None else (seed or "")
             verdicts.append(
                 ModelVerdict(
                     model=model or backend,

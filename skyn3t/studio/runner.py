@@ -133,7 +133,7 @@ class StudioRunner:
         if repo["local_path"]:
             slug_source = f"{slug_source} {Path(repo['local_path']).name}"
         slug = slug or self._slugify(slug_source)
-        artifact_dir = self.projects_root / slug
+        artifact_dir = self._validate_slug(slug)
         artifact_dir.mkdir(parents=True, exist_ok=True)
 
         existing = self.get_project(slug)
@@ -1391,6 +1391,13 @@ class StudioRunner:
                     message=manifest["next_action"],
                 )
                 self._save_manifest(artifact_dir, manifest)
+                self._record_pipeline_checkpoint(
+                    manifest,
+                    stage_index=stage_idx,
+                    stage_name=stage.name,
+                    resume_index=stage_idx,
+                )
+                self._save_manifest(artifact_dir, manifest)
                 self._publish(
                     "PROJECT_STAGE_STARTED",
                     {"slug": slug, "stage": stage.name, "agent": stage.agent},
@@ -1427,12 +1434,9 @@ class StudioRunner:
                     stage_error = f"stage timeout (>{timeout_secs}s)"
                     self._publish(
                         "PROJECT_STAGE_FAILED",
-                        {
-                            "slug": slug,
-                            "stage": stage.name,
-                            "agent": stage.agent,
-                            "error": "stage timeout",
-                        },
+                        self._stage_failure_payload(
+                            slug, stage.name, stage.agent, "stage timeout", manifest
+                        ),
                     )
                     manifest["status"] = "failed"
                     manifest["next_action"] = (
@@ -1508,12 +1512,9 @@ class StudioRunner:
                     stage_error = str(e)
                     self._publish(
                         "PROJECT_STAGE_FAILED",
-                        {
-                            "slug": slug,
-                            "stage": stage.name,
-                            "agent": stage.agent,
-                            "error": stage_error,
-                        },
+                        self._stage_failure_payload(
+                            slug, stage.name, stage.agent, stage_error, manifest
+                        ),
                     )
                     manifest["status"] = "failed"
                     manifest["next_action"] = (
@@ -1753,12 +1754,9 @@ class StudioRunner:
                     self._save_manifest(artifact_dir, manifest)
                     self._publish(
                         "PROJECT_STAGE_FAILED",
-                        {
-                            "slug": slug,
-                            "stage": stage.name,
-                            "agent": stage.agent,
-                            "error": stage_error,
-                        },
+                        self._stage_failure_payload(
+                            slug, stage.name, stage.agent, stage_error, manifest
+                        ),
                     )
                     break
 
@@ -2601,18 +2599,38 @@ class StudioRunner:
             if should_run_verifiers:
                 skip_fix_loops = reviewer_failed
                 failed_verifier = "build"
-                try:
-                    build_result = await self._run_build_verifier(
-                        str(scaffold_dir),
-                        brief,
-                        execution_profile=str(
-                            manifest.get("execution_profile") or "balanced"
-                        ),
-                    )
-                except Exception:
-                    logger.exception("build_verifier invocation failed")
-                    build_result = None
-                if build_result is not None:
+
+                build_result: Optional[Dict[str, Any]] = None
+                boot_result: Optional[Dict[str, Any]] = None
+                boot_verdict: Optional[str] = None
+                integration_result: Optional[Dict[str, Any]] = None
+                integration_verdict: Optional[str] = None
+
+                async def _verification_sequence() -> None:
+                    nonlocal verdict, build_result, failed_verifier, boot_result, boot_verdict, integration_result, integration_verdict
+
+                    try:
+                        build_result = await self._run_build_verifier(
+                            str(scaffold_dir),
+                            brief,
+                            execution_profile=str(
+                                manifest.get("execution_profile") or "balanced"
+                            ),
+                        )
+                    except Exception as exc:
+                        logger.exception("build_verifier invocation failed")
+                        build_result = {
+                            "verdict": "no",
+                            "failure_hint": f"build_verifier crashed: {exc}",
+                            "source": "exception",
+                        }
+                    if build_result is None:
+                        build_result = {
+                            "verdict": "no",
+                            "failure_hint": "Build verifier unavailable",
+                            "source": "missing",
+                        }
+                    build_result = self._normalize_verdict(build_result)
                     manifest["build_verification"] = build_result
                     verdict = str(build_result.get("verdict") or "")
                     # Phase-3: surface the new visual + test sub-gates onto the
@@ -2638,13 +2656,15 @@ class StudioRunner:
                             if not fixed:
                                 break
                             try:
-                                build_result = await self._run_build_verifier(
-                                    str(scaffold_dir),
-                                    brief,
-                                    execution_profile=str(
-                                        manifest.get("execution_profile") or "balanced"
-                                    ),
-                                ) or build_result
+                                build_result = self._normalize_verdict(
+                                    await self._run_build_verifier(
+                                        str(scaffold_dir),
+                                        brief,
+                                        execution_profile=str(
+                                            manifest.get("execution_profile") or "balanced"
+                                        ),
+                                    ) or build_result
+                                )
                             except Exception:
                                 logger.exception("re-verify after fix failed")
                                 break
@@ -2701,170 +2721,189 @@ class StudioRunner:
                             boot_result = await self._run_boot_verifier(
                                 str(scaffold_dir), brief,
                             )
-                        except Exception:
+                        except Exception as exc:
                             logger.exception("boot_verifier invocation failed")
-                            boot_result = None
-                        if boot_result is not None:
-                            manifest["boot_verification"] = boot_result
-                            boot_verdict = boot_result.get("verdict")
-                            # Phase-3: surface the functional CRUD smoke sub-gate.
-                            # boot_verifier already folded a failed round-trip
-                            # into its top-level verdict, so boot_verdict above
-                            # already reflects a 'no'.
-                            self._surface_verifier_subgates(
-                                manifest, "boot_verification", boot_result
+                            boot_result = {
+                                "verdict": "no",
+                                "failure_hint": f"boot_verifier crashed: {exc}",
+                                "source": "exception",
+                            }
+                        if boot_result is None:
+                            boot_result = {
+                                "verdict": "no",
+                                "failure_hint": "Boot verifier unavailable",
+                                "source": "missing",
+                            }
+                        boot_result = self._normalize_verdict(boot_result)
+                        manifest["boot_verification"] = boot_result
+                        boot_verdict = boot_result.get("verdict")
+                        # Phase-3: surface the functional CRUD smoke sub-gate.
+                        # boot_verifier already folded a failed round-trip
+                        # into its top-level verdict, so boot_verdict above
+                        # already reflects a 'no'.
+                        self._surface_verifier_subgates(
+                            manifest, "boot_verification", boot_result
+                        )
+                        if not skip_fix_loops:
+                            BOOT_FIX_ATTEMPTS = (
+                                3 if manifest.get("_entrypoint_stub_gate") else 2
                             )
-                            if not skip_fix_loops:
-                                BOOT_FIX_ATTEMPTS = (
-                                    3 if manifest.get("_entrypoint_stub_gate") else 2
-                                )
-                                boot_attempt = 0
-                                while boot_verdict == "no" and boot_attempt < BOOT_FIX_ATTEMPTS:
-                                    boot_attempt += 1
-                                    try:
-                                        fixed = await self._apply_build_fix_round(
-                                            scaffold_dir, brief, boot_result, boot_attempt,
-                                        )
-                                    except Exception:
-                                        logger.exception("boot fix round failed")
-                                        fixed = False
-                                    if not fixed:
-                                        break
-                                    try:
-                                        boot_result = await self._run_boot_verifier(
-                                            str(scaffold_dir), brief,
-                                        ) or boot_result
-                                    except Exception:
-                                        logger.exception("re-boot after fix failed")
-                                        break
-                                    manifest["boot_verification"] = boot_result
-                                    boot_verdict = boot_result.get("verdict")
-                                    manifest.setdefault("boot_fix_attempts", []).append({
-                                        "attempt": boot_attempt,
-                                        "verdict": boot_verdict,
-                                        "command": boot_result.get("command"),
-                                    })
-                                    if boot_verdict == "yes":
-                                        self._append_history(
-                                            manifest,
-                                            "BOOT_FIX_SUCCEEDED",
-                                            status="running",
-                                            message=(
-                                                f"In-place fix round {boot_attempt} "
-                                                f"got the server booting."
-                                            ),
-                                        )
-                                        try:
-                                            self._persist_fix_as_skill(
-                                                stack=(boot_result or {}).get("kind") or "unknown",
-                                                fix_round=boot_attempt,
-                                                prior_summary=(
-                                                    manifest.get("boot_verification", {}).get("summary")
-                                                ),
-                                            )
-                                        except Exception:
-                                            logger.exception("persist boot-fix-as-skill failed")
-                                        break
-                                if boot_verdict == "no":
-                                    verdict = "no"
-                                    build_result = boot_result
-                                    failed_verifier = "boot"
-                            if boot_verdict == "yes":
+                            boot_attempt = 0
+                            while boot_verdict == "no" and boot_attempt < BOOT_FIX_ATTEMPTS:
+                                boot_attempt += 1
                                 try:
-                                    integration_result = await self._run_integration_verifier(
-                                        str(scaffold_dir), brief,
+                                    fixed = await self._apply_build_fix_round(
+                                        scaffold_dir, brief, boot_result, boot_attempt,
                                     )
                                 except Exception:
-                                    logger.exception("integration_verifier invocation failed")
-                                    integration_result = None
-                                if integration_result is not None:
-                                    manifest["integration_verification"] = integration_result
-                                    integration_verdict = integration_result.get("verdict")
-                                    if not skip_fix_loops:
-                                        INTEGRATION_FIX_ATTEMPTS = 2
-                                        integration_attempt = 0
-                                        while (
-                                            integration_verdict == "no"
-                                            and integration_attempt < INTEGRATION_FIX_ATTEMPTS
-                                        ):
-                                            integration_attempt += 1
-                                            try:
-                                                fixed = await self._apply_integration_fix_round(
-                                                    scaffold_dir=scaffold_dir,
-                                                    brief=brief,
-                                                    integration_result=integration_result,
-                                                    attempt=integration_attempt,
-                                                )
-                                            except Exception:
-                                                logger.exception("integration fix round failed")
-                                                fixed = False
-                                            if not fixed:
-                                                break
-                                            try:
-                                                await self._kill_stray_server_processes(
-                                                    str(scaffold_dir)
-                                                )
-                                                await asyncio.sleep(0.5)
-                                            except Exception:
-                                                logger.debug("stray process cleanup failed (non-fatal)")
-                                            try:
-                                                boot_result = await self._run_boot_verifier(
-                                                    str(scaffold_dir), brief,
-                                                ) or boot_result
-                                            except Exception:
-                                                logger.exception("re-boot after integration fix failed")
-                                                break
-                                            manifest["boot_verification"] = boot_result
-                                            boot_verdict = (boot_result or {}).get("verdict")
-                                            if boot_verdict != "yes":
-                                                verdict = "no"
-                                                build_result = boot_result
-                                                failed_verifier = "boot"
-                                                break
-                                            try:
-                                                integration_result = await self._run_integration_verifier(
+                                    logger.exception("boot fix round failed")
+                                    fixed = False
+                                if not fixed:
+                                    break
+                                try:
+                                    boot_result = self._normalize_verdict(
+                                        await self._run_boot_verifier(
+                                            str(scaffold_dir), brief,
+                                        ) or boot_result
+                                    )
+                                except Exception:
+                                    logger.exception("re-boot after fix failed")
+                                    break
+                                manifest["boot_verification"] = boot_result
+                                boot_verdict = boot_result.get("verdict")
+                                manifest.setdefault("boot_fix_attempts", []).append({
+                                    "attempt": boot_attempt,
+                                    "verdict": boot_verdict,
+                                    "command": boot_result.get("command"),
+                                })
+                                if boot_verdict == "yes":
+                                    self._append_history(
+                                        manifest,
+                                        "BOOT_FIX_SUCCEEDED",
+                                        status="running",
+                                        message=(
+                                            f"In-place fix round {boot_attempt} "
+                                            f"got the server booting."
+                                        ),
+                                    )
+                                    try:
+                                        self._persist_fix_as_skill(
+                                            stack=(boot_result or {}).get("kind") or "unknown",
+                                            fix_round=boot_attempt,
+                                            prior_summary=(
+                                                manifest.get("boot_verification", {}).get("summary")
+                                            ),
+                                        )
+                                    except Exception:
+                                        logger.exception("persist boot-fix-as-skill failed")
+                                    break
+                            if boot_verdict == "no":
+                                verdict = "no"
+                                build_result = boot_result
+                                failed_verifier = "boot"
+                        if boot_verdict == "yes":
+                            try:
+                                integration_result = await self._run_integration_verifier(
+                                    str(scaffold_dir), brief,
+                                )
+                            except Exception as exc:
+                                logger.exception("integration_verifier invocation failed")
+                                integration_result = {
+                                    "verdict": "no",
+                                    "failure_hint": f"integration_verifier crashed: {exc}",
+                                    "source": "exception",
+                                }
+                            if integration_result is not None:
+                                integration_result = self._normalize_verdict(integration_result)
+                                manifest["integration_verification"] = integration_result
+                                integration_verdict = integration_result.get("verdict")
+                                if not skip_fix_loops:
+                                    INTEGRATION_FIX_ATTEMPTS = 2
+                                    integration_attempt = 0
+                                    while (
+                                        integration_verdict == "no"
+                                        and integration_attempt < INTEGRATION_FIX_ATTEMPTS
+                                    ):
+                                        integration_attempt += 1
+                                        try:
+                                            fixed = await self._apply_integration_fix_round(
+                                                scaffold_dir=scaffold_dir,
+                                                brief=brief,
+                                                integration_result=integration_result,
+                                                attempt=integration_attempt,
+                                            )
+                                        except Exception:
+                                            logger.exception("integration fix round failed")
+                                            fixed = False
+                                        if not fixed:
+                                            break
+                                        try:
+                                            await self._kill_stray_server_processes(
+                                                str(scaffold_dir)
+                                            )
+                                            await asyncio.sleep(0.5)
+                                        except Exception:
+                                            logger.debug("stray process cleanup failed (non-fatal)")
+                                        try:
+                                            boot_result = await self._run_boot_verifier(
+                                                str(scaffold_dir), brief,
+                                            ) or boot_result
+                                        except Exception:
+                                            logger.exception("re-boot after integration fix failed")
+                                            break
+                                        manifest["boot_verification"] = boot_result
+                                        boot_verdict = (boot_result or {}).get("verdict")
+                                        if boot_verdict != "yes":
+                                            verdict = "no"
+                                            build_result = boot_result
+                                            failed_verifier = "boot"
+                                            break
+                                        try:
+                                            integration_result = self._normalize_verdict(
+                                                await self._run_integration_verifier(
                                                     str(scaffold_dir), brief,
                                                 ) or integration_result
-                                            except Exception:
-                                                logger.exception("integration re-check failed")
-                                                break
-                                            manifest["integration_verification"] = integration_result
-                                            integration_verdict = integration_result.get("verdict")
-                                            manifest.setdefault("integration_fix_attempts", []).append({
-                                                "attempt": integration_attempt,
-                                                "verdict": integration_verdict,
-                                            })
-                                            if integration_verdict == "yes":
-                                                self._append_history(
-                                                    manifest,
-                                                    "INTEGRATION_FIX_SUCCEEDED",
-                                                    status="running",
-                                                    message=(
-                                                        f"In-place integration fix round "
-                                                        f"{integration_attempt} cleared "
-                                                        "the integration contract gate."
-                                                    ),
-                                                )
-                                                break
-                                        if integration_verdict == "no":
-                                            verdict = "no"
-                                            build_result = integration_result
-                                            failed_verifier = "integration"
-                                else:
-                                    verdict = "no"
-                                    build_result = {
-                                        "verdict": "no",
-                                        "summary": (
-                                            "Integration verifier could not run after the server booted."
-                                        ),
-                                        "failure_hint": (
-                                            "The project booted, but SkyN3t could not verify that frontend "
-                                            "API calls match backend routes. Treat this as a blocked release "
-                                            "until the integration contract check runs cleanly."
-                                        ),
-                                    }
-                                    manifest["integration_verification"] = build_result
-                                    failed_verifier = "integration"
+                                            )
+                                        except Exception:
+                                            logger.exception("integration re-check failed")
+                                            break
+                                        manifest["integration_verification"] = integration_result
+                                        integration_verdict = integration_result.get("verdict")
+                                        manifest.setdefault("integration_fix_attempts", []).append({
+                                            "attempt": integration_attempt,
+                                            "verdict": integration_verdict,
+                                        })
+                                        if integration_verdict == "yes":
+                                            self._append_history(
+                                                manifest,
+                                                "INTEGRATION_FIX_SUCCEEDED",
+                                                status="running",
+                                                message=(
+                                                    f"In-place integration fix round "
+                                                    f"{integration_attempt} cleared "
+                                                    "the integration contract gate."
+                                                ),
+                                            )
+                                            break
+                                    if integration_verdict == "no":
+                                        verdict = "no"
+                                        build_result = integration_result
+                                        failed_verifier = "integration"
+                            else:
+                                verdict = "no"
+                                build_result = {
+                                    "verdict": "no",
+                                    "summary": (
+                                        "Integration verifier could not run after the server booted."
+                                    ),
+                                    "failure_hint": (
+                                        "The project booted, but SkyN3t could not verify that frontend "
+                                        "API calls match backend routes. Treat this as a blocked release "
+                                        "until the integration contract check runs cleanly."
+                                    ),
+                                }
+                                manifest["integration_verification"] = build_result
+                                failed_verifier = "integration"
 
                     if not skip_fix_loops and verdict == "no":
                         manifest["status"] = "failed"
@@ -2900,65 +2939,86 @@ class StudioRunner:
                             scaffold_dir=scaffold_dir,
                             brief=brief,
                         )
+
+                try:
+                    await asyncio.wait_for(
+                        _verification_sequence(),
+                        timeout=_stage_to,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("Verification sequence exceeded stage timeout")
+                    verdict = "no"
+                    failed_verifier = "build"
+                    build_result = {
+                        "verdict": "no",
+                        "failure_hint": f"Verification sequence timed out after {_stage_to}s",
+                        "source": "timeout",
+                    }
+                    manifest["build_verification"] = build_result
+                    manifest["status"] = "failed"
+                    manifest["error"] = build_result["failure_hint"]
+                    manifest["next_action"] = "Retrying with the timeout as a hint."
+                    manifest["_retry_hint"] = build_result["failure_hint"]
+
+                try:
+                    from skyn3t.agents.stack_detector import (
+                        detect_stack_from_scaffold,
+                    )
+                    from skyn3t.intelligence.build_patterns import (
+                        get_default_scoreboard,
+                    )
+                    # Canonical, scaffold-aware detection — replaces the
+                    # coarse build_verifier probe.kind ('node'/'python'/
+                    # 'static'/'swift') so success rows land in the same
+                    # bucket as failure rows (root cause of the live
+                    # react_vite/vite_react/unknown split).
+                    stack = detect_stack_from_scaffold(scaffold_dir)
+                    # Persist the canonical stack so the PROJECT_COMPLETED
+                    # payload carries the SAME token the scoreboard records
+                    # under — otherwise the continuous-improvement per-stack
+                    # trend (Owner G) buckets under "unknown" and never
+                    # aligns with best_shape's buckets.
+                    manifest["stack"] = stack
+                    shape = self._scaffold_shape(scaffold_dir)
+                    sb = get_default_scoreboard()
+                    sb.record(stack, shape, str(verdict or "no"))
+                    # Attribute the verifier verdict to the backend
+                    # that ran the code stage — the same source of
+                    # truth (resolve_model) the agent itself used.
+                    # Lets the adaptive router learn from real
+                    # verifier outcomes, not just stage exceptions.
                     try:
-                        from skyn3t.agents.stack_detector import (
-                            detect_stack_from_scaffold,
-                        )
-                        from skyn3t.intelligence.build_patterns import (
-                            get_default_scoreboard,
-                        )
-                        # Canonical, scaffold-aware detection — replaces the
-                        # coarse build_verifier probe.kind ('node'/'python'/
-                        # 'static'/'swift') so success rows land in the same
-                        # bucket as failure rows (root cause of the live
-                        # react_vite/vite_react/unknown split).
-                        stack = detect_stack_from_scaffold(scaffold_dir)
-                        # Persist the canonical stack so the PROJECT_COMPLETED
-                        # payload carries the SAME token the scoreboard records
-                        # under — otherwise the continuous-improvement per-stack
-                        # trend (Owner G) buckets under "unknown" and never
-                        # aligns with best_shape's buckets.
-                        manifest["stack"] = stack
-                        shape = self._scaffold_shape(scaffold_dir)
-                        sb = get_default_scoreboard()
-                        sb.record(stack, shape, str(verdict or "no"))
-                        # Attribute the verifier verdict to the backend
-                        # that ran the code stage — the same source of
-                        # truth (resolve_model) the agent itself used.
-                        # Lets the adaptive router learn from real
-                        # verifier outcomes, not just stage exceptions.
-                        try:
-                            from skyn3t.core.model_router import resolve_model
-                            stage_backend, _ = resolve_model("code")
-                            if stage_backend and stack and shape:
-                                sb.record_backend(
-                                    stack, shape, stage_backend, str(verdict or "no"),
-                                )
-                        except Exception:
-                            logger.debug(
-                                "scoreboard record_backend on verifier verdict failed",
-                                exc_info=True,
+                        from skyn3t.core.model_router import resolve_model
+                        stage_backend, _ = resolve_model("code")
+                        if stage_backend and stack and shape:
+                            sb.record_backend(
+                                stack, shape, stage_backend, str(verdict or "no"),
                             )
-                        sb.flush()
                     except Exception:
-                        logger.exception("build_pattern record failed")
-                    # Grade the skills the CodeAgent injected into this build:
-                    # credit each one on a passing verdict, debit on a failing
-                    # one. Best-effort — never let skill grading break the run.
-                    if injected_skills:
-                        try:
-                            from skyn3t.intelligence.skill_library import (
-                                get_default_library,
-                            )
-                            lib = get_default_library()
-                            _passed = str(verdict).lower() == "yes"
-                            for _name in injected_skills:
-                                lib.record_use(_name, success=_passed)
-                        except Exception:
-                            logger.debug(
-                                "skill_library record_use after verdict failed",
-                                exc_info=True,
-                            )
+                        logger.debug(
+                            "scoreboard record_backend on verifier verdict failed",
+                            exc_info=True,
+                        )
+                    sb.flush()
+                except Exception:
+                    logger.exception("build_pattern record failed")
+                # Grade the skills the CodeAgent injected into this build:
+                # credit each one on a passing verdict, debit on a failing
+                # one. Best-effort — never let skill grading break the run.
+                if injected_skills:
+                    try:
+                        from skyn3t.intelligence.skill_library import (
+                            get_default_library,
+                        )
+                        lib = get_default_library()
+                        _passed = str(verdict).lower() == "yes"
+                        for _name in injected_skills:
+                            lib.record_use(_name, success=_passed)
+                    except Exception:
+                        logger.debug(
+                            "skill_library record_use after verdict failed",
+                            exc_info=True,
+                        )
             if manifest.get("status") != "failed":
                 manifest["status"], manifest["next_action"], manifest["error"] = (
                     self._finalize_project_outcome(
@@ -3475,7 +3535,7 @@ class StudioRunner:
                 message=(
                     f"AssetAgent: {generated}/{len(assets)} asset(s) produced"
                     + ("; tokens imported" if output.get("tokens") else "")
-                    + ("." if assets else "; none requested."),
+                    + ("." if assets else "; none requested.")
                 ),
             )
         except Exception:
@@ -3560,6 +3620,31 @@ class StudioRunner:
         s = s[:60].rstrip("-")
         suffix = f"{time.time_ns():x}"[-6:]
         return f"{s}-{suffix}"
+
+    def _validate_slug(self, slug: str) -> Path:
+        """Return the artifact directory for a slug, rejecting path traversal.
+
+        The slug is treated as a single directory name under ``projects_root``.
+        Any component that is absolute, contains ``..``, or resolves outside the
+        projects root raises ``ValueError``.
+        """
+        if not isinstance(slug, str) or not slug.strip():
+            raise ValueError("project slug must be a non-empty string")
+        # Reject absolute paths, parent references, and hidden components.
+        parts = Path(slug).parts
+        if any(part == ".." or part.startswith(".") for part in parts):
+            raise ValueError(f"invalid project slug: {slug}")
+        if len(parts) != 1:
+            raise ValueError(f"project slug must be a single name: {slug}")
+        candidate = self.projects_root / slug
+        try:
+            resolved = candidate.resolve()
+            root = self.projects_root.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"cannot resolve project path for slug {slug}") from exc
+        if resolved != root and root not in resolved.parents:
+            raise ValueError(f"project slug escapes projects root: {slug}")
+        return candidate
 
     # Extensions we treat as "real software output" — running code, markup,
     # styles, config, schemas. If the project produced any of these, it's
@@ -4157,7 +4242,7 @@ class StudioRunner:
         if str(quality.get("verdict") or "").lower() != "go":
             return False
         try:
-            score = int(quality.get("score"))
+            score = int(quality.get("score") or 0)
         except (TypeError, ValueError):
             return False
         return score >= self._reviewer_score_threshold(manifest)
@@ -4350,6 +4435,27 @@ class StudioRunner:
                 manifest["_retry_hint"] = str(hint)
         except Exception:
             logger.debug("surface verifier sub-gates failed", exc_info=True)
+
+    @staticmethod
+    def _normalize_verdict(result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Ensure a verifier result has a recognized verdict.
+
+        Unknown or missing verdicts are treated as ``no`` so the verifier
+        cannot be bypassed by returning an empty or malformed payload.
+        """
+        if not isinstance(result, dict):
+            return {
+                "verdict": "no",
+                "failure_hint": "malformed verifier output",
+                "source": "normalization",
+            }
+        verdict = str(result.get("verdict") or "").lower()
+        if verdict not in {"yes", "no", "skipped"}:
+            result = dict(result)
+            result["verdict"] = "no"
+            result.setdefault("failure_hint", "malformed verifier output")
+            result["source"] = "normalization"
+        return result
 
     async def _run_build_verifier(
         self,
@@ -4893,9 +4999,10 @@ class StudioRunner:
                     )
                 return current_result
 
-            has_issues = critique_result.get("has_issues", False)
-            issues = critique_result.get("issues", [])
-            critique_text = critique_result.get("critique_text", "")
+            critique_dict = critique_result if isinstance(critique_result, dict) else {}
+            has_issues = critique_dict.get("has_issues", False)
+            issues = critique_dict.get("issues", [])
+            critique_text = critique_dict.get("critique_text", "")
 
             self._publish(
                 "AGENT_CONVERSATION_TURN",
@@ -6416,13 +6523,37 @@ class StudioRunner:
         *,
         stage_index: int,
         stage_name: str,
+        resume_index: Optional[int] = None,
     ) -> None:
         """Forge/Ark-style checkpoint for resume after crash or restart."""
         manifest["pipeline_checkpoint"] = {
             "last_completed_index": stage_index,
             "last_completed_stage": stage_name,
-            "resume_index": stage_index + 1,
+            "resume_index": resume_index if resume_index is not None else stage_index + 1,
             "updated_at": time.time(),
+        }
+
+    @staticmethod
+    def _stage_failure_payload(
+        slug: str,
+        stage: str,
+        agent: str,
+        error: str,
+        manifest: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build a PROJECT_STAGE_FAILED payload with retry-relevant context.
+
+        Includes the project stack and stage so the event stream and lesson
+        embeddings can bucket failures by technical context.
+        """
+        return {
+            "slug": slug,
+            "stage": stage,
+            "agent": agent,
+            "error": error,
+            "stack": manifest.get("stack") or "unknown",
+            "stage_name": stage,
+            "error_signature": str(error).lower().strip()[:120],
         }
 
     @staticmethod
@@ -6673,45 +6804,47 @@ class StudioRunner:
         """
         quality = self._normalize_quality_summary(quality_summary)
 
-        # Build / boot verifier verdicts — pulled from manifest when
-        # available. These are independent of the reviewer.
-        build_verdict = None
-        boot_verdict = None
-        integration_verdict = None
-        if manifest is not None:
-            bv = manifest.get("build_verification") or {}
-            boot = manifest.get("boot_verification") or {}
-            integration = manifest.get("integration_verification") or {}
-            if isinstance(bv, dict):
-                build_verdict = bv.get("verdict")
-            if isinstance(boot, dict):
-                boot_verdict = boot.get("verdict")
-            if isinstance(integration, dict):
-                integration_verdict = integration.get("verdict")
+        # Build / boot verifier verdicts are checked below directly from the
+        # manifest so that malformed or skipped values fail closed.
 
         # 1. Hard failures from verifiers — these can't be reviewer-
-        # overridden. A program that doesn't boot isn't "done".
-        if build_verdict == "no":
-            return self._needs_fixes_outcome(
-                "Build verifier rejected the scaffold — see "
-                "build_verification.failure_hint for the cross-file issue.",
-                "build verifier said no",
-                manifest=manifest,
-            )
-        if boot_verdict == "no":
-            return self._needs_fixes_outcome(
+        # overridden. A program that doesn't boot isn't "done". A verifier
+        # that returns "skipped" or any value other than "yes" is also
+        # treated as a failure (fail-closed).
+        verifier_gates = [
+            (
+                "build_verification",
+                "build",
+                "Build verifier did not pass — see build_verification.failure_hint "
+                "for the cross-file issue.",
+            ),
+            (
+                "boot_verification",
+                "boot",
                 "Server failed to boot — see boot_verification.failure_hint "
                 "for the diagnosed cross-file issue.",
-                "boot verifier said no",
-                manifest=manifest,
-            )
-        if integration_verdict == "no":
-            return self._needs_fixes_outcome(
+            ),
+            (
+                "integration_verification",
+                "integration",
                 "Frontend/backend integration failed — see "
                 "integration_verification.failure_hint for the contract issue.",
-                "integration verifier said no",
-                manifest=manifest,
-            )
+            ),
+        ]
+        if manifest is not None:
+            for key, label, message in verifier_gates:
+                record = manifest.get(key)
+                if record is None:
+                    continue
+                v = str(
+                    record.get("verdict") if isinstance(record, dict) else ""
+                ).lower()
+                if v != "yes":
+                    return self._needs_fixes_outcome(
+                        message,
+                        f"{label} verifier said {v or 'skipped'}",
+                        manifest=manifest,
+                    )
 
         # 2. Reviewer-driven outcome, with the score threshold layered on.
         if quality is None:
@@ -7989,7 +8122,7 @@ class StudioRunner:
                     build_hint=build_hint or None,
                     blockers=None,
                     prior_backend=prior_backend or None,
-                    failed_stages=failed_stages or None,
+                    failed_stages=[s for s in (failed_stages or []) if isinstance(s, str)] or None,
                 )
         except Exception:
             logger.debug("reflective retry directive build failed", exc_info=True)

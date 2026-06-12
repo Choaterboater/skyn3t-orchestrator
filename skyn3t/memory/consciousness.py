@@ -286,3 +286,34 @@ class CollectiveConsciousness:
                 "total_insights": sum(len(v) for v in self._agent_insights.values()),
                 "agents_with_insights": list(self._agent_insights.keys()),
             }
+
+    async def to_snapshot(self) -> Dict[str, Any]:
+        """Serialize recoverable working memory, sessions and insights."""
+        async with self._lock:
+            now = time.time()
+            working = {
+                k: {"value": v["value"], "expires_at": v["expires_at"]}
+                for k, v in self._working_memory.items()
+                if v.get("expires_at", 0) > now
+            }
+            sessions = {
+                sid: dict(sess)
+                for sid, sess in self._session_contexts.items()
+                if (now - sess.get("last_active_ts", now)) <= self._session_ttl_seconds
+            }
+            return {
+                "working_memory": working,
+                "session_contexts": sessions,
+                "agent_insights": {
+                    k: list(v) for k, v in self._agent_insights.items()
+                },
+            }
+
+    async def restore_snapshot(self, data: Dict[str, Any]) -> None:
+        """Restore working memory, sessions and insights from a snapshot."""
+        async with self._lock:
+            self._working_memory = dict(data.get("working_memory") or {})
+            self._session_contexts = dict(data.get("session_contexts") or {})
+            self._agent_insights = {
+                k: list(v) for k, v in (data.get("agent_insights") or {}).items()
+            }

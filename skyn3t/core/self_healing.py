@@ -8,6 +8,9 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from skyn3t.core.events import Event, EventBus, EventType
 from skyn3t.memory.tuner import apply_adjustments_to_config
+from skyn3t.self_healing.budget import ProjectIterationBudget
+from skyn3t.self_healing.learned_generators import LearnedGeneratorManager
+from skyn3t.self_healing.retry_manager import AdaptiveRetryManager
 
 if TYPE_CHECKING:
     from skyn3t.core.orchestrator import Orchestrator
@@ -52,6 +55,22 @@ class SelfHealingManager:
         self._healing_handlers: Dict[str, Callable[[HealingAction], Any]] = {}
         self._isolated_agents: set[str] = set()
 
+        # Adaptive retry budget + learned generators — keeps retry storms
+        # bounded and gives the dashboard a live view of healing attempts.
+        self._retry_budget = ProjectIterationBudget(
+            project_id="__self_healing__",
+            per_type_limits={
+                "error_rate": 5,
+                "timeout": 5,
+                "memory": 3,
+                "default": 5,
+            },
+        )
+        self._retry_manager = AdaptiveRetryManager(
+            budget=self._retry_budget,
+            learned_manager=LearnedGeneratorManager(),
+        )
+
         # Register default handlers
         self.register_healing_handler("restart", self._handle_restart)
         self.register_healing_handler("reset_queue", self._handle_reset_queue)
@@ -76,11 +95,53 @@ class SelfHealingManager:
             self._lazy_healing_queue = asyncio.Queue()
         return self._lazy_healing_queue
 
-    def request_healing(self, agent_name: str, reason: str = "error_threshold") -> None:
-        """Request healing for an agent (safe from sync or async context)."""
+    def request_healing(
+        self,
+        agent_name: str,
+        reason: str = "error_threshold",
+        *,
+        error_sig: Optional[str] = None,
+        retry_type: Optional[str] = None,
+        exception: Optional[Exception] = None,
+        error_text: str = "",
+        file_path: Optional[str] = None,
+    ) -> None:
+        """Request healing for an agent (safe from sync or async context).
+
+        Consults the adaptive retry budget and error taxonomy. Generic
+        self-healing reasons (error_rate, timeout, memory) consume the
+        project-wide budget; detailed code-generation errors get a
+        classified recovery hint.
+        """
+        sig = error_sig or f"{agent_name}:{reason}"
+        rtype = retry_type or reason
+
+        if exception is not None or error_text:
+            should_retry, hint = self._retry_manager.should_retry(
+                sig,
+                rtype,
+                exception=exception,
+                error_text=error_text,
+                file_path=file_path,
+            )
+        else:
+            # Generic healing request: just enforce the budget.
+            should_retry = self._retry_budget.consume(rtype)
+            from skyn3t.self_healing.error_taxonomy import RecoveryHint
+
+            hint = RecoveryHint(action=reason, retryable=should_retry)
+
+        if not should_retry:
+            logger.info(
+                "Healing request for %s (reason=%s) skipped: retry budget/taxonomy says no",
+                agent_name,
+                reason,
+            )
+            return
+
         action = HealingAction(
             agent_name=agent_name,
-            action_type="default",
+            action_type=hint.action,
             reason=reason,
         )
         try:

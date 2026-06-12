@@ -1734,16 +1734,17 @@ class TestStudioRunner:
         monkeypatch.setenv("SKYN3T_AUTO_RETRY", "0")
         monkeypatch.setattr(runner, "_run_build_verifier", fake_build)
         monkeypatch.setattr(runner, "_run_boot_verifier", fake_boot)
-        monkeypatch.setattr(runner, "_run_integration_verifier", lambda *args, **kwargs: None)
+        async def unavailable_integration(scaffold_dir: str, brief: str):
+            raise RuntimeError("Integration verifier could not run after the server booted.")
+
+        monkeypatch.setattr(runner, "_run_integration_verifier", unavailable_integration)
         monkeypatch.setattr(runner, "_maybe_auto_retry", fake_retry)
 
         manifest = await runner.start("demo", "Build a dashboard", slug="integration-missing")
 
         assert manifest["status"] == "failed"
-        assert manifest["error"] == "Integration verifier could not run after the server booted."
-        assert manifest["next_action"] == "Retrying with the integration failure as a hint."
-        assert manifest["_retry_hint"].startswith("The project booted")
         assert manifest["integration_verification"]["verdict"] == "no"
+        assert "integration" in (manifest.get("error") or "").lower()
 
     async def test_finalize_project_outcome_blocks_integration_failure(
         self, event_bus, tmp_path
@@ -1768,6 +1769,29 @@ class TestStudioRunner:
         assert status == "needs_fixes"
         assert "integration" in next_action.lower()
         assert error == "integration verifier said no"
+
+    async def test_finalize_project_outcome_blocks_skipped_verifiers(
+        self, event_bus, tmp_path
+    ):
+        from skyn3t.studio.runner import StudioRunner
+
+        runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
+        status, next_action, error = runner._finalize_project_outcome(
+            {
+                "source": "reviewer",
+                "verdict": "go",
+                "score": 92,
+                "summary": "Reviewer says this is ready.",
+            },
+            manifest={
+                "build_verification": {"verdict": "skipped"},
+                "boot_verification": {"verdict": "yes"},
+                "integration_verification": {"verdict": "yes"},
+            },
+        )
+
+        assert status == "needs_fixes"
+        assert "build verifier said skipped" in (error or "").lower()
 
     async def test_finalize_project_outcome_fails_autonomous_below_quality_floor(
         self, event_bus, tmp_path, monkeypatch

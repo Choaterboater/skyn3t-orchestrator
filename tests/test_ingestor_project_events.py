@@ -220,7 +220,7 @@ def test_ingestor_routes_project_completed_with_failure_verdict(tmp_path) -> Non
     assert doc["metadata"]["success"] is False
 
 
-def test_ingestor_stages_lessons_as_drafts_until_approved(tmp_path) -> None:
+def test_ingestor_embeds_quality_lessons_and_marks_approved(tmp_path) -> None:
     rag = _FakeRAG()
     store = _FakeMemoryStore()
     bus = MagicMock()
@@ -241,17 +241,18 @@ def test_ingestor_stages_lessons_as_drafts_until_approved(tmp_path) -> None:
             suggestions=["keep the loop tight"],
             task_id="task-9",
         )
-        assert result is None
+        assert result == "emb-1"
 
     asyncio.run(_go())
 
-    assert rag.docs == []
+    assert len(rag.docs) == 1
+    assert rag.docs[0]["doc_type"] == "lesson"
     assert len(store.saved_docs) == 1
-    draft = store.saved_docs[0]
-    assert draft["doc_type"] == "lesson"
-    assert draft["embedding_id"] is None
-    assert draft["meta"]["review_status"] == "draft"
-    assert draft["meta"]["memory_layer"] == "operator"
+    doc = store.saved_docs[0]
+    assert doc["doc_type"] == "lesson"
+    assert doc["embedding_id"] == "emb-1"
+    assert doc["meta"]["review_status"] == "approved"
+    assert doc["meta"]["memory_layer"] == "operator"
 
 
 def test_ingestor_auto_rejects_low_signal_lessons_but_keeps_them(tmp_path) -> None:

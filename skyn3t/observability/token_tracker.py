@@ -203,6 +203,22 @@ class TokenTracker:
                 "projects_tracked": len(self._by_project),
             }
 
+    def to_snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "by_agent": {k: dict(v) for k, v in self._by_agent.items()},
+                "by_project": {k: dict(v) for k, v in self._by_project.items()},
+            }
+
+    def restore_snapshot(self, data: Dict[str, Any]) -> None:
+        with self._lock:
+            self._by_agent = {
+                k: dict(v) for k, v in (data.get("by_agent") or {}).items()
+            }
+            self._by_project = {
+                k: dict(v) for k, v in (data.get("by_project") or {}).items()
+            }
+
 
 _DEFAULT: Optional[TokenTracker] = None
 _DEFAULT_LOCK = threading.Lock()

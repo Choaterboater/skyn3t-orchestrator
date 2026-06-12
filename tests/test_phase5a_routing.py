@@ -200,6 +200,9 @@ def test_auto_mode_skips_low_sample_cells(monkeypatch):
 def test_best_model_for_never_forces_expensive_on_tie(monkeypatch, tmp_path):
     # Two backends with identical win-rate but different cost. The cheaper
     # one must win — auto-route must never drift toward the pricier model.
+    # Lock claude_cli to a high relative cost so the tie breaks to OpenRouter
+    # regardless of the live cost table.
+    monkeypatch.setenv("SKYN3T_ROUTER_BACKEND_COSTS", '{"claude_cli": 3.0}')
     _seed_observations(
         monkeypatch,
         {
@@ -345,7 +348,7 @@ def test_observations_persist_stack_feature_cells(monkeypatch, tmp_path):
                     "type": "llm_call",
                     "project_stage": "code",
                     "backend": "openrouter",
-                    "model": "openrouter/owl-alpha",
+                    "model": "google/gemini-3.1-flash-lite",
                     "total_tokens": 1500,
                 }
             ],
@@ -383,7 +386,7 @@ def test_observations_backward_compatible_without_stack(monkeypatch, tmp_path):
                     "type": "llm_call",
                     "project_stage": "reviewer",
                     "backend": "openrouter",
-                    "model": "xiaomi/mimo-v2.5-pro",
+                    "model": "qwen/qwen3-coder-plus",
                     "total_tokens": 2000,
                 }
             ],

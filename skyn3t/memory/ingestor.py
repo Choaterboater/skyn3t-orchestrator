@@ -305,16 +305,33 @@ class ExperienceIngestor:
             "task_id": task_id,
             "content_hash": content_hash,
         }
+        auto_reject_reason = self._auto_reject_reason_for_lesson(patterns, suggestions)
         metadata = self._with_governance_metadata(
             metadata,
             memory_layer="operator",
+            review_status="rejected" if auto_reject_reason else "approved",
             reusable=True,
             confidence=0.75 if success else 0.6,
-            auto_reject_reason=self._auto_reject_reason_for_lesson(patterns, suggestions),
+            auto_reject_reason=auto_reject_reason,
         )
-        await self._persist_doc(title, content, "reflection", "lesson", metadata, None)
-        self._record_seen(content_hash)
-        return None
+        if auto_reject_reason:
+            # Rejected lessons are persisted for audit but not embedded,
+            # so they cannot pollute retrieval.
+            await self._persist_doc(title, content, "reflection", "lesson", metadata, None)
+            self._record_seen(content_hash)
+            return None
+
+        embedding_id = await self.rag.add_knowledge_one(
+            content=content,
+            title=title,
+            source="reflection",
+            doc_type="lesson",
+            metadata=metadata,
+        )
+        if embedding_id:
+            await self._persist_doc(title, content, "reflection", "lesson", metadata, embedding_id)
+            self._record_seen(content_hash)
+        return embedding_id
 
     async def ingest_insight(
         self,

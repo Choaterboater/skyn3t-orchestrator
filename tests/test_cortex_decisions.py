@@ -153,20 +153,31 @@ def test_router_publishes_decision_on_demote(monkeypatch, tmp_path):
     from skyn3t.core.model_router import resolve_model_for_file
     from skyn3t.intelligence.build_patterns import BuildPatternScoreboard
 
-    # Disable ε-greedy so the demote is deterministic.
+    # Disable ε-greedy so the demote is deterministic, and clear persisted
+    # routing overrides so the static pick matches the default tier table.
     monkeypatch.setenv("SKYN3T_ROUTER_EXPLORATION_EPS", "0")
+    monkeypatch.setattr(
+        "skyn3t.core.model_router._load_persisted_overrides",
+        lambda: {},
+    )
 
     sb = BuildPatternScoreboard(store_path=tmp_path / "patterns.json")
-    # Static now picks openrouter for frontend files; record losses on it
-    # so the demote can fire.
+    # Static for a reviewer-stage docs file is claude_cli (strong tier).
+    # Record losses on claude_cli and wins on its openrouter alternative
+    # so the demote fires.
     for _ in range(10):
         sb.record_backend(
-            "react_vite", ["src/App.jsx"], "openrouter", "no",
+            "react_vite", ["review.md"], "claude_cli", "no",
+        )
+    for _ in range(10):
+        sb.record_backend(
+            "react_vite", ["review.md"], "openrouter", "yes",
         )
 
     bus = _BusRecorder()
     backend, _ = resolve_model_for_file(
-        "src/components/Foo.jsx",
+        "review.md",
+        stage_name="reviewer",
         stack="react_vite",
         scoreboard=sb,
         event_bus=bus,
@@ -176,12 +187,12 @@ def test_router_publishes_decision_on_demote(monkeypatch, tmp_path):
         e for e in bus.events
         if e.event_type == EventType.CORTEX_DECISION
     ]
-    assert backend != "openrouter", "static would have picked openrouter; demote should have fired"
+    assert backend != "claude_cli", "static would have picked claude_cli; demote should have fired"
     assert len(decisions) == 1
     payload = decisions[0].payload
     assert payload["system"] == "router"
     assert payload["action"] == "demote_backend"
-    assert payload["input"]["from_backend"] == "openrouter"
+    assert payload["input"]["from_backend"] == "claude_cli"
     assert payload["input"]["to_backend"] == backend
 
 

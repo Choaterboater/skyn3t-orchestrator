@@ -79,18 +79,23 @@ _TIERS: Dict[str, Tuple[str, Optional[str]]] = {
     # Capability-routed per file type — see _resolve_static below.
     # CHEAP + RELIABLE OpenRouter models. Free-only (the :free variants) was
     # heavily rate-limited, which forced constant failover and made the swarm
-    # feel dead; these dirt-cheap models (≈$0.02–0.05/build, ~$1–2/day for 50
-    # builds, hard-capped at SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD=$20) are
-    # the same set the model-evolution engine converged to on this account —
-    # minus the expensive Opus pick that's now disabled. or_docs stays free.
-    "or_cheap":   ("openrouter", "google/gemini-2.5-flash-lite-preview-09-2025"),
+    # feel dead; these dirt-cheap models stay hard-capped at
+    # SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD. or_docs stays free.
+    # Refreshed 2026-06-12 (owner: use the latest catalog generation):
+    # each pin bumped to its current-generation successor in the same
+    # price class — gemini 2.5 flash-lite preview → 3.1 flash-lite.
+    "or_cheap":   ("openrouter", "google/gemini-3.1-flash-lite"),
     # Code tiers: qwen specialists, PINNED (no silent :free/cheap swaps
     # by the evolution or catalog pickers — see _PINNED_CODE_TIERS).
     # Cheap-first codegen (flash-lite) is opt-in via
     # SKYN3T_CHEAP_FIRST_CODE; default path is the real coder models.
-    "or_ui":      ("openrouter", "qwen/qwen3.5-flash-02-23"),
-    "or_backend": ("openrouter", "qwen/qwen3-coder"),
-    "or_strong":  ("openrouter", "qwen/qwen3-coder"),
+    # 2026-06-12: qwen3.5-flash → qwen3.6-flash (UI), qwen3-coder →
+    # coder-next (backend volume; newer AND cheaper) / coder-plus
+    # (strong ceiling — also carries architect/reviewer while the
+    # Claude CLI is disabled).
+    "or_ui":      ("openrouter", "qwen/qwen3.6-flash"),
+    "or_backend": ("openrouter", "qwen/qwen3-coder-next"),
+    "or_strong":  ("openrouter", "qwen/qwen3-coder-plus"),
     "or_docs":    ("openrouter", "openai/gpt-oss-120b:free"),
     # Legacy tier names. 'cheap' is the hardcoded fallback for unmapped
     # stages (planner, decomposer, …) — it MUST stay HTTP-based so an
@@ -100,11 +105,11 @@ _TIERS: Dict[str, Tuple[str, Optional[str]]] = {
     # directive 2026-06-11): code work uses the OpenRouter specialists.
     # kimi_cli and copilot_cli are not authenticated here and are
     # unreachable from every default path.
-    "cheap":    ("openrouter", "google/gemini-2.5-flash-lite-preview-09-2025"),
+    "cheap":    ("openrouter", "google/gemini-3.1-flash-lite"),
     "balanced": ("claude_cli", "sonnet"),
     "strong":   ("claude_cli", "opus"),
     "max":      ("claude_cli", "fable"),
-    "ui":       ("openrouter", "qwen/qwen3.5-flash-02-23"),
+    "ui":       ("openrouter", "qwen/qwen3.6-flash"),
 }
 
 

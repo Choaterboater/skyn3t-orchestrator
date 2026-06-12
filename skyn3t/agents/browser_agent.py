@@ -148,9 +148,9 @@ class LocalCdpBackend(BaseBrowserBackend):
 
     def __init__(self, headless: bool = True) -> None:
         self._headless = headless
-        self._pw = None  # async_playwright context manager
-        self._browser = None
-        self._page = None
+        self._pw: Optional[Any] = None  # async_playwright context manager
+        self._browser: Optional[Any] = None
+        self._page: Optional[Any] = None
 
     @classmethod
     def available(cls) -> bool:
@@ -164,15 +164,19 @@ class LocalCdpBackend(BaseBrowserBackend):
         return _playwright_importable()
 
     async def open(self, url: str) -> None:
-        if self._page is None:
+        page = self._page
+        if page is None:
             # LAZY import — only reached when the backend was selected, which
             # only happens when available() returned True.
             from playwright.async_api import async_playwright  # noqa: WPS433
 
-            self._pw = await async_playwright().start()
-            self._browser = await self._pw.chromium.launch(headless=self._headless)
-            self._page = await self._browser.new_page()
-        await self._page.goto(url)
+            pw = await async_playwright().start()
+            browser = await pw.chromium.launch(headless=self._headless)
+            page = await browser.new_page()
+            self._pw = pw
+            self._browser = browser
+            self._page = page
+        await page.goto(url)
 
     async def act(self, instruction: str) -> BrowserStep:
         if self._page is None:
@@ -246,11 +250,11 @@ class BrowserbaseBackend(BaseBrowserBackend):
     name = "browserbase"
 
     def __init__(self) -> None:
-        self._client = None
-        self._session = None
-        self._page = None
-        self._pw = None
-        self._browser = None
+        self._client: Optional[Any] = None
+        self._session: Optional[Any] = None
+        self._page: Optional[Any] = None
+        self._pw: Optional[Any] = None
+        self._browser: Optional[Any] = None
 
     @classmethod
     def available(cls) -> bool:
@@ -269,18 +273,22 @@ class BrowserbaseBackend(BaseBrowserBackend):
         from browserbase import Browserbase  # noqa: WPS433
         from playwright.async_api import async_playwright  # noqa: WPS433
 
-        if self._page is None:
-            self._client = Browserbase(api_key=os.environ["BROWSERBASE_API_KEY"])
-            self._session = self._client.sessions.create(
+        page = self._page
+        if page is None:
+            client = Browserbase(api_key=os.environ["BROWSERBASE_API_KEY"])
+            session = client.sessions.create(
                 project_id=os.getenv("BROWSERBASE_PROJECT_ID", "")
             )
-            self._pw = await async_playwright().start()
-            self._browser = await self._pw.chromium.connect_over_cdp(
-                self._session.connect_url
-            )
-            ctx = self._browser.contexts[0]
-            self._page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-        await self._page.goto(url)
+            pw = await async_playwright().start()
+            browser = await pw.chromium.connect_over_cdp(session.connect_url)
+            ctx = browser.contexts[0]
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            self._client = client
+            self._session = session
+            self._pw = pw
+            self._browser = browser
+            self._page = page
+        await page.goto(url)
 
     async def act(self, instruction: str) -> BrowserStep:  # pragma: no cover
         if self._page is None:
@@ -327,7 +335,7 @@ class BrowserUseBackend(BaseBrowserBackend):
     name = "browser-use"
 
     def __init__(self) -> None:
-        self._agent = None
+        self._agent: Optional[Any] = None
         self._last_url = ""
         self._last_result = ""
 
@@ -347,9 +355,10 @@ class BrowserUseBackend(BaseBrowserBackend):
         from browser_use import Agent  # noqa: WPS433
 
         try:
-            self._agent = Agent(task=instruction)
-            result = await self._agent.run()
-            self._last_result = str(result)
+            agent = Agent(task=instruction)
+            result = await agent.run()
+            self._agent = agent
+            self._last_result = str(result or "")
             return BrowserStep(ok=True, detail=self._last_result[:200])
         except Exception as exc:
             return BrowserStep(ok=False, error=str(exc))
@@ -441,7 +450,8 @@ class BrowserAgent(BaseAgent):
     async def initialize(self) -> None:
         """No eager browser launch — selection is lazy + non-fatal."""
         self.metadata["initialized"] = True
-        self.metadata["backend"] = self._resolve_backend().name if self.backend_available else None
+        backend = self._resolve_backend() if self.backend_available else None
+        self.metadata["backend"] = backend.name if backend is not None else None
 
     async def health_check(self) -> bool:
         """Healthy regardless of browser availability.

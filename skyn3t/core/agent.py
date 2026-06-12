@@ -351,6 +351,7 @@ class BaseAgent(ABC):
                                         "execution_time_ms": result.execution_time_ms,
                                         "output_summary": str(result.output)[:200],
                                         "output": result.output,
+                                        **self._task_experience_fields(task, result),
                                     },
                                     correlation_id=task.task_id,
                                 )
@@ -376,6 +377,7 @@ class BaseAgent(ABC):
                                         # telemetry).
                                         "retry_count": getattr(task, "retry_count", 0),
                                         "max_retries": task.max_retries,
+                                        **self._task_experience_fields(task, result),
                                     },
                                     correlation_id=task.task_id,
                                 )
@@ -418,6 +420,7 @@ class BaseAgent(ABC):
                                 payload={
                                     "task_id": task.task_id,
                                     "error": str(e),
+                                    **self._task_experience_fields(task, error=str(e)),
                                 },
                                 correlation_id=task.task_id,
                             )
@@ -454,6 +457,32 @@ class BaseAgent(ABC):
                 payload={"error": error, "context": context},
             )
         )
+
+    def _task_experience_fields(
+        self,
+        task: TaskRequest,
+        result: Optional[TaskResult] = None,
+        error: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Extract structured context for the experience index from a task."""
+        input_data = task.input_data if isinstance(task.input_data, dict) else {}
+        meta = result.metadata if result is not None else {}
+        stack = input_data.get("stack") or meta.get("stack") or None
+        stage = input_data.get("stage") or meta.get("stage") or None
+        error_signature = (
+            meta.get("error_signature")
+            or input_data.get("error_signature")
+            or (error if error else None)
+        )
+        brief_shape = input_data.get("brief_shape")
+        fields: Dict[str, Any] = {
+            "stack": stack,
+            "stage": stage,
+            "error_signature": error_signature,
+        }
+        if brief_shape is not None:
+            fields["brief_shape"] = brief_shape
+        return fields
 
     def get_stats(self) -> Dict[str, Any]:
         """Get agent statistics."""

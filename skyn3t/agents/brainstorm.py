@@ -303,7 +303,7 @@ class BrainstormAgent(BaseAgent):
                 )
             prompt = f"Brief:\n{brief}\n\nReply JSON."
             out = await asyncio.wait_for(
-                client.complete(prompt, system=system, max_tokens=400, temperature=0.0),
+                client.complete(prompt, system=system, max_tokens=4000, temperature=0.0),
                 timeout=30,
             )
             if not out or "[deterministic-stub]" in out:

@@ -43,7 +43,7 @@ def test_persisted_policy_overrides_env_file(monkeypatch, tmp_path, _isolated_ro
 
     assert tier_for_stage("reviewer") == "or_cheap"
     assert route["backend"] == "openrouter"
-    assert route["model"] == "openrouter/owl-alpha"
+    assert route["model"] == "google/gemini-3.1-flash-lite"
     assert route["source"] == "persisted"
 
 
@@ -54,9 +54,11 @@ def test_delete_persisted_policy_reveals_default(_isolated_routing_policy):
     _isolated_routing_policy.delete("reviewer")
     route = describe_stage_route("reviewer")
 
-    assert route["tier"] == "or_strong"
-    assert route["backend"] == "openrouter"
-    assert route["model"] == "xiaomi/mimo-v2.5-pro"
+    # Default reviewer policy rides the Claude subscription (strong tier);
+    # production deployments without Claude remap it via the persisted store.
+    assert route["tier"] == "strong"
+    assert route["backend"] == "claude_cli"
+    assert route["model"] == "opus"
     assert route["source"] == "default"
 
 
@@ -78,7 +80,7 @@ def test_code_stage_defaults_to_strong_route():
 
     assert tier_for_stage("code") == "or_strong"
     assert route["backend"] == "openrouter"
-    assert route["model"] == "xiaomi/mimo-v2.5-pro"
+    assert route["model"] == "qwen/qwen3-coder-plus"
     assert route["source"] == "default"
 
 
@@ -90,11 +92,11 @@ def test_code_tier_env_overrides_code_stages(monkeypatch):
 
     assert tier_for_stage("code") == "or_backend"
     assert code_route["backend"] == "openrouter"
-    assert code_route["model"] == "qwen/qwen3-coder"
+    assert code_route["model"] == "qwen/qwen3-coder-next"
     assert code_route["source"] == "env_code_tier"
     assert agent_route["source"] == "env_code_tier"
     # Non-code stages stay on their defaults.
-    assert tier_for_stage("reviewer") == "or_strong"
+    assert tier_for_stage("reviewer") == "strong"
 
 
 def test_code_tier_env_overrides_per_file_routing(monkeypatch):
@@ -104,7 +106,7 @@ def test_code_tier_env_overrides_per_file_routing(monkeypatch):
 
     backend, model = resolve_model_for_file("src/components/Dashboard.jsx")
     assert backend == "openrouter"
-    assert model == "openrouter/owl-alpha"
+    assert model == "google/gemini-3.1-flash-lite"
 
 
 def test_model_routing_file_beats_code_tier_env(monkeypatch, tmp_path):
@@ -122,9 +124,10 @@ def test_model_routing_file_beats_code_tier_env(monkeypatch, tmp_path):
 def test_architecture_stage_defaults_to_strong_route():
     route = describe_stage_route("architecture")
 
-    assert tier_for_stage("architecture") == "or_strong"
-    assert route["backend"] == "openrouter"
-    assert route["model"] == "xiaomi/mimo-v2.5-pro"
+    # Architecture defaults to the Claude subscription (strong tier).
+    assert tier_for_stage("architecture") == "strong"
+    assert route["backend"] == "claude_cli"
+    assert route["model"] == "opus"
     assert route["source"] == "default"
 
 
@@ -133,7 +136,7 @@ def test_consistency_reviewer_defaults_to_strong_route():
 
     assert tier_for_stage("consistency_reviewer") == "or_strong"
     assert route["backend"] == "openrouter"
-    assert route["model"] == "xiaomi/mimo-v2.5-pro"
+    assert route["model"] == "qwen/qwen3-coder-plus"
     assert route["source"] == "default"
 
 
