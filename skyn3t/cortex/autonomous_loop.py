@@ -903,6 +903,54 @@ class AutonomousCoordinator:
             return 0
 
     @staticmethod
+    def _blended_token_rate() -> float:
+        """Blended $/token across the OpenRouter build tiers, from LIVE catalog
+        pricing. Returns 0.0 when those tiers are free models so free builds
+        register ~$0 (not a fabricated flat cost). Falls back to the legacy
+        1/250_000 heuristic only when pricing genuinely can't be resolved.
+
+        This fixes the prior over-estimate (a flat ~$0.80/build regardless of
+        model), which inflated daily_spend_usd ~10x vs. the real bill and could
+        falsely trip the daily budget cap even on free models.
+        """
+        legacy = 1.0 / 250_000.0
+        try:
+            from skyn3t.core.model_router import _TIERS
+            from skyn3t.core.openrouter_catalog import load_catalog
+        except Exception:
+            return legacy
+        wanted = [
+            entry[1]
+            for t in ("or_cheap", "or_ui", "or_backend", "or_strong")
+            if (entry := _TIERS.get(t)) and entry[0] == "openrouter" and entry[1]
+        ]
+        if not wanted:
+            return legacy
+        try:
+            models = load_catalog().models or []
+        except Exception:
+            return legacy
+        pricing_by_id = {
+            m.get("id"): m.get("pricing")
+            for m in models
+            if m.get("id") and isinstance(m.get("pricing"), dict)
+        }
+        best = 0.0
+        found = False
+        for mid in wanted:
+            pr = pricing_by_id.get(mid)
+            if not isinstance(pr, dict):
+                continue
+            found = True
+            try:
+                p = float(pr.get("prompt") or 0.0)
+                c = float(pr.get("completion") or 0.0)
+            except (TypeError, ValueError):
+                p = c = 0.0
+            best = max(best, (p + c) / 2.0)
+        return best if found else legacy
+
+    @staticmethod
     def _estimate_spend_from_tokens(
         tokens: int,
         *,
@@ -910,8 +958,11 @@ class AutonomousCoordinator:
     ) -> float:
         if reserved_max_cost <= 0:
             return 0.0
+        rate = AutonomousCoordinator._blended_token_rate()
+        if rate <= 0:
+            return 0.0  # free build tiers → real spend ~$0; don't fabricate cost
         if tokens > 0:
-            return min(float(reserved_max_cost), max(0.001, tokens / 250_000.0))
+            return min(float(reserved_max_cost), max(0.0, tokens * rate))
         return min(float(reserved_max_cost), 0.01)
 
     async def _maybe_start_build(self) -> Optional[str]:
