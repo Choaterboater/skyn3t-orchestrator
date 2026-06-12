@@ -274,15 +274,14 @@ class LLMClient:
         return None
 
     def _auto_cli_order(self) -> list[str]:
-        # Copilot-first because the Copilot CLI is effectively a
-        # multi-model proxy (--model gpt-4o / claude-sonnet / etc.).
-        # The user gets access to multiple models without us having to
-        # juggle three CLI dialects. Claude comes second as the
-        # large-subscription backup when Copilot has rate-limit or
-        # auth issues. Kimi is third because it has shown 180s
-        # streaming-idle hangs on architect/design calls. OpenAI CLI
-        # last because it requires an API key.
-        return ["copilot_cli", "claude_cli", "kimi_cli", "openai_cli"]
+        # claude_cli is the ONLY CLI in the auto chain: it is the one CLI
+        # reliably authenticated on this box (Claude Code subscription,
+        # zero marginal cost). copilot/kimi pass the --version probe but
+        # are NOT logged in, so every attempt burned a multi-minute
+        # timeout before failover — this stalled server startup ~3min.
+        # openai_cli needs an API key we don't set. Re-add a CLI here
+        # ONLY after `<cli> -p "ok"` works in a fresh shell.
+        return ["claude_cli"]
 
     async def _try_named_backend(self, name: str) -> bool:
         if name in getattr(self, "_skip_backends", ()):
@@ -319,6 +318,25 @@ class LLMClient:
         return False
 
     async def _resolve_auto_backend(self):
+        # "Not claude at all for coding": code-generation callers resolve
+        # to the OpenRouter API first — the Claude subscription is
+        # reserved for reasoning stages (planner/architect/reviewer).
+        # claude_cli stays as the LAST resort for code callers so a
+        # transient OpenRouter outage degrades to a real model instead
+        # of the deterministic stub.
+        if self._routing_hint == "code":
+            if self._openrouter_key and await self._try_named_backend("openrouter"):
+                return self._impl
+            for name in self._auto_cli_order():
+                if await self._try_named_backend(name):
+                    logger.warning(
+                        "code caller %s using %s — OpenRouter unavailable",
+                        self._caller_name or "llm", self._backend_name,
+                    )
+                    return self._impl
+            self._impl = _DeterministicBackend()
+            self._backend_name = "deterministic"
+            return self._impl
         for name in self._auto_cli_order():
             if await self._try_named_backend(name):
                 return self._impl

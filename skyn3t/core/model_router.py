@@ -31,15 +31,19 @@ Stages today (in order of "cheap is fine" → "strong matters"):
 Tier name → backend mapping:
   cheap    → openrouter flash-lite (HTTP, fast — safe fallback for
              unmapped stages; never a CLI)
-  balanced → claude_cli sonnet (Claude Code subscription — zero
-             marginal cost, strong coder)
-  strong   → claude_cli opus (subscription — highest reasoning
-             quality, slower)
+  balanced → claude_cli sonnet (Claude Code subscription — planning)
+  strong   → claude_cli opus (subscription — architecture, judging)
+  max      → claude_cli fable (subscription — escalation ceiling for
+             the heaviest reasoning)
 
-claude_cli is the ONLY CLI we route to: it is the one CLI reliably
-authenticated on this box. kimi_cli / copilot_cli are not logged in
-here — routing to them produced multi-minute timeout stalls (including
-blocking server startup) — so no tier points at them.
+Owner directives (2026-06-11): claude carries REASONING stages only —
+coding NEVER routes to claude; all code-gen uses the OpenRouter
+specialists (or_ui / or_backend / or_strong), with claude only as
+last-resort failover when OpenRouter itself is down. claude_cli is the
+ONLY CLI we route to: it is the one CLI reliably authenticated on this
+box. kimi_cli / copilot_cli are not logged in here — routing to them
+produced multi-minute timeout stalls (including blocking server
+startup) — so no tier points at them.
 
 Stage-level routing is intentionally a SHALLOW policy. Per-call
 routing (e.g. "this specific file is critical, use strong") stays
@@ -86,14 +90,17 @@ _TIERS: Dict[str, Tuple[str, Optional[str]]] = {
     "or_docs":    ("openrouter", "openai/gpt-oss-120b:free"),
     # Legacy tier names. 'cheap' is the hardcoded fallback for unmapped
     # stages (planner, decomposer, …) — it MUST stay HTTP-based so an
-    # unknown stage can never stall on a dead CLI. balanced/strong/ui
-    # ride the Claude Code subscription (zero marginal cost); kimi_cli
-    # and copilot_cli are not authenticated here and are unreachable
-    # from every default path.
+    # unknown stage can never stall on a dead CLI. balanced/strong/max
+    # ride the Claude Code subscription (zero marginal cost) and are for
+    # REASONING stages only — coding never routes to claude (owner
+    # directive 2026-06-11): code work uses the OpenRouter specialists.
+    # kimi_cli and copilot_cli are not authenticated here and are
+    # unreachable from every default path.
     "cheap":    ("openrouter", "google/gemini-2.5-flash-lite-preview-09-2025"),
     "balanced": ("claude_cli", "sonnet"),
     "strong":   ("claude_cli", "opus"),
-    "ui":       ("claude_cli", "sonnet"),
+    "max":      ("claude_cli", "fable"),
+    "ui":       ("openrouter", "qwen/qwen3.5-flash-02-23"),
 }
 
 
@@ -109,12 +116,13 @@ _DEFAULT_STAGE_POLICY: Dict[str, str] = {
     "marketer":           "or_cheap",
     "business_analyst":   "or_cheap",
 
-    # Heavy stages ride the Claude Code subscription (claude_cli):
-    # zero marginal cost vs metered OpenRouter, and quality matters
-    # most here. Opus where one mistake cascades (architecture,
-    # judging); sonnet where throughput matters (code-gen, planning,
-    # contract checks) — sonnet answers in seconds, opus can take a
-    # minute.
+    # REASONING stages ride the Claude Code subscription (claude_cli):
+    # zero marginal cost, and quality matters most here. Opus where one
+    # mistake cascades (architecture, judging); sonnet where throughput
+    # matters (planning). CODING stages never route to claude (owner
+    # directive 2026-06-11) — OpenRouter specialists handle all
+    # code-gen, with claude only as last-resort failover when
+    # OpenRouter itself is down.
     "planner":            "balanced",
     "plan":               "balanced",
     "architect":          "strong",
@@ -122,12 +130,12 @@ _DEFAULT_STAGE_POLICY: Dict[str, str] = {
     # Code-stage planning still uses the agent-level route before
     # per-file specialization kicks in (UI/backend files go to the
     # OpenRouter specialists in _resolve_static).
-    "code":               "balanced",
-    "code_agent":         "balanced",
-    "code_improver":      "balanced",
+    "code":               "or_strong",
+    "code_agent":         "or_strong",
+    "code_improver":      "or_strong",
     "reviewer":           "strong",
-    "contract_verifier":  "balanced",
-    "consistency_reviewer": "balanced",
+    "contract_verifier":  "or_strong",
+    "consistency_reviewer": "or_strong",
     "packaging_agent":    "or_cheap",
     "verifier":           "or_cheap",
     "docs":               "or_docs",
@@ -192,17 +200,19 @@ _CODE_STAGE_NAMES: frozenset[str] = frozenset(
 )
 
 # Escalation map: when cheap-first fails, bump to the next tier up.
-# Escalations land on the Claude subscription (balanced/strong) rather
-# than a pricier OpenRouter model — retries are exactly the "heavier
-# stuff" the subscription should absorb. 'strong' itself escalates to
-# or_strong via the default, as a cross-backend escape hatch.
+# Coding tiers (or_*) escalate WITHIN OpenRouter — never onto claude
+# (owner directive: no claude for coding). Reasoning tiers climb the
+# subscription ladder sonnet → opus → fable; 'max' escapes cross-
+# backend to or_strong if fable itself fails.
 _TIER_ESCALATION: Dict[str, str] = {
-    "or_cheap": "balanced",
-    "or_ui": "balanced",
-    "or_backend": "balanced",
+    "or_cheap": "or_strong",
+    "or_ui": "or_strong",
+    "or_backend": "or_strong",
     "or_docs": "or_cheap",
-    "cheap": "balanced",
+    "cheap": "or_strong",
     "balanced": "strong",
+    "strong": "max",
+    "max": "or_strong",
 }
 
 
