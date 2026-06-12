@@ -1232,6 +1232,19 @@ def start(
     """🚀 Start the SkyN3t orchestrator server."""
     import uvicorn
 
+    # Load .env into the process environment BEFORE the app is imported, so the
+    # os.getenv-based feature flags (SKYN3T_DEBATE, SKYN3T_AUTO_ROUTE,
+    # SKYN3T_REFLECTIVE_RETRY, SKYN3T_A2A_CONVERSATION, SKYN3T_ASSET_GEN, …) and
+    # credentials are active for the server process. pydantic Settings reads
+    # .env for the Settings model but does NOT populate os.environ, which these
+    # flags read directly. override=False so real exported env vars still win.
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(override=False)
+    except Exception:
+        pass
+
     settings = get_settings()
     host = host if host is not None else settings.web_host
     port = port if port is not None else settings.web_port
