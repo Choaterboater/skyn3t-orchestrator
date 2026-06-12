@@ -67,10 +67,14 @@ logger = logging.getLogger("skyn3t.core.model_router")
 _TIERS: Dict[str, Tuple[str, Optional[str]]] = {
     # OpenRouter-first tiers (HTTP-based; no 240s CLI idle-timeout cliff).
     # Capability-routed per file type — see _resolve_static below.
-    "or_cheap":   ("openrouter", "openrouter/owl-alpha"),
-    "or_ui":      ("openrouter", "xiaomi/mimo-v2-flash"),
-    "or_backend": ("openrouter", "qwen/qwen3-coder"),
-    "or_strong":  ("openrouter", "xiaomi/mimo-v2.5-pro"),
+    # FREE OpenRouter models so autonomous builds cost ~$0. Verified live on
+    # OpenRouter /models (pricing prompt+completion == 0) on 2026-06-11. The
+    # SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD cap is the hard backstop for any
+    # incidental paid usage (debate diversity, model-evolution, CLI fallback).
+    "or_cheap":   ("openrouter", "meta-llama/llama-3.3-70b-instruct:free"),
+    "or_ui":      ("openrouter", "nvidia/nemotron-3-super-120b-a12b:free"),
+    "or_backend": ("openrouter", "qwen/qwen3-coder:free"),
+    "or_strong":  ("openrouter", "qwen/qwen3-coder:free"),
     "or_docs":    ("openrouter", "openai/gpt-oss-120b:free"),
     # Local-CLI tiers — kept as safety net via _BACKEND_ALTERNATIVES.
     "cheap":    ("kimi_cli",    None),
