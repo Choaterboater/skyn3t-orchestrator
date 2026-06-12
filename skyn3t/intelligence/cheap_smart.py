@@ -39,9 +39,21 @@ def cheap_smart_enabled() -> bool:
     return True
 
 
+def cheap_first_code_enabled() -> bool:
+    """Cheap-FIRST codegen is now OPT-IN via ``SKYN3T_CHEAP_FIRST_CODE=1``.
+
+    The cheap-first experiment routed all code stages to the flash-lite
+    tier and build output quality cratered (owner, 2026-06-11: "nothing
+    really improved on output"). Escalation tracking and context boost
+    stay on; only the initial cheap routing for code is opt-in now.
+    """
+    raw = os.environ.get("SKYN3T_CHEAP_FIRST_CODE", "").strip().lower()
+    return raw in ("1", "on", "true", "yes")
+
+
 def cheap_smart_stage_tier(stage_name: Optional[str]) -> Optional[str]:
     """Cheap-first tier override for a stage when cheap-smart is active."""
-    if not cheap_smart_enabled() or not stage_name:
+    if not cheap_smart_enabled() or not cheap_first_code_enabled() or not stage_name:
         return None
     stage = str(stage_name).strip().lower()
     if stage in {"code", "code_agent", "code_improver"}:

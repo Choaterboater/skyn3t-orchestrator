@@ -84,9 +84,13 @@ _TIERS: Dict[str, Tuple[str, Optional[str]]] = {
     # the same set the model-evolution engine converged to on this account —
     # minus the expensive Opus pick that's now disabled. or_docs stays free.
     "or_cheap":   ("openrouter", "google/gemini-2.5-flash-lite-preview-09-2025"),
-    "or_ui":      ("openrouter", "qwen/qwen3.5-flash-02-23"),
-    "or_backend": ("openrouter", "qwen/qwen3-coder"),
-    "or_strong":  ("openrouter", "qwen/qwen3-coder"),
+    # Code tiers run gpt-5.3-codex (owner, 2026-06-11): the same model
+    # that produced the best builds via the old copilot CLI ("codex was
+    # getting better results with network tools", v15 dashboard 100/100).
+    # ~$1.75/M in, $14/M out — the daily budget cap still bounds spend.
+    "or_ui":      ("openrouter", "openai/gpt-5.3-codex"),
+    "or_backend": ("openrouter", "openai/gpt-5.3-codex"),
+    "or_strong":  ("openrouter", "openai/gpt-5.3-codex"),
     "or_docs":    ("openrouter", "openai/gpt-oss-120b:free"),
     # Legacy tier names. 'cheap' is the hardcoded fallback for unmapped
     # stages (planner, decomposer, …) — it MUST stay HTTP-based so an
@@ -278,6 +282,26 @@ def _task_kind_for_path(rel_path: str) -> str:
     return "general"
 
 
+# Code tiers are PINNED to their configured model (gpt-5.3-codex, owner
+# 2026-06-11). The evolution store and the keyword catalog picker kept
+# silently swapping deliberate picks for cheap/:free variants — that is
+# exactly how "nothing really improved on output" happened. The adaptive
+# re-pick machinery only touches these tiers when the cheap-first
+# experiment is explicitly opted into (SKYN3T_CHEAP_FIRST_CODE=1).
+_PINNED_CODE_TIERS: frozenset[str] = frozenset({"or_ui", "or_backend", "or_strong"})
+
+
+def _adaptive_repick_allowed(tier_name: str) -> bool:
+    if tier_name not in _PINNED_CODE_TIERS:
+        return True
+    try:
+        from skyn3t.intelligence.cheap_smart import cheap_first_code_enabled
+
+        return cheap_first_code_enabled()
+    except Exception:
+        return False
+
+
 def _tier_backend_model(
     tier_name: str,
     *,
@@ -297,11 +321,13 @@ def _tier_backend_model(
                 resolve_openrouter_model,
             )
 
-            evolved = tier_override_model(tier_name)
-            if evolved:
-                model = evolved
+            repick = _adaptive_repick_allowed(tier_name)
+            if repick:
+                evolved = tier_override_model(tier_name)
+                if evolved:
+                    model = evolved
             model = resolve_openrouter_model(tier_name, model)
-            if task_kind:
+            if task_kind and repick:
                 if is_evolution_enabled():
                     picked = pick_evolved_model_for_task(
                         tier_name,
