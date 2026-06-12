@@ -575,6 +575,16 @@ class AutonomousCoordinator:
         """
         parts = [text.strip()]
         domain = os.environ.get("SKYN3T_AUTONOMOUS_BRIEF_DOMAIN", "").strip()
+        if not domain:
+            # .env values only exist inside pydantic settings, not os.environ.
+            try:
+                from skyn3t.config.settings import get_settings
+
+                domain = str(
+                    getattr(get_settings(), "autonomous_brief_domain", "") or ""
+                ).strip()
+            except Exception:
+                domain = ""
         if domain and domain.lower()[:24] not in text.lower():
             parts.append(f"Domain focus: {domain}.")
         parts.append(

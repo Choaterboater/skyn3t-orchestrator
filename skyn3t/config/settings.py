@@ -166,6 +166,10 @@ class Settings(BaseSettings):
     # Autonomous loops — scout schedule + optional Studio builds without CLI
     autonomous_learning: bool = Field(default=True, alias="SKYN3T_AUTONOMOUS_LEARNING")
     autonomous_builds: bool = Field(default=False, alias="SKYN3T_AUTONOMOUS_BUILDS")
+    # Appended as "Domain focus: …" to every autonomous build brief.
+    autonomous_brief_domain: str = Field(
+        default="", alias="SKYN3T_AUTONOMOUS_BRIEF_DOMAIN"
+    )
     autonomous_build_daily_cap: int = Field(default=3, alias="SKYN3T_AUTONOMOUS_BUILD_DAILY_CAP")
     autonomous_build_interval_seconds: int = Field(
         default=900, alias="SKYN3T_AUTONOMOUS_BUILD_INTERVAL_SECONDS"
