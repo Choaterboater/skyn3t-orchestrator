@@ -4197,6 +4197,290 @@ async def studio_project_delete(slug: str):
     return delete_project(slug)
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Phase 5B — assistant parity status + opt-in trigger endpoints.
+#
+# Every new subsystem (remote execution backends, extra messaging channels,
+# the NL scheduler, the delivery gateway, the browser agent) is OPTIONAL and
+# credential/flag-gated. Each handler imports its dependency lazily inside a
+# try/except so a missing optional SDK can NEVER 500 the whole app — mirrors
+# the /api/execution/backend pattern above. Read-only GETs report
+# availability; POSTs are opt-in triggers (already web-token-gated by the
+# enforce_web_access middleware like every other /api/ route).
+# ─────────────────────────────────────────────────────────────────────────
+
+# Remote backends that hibernate their session between runs (serverless,
+# pay-per-use) rather than tearing it down. Used purely to annotate the
+# /api/backends status payload; the authoritative flag is the per-run
+# BackendResult.hibernated.
+_HIBERNATING_BACKENDS = frozenset({"modal", "daytona"})
+
+
+@app.get("/api/backends")
+async def remote_backends_status():
+    """List remote execution backends and their availability.
+
+    Sourced from skyn3t.intelligence.backends. ``hibernates`` is a static
+    hint (modal/daytona suspend the sandbox between runs); the live flag is
+    BackendResult.hibernated. Defensive: a missing optional backend SDK can
+    never 500 this endpoint."""
+    try:
+        from skyn3t.intelligence.backends import (
+            available_backends,
+            registered_backends,
+        )
+
+        registered = registered_backends()
+        available = available_backends()
+    except Exception as exc:
+        logger.debug("backends status probe failed: %s", exc)
+        return {"backends": [], "available": [], "error": str(exc)}
+
+    avail_set = set(available)
+    backends = [
+        {
+            "name": name,
+            "available": name in avail_set,
+            "hibernates": name in _HIBERNATING_BACKENDS,
+        }
+        for name in registered
+    ]
+    return {"backends": backends, "available": available}
+
+
+# The Phase 5B channel adapters that ship as separate modules. The default
+# router starts empty, so the status endpoint lazily instantiates + registers
+# each one (creds read from env in __init__); absent creds simply make
+# is_available() False and the channel is omitted from ``available``.
+_PHASE5B_CHANNEL_CLASSES = (
+    "HomeAssistantChannel",
+    "SmsChannel",
+    "DingTalkChannel",
+    "WeComChannel",
+    "WeChatChannel",
+    "LineChannel",
+    "KakaoTalkChannel",
+)
+
+
+def _register_phase5b_channels(router) -> None:
+    """Lazily instantiate + register the optional Phase 5B channels on the
+    given router. Each is guarded: an absent module/dep (bound to None in
+    skyn3t.integrations.__init__) or a constructor failure just skips that
+    channel without raising."""
+    import skyn3t.integrations as integ
+
+    for cls_name in _PHASE5B_CHANNEL_CLASSES:
+        cls = getattr(integ, cls_name, None)
+        if cls is None:
+            continue
+        platform = getattr(cls, "platform", None)
+        try:
+            if platform and router.get(platform) is not None:
+                continue  # already registered
+            router.register(cls(router.event_bus))
+        except Exception as exc:
+            logger.debug("phase5b channel %s registration skipped: %s", cls_name, exc)
+
+
+@app.get("/api/channels")
+async def messaging_channels_status():
+    """Messaging channel parity status.
+
+    {registered: router.platforms(), available: router.available_platforms()}.
+    Lazily registers the optional Phase 5B channel adapters first so absent
+    creds simply omit them from ``available``. Never 500s on a missing
+    optional dependency."""
+    try:
+        from skyn3t.integrations.messaging import get_default_router
+
+        router = get_default_router(event_bus)
+        _register_phase5b_channels(router)
+        registered = router.platforms()
+        try:
+            available = router.available_platforms()
+        except Exception:
+            available = []
+        return {"registered": registered, "available": available}
+    except Exception as exc:
+        logger.debug("channels status probe failed: %s", exc)
+        return {"registered": [], "available": [], "error": str(exc)}
+
+
+def _resolve_scheduler_agent():
+    """Return the registered SchedulerAgent instance, or None.
+
+    Matches by agent_type=='scheduler' (its declared type) falling back to a
+    'scheduler' name. Read-only; never raises."""
+    if not orchestrator:
+        return None
+    try:
+        for agent in orchestrator.agents.values():
+            if str(getattr(agent, "agent_type", "")).strip().lower() == "scheduler":
+                return agent
+        return orchestrator.agents.get("scheduler")
+    except Exception:
+        return None
+
+
+@app.get("/api/cron")
+async def cron_list():
+    """List scheduled jobs via the SchedulerAgent's list_jobs task.
+
+    503 when no SchedulerAgent is registered on the orchestrator."""
+    agent = _resolve_scheduler_agent()
+    if agent is None:
+        return JSONResponse(
+            {"error": "SchedulerAgent not available"}, status_code=503
+        )
+    try:
+        from skyn3t.core.agent import TaskRequest
+
+        result = await agent.execute(
+            TaskRequest(input_data={"task_type": "list_jobs"})
+        )
+        return {"ok": bool(result.success), "result": result.output}
+    except Exception as exc:
+        logger.debug("cron list failed: %s", exc)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/cron")
+async def cron_create(payload: Dict[str, Any]):
+    """Create a scheduled job from natural language.
+
+    Body: {text, agent_name?, prompt?, delivery:{channel,to}?}. Routed to the
+    SchedulerAgent 'schedule_nl' task which parses the recurrence and stamps
+    the delivery info onto the job payload so the gateway bridge can route the
+    result. 503 when no SchedulerAgent is registered."""
+    agent = _resolve_scheduler_agent()
+    if agent is None:
+        return JSONResponse(
+            {"error": "SchedulerAgent not available"}, status_code=503
+        )
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"error": "text is required"}, status_code=400)
+
+    input_data: Dict[str, Any] = {
+        "task_type": "schedule_nl",
+        "text": text,
+        "payload": {
+            "agent_name": payload.get("agent_name"),
+            "prompt": payload.get("prompt"),
+        },
+    }
+    delivery = payload.get("delivery")
+    if isinstance(delivery, dict) and delivery.get("channel"):
+        input_data["delivery"] = {
+            "channel": delivery.get("channel"),
+            "to": delivery.get("to"),
+        }
+    if payload.get("name"):
+        input_data["name"] = payload.get("name")
+    if payload.get("max_runs") is not None:
+        input_data["max_runs"] = payload.get("max_runs")
+
+    try:
+        from skyn3t.core.agent import TaskRequest
+
+        result = await agent.execute(TaskRequest(input_data=input_data))
+        status = 200 if result.success else 400
+        return JSONResponse(
+            {"ok": bool(result.success), "result": result.output, "error": result.error},
+            status_code=status,
+        )
+    except Exception as exc:
+        logger.debug("cron create failed: %s", exc)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/gateway/channels")
+async def gateway_channels_status():
+    """Report the DeliveryGateway's configured + available delivery channels.
+
+    Defensive: a missing optional dependency never 500s this endpoint."""
+    try:
+        from skyn3t.integrations.gateway import get_gateway
+
+        gateway = get_gateway()
+        # Register optional channels on the shared router so the gateway sees
+        # the same availability picture as /api/channels.
+        try:
+            from skyn3t.integrations.messaging import get_default_router
+
+            _register_phase5b_channels(get_default_router(event_bus))
+        except Exception:
+            pass
+        return {"channels": gateway.channels()}
+    except Exception as exc:
+        logger.debug("gateway channels probe failed: %s", exc)
+        return {"channels": [], "error": str(exc)}
+
+
+@app.post("/api/gateway/deliver")
+async def gateway_deliver(payload: Dict[str, Any]):
+    """Opt-in: deliver an ad-hoc/test message via DeliveryGateway.deliver().
+
+    Body: {channel, to, text, thread?, subject?}. An unconfigured/unavailable
+    channel returns {skipped: true} rather than an error. Web-token-gated by
+    the enforce_web_access middleware like every other POST."""
+    channel = str(payload.get("channel") or "").strip()
+    to = str(payload.get("to") or "").strip()
+    text = str(payload.get("text") or "")
+    if not channel:
+        return JSONResponse({"error": "channel is required"}, status_code=400)
+    if not text:
+        return JSONResponse({"error": "text is required"}, status_code=400)
+    try:
+        from skyn3t.integrations.gateway import get_gateway
+
+        gateway = get_gateway()
+        try:
+            from skyn3t.integrations.messaging import get_default_router
+
+            _register_phase5b_channels(get_default_router(event_bus))
+        except Exception:
+            pass
+        result = await gateway.deliver(
+            channel=channel,
+            to=to,
+            text=text,
+            thread=payload.get("thread"),
+            subject=payload.get("subject"),
+        )
+        return result.to_dict()
+    except Exception as exc:
+        logger.debug("gateway deliver failed: %s", exc)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/browser/status")
+async def browser_status():
+    """Report browser-agent readiness without launching anything.
+
+    {available, backend} where ``backend`` is the selected backend name (or
+    null). Playwright is not installed in the venv, so all probes are lazy and
+    non-raising — this never 500s and never opens a browser."""
+    try:
+        from skyn3t.agents.browser_agent import (
+            BrowserAgent,
+            select_browser_backend,
+        )
+
+        backend = select_browser_backend()
+        backend_name = getattr(backend, "name", None) if backend is not None else None
+        try:
+            agent = BrowserAgent(event_bus=event_bus)
+            available = bool(agent.backend_available)
+        except Exception:
+            available = backend is not None
+        return {"available": available, "backend": backend_name}
+    except Exception as exc:
+        logger.debug("browser status probe failed: %s", exc)
+        return {"available": False, "backend": None, "error": str(exc)}
+
+
 # SPA catch-all — must be the last route registered. React Router owns
 # the URL once the SPA loads, but a hard reload (Cmd-Shift-R) makes the
 # browser ask the server for /activity, /studio, /cortex, etc. directly.

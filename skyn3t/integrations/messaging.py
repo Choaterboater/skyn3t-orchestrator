@@ -92,6 +92,21 @@ class MessagingChannel(abc.ABC):
         (Slack thread_ts, Telegram reply_to_message_id, etc).
         """
 
+    def is_available(self) -> bool:
+        """Uniform availability gate for the gateway + status endpoint.
+
+        Returns True when this channel is configured well enough to send
+        (its credentials / bridge URL are present). The base default is
+        ``True`` so a channel only has to *opt out* — subclasses that
+        need credentials override this to report unavailable (rather than
+        crashing) when those creds are missing.
+
+        MUST be pure and non-raising: callers (DeliveryGateway.channels(),
+        MessagingRouter.available_platforms(), the /status endpoint) poll
+        it freely and never expect an exception.
+        """
+        return True
+
     async def ingest(self, raw: Dict[str, Any]) -> None:
         """Convenience: parse a raw payload + publish the TASK_CREATED
         event if the payload was a user-message we should respond to.
@@ -151,6 +166,10 @@ class TelegramChannel(MessagingChannel):
         # httpx client lazily; we don't want to require httpx just to
         # import this module (some test environments don't have it).
         self._http: Any = None
+
+    def is_available(self) -> bool:
+        """Available once a bot token is configured (for sending replies)."""
+        return bool(self.bot_token)
 
     async def handle_inbound(self, raw: Dict[str, Any]) -> Optional[InboundMessage]:
         """Normalize a Telegram Update payload.
@@ -267,6 +286,10 @@ class WhatsAppChannel(MessagingChannel):
         self.phone_number_id = phone_number_id or os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
         self._http: Any = None
 
+    def is_available(self) -> bool:
+        """Available once both the Graph token and phone-number-id are set."""
+        return bool(self.access_token and self.phone_number_id)
+
     async def handle_inbound(self, raw: Dict[str, Any]) -> Optional[InboundMessage]:
         """Normalize WhatsApp webhook envelope.
 
@@ -365,6 +388,10 @@ class MatrixChannel(MessagingChannel):
         self.access_token = access_token or os.getenv("MATRIX_ACCESS_TOKEN", "")
         self._http: Any = None
         self._txn_counter = 0
+
+    def is_available(self) -> bool:
+        """Available once the homeserver URL and bot access token are set."""
+        return bool(self.homeserver_url and self.access_token)
 
     async def handle_inbound(self, raw: Dict[str, Any]) -> Optional[InboundMessage]:
         """Normalize a single Matrix event.
@@ -469,6 +496,10 @@ class SignalChannel(MessagingChannel):
         self.bridge_url = (bridge_url or os.getenv("SIGNAL_BRIDGE_URL", "") or "").rstrip("/")
         self.number = number or os.getenv("SIGNAL_NUMBER", "")
         self._http: Any = None
+
+    def is_available(self) -> bool:
+        """Available once the signal-cli bridge URL and bot number are set."""
+        return bool(self.bridge_url and self.number)
 
     async def handle_inbound(self, raw: Dict[str, Any]) -> Optional[InboundMessage]:
         """Normalize a signal-cli-rest-api envelope.
@@ -584,6 +615,10 @@ class IMessageChannel(MessagingChannel):
         self.bridge_url = (bridge_url or os.getenv("BLUEBUBBLES_URL", "") or "").rstrip("/")
         self.password = password or os.getenv("BLUEBUBBLES_PASSWORD", "")
         self._http: Any = None
+
+    def is_available(self) -> bool:
+        """Available once the BlueBubbles bridge URL and password are set."""
+        return bool(self.bridge_url and self.password)
 
     async def handle_inbound(self, raw: Dict[str, Any]) -> Optional[InboundMessage]:
         """Normalize a BlueBubbles 'new-message' webhook envelope.
@@ -709,6 +744,10 @@ class MSTeamsChannel(MessagingChannel):
         self._http: Any = None
         self._token: Optional[str] = None
         self._token_expires_at: float = 0.0
+
+    def is_available(self) -> bool:
+        """Available once the Bot Framework app id and password are set."""
+        return bool(self.app_id and self.app_password)
 
     async def handle_inbound(self, raw: Dict[str, Any]) -> Optional[InboundMessage]:
         """Normalize a Teams Activity payload.
@@ -864,6 +903,10 @@ class MattermostChannel(MessagingChannel):
         self.username = username or os.getenv("MATTERMOST_USERNAME", "skyn3t")
         self._http: Any = None
 
+    def is_available(self) -> bool:
+        """Available once the incoming-webhook URL for replies is set."""
+        return bool(self.incoming_webhook_url)
+
     async def handle_inbound(self, raw: Dict[str, Any]) -> Optional[InboundMessage]:
         """Normalize the Mattermost outgoing-webhook form encoding.
 
@@ -945,6 +988,10 @@ class FeishuChannel(MessagingChannel):
         self._http: Any = None
         self._token: Optional[str] = None
         self._token_expires_at: float = 0.0
+
+    def is_available(self) -> bool:
+        """Available once the open-platform app id and secret are set."""
+        return bool(self.app_id and self.app_secret)
 
     async def handle_inbound(self, raw: Dict[str, Any]) -> Optional[InboundMessage]:
         """Normalize a Feishu event-subscription payload.
@@ -1102,6 +1149,10 @@ class GenericWebhookChannel(MessagingChannel):
         self.auth_headers = auth_headers or {}
         self._http: Any = None
 
+    def is_available(self) -> bool:
+        """Available once an outbound URL is configured for replies."""
+        return bool(self.outbound_url)
+
     async def handle_inbound(self, raw: Dict[str, Any]) -> Optional[InboundMessage]:
         text = str(raw.get(self.text_field) or "").strip()
         if not text:
@@ -1198,6 +1249,27 @@ class MessagingRouter:
 
     def platforms(self) -> List[str]:
         return sorted(self._channels.keys())
+
+    def available_platforms(self) -> List[str]:
+        """Return only the registered platforms whose channel reports
+        ``is_available()`` True (creds/bridge configured).
+
+        Additive companion to ``platforms()`` — the gateway and the
+        /status endpoint key off this to show which channels can actually
+        deliver. A channel whose ``is_available()`` raises is treated as
+        unavailable rather than propagating the error, so this never
+        throws.
+        """
+        out: List[str] = []
+        for name, ch in self._channels.items():
+            try:
+                if ch.is_available():
+                    out.append(name)
+            except Exception:
+                logger.exception(
+                    "MessagingRouter: is_available() raised for platform=%s", name
+                )
+        return sorted(out)
 
     async def reply(
         self, platform: str, channel: str, text: str, *, thread: Optional[str] = None

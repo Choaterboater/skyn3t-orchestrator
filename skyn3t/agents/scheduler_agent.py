@@ -33,6 +33,24 @@ class ScheduledJob:
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
+@dataclass
+class NLSchedule:
+    """Result of parsing a natural-language schedule phrase.
+
+    Produced by :meth:`SchedulerAgent.parse_nl_schedule`. The recurrence core
+    (next_run / interval_seconds) is derived from the existing regex parsers;
+    ``cron_expr`` is the normalised 'every N units' / 'daily at HH:MM' form, and
+    the optional delivery fields capture a trailing 'send to <channel>' clause so
+    the gateway bridge can route the triggered result.
+    """
+
+    next_run: Optional[datetime]
+    interval_seconds: Optional[float]  # None => one-shot
+    cron_expr: Optional[str]  # normalized 'every N units'/'daily at HH:MM' form
+    delivery_channel: Optional[str] = None  # parsed 'send to telegram' target platform
+    delivery_to: Optional[str] = None
+
+
 class SchedulerAgent(BaseAgent):
     """Agent for scheduling recurring tasks, cron management, and reminders."""
 
@@ -80,6 +98,18 @@ class SchedulerAgent(BaseAgent):
                     "message": "str",
                     "trigger_at": "str",
                     "recurring": "bool",
+                },
+            )
+        )
+        self.add_capability(
+            AgentCapability(
+                name="schedule_nl",
+                description="Schedule a recurring task from a natural-language phrase "
+                "(e.g. 'every weekday at 9am send to slack')",
+                parameters={
+                    "text": "str",
+                    "payload": "dict",
+                    "delivery": "dict",
                 },
             )
         )
@@ -165,6 +195,7 @@ class SchedulerAgent(BaseAgent):
             "reminder": self._reminder,
             "list_jobs": self._list_jobs,
             "cancel_job": self._cancel_job,
+            "schedule_nl": self._schedule_nl,
         }
 
         handler = handlers.get(task_type)
@@ -403,6 +434,92 @@ class SchedulerAgent(BaseAgent):
                 pass
         return {"success": True, "job_id": job_id, "cancelled": True}
 
+    async def _schedule_nl(self, task: TaskRequest) -> Dict[str, Any]:
+        """Schedule a job from a natural-language phrase.
+
+        input_data: {
+            text: str,                       # the NL schedule phrase
+            name: str (optional),
+            payload: {agent_name, prompt},   # what to run when triggered
+            delivery: {channel, to},         # optional explicit delivery override
+            max_runs: int (optional),
+        }
+
+        Builds a ScheduledJob whose payload carries
+        {agent_name, prompt, delivery:{channel,to}} so _trigger_job's existing
+        SYSTEM_ALERT(kind=scheduled_job_triggered) event hands the gateway
+        bridge everything it needs to route the result.
+        """
+        text = task.input_data.get("text", "")
+        if not text or not text.strip():
+            return {"success": False, "error": "No schedule text provided"}
+
+        parsed = self.parse_nl_schedule(text)
+        if parsed is None or parsed.next_run is None:
+            return {"success": False, "error": f"Could not parse schedule from: {text}"}
+
+        name = task.input_data.get("name") or text.strip()
+        in_payload = task.input_data.get("payload") or {}
+        max_runs = task.input_data.get("max_runs")
+
+        # Delivery: an explicit input_data.delivery overrides anything parsed
+        # from the NL tail ('... send to slack').
+        delivery_in = task.input_data.get("delivery") or {}
+        channel = delivery_in.get("channel") or parsed.delivery_channel
+        to = delivery_in.get("to") or parsed.delivery_to
+        delivery = {"channel": channel, "to": to}
+
+        # The job payload mirrors the persisted shape ({agent_name, prompt}) and
+        # adds the delivery block consumed by the gateway bridge.
+        payload: Dict[str, Any] = {
+            "agent_name": in_payload.get("agent_name"),
+            "prompt": in_payload.get("prompt"),
+            "delivery": delivery,
+        }
+
+        anchor: Optional[datetime] = None
+        if parsed.interval_seconds is not None:
+            anchor = parsed.next_run
+
+        job = ScheduledJob(
+            name=name,
+            schedule=parsed.cron_expr or text.strip(),
+            task_type="schedule_nl",
+            payload=payload,
+            next_run=parsed.next_run,
+            anchor=anchor,
+            interval_seconds=parsed.interval_seconds,
+            max_runs=max_runs,
+        )
+        self._jobs[job.job_id] = job
+        self.metadata["jobs_count"] = len(self._jobs)
+
+        # Persist to database (best-effort; DB may be absent in tests).
+        if self._store:
+            try:
+                await self._store.save_scheduled_job(
+                    job_id=job.job_id,
+                    name=job.name,
+                    schedule_expr=job.schedule,
+                    agent_name=payload.get("agent_name"),
+                    prompt=payload.get("prompt"),
+                    enabled=True,
+                    next_run=job.next_run,
+                    run_count=0,
+                )
+            except Exception:
+                pass
+
+        return {
+            "success": True,
+            "job_id": job.job_id,
+            "name": job.name,
+            "next_run": job.next_run.isoformat() if job.next_run else None,
+            "schedule": job.schedule,
+            "interval_seconds": job.interval_seconds,
+            "delivery": delivery,
+        }
+
     async def _scheduler_loop(self) -> None:
         """Background loop that checks and triggers scheduled jobs and reminders."""
         while self._scheduler_loop_running:
@@ -584,6 +701,217 @@ class SchedulerAgent(BaseAgent):
                 return now + timedelta(days=value)
 
         return None
+
+    # ---- Natural-language schedule parsing -------------------------------
+
+    _WEEKDAYS = {
+        "monday": 0, "mon": 0,
+        "tuesday": 1, "tue": 1, "tues": 1,
+        "wednesday": 2, "wed": 2,
+        "thursday": 3, "thu": 3, "thurs": 3,
+        "friday": 4, "fri": 4,
+        "saturday": 5, "sat": 5,
+        "sunday": 6, "sun": 6,
+    }
+
+    # Known messaging platforms the gateway can route to. Kept liberal: an
+    # unknown word after 'send to' is still captured as the channel so a new
+    # adapter doesn't require editing this list.
+    _KNOWN_CHANNELS = {
+        "telegram", "whatsapp", "matrix", "signal", "imessage", "slack",
+        "discord", "email", "msteams", "teams", "mattermost", "feishu",
+        "webhook", "sms",
+    }
+
+    def parse_nl_schedule(
+        self, text: str, *, base_time: Optional[datetime] = None
+    ) -> Optional[NLSchedule]:
+        """Parse a richer natural-language schedule phrase.
+
+        Handles forms the bare regex parsers don't, e.g.::
+
+            'every weekday at 9am'
+            'daily briefing at 8'
+            'weekly report on monday'
+            'every 5 minutes send to slack'
+            'daily at 09:00 send to telegram @ops'
+
+        and an optional trailing 'send to <channel> [<target>]' clause parsed
+        into delivery_channel / delivery_to. Returns ``None`` when no recurrence
+        can be extracted.
+
+        Reuses :meth:`_parse_interval_seconds` / :meth:`_parse_schedule` for the
+        recurrence core so this is purely additive — existing signatures are
+        untouched.
+        """
+        if not text or not text.strip():
+            return None
+
+        now = base_time or datetime.now(timezone.utc)
+        normalized = text.strip().lower()
+
+        # 1. Split off any trailing delivery clause: '... send to <chan> [tgt]'.
+        delivery_channel: Optional[str] = None
+        delivery_to: Optional[str] = None
+        schedule_part = normalized
+        m_send = re.search(
+            r"\bsend\s+(?:it\s+)?to\s+(\S+)(?:\s+(.+))?$", normalized
+        )
+        if m_send:
+            delivery_channel = self._normalize_channel(m_send.group(1))
+            tail = (m_send.group(2) or "").strip()
+            delivery_to = tail or None
+            schedule_part = normalized[: m_send.start()].strip()
+
+        # 2. Try direct reuse of the existing parser first (covers 'every N
+        #    units', 'daily at HH:MM', 'in N units', 'at <dt>', 'interval:Nu').
+        next_run = self._parse_schedule(schedule_part, base_time=now)
+        interval_seconds = self._parse_interval_seconds(schedule_part)
+        cron_expr: Optional[str] = None
+
+        if next_run is not None:
+            cron_expr = self._normalize_cron_expr(schedule_part)
+            return NLSchedule(
+                next_run=next_run,
+                interval_seconds=interval_seconds,
+                cron_expr=cron_expr,
+                delivery_channel=delivery_channel,
+                delivery_to=delivery_to,
+            )
+
+        # 3. Richer NL forms the base parser misses.
+        nl = self._parse_nl_recurrence(schedule_part, now)
+        if nl is None:
+            return None
+        next_run, interval_seconds, cron_expr = nl
+        return NLSchedule(
+            next_run=next_run,
+            interval_seconds=interval_seconds,
+            cron_expr=cron_expr,
+            delivery_channel=delivery_channel,
+            delivery_to=delivery_to,
+        )
+
+    def _normalize_channel(self, raw: str) -> Optional[str]:
+        """Normalise a parsed channel token (strip punctuation; map aliases)."""
+        token = raw.strip().strip(".,!?:;").lower()
+        if not token:
+            return None
+        if token == "teams":
+            return "msteams"
+        return token
+
+    def _parse_time_of_day(self, text: str) -> Optional[tuple]:
+        """Extract an (hour, minute) tuple from phrases like '9am', '8',
+        '09:00', '5:30pm'. Returns None if no time is present."""
+        # HH:MM with optional am/pm
+        m = re.search(r"\b(\d{1,2}):(\d{2})\s*(am|pm)?\b", text)
+        if m:
+            hour = int(m.group(1))
+            minute = int(m.group(2))
+            hour = self._apply_meridiem(hour, m.group(3))
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                return (hour, minute)
+        # bare hour with am/pm e.g. '9am', '5 pm'
+        m = re.search(r"\b(\d{1,2})\s*(am|pm)\b", text)
+        if m:
+            hour = self._apply_meridiem(int(m.group(1)), m.group(2))
+            if 0 <= hour <= 23:
+                return (hour, 0)
+        # bare hour after 'at' e.g. 'at 8'
+        m = re.search(r"\bat\s+(\d{1,2})\b", text)
+        if m:
+            hour = int(m.group(1))
+            if 0 <= hour <= 23:
+                return (hour, 0)
+        return None
+
+    @staticmethod
+    def _apply_meridiem(hour: int, meridiem: Optional[str]) -> int:
+        """Convert a 12-hour clock hour to 24-hour given an am/pm marker."""
+        if meridiem == "pm" and hour < 12:
+            return hour + 12
+        if meridiem == "am" and hour == 12:
+            return 0
+        return hour
+
+    def _parse_nl_recurrence(self, text: str, now: datetime):
+        """Parse richer NL recurrence forms not covered by _parse_schedule.
+
+        Returns (next_run, interval_seconds, cron_expr) or None.
+        """
+        hm = self._parse_time_of_day(text)
+        hour, minute = hm if hm else (9, 0)  # default to 9:00 for these forms
+
+        # 'every weekday ...' / 'weekdays ...' -> Mon-Fri at HH:MM, daily cadence
+        if re.search(r"\b(every\s+weekday|weekdays|each\s+weekday|business\s+day)\b", text):
+            next_run = self._next_weekday_run(now, hour, minute)
+            cron = f"every weekday at {hour:02d}:{minute:02d}"
+            return (next_run, None, cron)
+
+        # 'weekly ... on <weekday>' / 'every <weekday> ...' -> weekly cadence
+        m_dow = re.search(
+            r"\b(?:on\s+|every\s+)?(monday|mon|tuesday|tue|tues|wednesday|wed|"
+            r"thursday|thu|thurs|friday|fri|saturday|sat|sunday|sun)\b",
+            text,
+        )
+        is_weekly = "weekly" in text or re.search(r"\bevery\s+(mon|tue|wed|thu|fri|sat|sun)", text)
+        if m_dow and (is_weekly or "report" in text or "on " in text):
+            target_dow = self._WEEKDAYS[m_dow.group(1)]
+            next_run = self._next_dow_run(now, target_dow, hour, minute)
+            cron = f"weekly on {m_dow.group(1)} at {hour:02d}:{minute:02d}"
+            return (next_run, 7 * 86400.0, cron)
+
+        # 'daily ...' (e.g. 'daily briefing at 8', 'daily backup') -> daily at HH:MM
+        if re.search(r"\b(daily|every\s+day|each\s+day)\b", text):
+            next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if next_run <= now:
+                next_run += timedelta(days=1)
+            cron = f"daily at {hour:02d}:{minute:02d}"
+            return (next_run, 86400.0, cron)
+
+        # 'hourly' -> every hour
+        if re.search(r"\bhourly\b", text):
+            return (now + timedelta(hours=1), 3600.0, "every 1 hours")
+
+        return None
+
+    def _next_weekday_run(self, now: datetime, hour: int, minute: int) -> datetime:
+        """Next Mon-Fri occurrence at the given time (inclusive of today)."""
+        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= now:
+            candidate += timedelta(days=1)
+        while candidate.weekday() >= 5:  # Sat=5, Sun=6
+            candidate += timedelta(days=1)
+        return candidate
+
+    def _next_dow_run(self, now: datetime, target_dow: int, hour: int, minute: int) -> datetime:
+        """Next occurrence of target weekday at the given time (inclusive of today)."""
+        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        days_ahead = (target_dow - candidate.weekday()) % 7
+        candidate += timedelta(days=days_ahead)
+        if candidate <= now:
+            candidate += timedelta(days=7)
+        return candidate
+
+    def _normalize_cron_expr(self, schedule_part: str) -> Optional[str]:
+        """Normalise a base-parser-recognised phrase to its canonical cron form."""
+        s = schedule_part.strip()
+        m = re.match(
+            r"every\s+(\d+)\s+(second|seconds|minute|minutes|hour|hours|day|days)",
+            s,
+        )
+        if m:
+            unit = m.group(2)
+            plural = unit if unit.endswith("s") else unit + "s"
+            return f"every {m.group(1)} {plural}"
+        m = re.match(r"daily\s+at\s+(\d{1,2}):(\d{2})", s)
+        if m:
+            return f"daily at {int(m.group(1)):02d}:{int(m.group(2)):02d}"
+        m = re.match(r"interval:\s*(\d+)\s*([smhd])\b", s)
+        if m:
+            return f"interval:{m.group(1)}{m.group(2)}"
+        return s or None
 
     def _parse_datetime(self, dt_str: str) -> Optional[datetime]:
         """Parse a datetime string."""
