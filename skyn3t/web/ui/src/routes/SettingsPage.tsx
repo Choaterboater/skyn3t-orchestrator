@@ -5,6 +5,7 @@ import {
   api,
   HttpError,
   type BudgetView,
+  type RoutingView,
   type ExecutionBackendView,
   type GithubScoutConfig,
   type MetaStatus,
@@ -29,11 +30,12 @@ import Sparkline from "../components/Sparkline";
    key-write endpoint (only PATCH /api/execution/backend persists env today).
    ========================================================================== */
 
-type SectionId = "backends" | "budget" | "integrations" | "agents" | "autonomy";
+type SectionId = "backends" | "budget" | "routing" | "integrations" | "agents" | "autonomy";
 
 const SECTIONS: Array<{ id: SectionId; label: string; icon: string; blurb: string }> = [
   { id: "backends", label: "LLM & Sandbox", icon: "fa-solid fa-microchip", blurb: "Backends · execution · keys" },
   { id: "budget", label: "Budget & Cost", icon: "fa-solid fa-dollar-sign", blurb: "Spend cap · per-app max" },
+  { id: "routing", label: "Model Routing", icon: "fa-solid fa-route", blurb: "Free-only · cost mode" },
   { id: "integrations", label: "Skills & Scout", icon: "fa-solid fa-puzzle-piece", blurb: "Hub · install · GitHub scout" },
   { id: "agents", label: "Agents", icon: "fa-solid fa-robot", blurb: "Forge new operators" },
   { id: "autonomy", label: "Autonomy", icon: "fa-solid fa-tower-broadcast", blurb: "Meta-cognition loop" },
@@ -63,6 +65,7 @@ export default function SettingsPage() {
   const refs = useRef<Record<SectionId, HTMLElement | null>>({
     backends: null,
     budget: null,
+    routing: null,
     integrations: null,
     agents: null,
     autonomy: null,
@@ -147,6 +150,9 @@ export default function SettingsPage() {
           </Section>
           <Section id="budget" refs={refs}>
             <BudgetSection />
+          </Section>
+          <Section id="routing" refs={refs}>
+            <RoutingSection />
           </Section>
           <Section id="integrations" refs={refs}>
             <IntegrationsSection />
@@ -588,6 +594,135 @@ function BudgetForm({ view }: { view: BudgetView }) {
           <span className="text-status-green text-xs mt-3">
             <i className="fa-solid fa-check mr-1" />
             {save.data?.reset ? "reset to defaults" : "saved"}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* =============================================================================
+   SECTION 1c — Model routing policy (free-only cost mode)
+
+   One toggle, one card: force every routing tier to a free OpenRouter model.
+   Use when the key has no paid budget — otherwise cheap/reasoning/code tiers
+   point at paid models that 403 and kill the build at the research stage.
+   Persists SKYN3T_FREE_ONLY to .env via PATCH /api/routing and applies live.
+   ========================================================================== */
+
+function RoutingSection() {
+  const routingQ = useQuery({ queryKey: ["routing"], queryFn: api.routing });
+
+  return (
+    <PanelCard>
+      <PanelHeader
+        title="Model routing"
+        icon="fa-solid fa-route"
+        description={
+          <>
+            <strong>Free models only</strong> forces every routing tier to a free
+            OpenRouter model, so builds run at $0 instead of failing on a paid
+            model when the key has no budget. Persisted to{" "}
+            <code className="font-mono text-xs bg-bg-3 px-1 rounded">.env</code> and
+            applied immediately. <span className="text-text-dim">Turn off once the key is funded.</span>
+          </>
+        }
+        actions={
+          <StatusPill
+            status={
+              routingQ.isError
+                ? "disabled"
+                : routingQ.isLoading
+                  ? "pending"
+                  : routingQ.data?.free_only
+                    ? "online"
+                    : "disabled"
+            }
+            label={
+              routingQ.data
+                ? routingQ.data.free_only
+                  ? "free-only"
+                  : "paid ladder"
+                : routingQ.isError
+                  ? "error"
+                  : routingQ.isLoading
+                    ? "loading"
+                    : "—"
+            }
+          />
+        }
+      />
+      {routingQ.isLoading && <LoadingRow label="Loading routing…" />}
+      {routingQ.isError && <ErrorRow err={routingQ.error} />}
+      {routingQ.data && <RoutingForm view={routingQ.data} />}
+    </PanelCard>
+  );
+}
+
+function RoutingForm({ view }: { view: RoutingView }) {
+  const qc = useQueryClient();
+  const [freeOnly, setFreeOnly] = useState(view.free_only);
+
+  // Re-sync the local toggle whenever the server value changes (after save).
+  useEffect(() => setFreeOnly(view.free_only), [view.free_only]);
+
+  const save = useMutation({
+    mutationFn: (payload: { free_only: boolean }) => api.patchRouting(payload),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["routing"] }),
+  });
+
+  const dirty = freeOnly !== view.free_only;
+
+  return (
+    <div className="p-4 space-y-4">
+      <div className="flex items-start gap-3">
+        <button
+          type="button"
+          role="switch"
+          aria-checked={freeOnly}
+          aria-label="Free models only"
+          onClick={() => setFreeOnly((v) => !v)}
+          className={[
+            "relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors mt-0.5",
+            "focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60",
+            freeOnly ? "bg-accent" : "bg-bg-3 border border-border",
+          ].join(" ")}
+        >
+          <span
+            className={[
+              "inline-block h-4 w-4 transform rounded-full bg-white transition-transform",
+              freeOnly ? "translate-x-6" : "translate-x-1",
+            ].join(" ")}
+          />
+        </button>
+        <div className="min-w-0">
+          <div className="text-sm font-medium text-text-primary">Free models only</div>
+          <p className="text-[0.65rem] text-text-dim">
+            {freeOnly
+              ? "Every tier resolves to a free OpenRouter model. Builds run at $0; slower under free-tier rate limits."
+              : "Tiers use the normal paid ladder. Requires a funded OpenRouter key."}
+          </p>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-3 pt-1 border-t border-border">
+        <button
+          type="button"
+          className="btn-primary mt-3"
+          disabled={save.isPending || !dirty}
+          onClick={() => save.mutate({ free_only: freeOnly })}
+        >
+          {save.isPending ? "saving…" : "save to .env"}
+        </button>
+        <span className="text-[0.7rem] text-text-dim font-mono mt-3">default · paid ladder</span>
+        {save.isError && (
+          <span className="text-status-red text-xs mt-3">{errText(save.error, "save failed")}</span>
+        )}
+        {/* Honest only while the toggle still matches what was persisted. */}
+        {save.isSuccess && !save.isPending && !dirty && (
+          <span className="text-status-green text-xs mt-3">
+            <i className="fa-solid fa-check mr-1" />
+            saved
           </span>
         )}
       </div>

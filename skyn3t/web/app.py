@@ -1854,6 +1854,61 @@ async def budget_patch(payload: Dict[str, Any]):
     return {"ok": True, "reset": reset, "env_path": str(env_path), **_budget_snapshot()}
 
 
+_FREE_ONLY_ENV_KEY = "SKYN3T_FREE_ONLY"
+_FREE_ONLY_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _routing_snapshot() -> Dict[str, Any]:
+    """Current model-routing policy toggles, read live from the environment.
+
+    ``free_only`` mirrors what ``model_router._free_only_enabled()`` reads, so
+    the dashboard and the router never disagree.
+    """
+    import os
+
+    raw = os.environ.get(_FREE_ONLY_ENV_KEY, "").strip().lower()
+    return {"free_only": raw in _FREE_ONLY_TRUTHY, "default": False}
+
+
+@app.get("/api/routing")
+async def routing_get():
+    """Model-routing policy. ``free_only`` forces every tier to a free model."""
+    return _routing_snapshot()
+
+
+@app.patch("/api/routing")
+async def routing_patch(payload: Dict[str, Any]):
+    """Persist ``SKYN3T_FREE_ONLY`` to .env and apply it immediately.
+
+    Accepts ``free_only: bool``. When on, ``model_router`` rewrites every
+    OpenRouter tier to a real ``:free`` catalog model, so builds run at $0
+    instead of 403-ing on a paid model when the key has no budget. Reversible:
+    turn it off once the OpenRouter key is funded to restore the paid ladder.
+    The env var is set on the running process too, so it takes effect on the
+    next routing decision without a restart.
+    """
+    import os
+
+    from skyn3t.config.env_file import env_file_path, upsert_env_setting
+    from skyn3t.config.settings import get_settings
+
+    raw = payload.get("free_only")
+    # bool is an int subclass and "false"/"0" are truthy strings in Python, so
+    # require a real JSON boolean rather than silently coercing.
+    if not isinstance(raw, bool):
+        return JSONResponse(
+            {"error": f"'free_only' must be true or false, got {raw!r}"},
+            status_code=400,
+        )
+
+    text = "1" if raw else "0"
+    env_path = env_file_path()
+    upsert_env_setting(env_path, _FREE_ONLY_ENV_KEY, text)
+    os.environ[_FREE_ONLY_ENV_KEY] = text
+    get_settings.cache_clear()
+    return {"ok": True, "env_path": str(env_path), **_routing_snapshot()}
+
+
 @app.post("/api/agents/{name}/enable")
 async def agent_enable(name: str):
     if not orchestrator:

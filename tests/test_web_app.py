@@ -1389,7 +1389,9 @@ async def test_list_agents_includes_catalog_metadata(monkeypatch):
 
     assert result["agents"][0]["name"] == "verifier"
     assert result["agents"][0]["tier"] == "internal"
-    assert result["agents"][0]["recommended_backend"] == "claude_cli"
+    # NO_CLAUDE: verifier catalog recommendation neutralized to None
+    # (was "claude_cli") so the router decides at runtime.
+    assert result["agents"][0]["recommended_backend"] is None
     assert result["agents"][0]["config"]["backend"] is None
     assert result["agents"][0]["effective_backend"] == "openrouter"
     assert result["agents"][0]["effective_model"] == "google/gemini-3.1-flash-lite"
@@ -1641,6 +1643,73 @@ async def test_budget_patch_writes_env(monkeypatch, tmp_path):
     # Settings reload picks up the new values.
     assert get_settings().autonomous_build_daily_budget_usd == 12.5
     assert get_settings().max_build_cost_usd == 2.0
+
+
+# --- /api/routing (free-only model-routing toggle) ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_routing_get_reports_free_only_off_by_default(monkeypatch, tmp_path):
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("SKYN3T_FREE_ONLY", raising=False)
+
+    result = await web_app.routing_get()
+
+    assert result["free_only"] is False
+    assert result["default"] is False
+
+
+@pytest.mark.asyncio
+async def test_routing_patch_enables_free_only(monkeypatch, tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    # Own the var so monkeypatch restores it — routing_patch mutates os.environ.
+    monkeypatch.setenv("SKYN3T_FREE_ONLY", "0")
+
+    result = await web_app.routing_patch({"free_only": True})
+
+    assert result["ok"] is True
+    assert result["free_only"] is True
+    assert "SKYN3T_FREE_ONLY=1" in env_path.read_text(encoding="utf-8").splitlines()
+    # Applied to the running process so the router sees it without a restart.
+    assert os.environ["SKYN3T_FREE_ONLY"] == "1"
+    # And the router agrees.
+    from skyn3t.core.model_router import _free_only_enabled
+
+    assert _free_only_enabled() is True
+
+
+@pytest.mark.asyncio
+async def test_routing_patch_disables_free_only(monkeypatch, tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text("SKYN3T_FREE_ONLY=1\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SKYN3T_FREE_ONLY", "1")
+
+    result = await web_app.routing_patch({"free_only": False})
+
+    assert result["ok"] is True
+    assert result["free_only"] is False
+    assert "SKYN3T_FREE_ONLY=0" in env_path.read_text(encoding="utf-8").splitlines()
+    assert os.environ["SKYN3T_FREE_ONLY"] == "0"
+
+
+@pytest.mark.asyncio
+async def test_routing_patch_rejects_non_bool(monkeypatch, tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("SKYN3T_FREE_ONLY", raising=False)
+
+    # A truthy string must NOT be coerced to True — strict bool only.
+    result = await web_app.routing_patch({"free_only": "yes"})
+
+    assert isinstance(result, web_app.JSONResponse)
+    assert result.status_code == 400
+    # Nothing persisted on rejection.
+    assert "SKYN3T_FREE_ONLY" not in env_path.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio

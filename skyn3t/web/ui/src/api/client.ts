@@ -87,6 +87,11 @@ export type BudgetView = {
   defaults: { daily_budget_usd: number; max_build_cost_usd: number };
 };
 
+export type RoutingView = {
+  free_only: boolean;
+  default: boolean;
+};
+
 export type RoutingRecommendation = {
   stage: string;
   current_tier: string;
@@ -714,6 +719,12 @@ export const api = {
     reset?: boolean;
   }) =>
     fetchJson<BudgetView & { ok?: boolean; reset?: boolean }>("/api/budget", {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  routing: () => fetchJson<RoutingView>("/api/routing"),
+  patchRouting: (payload: { free_only: boolean }) =>
+    fetchJson<RoutingView & { ok?: boolean }>("/api/routing", {
       method: "PATCH",
       body: JSON.stringify(payload),
     }),
