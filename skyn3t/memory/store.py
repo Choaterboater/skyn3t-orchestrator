@@ -2,7 +2,7 @@
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import and_, delete, desc, func, select
@@ -1335,7 +1335,7 @@ class MemoryStore:
         if older_than_days <= 0:
             return 0
         cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        cutoff = cutoff.replace(day=cutoff.day - older_than_days)
+        cutoff = cutoff - timedelta(days=older_than_days)
         async with await self._session() as session:
             async with session.begin():
                 keep_query = (
@@ -1363,7 +1363,7 @@ class MemoryStore:
         if older_than_days <= 0:
             return 0
         cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        cutoff = cutoff.replace(day=cutoff.day - older_than_days)
+        cutoff = cutoff - timedelta(days=older_than_days)
         async with await self._session() as session:
             async with session.begin():
                 keep_result = await session.execute(
@@ -1385,7 +1385,7 @@ class MemoryStore:
         if older_than_days <= 0:
             return 0
         cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        cutoff = cutoff.replace(day=cutoff.day - older_than_days)
+        cutoff = cutoff - timedelta(days=older_than_days)
         async with await self._session() as session:
             async with session.begin():
                 keep_result = await session.execute(
@@ -1432,7 +1432,7 @@ class MemoryStore:
         if older_than_days <= 0:
             return 0
         cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        cutoff = cutoff.replace(day=cutoff.day - older_than_days)
+        cutoff = cutoff - timedelta(days=older_than_days)
         terminal = {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value}
         async with await self._session() as session:
             async with session.begin():

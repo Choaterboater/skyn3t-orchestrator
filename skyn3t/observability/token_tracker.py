@@ -207,8 +207,8 @@ class TokenTracker:
             total = 0
             calls = 0
             for a in self._by_agent.values():
-                total += a["total_tokens"]
-                calls += a["calls"]
+                total += a.get("total_tokens", 0)
+                calls += a.get("calls", 0)
             return {
                 "total_tokens": total,
                 "total_calls": calls,
