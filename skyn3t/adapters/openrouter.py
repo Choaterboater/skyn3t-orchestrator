@@ -10,11 +10,11 @@ from skyn3t.adapters.llm_client import LLMRequest
 
 logger = logging.getLogger("skyn3t.adapters.openrouter")
 
-# Current-day cheap reliable code model. ~$0.25/M in, $0.38/M out.
-# Was claude-3.5-sonnet but that's ~$3/M — way more than we need for
-# generic generation. Use SKYN3T_OPENROUTER_MODEL env var to override
-# globally, or pass model= per call for fine-grained routing.
-DEFAULT_MODEL = "deepseek/deepseek-v3.2"
+# Last-resort fallback model. The OpenRouter key is FREE-ONLY ($0 paid
+# budget), so this default MUST be a free id — deepseek-v3.2 (the old
+# default) is PAID and would 403 on the free-only key. Use SKYN3T_OPENROUTER_MODEL
+# env var to override globally, or pass model= per call for fine-grained routing.
+DEFAULT_MODEL = "openai/gpt-oss-120b:free"
 BASE_URL = "https://openrouter.ai/api/v1"
 
 

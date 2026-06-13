@@ -50,7 +50,9 @@ class Settings(BaseSettings):
 
     # LLM Defaults
     default_llm_provider: str = Field(default="openai", alias="DEFAULT_LLM_PROVIDER")
-    default_model: str = Field(default="gpt-4-turbo-preview", alias="DEFAULT_MODEL")
+    # Removed dead field: default_model (alias DEFAULT_MODEL). It was never
+    # read by live code and pinned a stale paid id ("gpt-4-turbo-preview").
+    # Model selection is dynamic via the OpenRouter catalog / model_router.
     llm_backend: str = Field(default="auto", alias="SKYN3T_LLM_BACKEND")
     llm_model: Optional[str] = Field(default=None, alias="SKYN3T_LLM_MODEL")
 

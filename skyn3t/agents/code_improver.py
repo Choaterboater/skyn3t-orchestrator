@@ -1149,10 +1149,13 @@ class CodeImproverAgent(BaseAgent):
     # config["fallback_chain"] to suit a specific deployment. Any entry whose
     # (backend, model) is not present in the live model catalog is silently
     # skipped at runtime to avoid spamming errors for nonexistent models.
+    # NO_CLAUDE + free-only OpenRouter key: the old chain
+    # (claude_cli/sonnet, claude_cli/opus, openai_cli/gpt-5) violated the
+    # no-Claude policy and would 403/fail on a $0-budget key. Use FREE
+    # OpenRouter code models so the fallback can actually run.
     DEFAULT_FALLBACK_CHAIN: List[Tuple[str, str]] = [
-        ("claude_cli", "sonnet"),
-        ("claude_cli", "opus"),
-        ("openai_cli", "gpt-5"),
+        ("openrouter", "qwen/qwen3-coder:free"),
+        ("openrouter", "openai/gpt-oss-120b:free"),
     ]
 
     async def _llm_draft_with_fallback(self, *, target_file: str,

@@ -3,6 +3,12 @@
 This is not a unit test: it exercises the full StudioRunner pipeline
 (start → planning → stage loop → manifest persistence) without calling
 real LLMs. Mark it with `-m slow` so the fast suite stays fast.
+
+NOTE: this is a PIPELINE-WIRING test, NOT a ship-rate gate. Because every
+agent is stubbed to return success, it stays green even when the live build
+loop ships ~0% of real briefs (e.g. when routing 403s on a paid model). For a
+gate that catches real routing/build regressions, see
+``test_studio_real_agent_e2e.py`` (opt-in, real agents, real routing).
 """
 
 from __future__ import annotations

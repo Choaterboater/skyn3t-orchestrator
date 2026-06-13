@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -177,3 +179,132 @@ def test_all_known_studio_stages_have_explicit_policy():
     )
 
     assert missing == []
+
+
+# ── Reintroduction guard ────────────────────────────────────────────
+#
+# These three tests are a TRIPWIRE against the recurring regression where a
+# tier model id drifts back to a PAID or NONEXISTENT model (e.g. or_cheap →
+# google/gemini-3.1-flash-lite), which 403s on the free-only OpenRouter key
+# and kills every build. They must FAIL if someone reintroduces such a pin.
+
+
+# The repo's real on-disk catalog cache. The conftest autouse fixture points
+# DATA_DIR at a tmp dir, so get_settings().data_dir does NOT find this file —
+# we must reference the committed cache directly. tests/ -> repo root -> data/.
+_REPO_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+
+
+def _load_real_catalog_ids():
+    """Load the committed on-disk catalog cache and return (snapshot, set_of_ids).
+
+    Loads ``<repo>/data/openrouter_models.json`` directly (the conftest
+    redirects DATA_DIR to a tmp dir, so get_settings() can't see the committed
+    cache) and populates the in-memory index so the free-only path
+    (``list_free_models`` / ``_force_free_model``) reads the real catalog.
+
+    Returns ``(None, None)`` when the cache is empty/missing so callers can
+    pytest.skip with a clear reason instead of asserting against an empty set.
+    """
+    from skyn3t.core import openrouter_catalog as catalog
+
+    catalog._catalog_index = None
+    catalog._catalog_loaded_at = 0.0
+    # Point load_catalog at the committed cache regardless of the tmp DATA_DIR.
+    snap = catalog.load_catalog(settings=SimpleNamespace(data_dir=str(_REPO_DATA_DIR)))
+    if snap.source == "empty" or not snap.models:
+        return None, None
+    ids = {str(m.get("id")) for m in snap.models if m.get("id")}
+    return snap, ids
+
+
+def test_free_only_forces_every_tier_to_free(monkeypatch):
+    """SKYN3T_FREE_ONLY=1 must force EVERY tier to a real ``:free`` model.
+
+    Runtime free-only guarantee: when the OpenRouter key has no paid budget,
+    no tier may resolve to a paid/non-free id — otherwise the build 403s on the
+    first stage. Guards against a paid pin (e.g. google/gemini-3.1-flash-lite)
+    silently surviving the free-only rewrite.
+    """
+    from skyn3t.core import model_router as mr
+
+    monkeypatch.setenv("SKYN3T_FREE_ONLY", "1")
+    monkeypatch.setenv("SKYN3T_NO_CLAUDE", "1")
+
+    snap, _ids = _load_real_catalog_ids()
+    if snap is None:
+        pytest.skip(
+            "on-disk OpenRouter catalog cache is empty/missing "
+            f"({mr.__name__}); cannot validate free-only forcing"
+        )
+    from skyn3t.core.openrouter_catalog import list_free_models
+
+    assert list_free_models(), "catalog loaded but has no :free models"
+
+    assert mr._free_only_enabled() is True
+
+    for tier in mr._TIERS:
+        backend, model = mr._tier_backend_model(tier, task_kind="backend")
+        # Every tier must resolve to OpenRouter (no Claude/CLI under NO_CLAUDE).
+        assert backend == "openrouter", (
+            f"tier {tier!r} resolved to backend {backend!r}, expected openrouter "
+            "under SKYN3T_FREE_ONLY+SKYN3T_NO_CLAUDE"
+        )
+        assert model, f"tier {tier!r} resolved to an empty model under free-only"
+        assert str(model).lower().endswith(":free"), (
+            f"tier {tier!r} resolved to non-free model {model!r} under "
+            "SKYN3T_FREE_ONLY=1 — a paid/nonexistent pin slipped through the guard"
+        )
+
+
+def test_static_free_fallback_ids_are_real_and_free():
+    """Every _STATIC_FREE_FALLBACK value must be a real ``:free`` catalog id.
+
+    This map is the last-resort FLOOR used when the live catalog is unreachable.
+    If any entry drifts to a nonexistent or paid id, the floor silently stops
+    being free and the build can 403 — so validate it against the real catalog.
+    """
+    from skyn3t.core import model_router as mr
+
+    snap, ids = _load_real_catalog_ids()
+    if snap is None:
+        pytest.skip(
+            "on-disk OpenRouter catalog cache is empty/missing; "
+            "cannot validate _STATIC_FREE_FALLBACK against catalog"
+        )
+
+    assert mr._STATIC_FREE_FALLBACK, "_STATIC_FREE_FALLBACK is empty"
+    for tier, model in mr._STATIC_FREE_FALLBACK.items():
+        assert str(model).lower().endswith(":free"), (
+            f"_STATIC_FREE_FALLBACK[{tier!r}] = {model!r} is not a :free id — "
+            "the floor must never drift to a paid model"
+        )
+        assert model in ids, (
+            f"_STATIC_FREE_FALLBACK[{tier!r}] = {model!r} is not present in the "
+            "OpenRouter catalog — the floor points at a nonexistent id"
+        )
+
+
+def test_no_static_tier_pins_to_claude():
+    """No static _TIERS entry may name a Claude model (NO_CLAUDE policy).
+
+    Static config must never hardcode a Claude id (e.g. anthropic/claude-* or
+    a model id containing 'claude'). Note: the legacy balanced/strong/max tiers
+    legitimately use backend ``claude_cli`` with model 'sonnet'/'opus'/'fable'
+    — those model NAMES do not contain 'claude', so this guard only fires on an
+    actual Claude *model id* reintroduction.
+    """
+    from skyn3t.core import model_router as mr
+
+    offenders = []
+    for tier, (_backend, model) in mr._TIERS.items():
+        if model is None:
+            continue
+        low = str(model).lower()
+        if "claude" in low or low.startswith("anthropic/"):
+            offenders.append((tier, model))
+
+    assert offenders == [], (
+        "static _TIERS pins a Claude model id (violates NO_CLAUDE policy): "
+        f"{offenders!r}"
+    )

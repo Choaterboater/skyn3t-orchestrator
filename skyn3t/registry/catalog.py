@@ -124,8 +124,9 @@ _CATALOG = [
         tier="internal",
         label="Verifier",
         summary="Runs quality-gate verdicts after artifact-producing stages.",
-        recommended_backend="claude_cli",
-        recommended_model="sonnet",
+        # NO_CLAUDE: was claude_cli/sonnet — neutralized so the router decides.
+        recommended_backend=None,
+        recommended_model=None,
     ),
     AgentCatalogEntry(
         class_name="ExplorerAgent",
@@ -133,8 +134,9 @@ _CATALOG = [
         tier="internal",
         label="Explorer",
         summary="Performs broad repo or knowledge exploration for other agents.",
-        recommended_backend="claude_cli",
-        recommended_model="haiku",
+        # NO_CLAUDE: was claude_cli/haiku — neutralized so the router decides.
+        recommended_backend=None,
+        recommended_model=None,
     ),
     AgentCatalogEntry(
         class_name="FileOpsAgent",
@@ -142,8 +144,9 @@ _CATALOG = [
         tier="internal",
         label="File ops",
         summary="Handles utility file reads, writes, and search tasks.",
-        recommended_backend="claude_cli",
-        recommended_model="haiku",
+        # NO_CLAUDE: was claude_cli/haiku — neutralized so the router decides.
+        recommended_backend=None,
+        recommended_model=None,
     ),
     AgentCatalogEntry(
         class_name="GitHubExplorerAgent",
@@ -169,8 +172,9 @@ _CATALOG = [
         tier="internal",
         label="Scheduler",
         summary="Runs cron-style reminders and deferred orchestration tasks.",
-        recommended_backend="claude_cli",
-        recommended_model="haiku",
+        # NO_CLAUDE: was claude_cli/haiku — neutralized so the router decides.
+        recommended_backend=None,
+        recommended_model=None,
     ),
     AgentCatalogEntry(
         class_name="ProjectMemoryAgent",

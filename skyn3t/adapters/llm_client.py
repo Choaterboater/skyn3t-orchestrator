@@ -1089,6 +1089,18 @@ class _AnthropicBackend:
         return False
 
     async def complete(self, req: LLMRequest) -> str:
+        # NO_CLAUDE policy: this is an Anthropic-only backend. Under
+        # SKYN3T_NO_CLAUDE the LLMClient constructor already coerces the
+        # backend to openrouter, so this code path should be unreachable —
+        # but guard here too so a stray direct call can't quietly hit the
+        # Anthropic API / a claude model id.
+        if os.environ.get("SKYN3T_NO_CLAUDE", "").strip().lower() in {
+            "1", "true", "yes", "on"
+        }:
+            raise RuntimeError(
+                "Anthropic backend disabled by SKYN3T_NO_CLAUDE; "
+                "route via OpenRouter instead"
+            )
         model = req.model or "claude-3-5-sonnet-latest"
         kw: dict = {"model": model, "max_tokens": req.max_tokens,
                     "temperature": req.temperature}

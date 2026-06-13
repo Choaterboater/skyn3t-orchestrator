@@ -350,6 +350,63 @@ def _no_claude_fallback_tier() -> str:
     return t if t in _TIERS else "or_cheap"
 
 
+# Real, currently-available FREE catalog ids per tier — the last-resort FLOOR,
+# used only when the live catalog can't be loaded. The dynamic path
+# (pick_free_model) is preferred; this map just guarantees a build never stalls
+# on a paid id when SKYN3T_FREE_ONLY is set and the catalog is unreachable.
+# Validated against the catalog by tests/test_model_router_policy.py so it can
+# never silently drift back to a paid/nonexistent id.
+_STATIC_FREE_FALLBACK: Dict[str, str] = {
+    "or_cheap":   "openai/gpt-oss-120b:free",
+    "cheap":      "openai/gpt-oss-120b:free",
+    "or_docs":    "openai/gpt-oss-120b:free",
+    "or_ui":      "qwen/qwen3-coder:free",
+    "ui":         "qwen/qwen3-coder:free",
+    "or_backend": "qwen/qwen3-coder:free",
+    "or_strong":  "qwen/qwen3-coder:free",
+}
+_DEFAULT_FREE_MODEL = "openai/gpt-oss-120b:free"
+
+
+def _free_only_enabled() -> bool:
+    """Force every OpenRouter tier to resolve to a FREE catalog model.
+
+    The OpenRouter key can be in a free-only state (paid budget exhausted —
+    every paid model 403s "Key limit exceeded"). In that state the normal
+    cheap-PAID tiers (or_cheap → gemini flash-lite, or_strong → qwen
+    coder-plus) make every real (non-autonomous) build die at the first stage.
+    ``SKYN3T_FREE_ONLY=1`` reroutes all tiers through the 20+ free catalog
+    models so builds keep shipping at $0. Reversible: unset once the key is
+    funded to restore the paid quality ladder. Autonomous Lane-A is already
+    free; this extends the same guarantee to Lane-B.
+    """
+    return os.environ.get("SKYN3T_FREE_ONLY", "").strip().lower() in {
+        "1", "on", "true", "yes",
+    }
+
+
+def _force_free_model(tier_name: str, task_kind: Optional[str]) -> Optional[str]:
+    """Best available FREE model for a tier — DETERMINISTIC best-per-tier.
+
+    Prefers the tier's known-best free id (validated to exist in the catalog by
+    the policy test) for quality + reproducibility, rather than the rotating
+    ``pick_free_model`` variety picker (which is right for autonomous drills but
+    can land a 1B toy model on a UI codegen tier). Falls back to any free id,
+    then to the static floor when the catalog is unreachable.
+    """
+    floor = _STATIC_FREE_FALLBACK.get(tier_name, _DEFAULT_FREE_MODEL)
+    try:
+        from skyn3t.core.openrouter_catalog import list_free_models
+
+        free = list_free_models()
+        if free:
+            return floor if floor in free else free[0]
+        return floor
+    except Exception:
+        logger.debug("free-only pick failed for tier %s", tier_name, exc_info=True)
+        return floor
+
+
 def _tier_backend_model(
     tier_name: str,
     *,
@@ -408,6 +465,15 @@ def _tier_backend_model(
         "claude" in str(model).lower() or str(model).lower().startswith("anthropic/")
     ):
         _, model = _TIERS.get(tier_name, _TIERS["or_cheap"])
+    # Free-only enforcement: when the key has no paid budget, rewrite any
+    # non-free OpenRouter model to a FREE catalog model so the build doesn't
+    # 403 on every paid tier. Applied LAST so it overrides static pins,
+    # evolution picks, and the no-claude fallback alike.
+    if backend == "openrouter" and model and _free_only_enabled():
+        if not str(model).lower().endswith(":free"):
+            free_model = _force_free_model(tier_name, task_kind)
+            if free_model:
+                model = free_model
     return backend, model
 
 
