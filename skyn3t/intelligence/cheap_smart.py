@@ -247,6 +247,24 @@ def build_cheap_context_boost(
     except Exception:
         logger.debug("cheap_smart build_pattern prefs read failed", exc_info=True)
 
+    # Distilled learnings the system has accumulated (the Learnings Store — the
+    # same curated corpus the local micro-LLM reads). Curated guidance from past
+    # builds beats noisy RAG chunks; pulled as plain context, no extra LLM call.
+    try:
+        from skyn3t.intelligence.learnings_store import get_default_store
+
+        items = get_default_store().guidance_for(
+            brief or stage_name, stack=stack, limit=3
+        )
+        if items:
+            lines = [
+                f"- {e.get('title', '')}: {e.get('content', '')}".strip()
+                for e in items
+            ]
+            sections.append("## Learned guidance (from past builds)\n" + "\n".join(lines))
+    except Exception:
+        logger.debug("cheap_smart learnings guidance read failed", exc_info=True)
+
     # One competitive pattern hint when the brief matches a known gap.
     try:
         from skyn3t.cortex.competitive_intel import match_competitor

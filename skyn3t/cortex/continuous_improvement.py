@@ -593,6 +593,10 @@ class ContinuousImprovementEngine:
         # defensively so a not-yet-landed curate_if_due never breaks the tick.
         self._maybe_curate_skills(settings)
 
+        # Refresh the Learnings Store (the distilled corpus the local micro-LLM
+        # and the build-context boost read). Time-gated; never breaks the tick.
+        self._maybe_compile_learnings(settings)
+
         # Item 7 — recompute rolling each-build-improves-next feedback metrics so
         # the dashboard/operators can see whether builds are getting better.
         first_attempt_trend = self._compute_first_attempt_trend()
@@ -629,6 +633,25 @@ class ContinuousImprovementEngine:
             rate[stack] = round(hits / total, 3)
         self.metrics.injection_hit_rate = rate
         return dict(rate)
+
+    def _maybe_compile_learnings(self, settings: Any) -> None:
+        """Refresh the Learnings Store corpus on a cadence (default 1h)."""
+        try:
+            import time as _time
+
+            interval = float(
+                getattr(settings, "improvement_learnings_compile_interval_seconds", 3600)
+            )
+            now = _time.time()
+            if now - getattr(self, "_last_learnings_compile", 0.0) < interval:
+                return
+            from skyn3t.intelligence.learnings_store import get_default_store
+
+            count = get_default_store().compile()
+            self._last_learnings_compile = now
+            logger.debug("learnings store compiled %d entries", count)
+        except Exception:
+            logger.debug("learnings compile failed", exc_info=True)
 
     def _maybe_curate_skills(self, settings: Any) -> None:
         """Item 3 — invoke Owner E's curate_if_due on a cadence (default 24h)."""
