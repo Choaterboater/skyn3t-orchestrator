@@ -21,10 +21,13 @@ from skyn3t.cortex.continuous_improvement import continuous_improvement_enabled
 
 logger = logging.getLogger("skyn3t.cortex.never_stop")
 
-WATCHDOG_CHECK_SECONDS = 30
+# Cortex audit 2026-06-13: 30s was far below the ~600s the loops actually want,
+# keeping the watchdog + ticks churning. Raised to cut the runaway without
+# breaking autonomy responsiveness.
+WATCHDOG_CHECK_SECONDS = 120
 DEFAULT_QUEUE_EMPTY_SECONDS = 300
 RECOVERY_ALERT = "NEVER_STOP_RECOVERED"
-MIN_TICK_INTERVAL_NEVER_STOP = 30
+MIN_TICK_INTERVAL_NEVER_STOP = 120
 
 
 def never_stop_enabled() -> bool:
