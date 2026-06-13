@@ -109,13 +109,23 @@ def debate_enabled(stage_name: str) -> bool:
     """
     if not _truthy(os.environ.get("SKYN3T_DEBATE")):
         return False
+    return _stage_in_debate_scope(stage_name)
+
+
+def debate_enabled_for_profile(stage_name: str, execution_profile: str = "balanced") -> bool:
+    """Deep Studio builds enable debate even when the global flag is off."""
+    if str(execution_profile or "").strip().lower() == "deep":
+        return _stage_in_debate_scope(stage_name)
+    return debate_enabled(stage_name)
+
+
+def _stage_in_debate_scope(stage_name: str) -> bool:
     stage = str(stage_name or "").strip().lower()
     if not stage:
         return False
     stages = _debate_stages()
     if stage in stages:
         return True
-    # Collapse code-stage aliases onto the canonical 'code' scope.
     if stage in {"code_agent", "code_improver"} and "code" in stages:
         return True
     if stage in {"architecture"} and "architect" in stages:

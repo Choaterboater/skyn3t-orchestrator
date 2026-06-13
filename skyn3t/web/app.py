@@ -3772,6 +3772,13 @@ async def improvement_status():
     return orchestrator.get_improvement_status()
 
 
+@app.get("/api/improvement/build-success")
+async def improvement_build_success():
+    from skyn3t.intelligence.build_success_rate import stack_rates
+
+    return {"stacks": stack_rates()}
+
+
 @app.get("/api/cortex/status")
 async def cortex_status():
     if orchestrator and hasattr(orchestrator, "get_cortex_status"):
@@ -4381,6 +4388,30 @@ async def studio_project_feedback(slug: str, payload: dict):
             status_code=200,
         )
     return {"ok": True, **result}
+
+
+@app.get("/api/security/live-read/status")
+async def live_read_status(slug: Optional[str] = None):
+    from skyn3t.security.live_read_gate import live_read_gate_status
+
+    return live_read_gate_status(slug=slug)
+
+
+@app.post("/api/security/live-read/approve")
+async def live_read_approve(payload: dict):
+    from skyn3t.security.live_read_gate import approve_live_read
+
+    slug = str(payload.get("slug") or "").strip() or None
+    operator = str(payload.get("operator") or "operator")
+    return approve_live_read(slug=slug, operator=operator)
+
+
+@app.post("/api/security/live-read/revoke")
+async def live_read_revoke(payload: dict):
+    from skyn3t.security.live_read_gate import revoke_live_read
+
+    slug = str(payload.get("slug") or "").strip() or None
+    return revoke_live_read(slug=slug)
 
 
 @app.get("/api/studio/approval-config")

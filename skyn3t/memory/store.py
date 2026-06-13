@@ -1400,6 +1400,30 @@ class MemoryStore:
                 result = await session.execute(delete(ExperienceIndex).where(cond))
                 return getattr(result, "rowcount", 0) or 0
 
+    async def reconcile_stale_tasks(self) -> Dict[str, int]:
+        """Mark running/queued/retrying DB tasks as failed after a crash."""
+        stale_statuses = (
+            TaskStatus.RUNNING,
+            TaskStatus.RETRYING,
+        )
+        updated = 0
+        async with await self._session() as session:
+            async with session.begin():
+                result = await session.execute(
+                    select(TaskModel).where(TaskModel.status.in_(stale_statuses))
+                )
+                tasks = result.scalars().all()
+                now = datetime.now(timezone.utc)
+                for task in tasks:
+                    task.status = TaskStatus.FAILED
+                    task.error_message = (
+                        task.error_message
+                        or "Task interrupted because the orchestrator restarted."
+                    )
+                    task.completed_at = now
+                    updated += 1
+        return {"updated": updated}
+
     async def prune_completed_tasks(
         self, older_than_days: int, keep_last: int = 500
     ) -> int:

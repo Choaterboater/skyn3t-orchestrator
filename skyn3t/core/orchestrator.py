@@ -69,6 +69,13 @@ def a2a_conversation_enabled() -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def a2a_conversation_enabled_for_profile(execution_profile: str = "balanced") -> bool:
+    """Deep Studio builds enable A2A even when the global flag is off."""
+    if str(execution_profile or "").strip().lower() == "deep":
+        return True
+    return a2a_conversation_enabled()
+
+
 def _default_convergence(turns: List[ConversationTurn]) -> bool:
     """Default convergence: reviewer reports no blockers.
 
@@ -483,7 +490,18 @@ class Orchestrator:
 
     async def stop(self) -> None:
         """Stop the orchestrator gracefully."""
+        import os
+
         self._running = False
+        shutdown_timeout = float(os.environ.get("SKYN3T_SHUTDOWN_TIMEOUT_SECONDS", "2.5"))
+
+        async def _bounded(awaitable: Any, label: str) -> None:
+            try:
+                await asyncio.wait_for(awaitable, timeout=shutdown_timeout)
+            except asyncio.TimeoutError:
+                logger.warning("%s timed out after %.1fs during shutdown", label, shutdown_timeout)
+            except Exception:
+                logger.debug("%s failed during shutdown", label, exc_info=True)
 
         if self._monitor_task:
             self._monitor_task.cancel()
@@ -499,27 +517,36 @@ class Orchestrator:
             except asyncio.CancelledError:
                 pass
 
-        await self._stop_cortex()
+        await _bounded(self._stop_cortex(), "cortex")
 
-        await self._self_healing.stop()
+        await _bounded(self._self_healing.stop(), "self_healing")
         if self._reflection:
-            await self._reflection.stop()
+            await _bounded(self._reflection.stop(), "reflection")
         if self._planner:
-            await self._planner.stop()
+            await _bounded(self._planner.stop(), "planner")
         # ingestor doesn't need explicit stop — it's event-driven
         if self._meta_agent:
-            await self._meta_agent.stop()
+            await _bounded(self._meta_agent.stop(), "meta_agent")
 
-        # Shutdown all agents in parallel. Sequential awaits scaled linearly
-        # with the number of agents (each shutdown waits for its task loop to
-        # observe _running=False), turning N-agent stop into N seconds.
+        # Shutdown all agents in parallel with a bounded wait so SIGTERM
+        # cannot hang restart-backend.sh indefinitely.
         if self.agents:
-            await asyncio.gather(
-                *[agent.shutdown() for agent in self.agents.values()],
-                return_exceptions=True,
-            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *[agent.shutdown() for agent in self.agents.values()],
+                        return_exceptions=True,
+                    ),
+                    timeout=shutdown_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "agent shutdown gather timed out after %.1fs (%d agents)",
+                    shutdown_timeout,
+                    len(self.agents),
+                )
 
-        await self._create_consciousness_snapshot(reason="shutdown")
+        await _bounded(self._create_consciousness_snapshot(reason="shutdown"), "consciousness_snapshot")
 
         if self._recovery_manager is not None:
             try:
@@ -528,6 +555,13 @@ class Orchestrator:
                     logger.info("shutdown recovery checkpoint created: %s", checkpoint_id)
             except Exception:
                 logger.exception("shutdown recovery checkpoint failed")
+
+        try:
+            from skyn3t.observability.token_tracker import persist_default_tracker
+
+            persist_default_tracker()
+        except Exception:
+            logger.debug("token rollup persist on shutdown failed", exc_info=True)
 
         self.event_bus.publish(
             Event(

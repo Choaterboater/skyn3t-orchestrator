@@ -495,6 +495,22 @@ function ProjectDetailView({
           </section>
         )}
 
+        {data.boot_verification && (
+          <section>
+            <SectionTitle>Boot verification</SectionTitle>
+            <BuildVerificationCard v={data.boot_verification} />
+          </section>
+        )}
+
+        {quality && verification?.verdict && verification.verdict !== "yes" &&
+          typeof quality.score === "number" &&
+          quality.score > 49 && (
+          <p className="text-xs text-status-amber rounded-lg border border-status-amber/30 bg-status-amber/10 px-3 py-2">
+            Reviewer score is capped when objective verification fails — displayed
+            score may not reflect ship readiness.
+          </p>
+        )}
+
         {quality && (
           <section>
             <SectionTitle>Quality</SectionTitle>

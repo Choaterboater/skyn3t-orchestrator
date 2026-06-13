@@ -22,13 +22,17 @@ fi
 
 SLUG="$1"
 
-# Load operator paths from .env when present.
-if [[ -f "${PROJECT_DIR}/.env" ]]; then
-    # shellcheck disable=SC1091
-    set -a
-    # shellcheck source=/dev/null
-    source "${PROJECT_DIR}/.env" 2>/dev/null || true
-    set +a
+# Load operator paths from .env when present (PROJECTS_DIR only — avoid
+# sourcing the full file because operator .env may invoke missing tools).
+if [[ -z "${PROJECTS_DIR:-}" && -f "${PROJECT_DIR}/.env" ]]; then
+    _pd_line="$(grep -E '^[[:space:]]*PROJECTS_DIR=' "${PROJECT_DIR}/.env" | tail -1 || true)"
+    if [[ -n "${_pd_line}" ]]; then
+        PROJECTS_DIR="${_pd_line#*=}"
+        PROJECTS_DIR="${PROJECTS_DIR%\"}"
+        PROJECTS_DIR="${PROJECTS_DIR#\"}"
+        PROJECTS_DIR="${PROJECTS_DIR%\'}"
+        PROJECTS_DIR="${PROJECTS_DIR#\'}"
+    fi
 fi
 
 PROJECTS_DIR="${PROJECTS_DIR:-${PROJECT_DIR}/projects}"
@@ -73,10 +77,14 @@ PY
     exit 0
 fi
 
-mapfile -t PY_FILES < <(find . -name '*.py' ! -path '*/__pycache__/*' -type f 2>/dev/null || true)
-if [[ ${#PY_FILES[@]} -gt 0 ]]; then
-    echo "→ python -m py_compile (${#PY_FILES[@]} file(s))"
-    python3 -m py_compile "${PY_FILES[@]}"
+# mapfile is bash 4+; macOS ships bash 3.2 — use find + xargs instead.
+PY_COUNT=0
+if PY_FILES=$(find . -name '*.py' ! -path '*/__pycache__/*' -type f 2>/dev/null); then
+    PY_COUNT=$(printf '%s\n' "$PY_FILES" | sed '/^$/d' | wc -l | tr -d ' ')
+fi
+if [[ "${PY_COUNT}" -gt 0 ]]; then
+    echo "→ python -m py_compile (${PY_COUNT} file(s))"
+    printf '%s\n' "$PY_FILES" | sed '/^$/d' | xargs python3 -m py_compile
     echo "✓ python scaffold OK"
     exit 0
 fi

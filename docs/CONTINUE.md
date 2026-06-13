@@ -2,6 +2,19 @@
 
 Use this file when a chat runs out of tokens or you start a fresh agent session.
 
+## Moat-first baseline (2026-06-12)
+
+| Item | Value |
+|------|--------|
+| **Homelab proof slug** | `aruba-central-field-triage` |
+| **Reviewer score** | 92/100 (manual repair validation) |
+| **Build verification** | `yes` (`npm run build`) |
+| **Domain benchmark** | 92/100 (`domain_benchmark` in project.json) |
+| **Studio smoke** | `bash scripts/studio_smoke.sh aruba-central-field-triage` (npm build path) |
+| **Test suite** | `pytest tests/ -q --ignore=tests/test_observability.py` — target green after moat batch |
+
+Phase 0–5 moat plan landed: score truth + feedback UI, generated smoke tests + pytest gate, token rollup persist, domain corpus prompts, graceful shutdown timeout, task reconciliation, deep-profile debate/A2A, examples decision doc, live-read approval API, weekly domain benchmark script.
+
 ## Current state (2026-06-11)
 
 - **Branch:** `main` @ `7cb27d0` before this commit; push this handoff commit to `origin/main`.

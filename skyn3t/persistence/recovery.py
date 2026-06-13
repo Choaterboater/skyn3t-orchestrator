@@ -68,12 +68,21 @@ class RecoveryManager:
             except Exception as e:
                 recovery_report["errors"].append(str(e))
 
-        # Restore task states
+        # Restore task states — reconcile stale running/queued rows in SQLite.
         if checkpoint.task_states:
-            _logger.warning(
-                "Task state recovery is not fully implemented; %d task states will be counted but not restored.",
-                len(checkpoint.task_states),
-            )
+            try:
+                from skyn3t.memory.store import MemoryStore
+
+                store = MemoryStore()
+                import asyncio
+
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(store.reconcile_stale_tasks())
+                except RuntimeError:
+                    asyncio.run(store.reconcile_stale_tasks())
+            except Exception as exc:
+                recovery_report["errors"].append(f"task reconciliation failed: {exc}")
         for task_state in checkpoint.task_states:
             try:
                 recovery_report["tasks_recovered"] += 1

@@ -123,6 +123,29 @@ class StudioRunner:
         # Reap projects that were "running" or "queued" when the server died.
         # Their async task is gone; they'll never progress on their own.
         self._reap_orphans()
+        self._schedule_task_reconciliation()
+
+    def _schedule_task_reconciliation(self) -> None:
+        """Mark stale orchestrator DB tasks interrupted on boot."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._reconcile_stale_tasks())
+
+    async def _reconcile_stale_tasks(self) -> None:
+        try:
+            from skyn3t.memory.store import MemoryStore
+
+            store = MemoryStore()
+            report = await store.reconcile_stale_tasks()
+            if report.get("updated"):
+                logger.info(
+                    "reconciled %d stale DB task(s) on boot",
+                    report["updated"],
+                )
+        except Exception:
+            logger.debug("task reconciliation on boot failed", exc_info=True)
 
     @staticmethod
     def _resolved_repo_target(value: Any) -> dict:
@@ -1288,6 +1311,7 @@ class StudioRunner:
                     artifact_dir=artifact_dir,
                     manifest=manifest,
                     prior_summaries=prior_summaries,
+                    execution_profile=execution_profile,
                 )
             except Exception:
                 logger.debug("A2A conversation pre-pass failed; continuing linear", exc_info=True)
@@ -1349,6 +1373,17 @@ class StudioRunner:
                         "boot": manifest.get("boot_verification"),
                         "integration": manifest.get("integration_verification"),
                     }
+                if stage.name in ("architect", "reviewer"):
+                    try:
+                        from skyn3t.intelligence.domain_corpus_prompts import corpus_prompt_block
+
+                        corpus_block = await corpus_prompt_block(brief, rag=self.rag)
+                        if corpus_block:
+                            input_data["domain_corpus"] = corpus_block
+                            brief = f"{brief}\n\n{corpus_block}"
+                            input_data["brief"] = brief
+                    except Exception:
+                        logger.debug("domain corpus injection failed", exc_info=True)
                 # Pass the prior stage summaries as a stable dict. Agents
                 # that want a "what did upstream decide?" recap can read
                 # this directly instead of crawling artifact files.
@@ -2691,6 +2726,7 @@ class StudioRunner:
                         manifest=manifest,
                     )
                 )
+                self._record_build_success_rate(manifest)
             else:
                 self._clear_quality_summary(manifest)
                 manifest["next_action"] = (
@@ -3168,6 +3204,7 @@ class StudioRunner:
                             manifest=manifest,
                     )
                 )
+                self._record_build_success_rate(manifest)
             completion_message = (
                 manifest["next_action"]
                 if manifest.get("status") in {"done", "needs_fixes"}
@@ -3465,6 +3502,7 @@ class StudioRunner:
         artifact_dir: Path,
         manifest: Dict[str, Any],
         prior_summaries: Dict[str, str],
+        execution_profile: str = "balanced",
     ) -> None:
         """Phase 5A ConversationLoopAPI: bounded A2A conversation pre-pass.
 
@@ -3483,12 +3521,12 @@ class StudioRunner:
         try:
             from skyn3t.core.orchestrator import (
                 Orchestrator,
-                a2a_conversation_enabled,
+                a2a_conversation_enabled_for_profile,
             )
         except Exception:
             logger.debug("orchestrator unavailable for A2A conversation", exc_info=True)
             return
-        if not a2a_conversation_enabled():
+        if not a2a_conversation_enabled_for_profile(execution_profile):
             return
 
         # Map planned stages → the agent triad we drive over A2A.
@@ -4827,6 +4865,7 @@ class StudioRunner:
         rounds: int,
         timeout_s: float,
         proposer_summary: str = "",
+        execution_profile: str = "balanced",
     ) -> Optional[Dict[str, Any]]:
         """Run a cheap/free cross-model debate as the critique step.
 
@@ -4846,11 +4885,24 @@ class StudioRunner:
             logger.debug("debate module unavailable for critique", exc_info=True)
             return None
         try:
-            if not _debate.debate_enabled(stage.name):
+            if not _debate.debate_enabled_for_profile(stage.name, execution_profile):
                 return None
         except Exception:
             logger.debug("debate_enabled check failed", exc_info=True)
             return None
+
+        slug = artifact_dir.name
+        token_cap = int(os.environ.get("SKYN3T_DEEP_DEBATE_TOKEN_CAP", "120000"))
+        if execution_profile == "deep" and token_cap > 0:
+            used = self._project_token_total(slug)
+            if used >= token_cap:
+                logger.info(
+                    "debate skipped for %s — deep token cap %d reached (%d used)",
+                    stage.name,
+                    token_cap,
+                    used,
+                )
+                return None
 
         try:
             result = await asyncio.wait_for(
@@ -5093,6 +5145,9 @@ class StudioRunner:
                         rounds=max_rounds,
                         timeout_s=critique_timeout_seconds,
                         proposer_summary=summary,
+                        execution_profile=str(
+                            (manifest or {}).get("execution_profile") or "balanced"
+                        ),
                     )
                 if critique_result is None:
                     critique_result = await asyncio.wait_for(
@@ -6967,6 +7022,38 @@ class StudioRunner:
             except Exception:
                 logger.debug("autonomous reviewer threshold lookup failed", exc_info=True)
         return threshold
+
+    def _record_build_success_rate(self, manifest: Dict[str, Any]) -> None:
+        try:
+            from skyn3t.intelligence.build_success_rate import record_outcome
+
+            stack = str(
+                (manifest.get("build_verification") or {}).get("stack")
+                or "unknown"
+            )
+            slug = str(manifest.get("slug") or "")
+            score = (manifest.get("quality_summary") or {}).get("score")
+            success = str(manifest.get("status") or "").lower() == "done"
+            record_outcome(
+                stack=stack,
+                success=success,
+                slug=slug,
+                score=int(score) if isinstance(score, (int, float)) else None,
+            )
+            if success and isinstance(score, (int, float)) and int(score) >= 85:
+                try:
+                    from skyn3t.intelligence.skills_hub import distill_skill_from_build
+
+                    distill_skill_from_build(
+                        slug=slug,
+                        brief=str(manifest.get("brief") or manifest.get("brief_raw") or ""),
+                        stack=stack,
+                        score=int(score),
+                    )
+                except Exception:
+                    logger.debug("skill distill from build failed", exc_info=True)
+        except Exception:
+            logger.debug("build success rate record failed", exc_info=True)
 
     def _finalize_project_outcome(
         self,

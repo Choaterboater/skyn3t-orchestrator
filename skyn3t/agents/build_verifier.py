@@ -578,6 +578,8 @@ class BuildVerifierAgent(BaseAgent):
 
         Only an actual test *failure* yields verdict 'no'.
         """
+        if probe.kind == "python":
+            return await self._run_python_test_gate(scaffold_dir)
         if probe.kind != "node":
             return None
         pkg_path = scaffold_dir / "package.json"
@@ -648,6 +650,41 @@ class BuildVerifierAgent(BaseAgent):
             "summary": (
                 "tests passed" if passed
                 else f"tests failed (exit {proc['returncode']})"
+            ),
+            "stdout_tail": tail[-4000:],
+        }
+
+    async def _run_python_test_gate(self, scaffold_dir: Path) -> Optional[Dict[str, Any]]:
+        """Run pytest when ``tests/`` exists under a python scaffold."""
+        tests_dir = scaffold_dir / "tests"
+        if not tests_dir.is_dir():
+            return None
+
+        def _skipped(summary: str) -> Dict[str, Any]:
+            return {
+                "ran": False, "passed": False, "verdict": "skipped",
+                "summary": summary, "stdout_tail": "",
+            }
+
+        if not _env_flag_on("SKYN3T_VERIFY_TESTS"):
+            return _skipped("test gate disabled (SKYN3T_VERIFY_TESTS=0)")
+
+        test_files = list(tests_dir.glob("test_*.py")) + list(tests_dir.glob("*_test.py"))
+        if not test_files:
+            return _skipped("no pytest files under tests/")
+
+        cmd = ["python3", "-m", "pytest", "tests", "-q", "--tb=short"]
+        proc = await self._run(cmd, scaffold_dir)
+        combined = ((proc.get("stdout") or "") + "\n" + (proc.get("stderr") or "")).strip()
+        tail = "\n".join(combined.splitlines()[-30:])
+        passed = proc["returncode"] == 0
+        return {
+            "ran": True,
+            "passed": passed,
+            "verdict": "yes" if passed else "no",
+            "summary": (
+                "pytest passed" if passed
+                else f"pytest failed (exit {proc['returncode']})"
             ),
             "stdout_tail": tail[-4000:],
         }

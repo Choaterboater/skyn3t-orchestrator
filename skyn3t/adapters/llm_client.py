@@ -6,7 +6,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Optional, cast
+from typing import Any, Dict, List, Optional, cast
 
 from skyn3t.core.event_context import current_event_context, current_event_correlation_id
 from skyn3t.security.secrets import redact_text
@@ -465,6 +465,18 @@ class LLMClient:
                     prompt_chars_full = len(req.prompt or "")
                     response_chars_full = len(out or "")
                     system_chars_full = len(req.system or "")
+                    usage_fields: Dict[str, int] = {}
+                    impl = getattr(self, "_impl", None)
+                    last_usage = getattr(impl, "_last_usage", None)
+                    if isinstance(last_usage, dict):
+                        pt = int(last_usage.get("prompt_tokens") or 0)
+                        rt = int(last_usage.get("response_tokens") or 0)
+                        if pt or rt:
+                            usage_fields = {
+                                "prompt_tokens": pt,
+                                "response_tokens": rt,
+                                "total_tokens": pt + rt,
+                            }
                     self._event_bus.publish(Event(
                         event_type=et,
                         source=self._caller_name or "llm",
@@ -479,6 +491,7 @@ class LLMClient:
                             "response_chars": response_chars_full,
                             "system_chars": system_chars_full,
                             "duration_ms": int(elapsed * 1000),
+                            **usage_fields,
                             **{
                                 key: value
                                 for key, value in context.items()

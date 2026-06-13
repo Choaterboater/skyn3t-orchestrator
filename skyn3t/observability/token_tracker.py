@@ -5,19 +5,20 @@ Subscribes to LLM_EXCHANGE events and keeps two rollups:
   - per-agent: total prompt+response tokens, call count, last-used ts
   - per-project (slug): per-stage and total tokens
 
-Token counts are estimated from character counts at 4 chars/token —
-the standard rule for English, ±15% accurate. Good enough for a
-"watch the budget" view. If precise counts matter later, we can swap
-in tiktoken or count from the backend's reported usage (already
-captured in openai_cli/anthropic backends).
+Token counts prefer provider-reported usage from LLM_EXCHANGE when
+present; otherwise fall back to character-count approximation (4 chars/token).
+
+Rollups persist to ``data/token_rollups.json`` on shutdown and reload on boot.
 
 Thread-safe; singleton via ``get_default_tracker()``.
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("skyn3t.observability.token_tracker")
@@ -65,28 +66,34 @@ class TokenTracker:
     def _on_exchange(self, event: Any) -> None:
         try:
             payload = getattr(event, "payload", {}) or {}
-            # Prefer the accurate pre-truncation length fields if the
-            # client provided them (llm_client.py now does). Fall back
-            # to the legacy "len of truncated preview + bump constant"
-            # estimate for older event sources.
-            if "prompt_chars" in payload or "response_chars" in payload:
-                prompt_chars = int(payload.get("prompt_chars") or 0)
-                response_chars = int(payload.get("response_chars") or 0)
-                system_chars = int(payload.get("system_chars") or 0)
+            provider_prompt = int(payload.get("prompt_tokens") or 0)
+            provider_response = int(payload.get("response_tokens") or 0)
+            if provider_prompt or provider_response:
+                prompt_tokens = provider_prompt
+                response_tokens = provider_response
             else:
-                # Legacy path — only the truncated preview field
-                # available. Best-effort estimate.
-                prompt_chars = len(payload.get("prompt") or "")
-                response_chars = len(payload.get("response") or "")
-                system_chars = len(payload.get("system") or "")
-                if prompt_chars >= 2000:
-                    prompt_chars = max(prompt_chars, 8000)
-                if response_chars >= 2000:
-                    response_chars = max(response_chars, 4000)
+                # Prefer the accurate pre-truncation length fields if the
+                # client provided them (llm_client.py now does). Fall back
+                # to the legacy "len of truncated preview + bump constant"
+                # estimate for older event sources.
+                if "prompt_chars" in payload or "response_chars" in payload:
+                    prompt_chars = int(payload.get("prompt_chars") or 0)
+                    response_chars = int(payload.get("response_chars") or 0)
+                    system_chars = int(payload.get("system_chars") or 0)
+                else:
+                    # Legacy path — only the truncated preview field
+                    # available. Best-effort estimate.
+                    prompt_chars = len(payload.get("prompt") or "")
+                    response_chars = len(payload.get("response") or "")
+                    system_chars = len(payload.get("system") or "")
+                    if prompt_chars >= 2000:
+                        prompt_chars = max(prompt_chars, 8000)
+                    if response_chars >= 2000:
+                        response_chars = max(response_chars, 4000)
 
-            prompt_tokens = _estimate_tokens("x" * prompt_chars)
-            prompt_tokens += _estimate_tokens("x" * system_chars)
-            response_tokens = _estimate_tokens("x" * response_chars)
+                prompt_tokens = _estimate_tokens("x" * prompt_chars)
+                prompt_tokens += _estimate_tokens("x" * system_chars)
+                response_tokens = _estimate_tokens("x" * response_chars)
             total = prompt_tokens + response_tokens
 
             agent_name = payload.get("agent") or "unknown"
@@ -225,6 +232,30 @@ class TokenTracker:
                 k: dict(v) for k, v in (data.get("by_project") or {}).items()
             }
 
+    def persist_rollups(self, path: Optional[Path] = None) -> None:
+        """Write rollups to disk (best-effort)."""
+        target = path or Path("./data/token_rollups.json")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            snapshot = self.to_snapshot()
+            snapshot["saved_at"] = time.time()
+            target.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+        except Exception:
+            logger.exception("token rollup persist failed")
+
+    def load_rollups(self, path: Optional[Path] = None) -> bool:
+        """Merge rollups from disk into the in-memory tracker."""
+        target = path or Path("./data/token_rollups.json")
+        if not target.exists():
+            return False
+        try:
+            data = json.loads(target.read_text(encoding="utf-8"))
+            self.restore_snapshot(data)
+            return True
+        except Exception:
+            logger.exception("token rollup load failed")
+            return False
+
 
 _DEFAULT: Optional[TokenTracker] = None
 _DEFAULT_LOCK = threading.Lock()
@@ -236,5 +267,13 @@ def get_default_tracker() -> TokenTracker:
     if _DEFAULT is None:
         with _DEFAULT_LOCK:
             if _DEFAULT is None:
-                _DEFAULT = TokenTracker()
+                tracker = TokenTracker()
+                tracker.load_rollups()
+                _DEFAULT = tracker
     return _DEFAULT
+
+
+def persist_default_tracker() -> None:
+    """Persist the singleton tracker rollups (shutdown hook)."""
+    if _DEFAULT is not None:
+        _DEFAULT.persist_rollups()

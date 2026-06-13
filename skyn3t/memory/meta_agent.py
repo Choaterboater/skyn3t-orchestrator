@@ -188,7 +188,22 @@ class MetaAgent:
         try:
             self._check_thresholds()
         except Exception:
-            logger.exception("meta_agent: _check_thresholds failed")
+            logger.debug("meta_agent threshold check failed", exc_info=True)
+        try:
+            self._auto_apply_safe_tier()
+        except Exception:
+            logger.debug("meta_agent safe auto-apply failed", exc_info=True)
+
+    def _auto_apply_safe_tier(self) -> None:
+        """Auto-apply routing/concurrency nudges that never self-edit the repo."""
+        from skyn3t.intelligence.cheap_smart import auto_apply_cheaper_routing
+
+        applied = auto_apply_cheaper_routing(min_confidence="high")
+        if applied:
+            self._publish(
+                "meta_agent_auto_apply",
+                {"kind": "routing", "applied": applied},
+            )
 
     # ------------------------------------------------------------------
     # Event-driven counters for threshold detection

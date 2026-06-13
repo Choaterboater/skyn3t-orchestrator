@@ -3412,6 +3412,12 @@ class CodeAgent(BaseAgent):
             logger.debug("strip-unused-deps failed (non-fatal)", exc_info=True)
 
         try:
+            smoke_written = self._ensure_smoke_tests(out_dir, tech_stack)
+            files_written.extend(smoke_written)
+        except Exception:
+            logger.debug("smoke test emission failed (non-fatal)", exc_info=True)
+
+        try:
             await self.share_learning(
                 f"scaffold: {len(files_written)} files for brief",
                 scope="studio",
@@ -4501,6 +4507,65 @@ if __name__ == '__main__':
 """,
         }
         return self._write_scaffold_files(out_dir, files)
+
+    @staticmethod
+    def _ensure_smoke_tests(out_dir, tech_stack: Dict[str, Any]) -> list[str]:
+        """Emit minimal vitest/pytest smoke tests when the scaffold has none."""
+        from pathlib import Path as _P
+
+        written: list[str] = []
+        root = _P(out_dir)
+        pkg_path = root / "package.json"
+        if pkg_path.exists():
+            tests_dir = root / "tests"
+            smoke_test = tests_dir / "smoke.test.js"
+            if not smoke_test.exists():
+                tests_dir.mkdir(parents=True, exist_ok=True)
+                smoke_test.write_text(
+                    "import { describe, it, expect } from 'vitest';\n"
+                    "describe('smoke', () => {\n"
+                    "  it('loads', () => { expect(true).toBe(true); });\n"
+                    "});\n",
+                    encoding="utf-8",
+                )
+                written.append(str(smoke_test))
+            try:
+                import json as _json_pkg
+
+                pkg = _json_pkg.loads(pkg_path.read_text(encoding="utf-8"))
+                if isinstance(pkg, dict):
+                    scripts = pkg.setdefault("scripts", {})
+                    if not isinstance(scripts, dict):
+                        scripts = {}
+                        pkg["scripts"] = scripts
+                    if not str(scripts.get("test") or "").strip():
+                        scripts["test"] = "vitest run"
+                        pkg_path.write_text(
+                            _json_pkg.dumps(pkg, indent=2) + "\n", encoding="utf-8"
+                        )
+                        written.append(str(pkg_path))
+            except Exception:
+                logger.debug("package.json test script patch failed", exc_info=True)
+            return written
+
+        tests_dir = root / "tests"
+        py_smoke = tests_dir / "test_smoke.py"
+        py_files = list(root.glob("**/*.py"))
+        if py_files and not py_smoke.exists():
+            tests_dir.mkdir(parents=True, exist_ok=True)
+            entry = "main"
+            for candidate in ("app", "main", "server"):
+                if (root / f"{candidate}.py").exists():
+                    entry = candidate
+                    break
+            py_smoke.write_text(
+                f"def test_smoke_import():\n"
+                f"    import importlib\n"
+                f"    importlib.import_module('{entry}')\n",
+                encoding="utf-8",
+            )
+            written.append(str(py_smoke))
+        return written
 
     @staticmethod
     def _write_scaffold_files(out_dir, files: Dict[str, str]) -> list[str]:

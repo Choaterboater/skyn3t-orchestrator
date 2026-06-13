@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import random
-from typing import Optional
+from typing import Dict, Optional
 
 from skyn3t.adapters.llm_client import LLMRequest
 
@@ -21,6 +21,7 @@ BASE_URL = "https://openrouter.ai/api/v1"
 class OpenRouterBackend:
     def __init__(self, api_key: Optional[str] = None, *, base_url: str = BASE_URL):
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        self._last_usage: Dict[str, int] = {"prompt_tokens": 0, "response_tokens": 0}
         if not self.api_key:
             raise RuntimeError("OPENROUTER_API_KEY not set")
         try:
@@ -77,6 +78,13 @@ class OpenRouterBackend:
                 continue
             r.raise_for_status()
             data = r.json()
+            usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+            self._last_usage = {
+                "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+                "response_tokens": int(
+                    usage.get("completion_tokens") or usage.get("response_tokens") or 0
+                ),
+            }
             choices = data.get("choices") or []
             if not choices:
                 raise RuntimeError("openrouter: empty choices")
