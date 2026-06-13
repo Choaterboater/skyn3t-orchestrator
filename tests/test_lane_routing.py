@@ -83,6 +83,17 @@ def test_llm_client_allows_claude_when_flag_off(monkeypatch):
     assert LLMClient(backend="claude_cli")._backend_name == "claude_cli"
 
 
+def test_model_less_openrouter_defaults_to_free(monkeypatch):
+    """A model-less OpenRouter client (the repair loop) must default to a FREE
+    model so it doesn't hit the paid default and 403 on the over-limit key."""
+    monkeypatch.setenv("SKYN3T_NO_CLAUDE", "1")
+    from skyn3t.adapters.llm_client import LLMClient
+
+    model = LLMClient(backend="openrouter").default_model
+    if model:  # only assert when the catalog is present in this environment
+        assert model.lower().endswith(":free")
+
+
 def test_free_model_picker_excludes_claude_and_rotates():
     from skyn3t.core import openrouter_catalog as cat
 

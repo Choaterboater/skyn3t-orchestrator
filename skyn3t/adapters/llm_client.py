@@ -294,6 +294,22 @@ class LLMClient:
             # meaningless to OpenRouter — drop it so a live catalog model loads.
             if self.default_model and "/" not in self.default_model:
                 self.default_model = None
+        # Free-first default: a model-less OpenRouter caller (the consistency /
+        # targeted-fix repair loop, etc.) would otherwise hit the backend's PAID
+        # default model and 403 on the over-limit key — which is why generated
+        # TODO stubs never got repaired. Default it to a free catalog model.
+        if (
+            not self.default_model
+            and self._backend_name == "openrouter"
+            and os.environ.get("SKYN3T_NO_CLAUDE", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        ):
+            try:
+                from skyn3t.core.openrouter_catalog import pick_free_model
+
+                self.default_model = pick_free_model()
+            except Exception:
+                pass
         # Cross-model debate: callers can list backends to skip (e.g. the
         # retry path passes the backend the prior attempt used). The auto
         # chain then naturally falls through to a different model.
