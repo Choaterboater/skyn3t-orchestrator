@@ -39,12 +39,13 @@ def test_never_stop_disabled_explicitly(monkeypatch):
     assert never_stop_enabled() is False
 
 
-def test_effective_loop_interval_min_30_when_never_stop(monkeypatch):
+def test_effective_loop_interval_min_120_when_never_stop(monkeypatch):
     monkeypatch.setenv("SKYN3T_NEVER_STOP", "1")
     monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILD_INTERVAL_SECONDS", "10")
     get_settings.cache_clear()
     settings = get_settings()
-    assert effective_loop_interval(settings, "autonomous_build_interval_seconds", 900) == 30
+    # cortex audit 2026-06-13: floor raised 30 -> 120 to cut loop runaway.
+    assert effective_loop_interval(settings, "autonomous_build_interval_seconds", 900) == 120
 
 
 def test_effective_loop_interval_min_60_when_never_stop_off(monkeypatch):

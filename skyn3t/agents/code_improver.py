@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import difflib
+import fcntl  # cortex audit 2026-06-13: cross-process git-apply lock
+import hashlib
 import json
 import logging
 import os
@@ -25,6 +28,58 @@ REPO_ROOT = Path(__file__).resolve().parents[2]   # /.../jarvis
 # manual checkout) would corrupt each other. A single module-level lock makes
 # the whole branch/apply/checks/rollback sequence atomic per process.
 _APPLY_LOCK = asyncio.Lock()
+
+
+# cortex audit 2026-06-13: the asyncio.Lock above is PROCESS-LOCAL, so respawned
+# / duplicate code_improver instances each got their own lock and serialized
+# nothing across processes -> `cannot lock ref 'refs/heads/skyn3t/auto/...':
+# reference already exists` collisions. Add a CROSS-PROCESS advisory file lock,
+# keyed on the repo, so concurrent processes serialize their git-apply critical
+# sections on the shared working tree.
+_LOCK_DIR = REPO_ROOT / "data" / "locks"
+
+
+def _repo_lock_path(repo_root: Path) -> Path:
+    """Per-repo lock file under data/locks/. Distinct repos get distinct locks
+    (so unrelated target repos don't serialize), while the same repo across
+    processes shares one lock file."""
+    key = hashlib.sha1(str(repo_root.resolve()).encode("utf-8")).hexdigest()[:16]
+    return _LOCK_DIR / f"skyn3t-self-edit-{key}.lock"
+
+
+@contextlib.contextmanager
+def _cross_process_apply_lock(repo_root: Path):
+    """Blocking advisory file lock (fcntl.flock) that serializes the git-apply
+    critical section across PROCESSES for a given repo. Released on every exit
+    path via try/finally. Best-effort: if the lock file can't be created/locked
+    (e.g. unusual FS), we proceed without it rather than block the apply."""
+    lock_path = _repo_lock_path(repo_root)
+    fd = None
+    try:
+        os.makedirs(_LOCK_DIR, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        logger.exception("could not acquire cross-process apply lock at %s; "
+                         "proceeding without it", lock_path)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            fd = None
+    try:
+        yield
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 
@@ -1295,6 +1350,20 @@ class CodeImproverAgent(BaseAgent):
             self._last_apply_info = {}
         if result.get("ok"):
             return result
+        # cortex audit 2026-06-13: AUTO-APPLIED (not user-initiated) patch
+        # failures were swallowed here -- only the synchronous user-initiated
+        # path in execute() called _publish_result, so background auto-apply
+        # failures (incl. branch-ref collisions) never raised a toast. Mirror
+        # that SYSTEM_ALERT for the auto-apply path. (User-initiated applies are
+        # alerted by execute(); skip them here to avoid a duplicate toast.)
+        if not payload.get("user_initiated"):
+            self._publish_result(
+                applied=False,
+                branch=result.get("branch"),
+                error=result.get("error") or "git apply failed",
+                target=str(payload.get("target_file") or "(unknown)"),
+                user_initiated=False,
+            )
         raise CodePatchApplyError(result.get("error") or "git apply failed", info=result)
 
     async def _do_apply(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1330,8 +1399,18 @@ class CodeImproverAgent(BaseAgent):
         # checkout) would corrupt each other. The lock makes it atomic per
         # process; the stash handling below tolerates a dirty tree without
         # losing the user's uncommitted work.
+        # cortex audit 2026-06-13: ALSO take a cross-process file lock so that
+        # respawned / duplicate code_improver PROCESSES serialize their git
+        # branch/apply on the shared working tree (the asyncio.Lock alone is
+        # process-local and let `refs/heads/skyn3t/auto/...` collide). flock
+        # blocks; run it off the event loop so we don't stall other coroutines.
         async with _APPLY_LOCK:
-            return await self._do_apply_git(payload, repo_root, target_file, patch)
+            cm = _cross_process_apply_lock(repo_root)
+            await asyncio.to_thread(cm.__enter__)
+            try:
+                return await self._do_apply_git(payload, repo_root, target_file, patch)
+            finally:
+                await asyncio.to_thread(cm.__exit__, None, None, None)
 
     async def _do_apply_git(self, payload: Dict[str, Any], repo_root: Path,
                             target_file: str, patch: str) -> Dict[str, Any]:

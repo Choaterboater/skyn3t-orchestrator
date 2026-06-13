@@ -597,6 +597,11 @@ class ContinuousImprovementEngine:
         # and the build-context boost read). Time-gated; never breaks the tick.
         self._maybe_compile_learnings(settings)
 
+        # cortex audit 2026-06-13 — reflective skill evolution was implemented
+        # but never scheduled; wire it into the flywheel here. Async + time-gated;
+        # never breaks the tick.
+        await self._maybe_evolve_skills(settings)
+
         # Item 7 — recompute rolling each-build-improves-next feedback metrics so
         # the dashboard/operators can see whether builds are getting better.
         first_attempt_trend = self._compute_first_attempt_trend()
@@ -652,6 +657,30 @@ class ContinuousImprovementEngine:
             logger.debug("learnings store compiled %d entries", count)
         except Exception:
             logger.debug("learnings compile failed", exc_info=True)
+
+    async def _maybe_evolve_skills(self, settings: Any) -> None:
+        """cortex audit 2026-06-13 — evolve underperforming skills into
+        approval-gated drafts+proposals on a cadence (default 24h). The live
+        skills are untouched until an owner approves; never breaks the tick."""
+        try:
+            import time as _time
+
+            interval = float(
+                getattr(settings, "improvement_skill_evolve_interval_seconds", 86_400)
+            )
+            now = _time.time()
+            if now - getattr(self, "_last_skill_evolve", 0.0) < interval:
+                return
+            from skyn3t.cortex.skill_evolver import run_once
+
+            proposed = await run_once(limit=2)
+            self._last_skill_evolve = now
+            if proposed:
+                logger.info("skill evolver proposed %d rewrites: %s", len(proposed), proposed)
+            else:
+                logger.debug("skill evolver found no candidates to rewrite")
+        except Exception:
+            logger.debug("skill evolve tick failed", exc_info=True)
 
     def _maybe_curate_skills(self, settings: Any) -> None:
         """Item 3 — invoke Owner E's curate_if_due on a cadence (default 24h)."""

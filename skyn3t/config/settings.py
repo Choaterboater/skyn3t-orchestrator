@@ -99,8 +99,10 @@ class Settings(BaseSettings):
     # Legacy master switch for automatic Cortex handling. When false,
     # system proposals stay fully review-gated and selective auto-triage
     # rules do not run.
+    # cortex audit 2026-06-13: default to review-gated (was True) — system
+    # proposals carry real change risk and must be opted in explicitly.
     cortex_auto_approve_system: bool = Field(
-        default=True, alias="SKYN3T_CORTEX_AUTO_APPROVE_SYSTEM"
+        default=False, alias="SKYN3T_CORTEX_AUTO_APPROVE_SYSTEM"
     )
     cortex_auto_reject_duplicates: bool = Field(
         default=True, alias="SKYN3T_CORTEX_AUTO_REJECT_DUPLICATES"
@@ -108,8 +110,10 @@ class Settings(BaseSettings):
     cortex_auto_reject_low_signal_ingest: bool = Field(
         default=True, alias="SKYN3T_CORTEX_AUTO_REJECT_LOW_SIGNAL_INGEST"
     )
+    # cortex audit 2026-06-13: default to review-gated (was True) — external
+    # ingests carry IP/licensing risk and must be opted in explicitly.
     cortex_auto_approve_safe_ingest: bool = Field(
-        default=True, alias="SKYN3T_CORTEX_AUTO_APPROVE_SAFE_INGEST"
+        default=False, alias="SKYN3T_CORTEX_AUTO_APPROVE_SAFE_INGEST"
     )
     cortex_auto_triage_duplicate_window_seconds: int = Field(
         default=86_400, alias="SKYN3T_CORTEX_AUTO_TRIAGE_DUPLICATE_WINDOW_SECONDS"
@@ -123,8 +127,10 @@ class Settings(BaseSettings):
     # GitHub repo-scout ingest is operational knowledge gathering — auto-run
     # without a manual ingest approval step. Follow-on SkyN3t code changes still
     # require a separate feature proposal approval.
+    # cortex audit 2026-06-13: default to review-gated (was True) — scout
+    # ingests pull external repo content (IP/licensing risk); opt in explicitly.
     cortex_auto_approve_scout_ingest: bool = Field(
-        default=True, alias="SKYN3T_CORTEX_AUTO_APPROVE_SCOUT_INGEST"
+        default=False, alias="SKYN3T_CORTEX_AUTO_APPROVE_SCOUT_INGEST"
     )
     cortex_auto_approve_safe_tuning: bool = Field(
         default=True, alias="SKYN3T_CORTEX_AUTO_APPROVE_SAFE_TUNING"

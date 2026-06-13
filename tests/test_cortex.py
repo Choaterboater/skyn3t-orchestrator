@@ -289,6 +289,19 @@ async def test_proposal_store_create_auto_applies_with_running_loop(tmp_path):
 async def test_proposal_store_sync_auto_approved_system_items_resume_without_user_review(
     tmp_path, monkeypatch
 ):
+    # cortex auto-triage is opt-in by default now (audit 2026-06-13); enable it.
+    monkeypatch.setattr(
+        "skyn3t.config.settings.get_settings",
+        lambda: SimpleNamespace(
+            cortex_auto_approve_system=True,
+            cortex_auto_approve_safe_ingest=True,
+            cortex_auto_reject_duplicates=True,
+            cortex_auto_reject_low_signal_ingest=True,
+            cortex_auto_triage_duplicate_window_seconds=86_400,
+            cortex_auto_triage_min_ingest_topic_length=6,
+            cortex_auto_triage_max_safe_ingest_limit=3,
+        ),
+    )
     store = ProposalStore(root=tmp_path / "proposals")
     applied = asyncio.Event()
 
@@ -417,7 +430,16 @@ async def test_retriage_pending_auto_rejects_invalid_studio_debug(tmp_path, monk
     assert current.triage_decision == "auto_rejected"
 
 
-def test_proposal_store_auto_rejects_duplicate_system_feature_proposals(tmp_path):
+def test_proposal_store_auto_rejects_duplicate_system_feature_proposals(tmp_path, monkeypatch):
+    # cortex auto-triage is opt-in by default now (audit 2026-06-13); enable it.
+    monkeypatch.setattr(
+        "skyn3t.config.settings.get_settings",
+        lambda: SimpleNamespace(
+            cortex_auto_approve_system=True,
+            cortex_auto_reject_duplicates=True,
+            cortex_auto_triage_duplicate_window_seconds=86_400,
+        ),
+    )
     store = ProposalStore(root=tmp_path / "proposals")
     first = store.create(
         kind="feature",
@@ -446,7 +468,16 @@ def test_proposal_store_auto_rejects_duplicate_system_feature_proposals(tmp_path
     assert second_current.triage_decision == "auto_rejected"
 
 
-def test_proposal_store_auto_rejects_low_signal_ingest(tmp_path):
+def test_proposal_store_auto_rejects_low_signal_ingest(tmp_path, monkeypatch):
+    # cortex auto-triage is opt-in by default now (audit 2026-06-13); enable it.
+    monkeypatch.setattr(
+        "skyn3t.config.settings.get_settings",
+        lambda: SimpleNamespace(
+            cortex_auto_approve_system=True,
+            cortex_auto_reject_low_signal_ingest=True,
+            cortex_auto_triage_min_ingest_topic_length=6,
+        ),
+    )
     store = ProposalStore(root=tmp_path / "proposals")
 
     proposal = store.create(

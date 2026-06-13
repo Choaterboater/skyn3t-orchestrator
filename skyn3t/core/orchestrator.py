@@ -1273,23 +1273,11 @@ class Orchestrator:
                     self._consciousness.join_session(task.session_id, target_agent.name)
                 )
 
-            # Inject collective context into task input (blocking, before queue)
+            # cortex audit 2026-06-13: removed dead get_relevant_context() call and
+            # the task.input_data["collective_context"] write it fed -- the key was
+            # read by zero agents, so building it was pure per-task compute waste.
+            # The TASK_ENRICHED event is preserved (consumed by web/app.py feed).
             if self._consciousness and target_agent:
-                try:
-                    cap_name = (
-                        target_agent.capabilities[0].name
-                        if target_agent.capabilities
-                        else None
-                    )
-                    ctx = await self._consciousness.get_relevant_context(
-                        agent_name=target_agent.name,
-                        task_description=task.description or task.title,
-                        capability=cap_name,
-                        session_id=task.session_id,
-                    )
-                    task.input_data["collective_context"] = ctx
-                except Exception:
-                    pass
                 self.event_bus.publish(
                     Event(
                         event_type=EventType.TASK_ENRICHED,

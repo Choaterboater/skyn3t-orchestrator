@@ -15,13 +15,48 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 
 from skyn3t.registry.catalog import build_agent_override
 
 logger = logging.getLogger("skyn3t.registry.defaults")
+
+# cortex audit 2026-06-13: GatedTuner writes approved tuning nudges to
+# data/config/runtime.json under {"agents": {<name>: {<config overrides>}}}
+# (see skyn3t/cortex/gated_tuner.py). Nothing read that file at startup, so
+# approved tuning never took effect (write-only dead loop). Load it here and
+# layer the per-agent overrides over each agent's base config at construction.
+RUNTIME_CONFIG_PATH = Path("data/config/runtime.json")
+
+
+def _load_runtime_agent_overrides(
+    path: Path | str = RUNTIME_CONFIG_PATH,
+) -> Dict[str, Dict[str, Any]]:
+    """Return {agent_name: {config overrides}} from runtime.json.
+
+    Defensive: a missing or corrupt file yields {} and never raises, so a bad
+    tuning write can never abort agent registration.
+    """
+    try:
+        p = Path(path)
+        if not p.exists():
+            return {}
+        loaded = json.loads(p.read_text())
+        agents = loaded.get("agents") if isinstance(loaded, dict) else None
+        if not isinstance(agents, dict):
+            return {}
+        return {
+            str(name): dict(cfg)
+            for name, cfg in agents.items()
+            if isinstance(cfg, dict)
+        }
+    except Exception:
+        logger.exception("runtime tuning overrides load failed (ignored)")
+        return {}
 
 
 def _kw_eb(o):  # event_bus only
@@ -68,6 +103,10 @@ async def register_default_roster(orchestrator) -> Dict[str, Any]:
     registered: List[str] = []
     skipped: List[Dict[str, str]] = []
 
+    # cortex audit 2026-06-13: approved tuning overrides keyed by agent name
+    # (and class name as fallback), layered over base config below.
+    runtime_overrides = _load_runtime_agent_overrides()
+
     import time as _time
 
     for class_name, kwargs_factory in DEFAULT_ROSTER:
@@ -111,6 +150,21 @@ async def register_default_roster(orchestrator) -> Dict[str, Any]:
                     agent.apply_override(merged)
             except Exception:
                 logger.exception("override apply failed for %s", class_name)
+            # cortex audit 2026-06-13: layer approved tuning (runtime.json)
+            # over the agent's base config. GatedTuner keys by runtime agent
+            # name; fall back to class name. Tuning keys (request_interval,
+            # timeout, max_tokens, prompt_suffix, auth_retry, temperature,
+            # max_retries) are read straight off agent.config, so merge there.
+            try:
+                tuning = (
+                    runtime_overrides.get(getattr(agent, "name", ""))
+                    or runtime_overrides.get(getattr(cls, "__name__", ""))
+                    or {}
+                )
+                if tuning and isinstance(getattr(agent, "config", None), dict):
+                    agent.config.update(tuning)
+            except Exception:
+                logger.exception("runtime tuning apply failed for %s", class_name)
             if hasattr(agent, "initialize"):
                 init = agent.initialize()
                 if inspect.iscoroutine(init):
