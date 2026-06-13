@@ -151,3 +151,48 @@ def auto_install_hub_if_enabled() -> Optional[Dict[str, Any]]:
     hub_result = install_from_hub(only_missing=True, reject_unsafe=True)
     draft_result = auto_approve_safe_skill_drafts()
     return {"hub": hub_result, "drafts": draft_result}
+
+
+def distill_skill_from_build(
+    *,
+    slug: str,
+    brief: str,
+    stack: str,
+    score: int,
+    min_score: int = 85,
+) -> Optional[Dict[str, Any]]:
+    """Auto-distill a skill draft after a high-scoring successful build (M5).
+
+    Writes to ``data/skills/drafts/`` — promotion to live library stays
+    approval-gated unless no-approval mode auto-approves safe drafts.
+    """
+    if score < min_score:
+        return None
+    from skyn3t.intelligence.skill_library import Skill, _slugify, get_default_library
+
+    lib = get_default_library()
+    stack_tag = (stack or "unknown").strip().lower() or "unknown"
+    name = f"{stack_tag}-winning-pattern-{slug[:40]}"
+    slugged = _slugify(name)
+    existing = {s.slug for s in lib.all()}
+    if lib.get_draft(name) or slugged in existing:
+        return {"skipped": name, "reason": "already exists"}
+
+    body = (
+        f"# Winning build pattern: {slug}\n\n"
+        f"Studio build scored **{score}/100** on stack `{stack_tag}`.\n\n"
+        f"**Brief (truncated):** {brief[:600]}\n\n"
+        "Reuse this scaffold shape, verification gates, and packaging layout "
+        "for similar briefs on the same stack."
+    )
+    skill = Skill(
+        name=name,
+        body=body,
+        description=f"Auto-distilled from successful build {slug} ({score}/100).",
+        tags=[stack_tag, "build-success", "auto-distilled"],
+        triggers=[stack_tag, "scaffold"],
+        success_count=1,
+        source="build_distill",
+    )
+    path = lib.upsert_draft(skill)
+    return {"draft": path.stem, "path": str(path)}

@@ -48,6 +48,53 @@ services:
       start_period: 60s
 ```
 
+## Fleet-aware supervisor (moat plan Phase 3)
+
+For autonomous fleet runs, probe **`/api/fleet/status`** in addition to `/health`
+so a hung cortex (web up, fleet dead) still triggers a restart.
+
+```bash
+# scripts/healthcheck_fleet.sh — exit non-zero when fleet API is unhealthy
+curl -sf "http://127.0.0.1:6660/api/fleet/status" | python3 -c \
+  "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('ok', True) else 1)"
+```
+
+### systemd unit (Linux)
+
+```ini
+[Unit]
+Description=SkyN3t orchestrator
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/skyn3t/repo
+Environment=SKYN3T_NEVER_STOP=1
+ExecStart=/opt/skyn3t/repo/.venv/bin/python -m skyn3t.cli.main start --host 127.0.0.1 --port 6660
+ExecStartPost=/bin/sleep 5
+Restart=on-failure
+RestartSec=10
+# Optional external wrapper instead of direct ExecStart:
+# ExecStart=/opt/skyn3t/repo/scripts/never_stop.sh
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Pair with a timer or `WatchdogSec` using `scripts/healthcheck_fleet.sh`.
+
+### launchd (macOS)
+
+Use `scripts/never_stop.sh` as the `ProgramArguments` entry and set
+`KeepAlive` + `ThrottleInterval` 30. Point a `StartInterval` job at
+`scripts/healthcheck_fleet.sh` to restart when fleet status fails.
+
+### Process wrapper
+
+`scripts/never_stop.sh` restarts the web server when port 6660 stops
+listening. It complements — but does not replace — an external supervisor
+for OOM/segfault kills.
+
 ## Credential hygiene
 
 Keep `.env` at mode `600`, store production secrets in a keychain / secret

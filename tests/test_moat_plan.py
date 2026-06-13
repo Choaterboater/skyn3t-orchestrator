@@ -113,11 +113,17 @@ def test_a2a_enabled_for_deep_profile(monkeypatch) -> None:
 
 
 def test_distill_skill_from_high_scoring_build(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("SKYN3T_SKILLS_DIR", str(tmp_path / "skills"))
-    from skyn3t.intelligence.skills_hub import distill_skill_from_build
+    from skyn3t.intelligence.skill_library import SkillLibrary
+    from skyn3t.intelligence import skills_hub
 
-    result = distill_skill_from_build(
-        slug="demo-app",
+    lib = SkillLibrary(root=tmp_path / "skills")
+    monkeypatch.setattr(
+        "skyn3t.intelligence.skill_library.get_default_library",
+        lambda: lib,
+    )
+
+    result = skills_hub.distill_skill_from_build(
+        slug="unique-demo-app-xyz",
         brief="Build a FastAPI health dashboard",
         stack="python",
         score=88,

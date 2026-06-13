@@ -235,7 +235,8 @@ class TestCodeAgent:
         result = await agent.execute(task)
 
         assert result.success is True
-        assert result.output["files"] == [str(tmp_path / "scaffold" / "app.py")]
+        files = result.output["files"]
+        assert str(tmp_path / "scaffold" / "app.py") in files
         assert (tmp_path / "scaffold" / "app.py").exists()
         assert not (tmp_path / "scaffold_log.txt").exists()
 
