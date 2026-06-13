@@ -1421,10 +1421,12 @@ async def test_list_agents_surfaces_effective_policy_route(monkeypatch):
 
     result = await web_app.list_agents()
 
-    assert result["agents"][0]["backend"] == "openrouter"
-    assert result["agents"][0]["model"] == "qwen/qwen3-coder-plus"
-    assert result["agents"][0]["effective_backend"] == "openrouter"
-    assert result["agents"][0]["effective_model"] == "qwen/qwen3-coder-plus"
+    # reviewer is a reasoning stage → strong tier → claude_cli/opus
+    # (owner directive 2026-06-11); effective route is sourced from policy.
+    assert result["agents"][0]["backend"] == "claude_cli"
+    assert result["agents"][0]["model"] == "opus"
+    assert result["agents"][0]["effective_backend"] == "claude_cli"
+    assert result["agents"][0]["effective_model"] == "opus"
 
 
 @pytest.mark.asyncio
@@ -1701,7 +1703,8 @@ async def test_agent_config_reset_clears_backend_model_only(monkeypatch, tmp_pat
     assert "model" not in agent.config
     assert agent.config["temperature"] == 0.4
     assert store.get("reviewer") == {"temperature": 0.4}
-    assert result["config_view"]["effective_backend"] == "openrouter"
+    # reviewer policy route → strong tier → claude_cli (2026-06-11 directive)
+    assert result["config_view"]["effective_backend"] == "claude_cli"
     assert result["config_view"]["effective_source"] == "policy"
 
 

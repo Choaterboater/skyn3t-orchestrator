@@ -35,6 +35,10 @@ def isolate_runtime_state(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
     monkeypatch.setenv("SECRET_STORAGE_PATH", str(secrets_path))
     monkeypatch.setenv("AUDIT_LOG_DIR", str(audit_dir))
+    # model_routing_path defaults to a hardcoded ./data path, so the live
+    # system's auto-tuning (regression tier bumps, model evolution) leaks into
+    # tests that read effective policy routes. Pin it into the isolated dir.
+    monkeypatch.setenv("SKYN3T_MODEL_ROUTING_PATH", str(data_dir / "model_routing.json"))
     # Prevent real OpenRouter calls in tests (scaffold entrypoint fast-path).
     monkeypatch.setenv("OPENROUTER_API_KEY", "")
     # Force inline execution backend so tests don't pull Docker images.
@@ -69,7 +73,16 @@ def isolate_runtime_state(tmp_path_factory, monkeypatch):
         except Exception:
             pass
 
+    def _reset_routing_store() -> None:
+        try:
+            import skyn3t.config.model_routing as routing_module
+
+            routing_module._store = None
+        except Exception:
+            pass
+
     get_settings.cache_clear()
+    _reset_routing_store()
     try:
         asyncio.run(close_engine())
     except Exception:
@@ -87,6 +100,7 @@ def isolate_runtime_state(tmp_path_factory, monkeypatch):
     memory_database._async_session_maker = None
     get_settings.cache_clear()
     _reset_proposal_store()
+    _reset_routing_store()
 
 
 @pytest.fixture

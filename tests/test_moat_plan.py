@@ -113,8 +113,8 @@ def test_a2a_enabled_for_deep_profile(monkeypatch) -> None:
 
 
 def test_distill_skill_from_high_scoring_build(tmp_path, monkeypatch) -> None:
-    from skyn3t.intelligence.skill_library import SkillLibrary
     from skyn3t.intelligence import skills_hub
+    from skyn3t.intelligence.skill_library import SkillLibrary
 
     lib = SkillLibrary(root=tmp_path / "skills")
     monkeypatch.setattr(

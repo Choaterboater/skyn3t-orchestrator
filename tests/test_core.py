@@ -517,8 +517,11 @@ class TestOrgChart:
 
         assert view["config"]["backend"] is None
         assert view["config"]["model"] is None
-        assert view["effective_backend"] == "openrouter"
-        assert view["effective_model"] == "qwen/qwen3-coder-plus"
+        # reviewer is a reasoning stage → strong tier → claude_cli/opus
+        # (owner directive 2026-06-11). The exact backend is incidental; the
+        # point is that the effective route is sourced from policy.
+        assert view["effective_backend"] == "claude_cli"
+        assert view["effective_model"] == "opus"
         assert view["effective_source"] == "policy"
 
     async def test_get_config_view_can_resolve_policy_from_agent_type(self, event_bus):
@@ -558,7 +561,8 @@ class TestOrgChart:
         assert "model" not in agent.config
         assert agent.config["temperature"] == 0.2
         assert result["config_view"]["effective_source"] == "policy"
-        assert result["config_view"]["effective_backend"] == "openrouter"
+        # reviewer policy route → strong tier → claude_cli (2026-06-11 directive)
+        assert result["config_view"]["effective_backend"] == "claude_cli"
 
     async def test_orchestrator_registry_includes_hierarchy(self, event_bus):
         orch = Orchestrator(event_bus)
