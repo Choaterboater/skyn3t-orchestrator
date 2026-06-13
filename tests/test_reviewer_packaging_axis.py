@@ -448,6 +448,77 @@ class TestSubScoreParser:
         assert total == 70
 
 
+class TestTotalScoreParsing:
+    """Production ``_parse_total_score`` must recover a total from loose
+    formats. Cheaper model tiers frequently drop the exact ``Score:`` label;
+    when the total can't be parsed the whole LLM review is discarded and the
+    blend collapses to a deterministic heuristic-only ~53 (the react_vite
+    score regression this guards against)."""
+
+    def _p(self, text: str):
+        return ReviewerAgent._parse_total_score(text)
+
+    def test_canonical_score_line(self):
+        assert self._p("Score: 82/100") == 82
+
+    def test_rating_keyword(self):
+        assert self._p("Overall Rating: 71") == 71
+
+    def test_slash_100_without_keyword(self):
+        assert self._p("Total: 76/100") == 76
+
+    def test_out_of_100_phrasing(self):
+        assert self._p("I'd put this at 68 out of 100 overall.") == 68
+
+    def test_lone_sub_score_is_not_a_total(self):
+        assert self._p("Completeness: 20/25") is None
+
+    def test_no_numeric_score_returns_none(self):
+        assert self._p("This review has no numeric score at all.") is None
+
+
+class TestPartialAxisScoreRecovery:
+    """When the LLM emits 2-3 axes and no parseable total, _llm_review should
+    estimate the total from the mean axis rather than returning None (which
+    forces the deterministic heuristic-only fallback)."""
+
+    @pytest.mark.asyncio
+    async def test_three_axes_no_total_recovers_score(self, monkeypatch):
+        agent = _make_reviewer()
+
+        async def fake_gen(**_kwargs):
+            return (
+                "## Review\n"
+                "Completeness: 20/25\n"
+                "Correctness: 18/25\n"
+                "Consistency: 22/25\n"
+                "Looks solid overall.\n"
+            )
+
+        monkeypatch.setattr(agent, "_llm_generate", fake_gen)
+        body, score, subs = await agent._llm_review(
+            brief="b", contents={"a.py": "x = 1"}
+        )
+        assert body is not None
+        # mean axis = (20+18+22)/3 = 20 → *4 = 80
+        assert score == 80
+        # only three axes → not a full 4-axis sub_score dict
+        assert subs is None
+
+    @pytest.mark.asyncio
+    async def test_review_with_slash_100_total_is_kept(self, monkeypatch):
+        agent = _make_reviewer()
+
+        async def fake_gen(**_kwargs):
+            return "## Review\nStrong work.\nTotal: 77/100\n"
+
+        monkeypatch.setattr(agent, "_llm_generate", fake_gen)
+        _body, score, _subs = await agent._llm_review(
+            brief="b", contents={"a.py": "x = 1"}
+        )
+        assert score == 77
+
+
 class TestEdgeCases:
     def test_nonexistent_path_returns_zero(self) -> None:
         score, gaps, family = _make_reviewer()._packaging_score(Path("/does/not/exist"))

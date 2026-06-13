@@ -40,6 +40,12 @@ _SCORE_RE = re.compile(
     r"(?:score|rating)\b[ \t:\-–—]*?(\d{1,3})\b(?!\s*/\s*25)",
     re.IGNORECASE,
 )
+# Fallback total-score patterns for models that drop the "Score:" label.
+# Matches "75/100" or "75 out of 100" but never a "/25" sub-score line.
+_SCORE_OUT_OF_100_RE = re.compile(
+    r"\b(\d{1,3})\s*(?:/|out\s+of)\s*100\b",
+    re.IGNORECASE,
+)
 # Per-axis regexes for the 4-axis structured rubric. Each axis scores
 # /25 and the four sum into the /100 total. We accept "Completeness:
 # 18/25", "Completeness: 18", and "Completeness 18 / 25" — graders
@@ -727,6 +733,35 @@ class ReviewerAgent(BaseAgent):
             pass
         return fallback
 
+    @staticmethod
+    def _parse_total_score(text: str) -> Optional[int]:
+        """Extract a 0-100 total score from a free-form LLM review.
+
+        Tries the keyworded ``Score:``/``Rating:`` line first, then any
+        ``NN/100`` / ``NN out of 100`` phrasing. Cheaper models often drop
+        the exact ``Score:`` label; without this fallback a perfectly good
+        LLM review is discarded and the blend collapses to a deterministic
+        heuristic-only score (~53), which silently tanks the stack trend.
+        """
+        if not text:
+            return None
+        m = _SCORE_RE.search(text)
+        if m:
+            try:
+                v = int(m.group(1))
+                if 0 <= v <= 100:
+                    return v
+            except ValueError:
+                pass
+        for m2 in _SCORE_OUT_OF_100_RE.finditer(text):
+            try:
+                v = int(m2.group(1))
+            except ValueError:
+                continue
+            if 0 <= v <= 100:
+                return v
+        return None
+
     async def _llm_review(
         self,
         *,
@@ -830,21 +865,20 @@ class ReviewerAgent(BaseAgent):
             if 0 <= v_axis <= 25:
                 sub_scores[axis] = v_axis
 
-        # Total score. Prefer the explicit `Score: NN/100` line. Fall
-        # back to summing the four sub-scores when they're all present.
-        score: Optional[int] = None
-        m = _SCORE_RE.search(out)
-        if m:
-            try:
-                v = int(m.group(1))
-                if 0 <= v <= 100:
-                    score = v
-            except ValueError:
-                pass
+        # Total score. Prefer the explicit `Score: NN/100` line, then any
+        # `NN/100` phrasing, then summing the four sub-scores.
+        score: Optional[int] = self._parse_total_score(out)
         if score is None and len(sub_scores) == 4:
             total = sum(sub_scores.values())
             if 0 <= total <= 100:
                 score = total
+        # Partial-axis recovery: cheaper models sometimes emit only 2-3 axes
+        # and no parseable total. Scale the mean axis (/25) to /100 instead of
+        # discarding the whole LLM review — without this the blend collapses to
+        # a deterministic heuristic-only ~53 and tanks the stack's score trend.
+        if score is None and 2 <= len(sub_scores) < 4:
+            mean_axis = sum(sub_scores.values()) / len(sub_scores)
+            score = max(0, min(100, int(round(mean_axis * 4))))
 
         # Only return sub_scores when all four are present — partial
         # coverage isn't useful downstream and would mislead the rubric
