@@ -135,6 +135,12 @@ class Settings(BaseSettings):
     cortex_auto_triage_max_scout_ingest_limit: int = Field(
         default=10, alias="SKYN3T_CORTEX_AUTO_TRIAGE_MAX_SCOUT_INGEST_LIMIT"
     )
+    # Max self-edit (feature/code_patch) applies to spawn per retriage sweep.
+    # Each apply runs the full test suite, so a deep backlog is drained in
+    # bounded batches instead of all at once. 0 = unlimited.
+    cortex_self_edit_retriage_batch: int = Field(
+        default=5, alias="SKYN3T_CORTEX_SELF_EDIT_RETRIAGE_BATCH"
+    )
     cortex_scout_spawn_features: bool = Field(
         default=True, alias="SKYN3T_CORTEX_SCOUT_SPAWN_FEATURES"
     )
@@ -172,7 +178,13 @@ class Settings(BaseSettings):
     autonomous_brief_domain: str = Field(
         default="", alias="SKYN3T_AUTONOMOUS_BRIEF_DOMAIN"
     )
+    # 0 = no count limit; the daily budget (USD) governs instead.
     autonomous_build_daily_cap: int = Field(default=3, alias="SKYN3T_AUTONOMOUS_BUILD_DAILY_CAP")
+    # When true (and full-auto/no-approval is on), repo self-edit proposals
+    # (feature / code_patch, incl. user dashboard ideas) auto-approve and apply.
+    # Applies happen on a throwaway `skyn3t/auto/<id>` branch behind a pytest
+    # gate — never directly on main — so this stays safe to leave on.
+    auto_apply_self_edits: bool = Field(default=False, alias="SKYN3T_AUTO_APPLY_SELF_EDITS")
     autonomous_build_interval_seconds: int = Field(
         default=900, alias="SKYN3T_AUTONOMOUS_BUILD_INTERVAL_SECONDS"
     )

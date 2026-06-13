@@ -110,6 +110,62 @@ async def test_autonomous_build_respects_daily_cap(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_autonomous_build_cap_zero_means_unlimited(monkeypatch):
+    # cap=0 → no count limit; the daily budget governs instead. Without the
+    # cap>0 guard, daily_builds >= 0 would block every build.
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILDS", "1")
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILD_DAILY_CAP", "0")
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD", "100.0")
+    get_settings.cache_clear()
+
+    runner = _FakeRunner()
+    orch = SimpleNamespace(
+        memory_store=_FakeMemory(),
+        running_tasks={},
+        get_studio_runner=lambda: runner,
+        _repo_scout=None,
+    )
+    coord = AutonomousCoordinator(orch, MagicMock())
+    coord.state.daily_builds = 9999  # far above any historical count cap
+    coord.state.today_date = __import__("time").strftime("%Y-%m-%d")
+    await coord._pending.put(
+        AutonomousBrief(brief="Build a tiny notes app.", source="test")
+    )
+
+    skip = await coord._maybe_start_build()
+    assert skip is None
+    assert len(runner.started) == 1
+
+
+@pytest.mark.asyncio
+async def test_autonomous_build_cap_zero_still_honors_budget(monkeypatch):
+    # Even with an unlimited count cap, the daily USD budget remains the guard.
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILDS", "1")
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILD_DAILY_CAP", "0")
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD", "5.0")
+    get_settings.cache_clear()
+
+    runner = _FakeRunner()
+    orch = SimpleNamespace(
+        memory_store=_FakeMemory(),
+        running_tasks={},
+        get_studio_runner=lambda: runner,
+        _repo_scout=None,
+    )
+    coord = AutonomousCoordinator(orch, MagicMock())
+    coord.state.daily_spend_usd = 9.0  # over the $5 budget
+    coord.state.today_date = __import__("time").strftime("%Y-%m-%d")
+    await coord._pending.put(
+        AutonomousBrief(brief="Build a tiny notes app.", source="test")
+    )
+
+    skip = await coord._maybe_start_build()
+    assert skip is not None
+    assert "budget" in skip.lower()
+    assert len(runner.started) == 0
+
+
+@pytest.mark.asyncio
 async def test_autonomous_build_starts_when_enabled(monkeypatch):
     monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD", "100.0")
     monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILDS", "1")

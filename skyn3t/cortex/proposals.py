@@ -164,6 +164,20 @@ class ProposalStore:
             )
             defer_auto_apply = True
             decided_now = True
+        elif not requires_approval and self._handlers.get(kind) is None:
+            # Handler not registered yet (boot ordering: a component may create
+            # an auto-approved proposal before cortex install_handlers runs).
+            # Store as approved so resume_inflight() applies it once the handler
+            # exists, instead of auto-applying now and hard-failing on "no
+            # handler".
+            logger.debug(
+                "proposal %s/%s auto-apply deferred: no handler for '%s' yet",
+                kind,
+                title[:80],
+                kind,
+            )
+            defer_auto_apply = True
+            decided_now = True
         if rejected_immediately:
             initial_status = "rejected"
         elif defer_auto_apply:
@@ -262,12 +276,34 @@ class ProposalStore:
         self._emit({"type": "rejected", "proposal": p.to_public()})
         return {"ok": True}
 
-    async def retriage_pending(self) -> Dict[str, int]:
+    async def retriage_pending(
+        self, *, max_self_edits: Optional[int] = None
+    ) -> Dict[str, int]:
         auto_approved = 0
         auto_rejected = 0
-        for proposal in list(self.list(status="pending", origin="system")):
+        self_edits_done = 0
+        # Process every pending origin (system + user dashboard ideas). The
+        # per-kind triage gates decide what's eligible; user self-edits only
+        # auto-approve when SKYN3T_AUTO_APPLY_SELF_EDITS is on.
+        #
+        # ``max_self_edits`` bounds how many feature/code_patch applies we
+        # spawn per call — each runs the full test suite (up to a 20-min
+        # timeout), so draining a deep backlog all at once would peg the box.
+        # The remainder stays pending and drains on later cycles.
+        for proposal in list(self.list(status="pending")):
             current = self.get(proposal.id)
             if current is None or current.status != "pending":
+                continue
+            is_self_edit = (
+                current.kind in {"feature", "code_patch"}
+                and str((current.payload or {}).get("kind") or "").strip()
+                != "build_pattern_bias"
+            )
+            if (
+                is_self_edit
+                and max_self_edits is not None
+                and self_edits_done >= max_self_edits
+            ):
                 continue
             triage = self._decide_auto_triage(
                 kind=current.kind,
@@ -292,12 +328,20 @@ class ProposalStore:
                 auto_rejected += 1
                 continue
             if triage.action == "auto_approved":
+                # Don't approve a kind whose handler isn't registered yet
+                # (boot ordering: retriage can run before install_handlers).
+                # Approving now would hard-fail it; leave it pending so a later
+                # sweep approves it once the handler exists.
+                if self._handlers.get(current.kind) is None:
+                    continue
                 current.requires_approval = False
                 current.triage_decision = "auto_approved"
                 current.triage_reason = triage.reason
                 self._write(current, decided=False)
                 await self.approve(current.id)
                 auto_approved += 1
+                if is_self_edit:
+                    self_edits_done += 1
         return {
             "auto_approved": auto_approved,
             "auto_rejected": auto_rejected,
@@ -333,6 +377,10 @@ class ProposalStore:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         return {"cancelled": len(tasks)}
+
+    def inflight_apply_count(self) -> int:
+        """How many proposal applies are running in the background right now."""
+        return len(self._active_apply_ids)
 
     # internals ---
     def _path(self, p: Proposal, *, decided: bool = False) -> Path:
@@ -442,7 +490,29 @@ class ProposalStore:
         except Exception:
             return _AutoTriageDecision("pending")
 
-        # Safety floor: never auto-approve SkyN3t repo self-edits.
+        # Operator opt-in (SKYN3T_AUTO_APPLY_SELF_EDITS=1) to let the system
+        # apply its own learnings. Safe because code_improver applies every
+        # patch on a throwaway `skyn3t/auto/<id>` branch behind a pytest gate —
+        # main is never edited directly.
+        self_edits_auto = full_auto and bool(
+            getattr(settings, "auto_apply_self_edits", False)
+        )
+
+        # Self-edit proposals (feature / code_patch), including user-submitted
+        # dashboard ideas (origin != "system"), auto-approve when opted in.
+        # build_pattern_bias is handled by its own safe branch further down.
+        if (
+            self_edits_auto
+            and kind in {"feature", "code_patch"}
+            and str(payload.get("kind") or "").strip() != "build_pattern_bias"
+        ):
+            return _AutoTriageDecision(
+                "auto_approved",
+                "auto-approved self-edit (auto-apply mode)",
+            )
+
+        # Safety floor: never auto-approve SkyN3t repo self-edits unless the
+        # operator explicitly opted in above.
         if kind == "code_patch":
             return _AutoTriageDecision("pending")
         if kind == "feature" and str(payload.get("kind") or "").strip() != "build_pattern_bias":

@@ -326,9 +326,13 @@ async def _resume_cortex_proposals() -> Dict[str, int]:
 
 
 async def _retriage_cortex_proposals() -> Dict[str, int]:
+    from skyn3t.config.settings import get_settings
     from skyn3t.cortex import get_store
 
-    return await get_store().retriage_pending()
+    batch = max(0, int(getattr(get_settings(), "cortex_self_edit_retriage_batch", 5)))
+    # Bound the at-boot self-edit applies; the rest drain on later cycles so a
+    # deep backlog can't kick off dozens of test runs at startup.
+    return await get_store().retriage_pending(max_self_edits=batch or None)
 
 
 async def _reset_runtime_services() -> Dict[str, Any]:

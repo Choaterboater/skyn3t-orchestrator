@@ -87,6 +87,171 @@ def test_proposal_store_feature_proposals_stay_pending_under_selective_triage(tm
     assert current.decided_at is None
 
 
+def _enable_self_edit_autoapply(monkeypatch):
+    """Full-auto + SKYN3T_AUTO_APPLY_SELF_EDITS=1 equivalent for triage."""
+    settings = SimpleNamespace(
+        auto_apply_self_edits=True,
+        cortex_auto_approve_system=False,
+        cortex_auto_reject_duplicates=False,
+        cortex_auto_reject_low_signal_ingest=False,
+    )
+    monkeypatch.setattr("skyn3t.config.settings.get_settings", lambda: settings)
+    monkeypatch.setattr(
+        "skyn3t.config.settings.auto_approve_enabled", lambda s=None: True
+    )
+
+
+@pytest.mark.asyncio
+async def test_feature_proposal_auto_applies_when_self_edits_enabled(tmp_path, monkeypatch):
+    _enable_self_edit_autoapply(monkeypatch)
+    store = ProposalStore(root=tmp_path / "proposals")
+    applied = asyncio.Event()
+
+    async def handler(payload):
+        applied.set()
+        return {"ok": True}
+
+    store.register_handler("feature", handler)
+    proposal = store.create(
+        kind="feature",
+        title="System learning",
+        summary="Improve retry backoff",
+        detail="detail",
+        payload={"idea": "improve retry backoff", "target_file": "skyn3t/x.py"},
+        source="feature_suggester:failure_pattern",
+    )
+
+    await asyncio.wait_for(applied.wait(), timeout=1)
+    current = store.get(proposal.id)
+    assert current is not None
+    assert current.requires_approval is False
+    assert current.triage_decision == "auto_approved"
+
+
+@pytest.mark.asyncio
+async def test_user_dashboard_feature_auto_applies_when_self_edits_enabled(tmp_path, monkeypatch):
+    """User-submitted dashboard ideas (origin != system) also auto-apply."""
+    _enable_self_edit_autoapply(monkeypatch)
+    store = ProposalStore(root=tmp_path / "proposals")
+    applied = asyncio.Event()
+
+    async def handler(payload):
+        applied.set()
+        return {"ok": True}
+
+    store.register_handler("feature", handler)
+    proposal = store.create(
+        kind="feature",
+        title="User idea: dark mode",
+        summary="dark mode",
+        detail="detail",
+        payload={"idea": "dark mode", "target_file": "skyn3t/web/app.py"},
+        source="user_dashboard",
+        origin="user",
+    )
+
+    await asyncio.wait_for(applied.wait(), timeout=1)
+    current = store.get(proposal.id)
+    assert current is not None
+    assert current.triage_decision == "auto_approved"
+
+
+def test_feature_stays_pending_without_self_edit_flag(tmp_path, monkeypatch):
+    """Safety default preserved: full-auto alone does NOT apply self-edits."""
+    settings = SimpleNamespace(auto_apply_self_edits=False)
+    monkeypatch.setattr("skyn3t.config.settings.get_settings", lambda: settings)
+    monkeypatch.setattr(
+        "skyn3t.config.settings.auto_approve_enabled", lambda s=None: True
+    )
+    store = ProposalStore(root=tmp_path / "proposals")
+    proposal = store.create(
+        kind="feature",
+        title="System learning",
+        summary="Improve retry backoff",
+        detail="detail",
+        payload={"idea": "improve retry backoff"},
+        source="feature_suggester:failure_pattern",
+    )
+    current = store.get(proposal.id)
+    assert current is not None
+    assert current.status == "pending"
+    assert current.requires_approval is True
+
+
+@pytest.mark.asyncio
+async def test_retriage_pending_clears_user_feature_backlog(tmp_path, monkeypatch):
+    """The 43-deep user feature backlog auto-applies on retriage when opted in."""
+    # Create the proposal while self-edits are OFF so it lands pending.
+    off = SimpleNamespace(auto_apply_self_edits=False)
+    monkeypatch.setattr("skyn3t.config.settings.get_settings", lambda: off)
+    monkeypatch.setattr(
+        "skyn3t.config.settings.auto_approve_enabled", lambda s=None: True
+    )
+    store = ProposalStore(root=tmp_path / "proposals")
+    applied = asyncio.Event()
+
+    async def handler(payload):
+        applied.set()
+        return {"ok": True}
+
+    store.register_handler("feature", handler)
+    proposal = store.create(
+        kind="feature",
+        title="User idea: small chunked body",
+        summary="small chunked body",
+        detail="detail",
+        payload={"idea": "small chunked body", "target_file": "skyn3t/x.py"},
+        source="user_dashboard",
+        origin="user",
+    )
+    assert store.get(proposal.id).status == "pending"
+
+    # Operator flips SKYN3T_AUTO_APPLY_SELF_EDITS=1, then retriage runs at boot.
+    _enable_self_edit_autoapply(monkeypatch)
+    result = await store.retriage_pending()
+
+    assert result["auto_approved"] == 1
+    await asyncio.wait_for(applied.wait(), timeout=1)
+    current = store.get(proposal.id)
+    assert current is not None
+    assert current.triage_decision == "auto_approved"
+
+
+@pytest.mark.asyncio
+async def test_create_defers_auto_apply_when_handler_missing(tmp_path):
+    """Auto-approved proposals created before their handler exists are stored
+    as approved (deferred) and applied by resume_inflight — not hard-failed.
+
+    Reproduces the boot race where a component creates an auto-approved
+    proposal before cortex install_handlers runs.
+    """
+    store = ProposalStore(root=tmp_path / "proposals")
+    proposal = store.create(
+        kind="ingest",
+        title="boot-time ingest",
+        summary="x",
+        detail="d",
+        payload={"topic": "agentic rag"},
+        source="meta",
+        requires_approval=False,
+    )
+    current = store.get(proposal.id)
+    assert current is not None
+    assert current.status == "approved"  # deferred, NOT failed
+    assert current.applied_at is None
+
+    applied = asyncio.Event()
+
+    async def handler(payload):
+        applied.set()
+        return {"ok": True}
+
+    store.register_handler("ingest", handler)
+    replay = await store.resume_inflight()
+    assert replay["requeued"] == 1
+    await asyncio.wait_for(applied.wait(), timeout=1)
+
+
 @pytest.mark.asyncio
 async def test_proposal_store_create_auto_applies_with_running_loop(tmp_path):
     store = ProposalStore(root=tmp_path / "proposals")

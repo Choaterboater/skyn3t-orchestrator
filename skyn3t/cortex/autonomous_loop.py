@@ -685,6 +685,7 @@ class AutonomousCoordinator:
                 _reset_daily_counters(self.state)
                 self.state.last_tick_at = time.time()
                 await self._maybe_propose_briefs()
+                await self._maybe_retriage_proposals()
                 if not self._fleet_delegates_builds:
                     skip = await self._maybe_start_build()
                     if skip:
@@ -744,6 +745,30 @@ class AutonomousCoordinator:
                 queue_depth=self._pending.qsize(),
             )
         return injected
+
+    async def _maybe_retriage_proposals(self) -> None:
+        """Drain a small batch of pending self-edit learnings each tick.
+
+        New learnings auto-apply on creation; this sweeps any backlog (e.g.
+        proposals queued while the server was down or before the operator
+        enabled auto-apply) without spawning dozens of test runs at once.
+        """
+        try:
+            from skyn3t.config.settings import get_settings
+            from skyn3t.cortex import get_store
+
+            settings = get_settings()
+            if not bool(getattr(settings, "auto_apply_self_edits", False)):
+                return
+            store = get_store()
+            # Backpressure: don't queue more applies while some are still
+            # running (each holds a serialized lock + runs the test suite).
+            if store.inflight_apply_count() > 0:
+                return
+            batch = max(0, int(getattr(settings, "cortex_self_edit_retriage_batch", 5)))
+            await store.retriage_pending(max_self_edits=batch or None)
+        except Exception:
+            logger.debug("periodic proposal retriage failed", exc_info=True)
 
     async def _maybe_propose_briefs(self) -> None:
         self._track_queue_depth()
@@ -843,10 +868,14 @@ class AutonomousCoordinator:
         daily_cap = effective_build_daily_cap(settings)
         daily_budget = float(getattr(settings, "autonomous_build_daily_budget_usd", 5.0))
 
-        if self.state.daily_builds >= daily_cap:
+        # cap == 0 means "no count limit" — let the daily budget govern instead.
+        # (Mirrors replenish_queue_if_stale, which already treats cap>0 as the
+        # only count gate. Without this, cap=0 would block every build because
+        # daily_builds >= 0 is always true.)
+        if daily_cap > 0 and self.state.daily_builds >= daily_cap:
             return f"daily cap reached ({daily_cap})"
         if daily_budget > 0 and self.state.daily_spend_usd >= daily_budget:
-            return f"daily token budget reached (${daily_budget:.2f})"
+            return f"daily budget reached (${daily_budget:.2f})"
 
         runner = self._get_runner()
         if runner is None:
