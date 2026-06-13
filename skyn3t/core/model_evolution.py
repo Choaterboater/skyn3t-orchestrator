@@ -357,6 +357,14 @@ def run_evolution(
         }
         tier_summary[tier_name] = row
 
+        # Operator-locked override (pinned from the dashboard): never let
+        # automatic evolution overwrite a model the user deliberately chose.
+        # Clearing/resetting the tier removes the lock and re-enables evolution.
+        existing_entry = tiers_block.get(tier_name)
+        if isinstance(existing_entry, dict) and existing_entry.get("locked"):
+            row["source"] = "manual_locked"
+            continue
+
         if not best_id or best_score <= 0:
             continue
 

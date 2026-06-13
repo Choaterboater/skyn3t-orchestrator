@@ -1909,6 +1909,128 @@ async def routing_patch(payload: Dict[str, Any]):
     return {"ok": True, "env_path": str(env_path), **_routing_snapshot()}
 
 
+def _routing_tiers_snapshot() -> Dict[str, Any]:
+    """Per-tier model state: the built-in default, the operator's pinned override
+    (if any), and ``effective_model`` — what the router will actually use right
+    now (free-only mode can force a free model regardless of the pin)."""
+    from skyn3t.core.model_evolution import OPENROUTER_TIERS, load_overrides
+    from skyn3t.core.model_router import _TIERS, _tier_backend_model
+
+    raw_tiers = load_overrides(max_age=0.0).get("tiers")
+    overrides = raw_tiers if isinstance(raw_tiers, dict) else {}
+    rows = []
+    for tier in OPENROUTER_TIERS:
+        _, default_model = _TIERS.get(tier, (None, None))
+        entry = overrides.get(tier) if isinstance(overrides.get(tier), dict) else None
+        backend, effective = _tier_backend_model(tier)
+        rows.append(
+            {
+                "tier": tier,
+                "default_model": default_model,
+                "override_model": (entry or {}).get("model"),
+                "locked": bool((entry or {}).get("locked")),
+                "effective_model": effective,
+                "backend": backend,
+            }
+        )
+    return {"tiers": rows, "free_only": _routing_snapshot()["free_only"]}
+
+
+def _catalog_model_ids() -> set:
+    """Model ids in the on-disk OpenRouter catalog (empty when never synced)."""
+    from skyn3t.core.openrouter_catalog import load_catalog
+
+    try:
+        return {m.get("id") for m in load_catalog().models if m.get("id")}
+    except Exception:
+        return set()
+
+
+@app.get("/api/routing/tiers")
+async def routing_tiers_get():
+    """Per-tier model picks (default · override · effective model)."""
+    return _routing_tiers_snapshot()
+
+
+@app.patch("/api/routing/tiers")
+async def routing_tiers_patch(payload: Dict[str, Any]):
+    """Pin the model one tier uses. Body: ``{"tier": ..., "model": ...}``.
+
+    The model must exist in the OpenRouter catalog (rejects typos / stale ids —
+    the failure mode that pinned non-existent models and broke routing before).
+    The pin is LOCKED so automatic model-evolution won't overwrite it; reset to
+    release it. Takes effect on the next routing decision (no restart).
+    """
+    from skyn3t.core.model_evolution import (
+        OPENROUTER_TIERS,
+        load_overrides,
+        save_overrides,
+    )
+
+    tier = str(payload.get("tier") or "").strip()
+    model = str(payload.get("model") or "").strip()
+    if tier not in OPENROUTER_TIERS:
+        return JSONResponse(
+            {"error": f"unknown tier '{tier}'", "valid_tiers": list(OPENROUTER_TIERS)},
+            status_code=400,
+        )
+    if not model:
+        return JSONResponse({"error": "model id required"}, status_code=400)
+    catalog_ids = _catalog_model_ids()
+    # Only enforce membership when we actually have a catalog to check against —
+    # an empty/never-synced cache must not block the operator from pinning.
+    if catalog_ids and model not in catalog_ids:
+        return JSONResponse(
+            {"error": f"model '{model}' is not in the OpenRouter catalog"},
+            status_code=400,
+        )
+
+    data = load_overrides(max_age=0.0)
+    tiers = data.get("tiers")
+    if not isinstance(tiers, dict):
+        tiers = {}
+    entry = tiers.get(tier) if isinstance(tiers.get(tier), dict) else {}
+    entry["model"] = model
+    entry["locked"] = True
+    entry["source"] = "manual"
+    tiers[tier] = entry
+    data["tiers"] = tiers
+    save_overrides(data)
+    return _routing_tiers_snapshot()
+
+
+@app.post("/api/routing/tiers/reset")
+async def routing_tiers_reset(payload: Optional[Dict[str, Any]] = None):
+    """Release a tier's model pin (back to the default + automatic evolution).
+
+    Body ``{"tier": ...}`` resets one tier; an empty body resets all of them.
+    """
+    from skyn3t.core.model_evolution import (
+        OPENROUTER_TIERS,
+        load_overrides,
+        save_overrides,
+    )
+
+    payload = payload or {}
+    tier = str(payload.get("tier") or "").strip()
+    data = load_overrides(max_age=0.0)
+    tiers = data.get("tiers")
+    if not isinstance(tiers, dict):
+        tiers = {}
+    if tier:
+        if tier not in OPENROUTER_TIERS:
+            return JSONResponse(
+                {"error": f"unknown tier '{tier}'", "valid_tiers": list(OPENROUTER_TIERS)},
+                status_code=400,
+            )
+        tiers.pop(tier, None)
+    else:
+        tiers = {}
+    data["tiers"] = tiers
+    save_overrides(data)
+    return _routing_tiers_snapshot()
+
+
 @app.post("/api/agents/{name}/enable")
 async def agent_enable(name: str):
     if not orchestrator:

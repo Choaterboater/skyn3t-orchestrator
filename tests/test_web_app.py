@@ -1712,6 +1712,79 @@ async def test_routing_patch_rejects_non_bool(monkeypatch, tmp_path):
     assert "SKYN3T_FREE_ONLY" not in env_path.read_text(encoding="utf-8")
 
 
+# --- /api/routing/tiers (per-tier model pins, change + reset) ------------------
+# These rely on the autouse conftest isolation that redirects DATA_DIR to a tmp
+# dir, so model_tier_overrides.json + the (empty) catalog cache live in isolation.
+
+
+@pytest.mark.asyncio
+async def test_routing_tiers_get_lists_all_openrouter_tiers():
+    from skyn3t.core.model_evolution import OPENROUTER_TIERS
+
+    result = await web_app.routing_tiers_get()
+
+    names = {r["tier"] for r in result["tiers"]}
+    assert names == set(OPENROUTER_TIERS)
+    for row in result["tiers"]:
+        assert "default_model" in row
+        assert "effective_model" in row
+        assert "override_model" in row
+        assert "locked" in row
+
+
+@pytest.mark.asyncio
+async def test_routing_tiers_patch_pins_locked_and_persists():
+    # Empty catalog in the isolated data dir -> model validation is skipped,
+    # so any well-formed id can be pinned (the validation path is tested below).
+    result = await web_app.routing_tiers_patch(
+        {"tier": "or_strong", "model": "qwen/qwen3-coder:free"}
+    )
+    assert not isinstance(result, web_app.JSONResponse)
+    row = next(r for r in result["tiers"] if r["tier"] == "or_strong")
+    assert row["override_model"] == "qwen/qwen3-coder:free"
+    assert row["locked"] is True
+
+    # Persisted: a fresh GET reflects it, and the router's tier_override_model agrees.
+    again = await web_app.routing_tiers_get()
+    assert next(r for r in again["tiers"] if r["tier"] == "or_strong")["override_model"] == (
+        "qwen/qwen3-coder:free"
+    )
+    from skyn3t.core.model_evolution import tier_override_model
+
+    assert tier_override_model("or_strong") == "qwen/qwen3-coder:free"
+
+
+@pytest.mark.asyncio
+async def test_routing_tiers_patch_rejects_unknown_tier():
+    result = await web_app.routing_tiers_patch({"tier": "bogus_tier", "model": "x/y"})
+    assert isinstance(result, web_app.JSONResponse)
+    assert result.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_routing_tiers_patch_rejects_model_not_in_catalog(monkeypatch):
+    # When a catalog IS available, a model that isn't in it must be rejected —
+    # this is the guard against pinning a typo/stale id (the original break).
+    monkeypatch.setattr(web_app, "_catalog_model_ids", lambda: {"openai/gpt-oss-120b:free"})
+    result = await web_app.routing_tiers_patch({"tier": "or_cheap", "model": "made/up-model"})
+    assert isinstance(result, web_app.JSONResponse)
+    assert result.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_routing_tiers_reset_clears_one_and_all():
+    await web_app.routing_tiers_patch({"tier": "or_ui", "model": "qwen/qwen3-coder:free"})
+    one = await web_app.routing_tiers_reset({"tier": "or_ui"})
+    assert next(r for r in one["tiers"] if r["tier"] == "or_ui")["override_model"] is None
+    assert next(r for r in one["tiers"] if r["tier"] == "or_ui")["locked"] is False
+
+    # reset-all clears every pin.
+    await web_app.routing_tiers_patch({"tier": "or_backend", "model": "qwen/qwen3-coder:free"})
+    await web_app.routing_tiers_patch({"tier": "or_cheap", "model": "openai/gpt-oss-120b:free"})
+    res_all = await web_app.routing_tiers_reset({})
+    assert all(r["override_model"] is None for r in res_all["tiers"])
+
+
 @pytest.mark.asyncio
 async def test_budget_patch_reset_restores_defaults(monkeypatch, tmp_path):
     from skyn3t.config.settings import get_settings

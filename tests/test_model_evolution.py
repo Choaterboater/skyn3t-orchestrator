@@ -133,6 +133,26 @@ def test_run_evolution_upgrades_cheap_tier(tmp_path, monkeypatch):
     assert overrides["tiers"]["or_cheap"]["model"] == "openrouter/owl-beta-v2"
 
 
+def test_run_evolution_skips_operator_locked_override(tmp_path, monkeypatch):
+    """A dashboard-pinned (locked) tier model must survive automatic evolution.
+
+    Without the lock, evolution would upgrade or_cheap to owl-beta-v2 (see the
+    test above). With locked=True the operator's choice is preserved.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    _write_catalog(tmp_path, _sample_models())
+    evolution.save_overrides(
+        {"tiers": {"or_cheap": {"model": "xiaomi/mimo-v2-flash", "locked": True}}}
+    )
+
+    result = evolution.run_evolution()
+
+    assert not any(u["tier"] == "or_cheap" for u in result["upgrades"])
+    overrides = evolution.load_overrides(max_age=0.0)
+    assert overrides["tiers"]["or_cheap"]["model"] == "xiaomi/mimo-v2-flash"
+    assert overrides["tiers"]["or_cheap"]["locked"] is True
+
+
 def test_run_evolution_does_not_downgrade_by_default(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
     _write_catalog(tmp_path, _sample_models())

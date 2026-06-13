@@ -92,6 +92,20 @@ export type RoutingView = {
   default: boolean;
 };
 
+export type RoutingTierModel = {
+  tier: string;
+  default_model?: string | null;
+  override_model?: string | null;
+  locked: boolean;
+  effective_model?: string | null;
+  backend?: string | null;
+};
+
+export type RoutingTiersView = {
+  tiers: RoutingTierModel[];
+  free_only: boolean;
+};
+
 export type RoutingRecommendation = {
   stage: string;
   current_tier: string;
@@ -727,6 +741,17 @@ export const api = {
     fetchJson<RoutingView & { ok?: boolean }>("/api/routing", {
       method: "PATCH",
       body: JSON.stringify(payload),
+    }),
+  routingTiers: () => fetchJson<RoutingTiersView>("/api/routing/tiers"),
+  patchRoutingTier: (tier: string, model: string) =>
+    fetchJson<RoutingTiersView>("/api/routing/tiers", {
+      method: "PATCH",
+      body: JSON.stringify({ tier, model }),
+    }),
+  resetRoutingTier: (tier?: string) =>
+    fetchJson<RoutingTiersView>("/api/routing/tiers/reset", {
+      method: "POST",
+      body: JSON.stringify(tier ? { tier } : {}),
     }),
   projects: () =>
     fetchJson<{ projects: ProjectRow[] }>("/api/studio/projects").then(

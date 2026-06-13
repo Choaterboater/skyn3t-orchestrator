@@ -6,6 +6,7 @@ import {
   HttpError,
   type BudgetView,
   type RoutingView,
+  type RoutingTierModel,
   type ExecutionBackendView,
   type GithubScoutConfig,
   type MetaStatus,
@@ -611,6 +612,15 @@ function BudgetForm({ view }: { view: BudgetView }) {
    ========================================================================== */
 
 function RoutingSection() {
+  return (
+    <>
+      <FreeOnlyCard />
+      <TierModelsCard />
+    </>
+  );
+}
+
+function FreeOnlyCard() {
   const routingQ = useQuery({ queryKey: ["routing"], queryFn: api.routing });
 
   return (
@@ -723,6 +733,166 @@ function RoutingForm({ view }: { view: RoutingView }) {
           <span className="text-status-green text-xs mt-3">
             <i className="fa-solid fa-check mr-1" />
             saved
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* Per-tier model picker: choose which catalog model each OpenRouter tier uses,
+   and reset to the built-in default. Pins are catalog-validated + locked so
+   automatic evolution can't overwrite them. */
+
+type ModelOption = { id: string; price: number; label: string };
+
+function modelCombinedPrice(p?: Record<string, unknown>): number {
+  if (!p) return Number.POSITIVE_INFINITY;
+  const pr = Number((p.prompt ?? p.input) as number);
+  const co = Number((p.completion ?? p.output) as number);
+  if (!Number.isFinite(pr) && !Number.isFinite(co)) return Number.POSITIVE_INFINITY;
+  return (Number.isFinite(pr) ? pr : 0) + (Number.isFinite(co) ? co : 0);
+}
+
+function modelPriceLabel(p?: Record<string, unknown>): string {
+  const pr = Number((p?.prompt ?? 0) as number) * 1e6;
+  const co = Number((p?.completion ?? 0) as number) * 1e6;
+  if (!pr && !co) return "free";
+  return `$${pr.toFixed(2)}/$${co.toFixed(2)} per 1M`;
+}
+
+function TierModelsCard() {
+  const tiersQ = useQuery({ queryKey: ["routing_tiers"], queryFn: api.routingTiers });
+  const catalogQ = useQuery({ queryKey: ["openrouter_models"], queryFn: () => api.openrouterModels() });
+  const qc = useQueryClient();
+
+  // Catalog models, Claude excluded (NO_CLAUDE policy), cheapest first.
+  const options = useMemo<ModelOption[]>(() => {
+    const ms = catalogQ.data?.models ?? [];
+    return ms
+      .filter((m) => {
+        const id = (m.id || "").toLowerCase();
+        return id && !id.includes("claude") && !id.startsWith("anthropic/");
+      })
+      .map((m) => ({
+        id: m.id as string,
+        price: modelCombinedPrice(m.pricing),
+        label: `${m.id} · ${modelPriceLabel(m.pricing)}`,
+      }))
+      .sort((a, b) => a.price - b.price);
+  }, [catalogQ.data]);
+
+  const resetAll = useMutation({
+    mutationFn: () => api.resetRoutingTier(),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["routing_tiers"] }),
+  });
+
+  const freeOnly = tiersQ.data?.free_only ?? false;
+  const anyOverride = (tiersQ.data?.tiers ?? []).some((t) => t.override_model);
+
+  return (
+    <PanelCard>
+      <PanelHeader
+        title="Tier models"
+        icon="fa-solid fa-sliders"
+        description={
+          <>
+            Pick which model each routing tier uses, or leave it on the default.
+            Pins are validated against the live OpenRouter catalog and locked so
+            automatic evolution won&apos;t overwrite them. Persisted to{" "}
+            <code className="font-mono text-xs bg-bg-3 px-1 rounded">data/model_tier_overrides.json</code>.
+          </>
+        }
+        actions={
+          <button
+            type="button"
+            className="btn-ghost text-xs"
+            disabled={resetAll.isPending || !anyOverride}
+            onClick={() => {
+              if (window.confirm("Reset ALL tier model pins to their defaults?")) {
+                resetAll.mutate();
+              }
+            }}
+          >
+            <i className="fa-solid fa-rotate-left mr-1.5" />
+            {resetAll.isPending ? "resetting…" : "reset all"}
+          </button>
+        }
+      />
+      {freeOnly && (
+        <div className="mx-4 mt-4 px-3 py-2 text-xs text-status-yellow border border-status-yellow/30 bg-status-yellow/5 rounded">
+          <i className="fa-solid fa-circle-info mr-1.5" />
+          Free-only routing is ON, so every tier is forced to a free model — these
+          pins take effect once you turn Free models only off above.
+        </div>
+      )}
+      {(tiersQ.isLoading || catalogQ.isLoading) && <LoadingRow label="Loading tiers…" />}
+      {tiersQ.isError && <ErrorRow err={tiersQ.error} />}
+      {tiersQ.data && (
+        <div className="p-4 space-y-3">
+          {tiersQ.data.tiers.map((row) => (
+            <TierModelRow key={row.tier} row={row} options={options} />
+          ))}
+          {catalogQ.isError && (
+            <p className="text-[0.65rem] text-status-yellow">
+              <i className="fa-solid fa-triangle-exclamation mr-1" />
+              catalog unavailable — you can still type a model id, but it won&apos;t be price-sorted
+            </p>
+          )}
+        </div>
+      )}
+    </PanelCard>
+  );
+}
+
+function TierModelRow({ row, options }: { row: RoutingTierModel; options: ModelOption[] }) {
+  const qc = useQueryClient();
+  const [draft, setDraft] = useState(row.override_model ?? "");
+
+  // Re-sync when the server value changes (after save/reset/reset-all).
+  useEffect(() => setDraft(row.override_model ?? ""), [row.override_model]);
+
+  const save = useMutation({
+    mutationFn: (model: string) =>
+      model ? api.patchRoutingTier(row.tier, model) : api.resetRoutingTier(row.tier),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["routing_tiers"] }),
+  });
+
+  const dirty = draft !== (row.override_model ?? "");
+
+  return (
+    <div className="grid gap-2 sm:grid-cols-[8rem_minmax(0,1fr)_auto] sm:items-center">
+      <div className="min-w-0">
+        <div className="font-mono text-xs text-text-primary">{row.tier}</div>
+        <div className="text-[0.6rem] text-text-dim truncate" title={row.effective_model ?? ""}>
+          now: {row.effective_model ?? "—"}
+        </div>
+      </div>
+      <select
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        aria-label={`Model for ${row.tier}`}
+        className="data-input font-mono text-xs w-full focus-visible:ring-2 focus-visible:ring-accent/60"
+      >
+        <option value="">default · {row.default_model ?? "—"}</option>
+        {options.map((o) => (
+          <option key={o.id} value={o.id}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          className="btn-primary text-xs"
+          disabled={save.isPending || !dirty}
+          onClick={() => save.mutate(draft)}
+        >
+          {save.isPending ? "…" : draft ? "pin" : "use default"}
+        </button>
+        {row.override_model && (
+          <span className="text-[0.55rem] uppercase tracking-wide text-accent" title="operator-pinned (evolution won't overwrite)">
+            <i className="fa-solid fa-lock mr-0.5" />pinned
           </span>
         )}
       </div>
