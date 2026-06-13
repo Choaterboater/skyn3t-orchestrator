@@ -299,6 +299,78 @@ def test_evolution_status_payload_for_api(monkeypatch, tmp_path):
     assert status["tiers"]["or_cheap"]["model"] == "openrouter/owl-beta-v2"
 
 
+def test_recency_bonus_prefers_newer_family_versions():
+    """Family point-releases must rank: qwen3.7 > qwen3.6 > qwen3(-coder),
+    and deepseek-v4 > deepseek-v3.2 — none of which the old year/vN-only
+    parser could distinguish."""
+    assert evolution._recency_bonus("qwen/qwen3.7-plus") > evolution._recency_bonus(
+        "qwen/qwen3.6-flash"
+    )
+    assert evolution._recency_bonus("qwen/qwen3.6-flash") > evolution._recency_bonus(
+        "qwen/qwen3-coder-plus"
+    )
+    assert evolution._recency_bonus("deepseek/deepseek-v4-flash") > evolution._recency_bonus(
+        "deepseek/deepseek-v3.2"
+    )
+
+
+def test_score_does_not_let_name_keywords_dominate():
+    """An old coder-named model that is slightly cheaper must NOT out-score a
+    newer GENERAL model that is meaningfully cheaper. Before the fix the
+    coder/code/qwen keyword stack (+6) buried recency + cost."""
+    old_coder = {
+        "id": "qwen/qwen3-coder-plus",
+        "name": "Qwen3 Coder Plus",
+        "description": "qwen coder code specialist backend dev",
+        "context_length": 256_000,
+        "pricing": {"prompt": "0.00000065", "completion": "0.00000325"},
+        "supported_parameters": ["temperature", "tools"],
+    }
+    newer_cheaper = {
+        "id": "qwen/qwen3.7-plus",
+        "name": "Qwen3.7 Plus",
+        "description": "qwen newer general model",
+        "context_length": 256_000,
+        "pricing": {"prompt": "0.00000032", "completion": "0.00000128"},
+        "supported_parameters": ["temperature", "tools"],
+    }
+    for tier in ("or_strong", "or_backend"):
+        old_score = evolution.score_model_for_tier(tier, old_coder["id"], old_coder)
+        new_score = evolution.score_model_for_tier(tier, newer_cheaper["id"], newer_cheaper)
+        assert new_score >= old_score, (
+            f"{tier}: newer cheaper {new_score:.3f} should be >= old coder {old_score:.3f}"
+        )
+
+
+def test_find_best_for_tier_picks_newer_cheaper_over_old_coder(tmp_path):
+    """Catalog with both a qwen3-coder-plus-like and a qwen3.7-plus-like entry:
+    the backend tier must pick the newer, cheaper qwen3.7-plus."""
+    models = [
+        {
+            "id": "qwen/qwen3-coder-plus",
+            "name": "Qwen3 Coder Plus",
+            "description": "qwen coder code backend dev specialist",
+            "context_length": 1_000_000,
+            "pricing": {"prompt": "0.00000065", "completion": "0.00000325"},
+            "supported_parameters": ["temperature", "tools"],
+            "architecture": {"modality": "text"},
+        },
+        {
+            "id": "qwen/qwen3.7-plus",
+            "name": "Qwen3.7 Plus",
+            "description": "qwen newer general flagship",
+            "context_length": 1_000_000,
+            "pricing": {"prompt": "0.00000032", "completion": "0.00000128"},
+            "supported_parameters": ["temperature", "tools"],
+            "architecture": {"modality": "text"},
+        },
+    ]
+    _write_catalog(tmp_path, models)
+    index = {m["id"]: m for m in models}
+    best_id, _ = evolution.find_best_for_tier("or_backend", index)
+    assert best_id == "qwen/qwen3.7-plus"
+
+
 @pytest.mark.asyncio
 async def test_sync_catalog_triggers_evolution(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")

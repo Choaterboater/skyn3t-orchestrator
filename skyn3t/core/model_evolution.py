@@ -43,6 +43,13 @@ _TIER_KEYWORDS: Dict[str, List[str]] = {
 _RECENCY_RE = re.compile(r"(?:^|[^0-9])(20[2-9][0-9]|v(?:\d+(?:\.\d+)?))(?:[^0-9]|$)", re.I)
 _VERSION_RE = re.compile(r"v(\d+(?:\.\d+)?)", re.I)
 
+# Family-version: a numeric release that immediately follows a letter (the
+# model family stem) — e.g. ``qwen3.7``, ``glm-4.6``, ``llama-3.3``, ``k2.7``,
+# ``m3``. Captures the version number so newer point-releases (3.7 > 3.6 > 3)
+# can be rewarded. The trailing ``(?![0-9bB])`` guard rejects parameter sizes
+# like ``120b``/``70b`` and avoids swallowing longer integers.
+_FAMILY_VERSION_RE = re.compile(r"[a-z]-?(\d+(?:\.\d+)?)(?![0-9]*[bB])", re.I)
+
 _event_bus: Any = None
 _overrides_cache: Optional[Dict[str, Any]] = None
 _overrides_loaded_at: float = 0.0
@@ -198,9 +205,20 @@ def _has_tool_support(meta: Dict[str, Any]) -> bool:
 
 
 def _recency_bonus(model_id: str) -> float:
+    """Reward newer models from id hints: release year, ``vN`` version, and
+    the family point-release (``qwen3.7`` > ``qwen3.6`` > ``qwen3-coder``).
+
+    The three signals don't stack — we take the strongest — so a model that
+    encodes both a year and a version number can't out-game one that only
+    states a (higher) version. The family-version path is what lets
+    ``qwen3.7`` beat ``qwen3.6`` and ``deepseek-v4`` beat ``deepseek-v3.2``
+    even when neither carries a year token.
+    """
     bonus = 0.0
+    year_or_v_spans: List[Tuple[int, int]] = []
     for match in _RECENCY_RE.finditer(model_id):
         token = match.group(1)
+        year_or_v_spans.append(match.span(1))
         if token.startswith("20"):
             try:
                 year = int(token)
@@ -210,9 +228,25 @@ def _recency_bonus(model_id: str) -> float:
         elif token.lower().startswith("v"):
             try:
                 ver = float(token[1:])
-                bonus = max(bonus, min(ver * 0.3, 2.0))
+                # vN versions feed the family-version bonus magnitude too, so
+                # a v4 (deepseek-v4) and a 4.x family release rank alike.
+                bonus = max(bonus, min(ver * 0.4, 3.0))
             except ValueError:
                 pass
+
+    # Family point-release: any number glued to a letter family stem, NOT
+    # already consumed by a year (2026) or vN token. This is the general
+    # heuristic that distinguishes qwen3.7/qwen3.6, glm-4.7/glm-4.6, etc.
+    for match in _FAMILY_VERSION_RE.finditer(model_id):
+        start, end = match.span(1)
+        # Skip if this number overlaps a year/vN token we already scored.
+        if any(s < end and start < e for s, e in year_or_v_spans):
+            continue
+        try:
+            ver = float(match.group(1))
+        except ValueError:
+            continue
+        bonus = max(bonus, min(ver * 0.4, 3.0))
     return bonus
 
 
@@ -221,10 +255,19 @@ def score_model_for_tier(tier_name: str, model_id: str, meta: Dict[str, Any]) ->
     keywords = _TIER_KEYWORDS.get(tier_name, [])
     hay = f"{model_id} {meta.get('name', '')} {meta.get('description', '')}".lower()
 
+    # Name keywords are a TIEBREAKER, not the dominant signal. Each match is
+    # worth only +1.0 and the TOTAL is capped at 1.0, so a model whose NAME
+    # happens to contain coder/code/qwen all at once gets the same keyword
+    # credit as a model matching a single tier keyword. This collapses the
+    # old runaway "+2.0 per keyword" bias (qwen3-coder-plus used to bank +6)
+    # to a flat tier-relevance flag, letting recency + cost + context decide
+    # between two on-tier models — exactly so a newer, cheaper model can win.
     score = 0.0
+    keyword_score = 0.0
     for kw in keywords:
         if kw and kw in hay:
-            score += 2.0
+            keyword_score += 1.0
+    score += min(keyword_score, 1.0)
 
     ctx = meta.get("context_length") or 0
     if isinstance(ctx, (int, float)) and ctx > 0:
@@ -235,10 +278,15 @@ def score_model_for_tier(tier_name: str, model_id: str, meta: Dict[str, Any]) ->
     cost = _prompt_cost(meta)
     if cost == 0.0:
         score += 2.0 if tier_name in {"or_cheap", "or_docs"} else 0.5
-    elif cost < 0.0001:
-        score += 1.0
     else:
-        score += max(0.0, 1.5 - cost * 10_000.0)
+        # OpenRouter prices are per-token; the realistic spread is tiny in raw
+        # terms (e.g. 0.00000032 vs 0.00000065) so the old ``cost * 10_000``
+        # term flattened to ~0 and couldn't distinguish a $0.10/1M model from a
+        # $0.65/1M one. Normalise to dollars-per-million tokens and reward
+        # cheaper models on a smooth decay so cost is a real signal that can
+        # outweigh raw name-keyword matching between near-tier models.
+        per_million = cost * 1_000_000.0
+        score += max(0.0, 2.0 / (1.0 + per_million))
 
     if _has_tool_support(meta):
         score += 1.0 if tier_name in {"or_backend", "or_strong"} else 0.3

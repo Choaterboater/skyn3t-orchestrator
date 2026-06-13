@@ -9,16 +9,20 @@ will pick the wrong model for a Python CLI or a marketing site. By
 routing based on classification, we let each model play to its strength
 instead of forcing one tool through every domain.
 
-Empirical baseline (from OpenRouter docs + my own testing):
+Empirical baseline (refreshed against the current OpenRouter catalog —
+newer + cheaper preferred over entrenched older ids):
 
-* **Owl Alpha** — free, 1M ctx, agentic + general code. Strong default.
-* **Qwen3-Coder** — explicit code specialist. Good for backend/CLI/types.
-* **DeepSeek v3.2** — reliable everyday. Bigger files, less drift.
-* **Mimo v2-Flash** — fast paid option for visual / UI work.
-* **Mimo v2.5 Pro** — SWE-bench Pro leader. Premium fallback for the
-  hardest single-file tasks.
-* **Hunyuan-3 Preview** — Tencent's agentic model, strong reasoning.
-* **GPT-5 Mini** — strict logic, predictable JSON output.
+* **DeepSeek V4 Flash** — newest DeepSeek, 1M ctx, ~$0.10/1M in. Cheapest
+  capable everyday driver; replaced the older v3.2.
+* **Qwen3.7 Plus** — current Qwen general flagship, 1M ctx, ~$0.32/1M in.
+  Cheaper than the older qwen3-coder-plus and a newer point release.
+* **Qwen3 Coder Flash** — fast, cheap code-leaning option for visual/UI work.
+* **Owl Alpha** — free, 1M ctx, agentic + general code. Tail fallback.
+* **gpt-oss-120b:free** — free docs/long-form fallback.
+
+NOTE: the static ladders below are only the fast-path fallback. The live
+path (``_catalog_aware_ladder``) scores the on-disk catalog via the model
+evolution scorer, which now prefers newer + cheaper models automatically.
 
 Classifier is regex-first (cheap, fast); falls back to a generic ladder
 if nothing matches. No LLM call to classify — that would defeat the
@@ -48,12 +52,19 @@ class RoutingProfile:
     notes: str
 
 
+# NOTE: these static ladders are the FAST-PATH FALLBACK only — the primary
+# path is ``_catalog_aware_ladder`` which scores the live catalog. Every id
+# below is validated present in the on-disk catalog cache
+# (data/openrouter_models.json) and refreshed to current, newer+cheaper
+# models (qwen3.7-plus / deepseek-v4-flash class) rather than the entrenched
+# qwen3.6-flash / qwen3-coder-next / deepseek-v3.2 ids. A :free model is the
+# tail fallback so rate-limited keys still make progress.
 UI_HEAVY = RoutingProfile(
     project_type="ui_heavy",
     ladder=(
-        "qwen/qwen3.6-flash",
-        "qwen/qwen3-coder-next",
-        "deepseek/deepseek-v3.2",
+        "qwen/qwen3.7-plus",
+        "deepseek/deepseek-v4-flash",
+        "qwen/qwen3-coder-flash",
         "openrouter/owl-alpha",
     ),
     notes="React/Vue/Svelte SPAs, dashboards, visual-first apps",
@@ -62,9 +73,9 @@ UI_HEAVY = RoutingProfile(
 BACKEND = RoutingProfile(
     project_type="backend",
     ladder=(
-        "qwen/qwen3-coder-next",
-        "deepseek/deepseek-v3.2",
-        "openai/gpt-5-mini",
+        "deepseek/deepseek-v4-flash",
+        "qwen/qwen3.7-plus",
+        "qwen/qwen3-coder-flash",
         "openrouter/owl-alpha",
     ),
     notes="Express/FastAPI/CLI/scripts, types and error handling matter",
@@ -73,9 +84,9 @@ BACKEND = RoutingProfile(
 DATA_VIZ = RoutingProfile(
     project_type="data_viz",
     ladder=(
-        "qwen/qwen3.6-flash",
-        "qwen/qwen3-coder-next",
-        "deepseek/deepseek-v3.2",
+        "qwen/qwen3.7-plus",
+        "deepseek/deepseek-v4-flash",
+        "qwen/qwen3-coder-flash",
         "openrouter/owl-alpha",
     ),
     notes="Charts, dashboards w/ live data, analytics views",
@@ -84,9 +95,9 @@ DATA_VIZ = RoutingProfile(
 GAME = RoutingProfile(
     project_type="game",
     ladder=(
-        "qwen/qwen3-coder-next",
-        "deepseek/deepseek-v3.2",
-        "tencent/hy3-preview",
+        "deepseek/deepseek-v4-flash",
+        "qwen/qwen3.7-plus",
+        "qwen/qwen3-coder-flash",
         "openrouter/owl-alpha",
     ),
     notes="Canvas games, state machines, event-loop heavy",
@@ -95,8 +106,9 @@ GAME = RoutingProfile(
 DOCS = RoutingProfile(
     project_type="docs",
     ladder=(
+        "deepseek/deepseek-v4-flash",
+        "qwen/qwen3.7-plus",
         "openai/gpt-oss-120b:free",
-        "deepseek/deepseek-v3.2",
         "openrouter/owl-alpha",
     ),
     notes="READMEs, docs sites, markdown content, blog-style copy",
@@ -105,9 +117,9 @@ DOCS = RoutingProfile(
 GENERIC = RoutingProfile(
     project_type="generic",
     ladder=(
-        "qwen/qwen3-coder-next",
-        "qwen/qwen3.6-flash",
-        "deepseek/deepseek-v3.2",
+        "deepseek/deepseek-v4-flash",
+        "qwen/qwen3.7-plus",
+        "qwen/qwen3-coder-flash",
         "openrouter/owl-alpha",
     ),
     notes="Default ladder when project type isn't classified",
