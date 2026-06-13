@@ -81,8 +81,23 @@ def isolate_runtime_state(tmp_path_factory, monkeypatch):
         except Exception:
             pass
 
+    def _reset_skill_library() -> None:
+        # The skill library is a module-level singleton bound to data_dir at
+        # first use. Without resetting it per-test, a test that calls
+        # get_default_library() (install_from_hub, curate, etc.) operates on the
+        # REAL data/skills dir instead of this isolated tmp one — and can DELETE
+        # the operator's installed skills. Reset so every test gets a fresh,
+        # tmp-bound library.
+        try:
+            import skyn3t.intelligence.skill_library as skill_module
+
+            skill_module._default_library = None
+        except Exception:
+            pass
+
     get_settings.cache_clear()
     _reset_routing_store()
+    _reset_skill_library()
     try:
         asyncio.run(close_engine())
     except Exception:
@@ -101,6 +116,7 @@ def isolate_runtime_state(tmp_path_factory, monkeypatch):
     get_settings.cache_clear()
     _reset_proposal_store()
     _reset_routing_store()
+    _reset_skill_library()
 
 
 @pytest.fixture

@@ -344,7 +344,19 @@ class SkillLibrary:
     """
 
     def __init__(self, root: Optional[Path] = None):
-        self.root = Path(root) if root else Path("data/skills")
+        if root is None:
+            # Respect the configured data_dir (like the catalog/overrides stores)
+            # instead of a cwd-relative "data/skills". Without this, tests that
+            # set DATA_DIR to a tmp dir still hit the REAL data/skills (cwd=repo)
+            # and could delete operator-installed skills. Falls back to the old
+            # relative path only if settings can't be loaded.
+            try:
+                from skyn3t.config.settings import get_settings
+
+                root = Path(get_settings().data_dir) / "skills"
+            except Exception:
+                root = Path("data/skills")
+        self.root = Path(root)
         self.drafts_root = self.root / "drafts"
         self._lock = threading.Lock()
         try:
