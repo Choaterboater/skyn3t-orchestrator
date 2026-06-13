@@ -17,6 +17,22 @@ logger = logging.getLogger("skyn3t.adapters.openrouter")
 DEFAULT_MODEL = "openai/gpt-oss-120b:free"
 BASE_URL = "https://openrouter.ai/api/v1"
 
+# Process-wide cap on CONCURRENT OpenRouter requests. Without it, parallel file
+# generation (up to 4/build) x stages x the autonomous fleet all hit the API at
+# once and burst past provider rate limits — builds then die in a wall of 429s
+# (observed: 224 in one build). Bounding total in-flight requests + the existing
+# retry-after backoff lets builds actually complete. Tunable; raise once you know
+# the key's real rate ceiling. Created lazily so it binds to the running loop.
+_MAX_CONCURRENCY = max(1, int(os.environ.get("SKYN3T_OPENROUTER_MAX_CONCURRENCY", "4") or 4))
+_request_semaphore: Optional["asyncio.Semaphore"] = None
+
+
+def _get_request_semaphore() -> "asyncio.Semaphore":
+    global _request_semaphore
+    if _request_semaphore is None:
+        _request_semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)
+    return _request_semaphore
+
 
 class OpenRouterBackend:
     def __init__(self, api_key: Optional[str] = None, *, base_url: str = BASE_URL):
@@ -53,11 +69,14 @@ class OpenRouterBackend:
         }
         # Retry on 429 + 5xx with exponential backoff and jitter. Never retry
         # on 4xx other than 429 — those are caller errors and won't fix on retry.
-        max_attempts = 4
+        max_attempts = 6
         last_exc: Optional[Exception] = None
         for attempt in range(1, max_attempts + 1):
             try:
-                r = await self._client.post("/chat/completions", json=payload)
+                # Bound concurrent in-flight requests process-wide so parallel
+                # files/stages/builds can't burst past the rate limit.
+                async with _get_request_semaphore():
+                    r = await self._client.post("/chat/completions", json=payload)
             except Exception as exc:  # network-level
                 last_exc = exc
                 if attempt == max_attempts:
