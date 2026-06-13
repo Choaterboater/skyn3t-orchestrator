@@ -213,7 +213,7 @@ class ConsistencyReviewerAgent(BaseAgent):
             scaffold_dir, brief, architecture_md, task, decisions=decisions
         )
 
-        all_findings = heuristic_findings + llm_findings
+        all_findings = heuristic_findings + llm_findings + self._anti_slop_check(scaffold_dir)
         blockers = [f for f in all_findings if f.severity == "blocker"]
         review = ConsistencyReview(ok=len(blockers) == 0, findings=all_findings)
 
@@ -227,6 +227,25 @@ class ConsistencyReviewerAgent(BaseAgent):
                 "scaffold_dir": str(scaffold_dir),
             },
         )
+
+    def _anti_slop_check(self, scaffold_dir: Path) -> List[ConsistencyFinding]:
+        """Mechanical 'AI tell' findings (warnings) — placeholder content, em-dash
+        copy, AI-default fonts, scroll-jank. Gradeable, feeds skill grading."""
+        out: List[ConsistencyFinding] = []
+        try:
+            from skyn3t.agents.anti_slop import scan_project
+
+            for f in scan_project(scaffold_dir):
+                out.append(ConsistencyFinding(
+                    severity="warning",
+                    category="hallucination",
+                    file=f.get("path", ""),
+                    message=f"anti-slop: {f.get('detail', f.get('rule', ''))}",
+                    suggestion="Replace placeholder / AI-default patterns with real, brief-specific content.",
+                ))
+        except Exception:
+            pass
+        return out
 
     def _heuristic_check(
         self,
