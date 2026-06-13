@@ -444,6 +444,52 @@ def pick_free_model(task_kind: Optional[str] = None) -> Optional[str]:
     return pool[idx]
 
 
+def cheapest_paid_models(task_kind: Optional[str] = None, *, limit: int = 3) -> List[str]:
+    """Cheapest non-free, non-Claude catalog models (task-biased). Last-resort
+    fallback when every free model is rate-limited/exhausted."""
+    if _catalog_index is None or not _catalog_index:
+        load_catalog()
+    if not _catalog_index:
+        return []
+    priced: List[tuple] = []
+    for mid, meta in _catalog_index.items():
+        low = str(mid).lower()
+        if low.endswith(":free") or "claude" in low or low.startswith("anthropic/"):
+            continue
+        pricing = meta.get("pricing") if isinstance(meta.get("pricing"), dict) else {}
+        cost = float((pricing.get("prompt") if isinstance(pricing, dict) else None)
+                     or (pricing.get("input") if isinstance(pricing, dict) else None) or 0.0)
+        if cost <= 0.0:
+            continue
+        priced.append((cost, str(mid)))
+    priced.sort()
+    kws = _TASK_KIND_KEYWORDS.get(task_kind or "", [])
+    if kws:
+        matched = [m for _c, m in priced if any(k in m.lower() for k in kws)]
+        if matched:
+            return matched[:limit]
+    return [m for _c, m in priced[:limit]]
+
+
+def free_first_ladder(
+    task_kind: Optional[str] = None, *, free_limit: int = 6, paid_limit: int = 3,
+) -> tuple:
+    """Free models first (task-biased, varied), then cheapest paid as fallback.
+
+    Implements the owner policy: use the many free models; only fall through to
+    the cheapest paid model when the frees are rate-limited/exhausted. No Claude.
+    """
+    free = list_free_models()
+    kws = _TASK_KIND_KEYWORDS.get(task_kind or "", [])
+    if kws:
+        matched = [m for m in free if any(k in m.lower() for k in kws)]
+        free_ordered = matched + [m for m in free if m not in matched]
+    else:
+        free_ordered = free
+    ladder = list(free_ordered[:free_limit]) + cheapest_paid_models(task_kind, limit=paid_limit)
+    return tuple(ladder)
+
+
 def resolve_openrouter_model(tier_name: str, model_id: Optional[str]) -> Optional[str]:
     """Validate a tier model against the catalog; fall back when missing."""
     if not model_id:

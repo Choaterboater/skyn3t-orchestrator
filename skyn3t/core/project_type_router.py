@@ -238,15 +238,18 @@ def _catalog_aware_ladder(project_type: str, ladder: Tuple[str, ...]) -> Tuple[s
     task_kind = _PROFILE_TASK_KIND.get(project_type, "general")
     try:
         from skyn3t.core.openrouter_catalog import (
+            free_first_ladder,
             pick_best_model_for_task,
             resolve_openrouter_model,
         )
 
-        best = pick_best_model_for_task(
-            tier,
-            task_kind,
-            prefer_evolution=True,
-        )
+        # Owner policy: FREE models first (the catalog has many; rotate through
+        # them on rate-limits), cheapest paid only as last-resort fallback. This
+        # is what lets autonomous builds actually run on the over-limit key.
+        resolved.extend(free_first_ladder(task_kind))
+        # Then the catalog/evolution winner and the curated static ladder as
+        # additional fallbacks (deduped below, so free stays first).
+        best = pick_best_model_for_task(tier, task_kind, prefer_evolution=True)
         if best:
             resolved.append(best)
         for model in ladder:
