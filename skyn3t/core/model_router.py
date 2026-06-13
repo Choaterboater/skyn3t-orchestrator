@@ -401,6 +401,13 @@ def _tier_backend_model(
                     model = picked
         except Exception:
             logger.debug("openrouter tier validation skipped", exc_info=True)
+    # Final no-Claude backstop: the evolution/catalog picker can still surface a
+    # Claude model ON OpenRouter (anthropic/claude-*). Reject it and keep the
+    # tier's configured non-Claude base model.
+    if no_claude and model and (
+        "claude" in str(model).lower() or str(model).lower().startswith("anthropic/")
+    ):
+        _, model = _TIERS.get(tier_name, _TIERS["or_cheap"])
     return backend, model
 
 

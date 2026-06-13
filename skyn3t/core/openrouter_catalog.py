@@ -341,6 +341,18 @@ def pick_best_model_for_task(
     if not _catalog_index:
         return None
 
+    no_claude = os.environ.get("SKYN3T_NO_CLAUDE", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+    def _is_claude(mid: str) -> bool:
+        t = (mid or "").lower()
+        return "claude" in t or t.startswith("anthropic/")
+
+    # Owner directive: never select a Claude model, even a cheap one on OpenRouter.
+    if no_claude and base_model and _is_claude(base_model):
+        base_model = None
+
     tier_keywords = list(_TIER_FALLBACK_KEYWORDS.get(tier_name, []))
     kind_keywords = list(_TASK_KIND_KEYWORDS.get(task_kind, []))
     if not tier_keywords and not kind_keywords:
@@ -378,6 +390,8 @@ def pick_best_model_for_task(
 
     for mid, meta in _catalog_index.items():
         if base_model and mid == base_model:
+            continue
+        if no_claude and _is_claude(mid):
             continue
         score = _score(mid, meta)
         if score > best_score + min_delta:

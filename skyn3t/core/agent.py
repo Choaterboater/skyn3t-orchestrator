@@ -870,9 +870,22 @@ class BaseAgent(ABC):
         raw_backend = self.config.get("backend")
         raw_model = self.config.get("model")
         if raw_backend:
+            eff_backend, eff_model = raw_backend, raw_model
+            # Reflect the runtime no-Claude / OpenRouter-only coercion in the UI:
+            # CLI-backed agents (claude_cli/copilot_cli/...) actually run on
+            # OpenRouter, so show that instead of a stale "claude_cli haiku".
+            import os as _os
+            if _os.environ.get("SKYN3T_NO_CLAUDE", "").strip().lower() in {
+                "1", "true", "yes", "on"
+            } and str(eff_backend) in {
+                "claude_cli", "anthropic", "copilot_cli", "kimi_cli", "openai_cli", "auto"
+            }:
+                eff_backend = "openrouter"
+                if eff_model and "/" not in str(eff_model):
+                    eff_model = None  # bare CLI id -> dynamic catalog pick
             return {
-                "effective_backend": raw_backend,
-                "effective_model": raw_model,
+                "effective_backend": eff_backend,
+                "effective_model": eff_model,
                 "effective_source": "config",
                 "effective_stage": None,
                 "effective_tier": None,

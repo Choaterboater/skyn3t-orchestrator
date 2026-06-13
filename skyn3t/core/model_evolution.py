@@ -90,6 +90,16 @@ def _is_premium_model(model_id: str) -> bool:
     return any(marker in text for marker in premium_markers)
 
 
+def _no_claude_models() -> bool:
+    """Owner directive: never select Claude models, even cheap ones on OpenRouter."""
+    return _env_truthy("SKYN3T_NO_CLAUDE")
+
+
+def _is_claude_model(model_id: str) -> bool:
+    text = (model_id or "").lower()
+    return "claude" in text or text.startswith("anthropic/")
+
+
 def set_evolution_event_bus(event_bus: Any) -> None:
     """Optional hook so background evolution can publish SYSTEM_ALERT events."""
     global _event_bus
@@ -248,10 +258,13 @@ def find_best_for_tier(
     best_id: Optional[str] = None
     best_score = -1.0
     premium_ok = allow_premium_models()
+    no_claude = _no_claude_models()
     for mid, meta in catalog_index.items():
         if not mid or not isinstance(meta, dict):
             continue
         if not premium_ok and _is_premium_model(mid):
+            continue
+        if no_claude and _is_claude_model(mid):
             continue
         s = score_model_for_tier(tier_name, mid, meta)
         if s > best_score:
