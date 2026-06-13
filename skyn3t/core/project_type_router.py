@@ -31,6 +31,7 @@ point of routing in the first place.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from typing import Sequence, Tuple
@@ -251,22 +252,34 @@ def _catalog_aware_ladder(project_type: str, ladder: Tuple[str, ...]) -> Tuple[s
     try:
         from skyn3t.core.openrouter_catalog import (
             free_first_ladder,
+            list_free_models,
             pick_best_model_for_task,
             resolve_openrouter_model,
         )
 
-        # Owner policy: FREE models first (the catalog has many; rotate through
-        # them on rate-limits), cheapest paid only as last-resort fallback. This
-        # is what lets autonomous builds actually run on the over-limit key.
-        resolved.extend(free_first_ladder(task_kind))
-        # Then the catalog/evolution winner and the curated static ladder as
-        # additional fallbacks (deduped below, so free stays first).
+        free_only = os.environ.get("SKYN3T_FREE_ONLY", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
         best = pick_best_model_for_task(tier, task_kind, prefer_evolution=True)
-        if best:
-            resolved.append(best)
-        for model in ladder:
-            candidate = resolve_openrouter_model(tier, model) or model
-            resolved.append(candidate)
+        if free_only:
+            # $0-key policy: free models first (rotate on rate-limits), then the
+            # scorer winner + curated ladder as fallbacks (deduped below).
+            resolved.extend(free_first_ladder(task_kind))
+            if best:
+                resolved.append(best)
+            for model in ladder:
+                resolved.append(resolve_openrouter_model(tier, model) or model)
+        else:
+            # Funded: QUALITY-FIRST. Lead with the curated reliable ladder
+            # (deepseek-v4-flash / qwen3.7-plus class) + the scorer winner; free
+            # models only as a rate-limit fallback. Leading with free OR the
+            # absolute-cheapest paid models churns on truncated "unusable body"
+            # responses and ships TODO-stub files (regressed a build to 9 stubs).
+            for model in ladder:
+                resolved.append(resolve_openrouter_model(tier, model) or model)
+            if best:
+                resolved.append(best)
+            resolved.extend(list_free_models()[:3])
     except Exception:
         resolved.extend(ladder)
 
