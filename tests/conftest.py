@@ -43,6 +43,9 @@ def isolate_runtime_state(tmp_path_factory, monkeypatch):
     # loopback auth that the production code now requires by default.
     monkeypatch.setenv("SKYN3T_ALLOW_INLINE_EXEC", "1")
     monkeypatch.setenv("SKYN3T_ALLOW_UNAUTHENTICATED_LOOPBACK", "1")
+    # The test suite runs the Linux Sandbox without Docker; allow the weak
+    # rlimits-only path in tests only.
+    monkeypatch.setenv("SKYN3T_ALLOW_WEAK_LINUX_SANDBOX", "1")
     monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILDS", "0")
     monkeypatch.setenv("SKYN3T_AUTO_APPROVE", "0")
     monkeypatch.setenv("SKYN3T_NO_APPROVAL", "0")

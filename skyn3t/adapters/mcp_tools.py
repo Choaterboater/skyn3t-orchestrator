@@ -21,9 +21,13 @@ MAX_READ_BYTES = 200_000
 
 def _safe_path(p: str) -> Path:
     """Resolve path inside REPO_ROOT, refuse traversal."""
+    if Path(p).is_absolute():
+        raise ValueError(f"absolute paths not allowed: {p}")
     target = (REPO_ROOT / p).resolve()
-    if not str(target).startswith(str(REPO_ROOT.resolve())):
-        raise ValueError(f"path escapes repo: {p}")
+    try:
+        target.relative_to(REPO_ROOT.resolve())
+    except ValueError as exc:
+        raise ValueError(f"path escapes repo: {p}") from exc
     return target
 
 

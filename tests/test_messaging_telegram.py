@@ -251,3 +251,44 @@ def test_telegram_webhook_route_is_mounted():
     from skyn3t.web.app import app
     paths = {getattr(r, "path", None) for r in app.routes}
     assert "/webhooks/telegram" in paths
+
+
+@pytest.mark.parametrize("secret_set", [True, False])
+def test_telegram_webhook_fail_closed(secret_set: bool, monkeypatch: pytest.MonkeyPatch):
+    """H10: the webhook must reject all traffic when TELEGRAM_WEBHOOK_SECRET is unset,
+    and verify the header when it is set."""
+    import os
+
+    from fastapi.testclient import TestClient
+
+    from skyn3t.web.app import app
+
+    expected = "super-secret"
+    if secret_set:
+        monkeypatch.setitem(os.environ, "TELEGRAM_WEBHOOK_SECRET", expected)
+    else:
+        monkeypatch.setitem(os.environ, "TELEGRAM_WEBHOOK_SECRET", "")
+
+    client = TestClient(app)
+    payload = {"update_id": 1, "message": {"message_id": 1, "text": "hi"}}
+
+    if not secret_set:
+        resp = client.post("/webhooks/telegram", json=payload)
+        assert resp.status_code == 503
+        return
+
+    # Wrong secret header → 401.
+    resp = client.post(
+        "/webhooks/telegram",
+        json=payload,
+        headers={"X-Telegram-Bot-Api-Secret-Token": "wrong"},
+    )
+    assert resp.status_code == 401
+
+    # Correct secret header → accepted (ingest will return 200 even if no channel registered).
+    resp = client.post(
+        "/webhooks/telegram",
+        json=payload,
+        headers={"X-Telegram-Bot-Api-Secret-Token": expected},
+    )
+    assert resp.status_code in (200, 202)

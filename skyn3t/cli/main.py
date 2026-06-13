@@ -2304,6 +2304,14 @@ def task_submit(
                         time_mod.sleep(1)
                         progress.update(t, advance=0)
 
+                # H14: don't pipe failed upstream output into a follow-up task.
+                if not result_data.get("success") or result_data.get("status") in ("failed", "error"):
+                    _error(
+                        f"Upstream task {task_id} failed ({result_data.get('status')}); "
+                        "not piping to follow-up agent."
+                    )
+                    raise typer.Exit(1)
+
                 output = result_data.get("output", {})
                 stdin_text = _extract_text(output)
                 follow_payload = {

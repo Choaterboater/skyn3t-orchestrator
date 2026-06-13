@@ -324,14 +324,15 @@ class SecretStore:
 
         Returns None if not found or expired.
         """
+        entry = self.get_secret_entry(name)
+        if entry is None or entry.is_expired():
+            return None
+        return entry.value
+
+    def get_secret_entry(self, name: str) -> Optional[SecretEntry]:
+        """Retrieve the full secret entry (metadata + value), or None."""
         with self._lock:
-            entry = self._secrets.get(name)
-            if entry is None:
-                return None
-            if entry.is_expired():
-                logger.warning("Secret '%s' has expired", name)
-                return None
-            return entry.value
+            return self._secrets.get(name)
 
     def delete_secret(self, name: str) -> bool:
         """Delete a secret."""
@@ -421,3 +422,33 @@ class SecretStore:
                 for name, entry in self._secrets.items()
                 if not entry.is_expired()
             }
+
+
+# Singleton accessor so the web layer shares one encrypted store.
+_secret_store_singleton: Optional[SecretStore] = None
+_secret_store_lock = threading.Lock()
+
+
+def get_secret_store() -> Optional[SecretStore]:
+    """Return the process-wide SecretStore, or None if no master key is set.
+
+    The store is intentionally optional: deployments that only use env vars
+    don't need it, and we don't want a missing master key to crash startup.
+    """
+    global _secret_store_singleton
+    if _secret_store_singleton is None:
+        with _secret_store_lock:
+            if _secret_store_singleton is None:
+                from skyn3t.config.settings import get_settings
+
+                settings = get_settings()
+                storage_path = getattr(settings, "secret_storage_path", None)
+                try:
+                    _secret_store_singleton = SecretStore(
+                        storage_path=Path(storage_path) if storage_path else None,
+                        allow_ephemeral=True,
+                    )
+                except RuntimeError:
+                    # No master key configured and ephemeral not allowed.
+                    return None
+    return _secret_store_singleton

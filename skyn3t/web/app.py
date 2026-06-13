@@ -46,6 +46,8 @@ from skyn3t.observability.health import get_health_registry
 from skyn3t.observability.metrics import generate_metrics
 from skyn3t.observability.tracing import get_tracer
 from skyn3t.registry.catalog import get_agent_catalog_metadata
+from skyn3t.security.audit import get_audit_log
+from skyn3t.security.secrets import get_secret_store
 from skyn3t.studio.penpot_handoff import build_penpot_manifest, build_penpot_package
 
 # Global orchestrator instance
@@ -987,6 +989,93 @@ async def get_system_insights(days: int = 7):
     }
 
 
+@app.get("/api/audit")
+async def get_audit_entries(
+    actor: Optional[str] = None,
+    action: Optional[str] = None,
+    resource: Optional[str] = None,
+    result: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+):
+    """H31: query the tamper-resistant audit log."""
+    limit = _clamp_limit(limit, default=100, hi=1000)
+    audit = get_audit_log()
+    entries = audit.query(
+        actor=actor,
+        action=action,
+        resource=resource,
+        result=result,
+        limit=limit,
+        offset=offset,
+    )
+    return {
+        "count": len(entries),
+        "limit": limit,
+        "offset": offset,
+        "entries": [e.to_dict() for e in entries],
+    }
+
+
+@app.get("/api/secrets")
+async def list_secrets():
+    """H32: list encrypted secret names and metadata (values masked)."""
+    store = get_secret_store()
+    if store is None:
+        return JSONResponse(
+            {"error": "secret store not configured"}, status_code=503
+        )
+    return {"secrets": store.list_secrets()}
+
+
+@app.get("/api/secrets/{name}")
+async def get_secret(name: str):
+    """Return a single secret's metadata; the value is always masked."""
+    store = get_secret_store()
+    if store is None:
+        return JSONResponse(
+            {"error": "secret store not configured"}, status_code=503
+        )
+    entry = store.get_secret_entry(name)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="secret not found")
+    return entry.to_dict(mask_value=True)
+
+
+@app.post("/api/secrets")
+async def create_secret(data: Dict[str, Any]):
+    """Encrypt and store a secret."""
+    store = get_secret_store()
+    if store is None:
+        return JSONResponse(
+            {"error": "secret store not configured"}, status_code=503
+        )
+    name = str(data.get("name") or "").strip()
+    value = data.get("value")
+    if not name or not isinstance(value, str):
+        raise HTTPException(status_code=400, detail="name and value required")
+    store.set_secret(
+        name,
+        value,
+        expires_in_days=data.get("expires_in_days"),
+        metadata=data.get("metadata") or {},
+    )
+    return {"ok": True, "name": name}
+
+
+@app.delete("/api/secrets/{name}")
+async def delete_secret(name: str):
+    """Delete a stored secret."""
+    store = get_secret_store()
+    if store is None:
+        return JSONResponse(
+            {"error": "secret store not configured"}, status_code=503
+        )
+    if not store.delete_secret(name):
+        raise HTTPException(status_code=404, detail="secret not found")
+    return {"ok": True, "deleted": name}
+
+
 @app.get("/metrics", response_class=PlainTextResponse)
 async def get_metrics():
     """Prometheus metrics endpoint."""
@@ -1320,7 +1409,7 @@ async def agent_config_get(name: str):
     try:
         return a.get_config_view()
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return _safe_error_response(e)
 
 
 @app.patch("/api/agents/{name}/config")
@@ -1736,8 +1825,8 @@ async def agent_create(payload: Dict[str, Any]):
     try:
         from skyn3t.config.custom_agents import get_custom_store
         get_custom_store().upsert({**(payload or {}), "name": name})
-    except Exception as e:
-        return JSONResponse({"error": f"persist failed: {e}"}, status_code=500)
+    except Exception as exc:
+        return _safe_error_response(exc)
     # also register live (avoid restart)
     try:
         import importlib
@@ -1765,8 +1854,8 @@ async def agent_create(payload: Dict[str, Any]):
         if hasattr(agent, "apply_override"):
             agent.apply_override(payload or {})
         orchestrator.register_agent(agent)
-    except Exception as e:
-        return JSONResponse({"error": f"register failed: {e}"}, status_code=500)
+    except Exception as exc:
+        return _safe_error_response(exc)
     return {"ok": True, "name": name}
 
 
@@ -1950,7 +2039,7 @@ async def llm_complete(data: Dict[str, Any]):
             "model": info.get("default_model"),
         }
     except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        return _safe_error_response(exc)
 
 
 @app.post("/api/orchestrator/submit")
@@ -2030,12 +2119,8 @@ async def exec_agent(
     if not agent.metadata.get("initialized"):
         try:
             await agent.initialize()
-        except Exception as e:
-            from fastapi.responses import JSONResponse
-            return JSONResponse(
-                status_code=500,
-                content={"error": f"Agent initialization failed: {e}"},
-            )
+        except Exception as exc:
+            return _safe_error_response(exc)
 
     task = TaskRequest(
         title="Quick exec",
@@ -2853,11 +2938,8 @@ async def exec_code(request: Request):
             "truncated": result.truncated,
             "backend": backend.__class__.__name__,
         }
-    except Exception as e:
-        return JSONResponse(
-            {"error": f"Execution failed: {e}"},
-            status_code=500,
-        )
+    except Exception as exc:
+        return _safe_error_response(exc)
 
 
 @app.get("/api/usage/totals")
@@ -4245,6 +4327,45 @@ async def studio_project_reject(slug: str, payload: dict):
     return {"ok": True}
 
 
+@app.post("/api/studio/projects/{slug}/cancel")
+async def studio_project_cancel(slug: str):
+    """H30: request cancellation of a running Studio build."""
+    runner = _get_studio_runner(app)
+    if runner.get_project(slug) is None:
+        return JSONResponse({"error": "project not found"}, status_code=404)
+    cancelled = runner.cancel_project(slug)
+    if not cancelled:
+        return JSONResponse(
+            {"error": "project is not running or already terminal"}, status_code=409
+        )
+    return {"ok": True, "status": "cancelled"}
+
+
+@app.post("/api/studio/projects/{slug}/feedback")
+async def studio_project_feedback(slug: str, payload: dict):
+    """H27: post-ship user feedback on a completed Studio build.
+
+    ``helpful`` must be a boolean (True = thumbs up, False = thumbs down).
+    The feedback is credited/debited to every lesson that was injected
+    during the build.
+    """
+    runner = _get_studio_runner(app)
+    if runner.get_project(slug) is None:
+        return JSONResponse({"error": "project not found"}, status_code=404)
+    helpful = payload.get("helpful")
+    if not isinstance(helpful, bool):
+        return JSONResponse(
+            {"error": "helpful must be a boolean"}, status_code=400
+        )
+    result = runner.record_feedback(slug, helpful=helpful)
+    if result.get("credited", 0) == 0:
+        return JSONResponse(
+            {"ok": True, "message": "no injected lessons to attribute", "credited": 0},
+            status_code=200,
+        )
+    return {"ok": True, **result}
+
+
 @app.get("/api/studio/approval-config")
 async def studio_approval_config_get():
     from skyn3t.studio.approval_gate import load_gate_config
@@ -4514,7 +4635,7 @@ async def cron_list():
         return {"ok": bool(result.success), "result": result.output}
     except Exception as exc:
         logger.debug("cron list failed: %s", exc)
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        return _safe_error_response(exc)
 
 
 @app.post("/api/cron")
@@ -4564,7 +4685,7 @@ async def cron_create(payload: Dict[str, Any]):
         )
     except Exception as exc:
         logger.debug("cron create failed: %s", exc)
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        return _safe_error_response(exc)
 
 
 @app.get("/api/gateway/channels")
@@ -4624,7 +4745,7 @@ async def gateway_deliver(payload: Dict[str, Any]):
         return result.to_dict()
     except Exception as exc:
         logger.debug("gateway deliver failed: %s", exc)
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        return _safe_error_response(exc)
 
 
 @app.get("/api/browser/status")

@@ -252,6 +252,25 @@ class ReviewerAgent(BaseAgent):
             blended = min(blended, int(networking_report.score))
             verdict_score = min(verdict_score, int(networking_report.score))
 
+        # H26: cap the reviewer score when objective verification failed.
+        # A high LLM/heuristic score must not overrule "the scaffold didn't
+        # build/boot/integrate".
+        objective = (data or {}).get("objective_verification") or {}
+        failed_objective = [
+            name
+            for name, record in objective.items()
+            if isinstance(record, dict)
+            and str(record.get("verdict") or "").lower() != "yes"
+        ]
+        if failed_objective:
+            risks.append(
+                "Objective verification failed: "
+                + ", ".join(failed_objective)
+                + " — reviewer score capped."
+            )
+            blended = min(blended, 49)
+            verdict_score = min(verdict_score, 49)
+
         # Hard guard: if the brief explicitly asks for runnable code
         # ("build a … app/dashboard/site/api/script/cli with React/FastAPI/etc.")
         # but the artifact dir contains zero source files, the run shipped

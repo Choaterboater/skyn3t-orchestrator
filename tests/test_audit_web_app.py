@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -116,3 +117,126 @@ def test_other_api_routes_still_gated(monkeypatch):
     client = TestClient(web_app.app)
     response = client.get("/api/status")
     assert response.status_code == 401
+
+
+class _FakeOrchestrator:
+    agents: dict = {}
+
+
+# ─── 5. 500 responses must not leak internal exception text ────────────────
+def test_500_errors_use_safe_response_without_exception_text(monkeypatch):
+    """H8: agent_create must route unexpected exceptions through
+    _safe_error_response() rather than returning the raw exception string."""
+    monkeypatch.setattr(
+        web_app,
+        "get_settings",
+        lambda: SimpleNamespace(web_token=None, allow_unauthenticated_loopback=True),
+    )
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("sensitive internal path /etc/secrets")
+
+    monkeypatch.setattr(web_app, "orchestrator", _FakeOrchestrator())
+    monkeypatch.setitem(web_app.__dict__, "get_custom_store", None)
+    from skyn3t.config import custom_agents
+
+    monkeypatch.setattr(custom_agents, "get_custom_store", _boom)
+
+    client = TestClient(web_app.app)
+    response = client.post("/api/agents", json={"name": "x", "base_type": "blank"})
+
+    assert response.status_code == 500
+    body = response.json()
+    assert body.get("error") == "internal error"
+    assert "correlation_id" in body
+    assert "sensitive internal path" not in response.text
+
+
+# ─── 6. Audit log query endpoint is wired ───────────────────────────────
+def test_audit_endpoint_returns_entries(monkeypatch):
+    monkeypatch.setattr(
+        web_app,
+        "get_settings",
+        lambda: SimpleNamespace(web_token=None, allow_unauthenticated_loopback=True),
+    )
+
+    from skyn3t.security.audit import get_audit_log
+
+    audit = get_audit_log()
+    audit.record("alice", "login", "dashboard", "success")
+    audit.record("bob", "task_submit", "task-1", "denied")
+
+    client = TestClient(web_app.app)
+    response = client.get("/api/audit")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["count"] >= 2
+    assert any(e["actor"] == "alice" for e in body["entries"])
+
+    filtered = client.get("/api/audit?actor=bob")
+    assert filtered.status_code == 200
+    assert all(e["actor"] == "bob" for e in filtered.json()["entries"])
+
+
+# ─── 7. Encrypted secret store HTTP surface ─────────────────────────────
+def test_secret_store_endpoints(monkeypatch):
+    monkeypatch.setenv("SKYN3T_MASTER_KEY", "test-master-key-for-secrets-32bytes!")
+    monkeypatch.setattr(
+        web_app,
+        "get_settings",
+        lambda: SimpleNamespace(web_token=None, allow_unauthenticated_loopback=True),
+    )
+    # Reset singleton so the new env key is picked up.
+    from skyn3t.security import secrets as secrets_module
+
+    secrets_module._secret_store_singleton = None
+
+    client = TestClient(web_app.app)
+
+    create = client.post("/api/secrets", json={"name": "api-key", "value": "super-secret"})
+    assert create.status_code == 200
+
+    listing = client.get("/api/secrets")
+    assert listing.status_code == 200
+    names = {s["name"] for s in listing.json()["secrets"]}
+    assert "api-key" in names
+    assert all(s["value"] == "***REDACTED***" for s in listing.json()["secrets"])
+
+    single = client.get("/api/secrets/api-key")
+    assert single.status_code == 200
+    assert single.json()["value"] == "***REDACTED***"
+
+    deleted = client.delete("/api/secrets/api-key")
+    assert deleted.status_code == 200
+    assert client.get("/api/secrets/api-key").status_code == 404
+
+
+# ─── 8. Studio build cancellation endpoint ──────────────────────────────
+def test_studio_cancel_endpoint_sets_cancelled_status(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(
+        web_app,
+        "get_settings",
+        lambda: SimpleNamespace(
+            web_token=None,
+            allow_unauthenticated_loopback=True,
+            projects_dir=tmp_path / "projects",
+        ),
+    )
+    client = TestClient(web_app.app)
+
+    runner = web_app._get_studio_runner(web_app.app)
+    (tmp_path / "projects" / "cancel-me").mkdir(parents=True)
+    manifest = {
+        "slug": "cancel-me",
+        "status": "running",
+        "stages": [],
+        "history": [],
+        "artifacts": [],
+    }
+    runner._save_manifest(tmp_path / "projects" / "cancel-me", manifest)
+
+    resp = client.post("/api/studio/projects/cancel-me/cancel")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "cancelled"
+    updated = runner.get_project("cancel-me")
+    assert updated["status"] == "cancelled"

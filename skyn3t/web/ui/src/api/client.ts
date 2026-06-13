@@ -733,6 +733,11 @@ export const api = {
       `/api/studio/projects/${encodeURIComponent(slug)}/reject`,
       { method: "POST", body: JSON.stringify({ feedback }) },
     ),
+  feedbackProject: (slug: string, helpful: boolean) =>
+    fetchJson<{ ok: boolean; credited?: number }>(
+      `/api/studio/projects/${encodeURIComponent(slug)}/feedback`,
+      { method: "POST", body: JSON.stringify({ helpful }) },
+    ),
   clarifyProject: (slug: string, answers: string[]) =>
     fetchJson<{ ok: boolean; resuming?: string; answer_count?: number }>(
       `/api/studio/projects/${encodeURIComponent(slug)}/clarify`,

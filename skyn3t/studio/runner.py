@@ -99,6 +99,18 @@ class StudioRunner:
     ) -> None:
         self.event_bus = event_bus
         self.rag = rag
+        # H20: reuse the orchestrator-style LearningLoop so Studio builds
+        # get lesson injection + attribution through LessonScoreboard even
+        # though they bypass orchestrator.execute_task().
+        self._learning_loop: Optional[Any] = None
+        self._scoreboard: Optional[Any] = None
+        try:
+            from skyn3t.intelligence.learning_loop import LearningLoop
+
+            self._learning_loop = LearningLoop(event_bus, rag=rag)
+            self._scoreboard = self._learning_loop.scoreboard
+        except Exception:
+            logger.debug("Studio LearningLoop init failed", exc_info=True)
         self._retry_tasks: Set[asyncio.Task[Any]] = set()
         # Phase 5A ReflectionPlannerHook: a RetryDirective stashed by
         # _maybe_auto_retry keyed by retry-slug, consumed once at the
@@ -214,6 +226,74 @@ class StudioRunner:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    def cancel_project(self, slug: str) -> bool:
+        """Request cancellation of a running Studio project.
+
+        Sets the manifest status to 'cancelled' so the stage loop stops
+        before beginning the next stage. The currently executing stage is
+        allowed to finish (agents don't yet support mid-task abort), but
+        no further stages will run.
+        """
+        artifact_dir = self._validate_slug(slug)
+        manifest = self.get_project(slug)
+        if manifest is None:
+            return False
+        manifest = self._normalize_manifest(manifest)
+        status = manifest.get("status")
+        if status in ("completed", "failed", "cancelled"):
+            return False
+        manifest["status"] = "cancelled"
+        manifest["next_action"] = "Cancelled by user."
+        self._save_manifest(artifact_dir, manifest)
+        return True
+
+    def record_feedback(self, slug: str, *, helpful: bool) -> Dict[str, Any]:
+        """Apply post-ship user feedback to the lessons injected for a project.
+
+        Returns a dict with the number of lessons credited/debited. Safe to
+        call multiple times; idempotent attribution is left to the scoreboard.
+        """
+        result: Dict[str, Any] = {"slug": slug, "helpful": helpful, "credited": 0}
+        if self._scoreboard is None:
+            return result
+        manifest = self.get_project(slug)
+        if manifest is None:
+            return result
+        # Prefer the per-stage records so feedback applies only to lessons
+        # that were actually injected, then fall back to the project-wide list.
+        ids: List[str] = []
+        for rec in (manifest.get("stages") or []):
+            if isinstance(rec, dict):
+                ids.extend(rec.get("injected_lesson_ids") or [])
+        if not ids:
+            ids = list(manifest.get("injected_lesson_ids") or [])
+        seen: Set[str] = set()
+        credited = 0
+        for lid in ids:
+            if not lid or lid in seen:
+                continue
+            seen.add(lid)
+            try:
+                self._scoreboard.record_feedback(lid, helpful=helpful)
+                credited += 1
+            except Exception:
+                logger.debug("record_feedback for %s failed", lid, exc_info=True)
+        result["credited"] = credited
+        # Best-effort audit trail so operators can trace feedback.
+        try:
+            from skyn3t.security.audit import get_audit_log
+
+            get_audit_log().record(
+                actor="user",
+                action="studio_feedback",
+                resource=f"studio/{slug}",
+                result="success",
+                metadata={"helpful": helpful, "lessons": list(seen)},
+            )
+        except Exception:
+            logger.debug("feedback audit failed", exc_info=True)
+        return result
+
     async def start(
         self,
         template_key: str,
@@ -1215,6 +1295,17 @@ class StudioRunner:
             for stage_idx, stage in enumerate(stages):
                 if stage_idx < (_start_from_index or 0):
                     continue
+                # H30: honour a user-initiated cancellation request.
+                if manifest.get("status") == "cancelled":
+                    self._append_history(
+                        manifest,
+                        "PROJECT_CANCELLED",
+                        status="cancelled",
+                        stage=stage.name,
+                        message="Project cancelled by user.",
+                    )
+                    self._save_manifest(artifact_dir, manifest)
+                    return manifest
                 if self._studio_token_budget_exceeded(slug):
                     limit = token_budget_limit
                     used = self._project_token_total(slug)
@@ -1249,6 +1340,15 @@ class StudioRunner:
                     **(extra or {}),
                     **stage.input_extra,
                 }
+                # H26: reviewer must know whether objective verifiers passed
+                # so it cannot award a high score to a scaffold that didn't
+                # build, boot, or integrate.
+                if stage.name == "reviewer":
+                    input_data["objective_verification"] = {
+                        "build": manifest.get("build_verification"),
+                        "boot": manifest.get("boot_verification"),
+                        "integration": manifest.get("integration_verification"),
+                    }
                 # Pass the prior stage summaries as a stable dict. Agents
                 # that want a "what did upstream decide?" recap can read
                 # this directly instead of crawling artifact files.
@@ -1294,20 +1394,18 @@ class StudioRunner:
                     # input_data['rag_engine'] and skips the cold-start.
                     if self.rag is not None:
                         input_data["rag_engine"] = self.rag
-                    # Read-side lesson injection. The studio build path does
-                    # NOT route through orchestrator.execute_task, so
-                    # TASK_ROUTED never fires and learning_loop._inject never
-                    # populates input_data['lessons']. Query the live RAG here
-                    # so the CodeAgent (Owner B) can fold past lessons into the
-                    # build prompt. Best-effort; never blocks the build.
-                    lessons = await self._lessons_for_code_stage(brief)
-                    if lessons:
-                        input_data["lessons"] = lessons
+                    # Read-side lesson injection via the shared LearningLoop.
+                    # The studio build path does NOT route through
+                    # orchestrator.execute_task, so TASK_ROUTED never fires and
+                    # learning_loop._inject never populates input_data['lessons'].
+                    # Calling inject_for_task here both fills the prompt and
+                    # records attribution on LessonScoreboard (H20).
+                    lessons_count = 0
+                    injected_lesson_ids: List[str] = []
                     # Track for the PROJECT_COMPLETED payload so the
                     # continuous-improvement injection-hit-rate metric (Owner G)
                     # can tell builds that received lessons apart from those
                     # that didn't.
-                    manifest["lessons_count"] = len(lessons)
                     # ADVISORY (non-binding) plan hints derived from the
                     # build-pattern scoreboard's best historical shape and the
                     # skill library's most-relevant entries. Never hard-pins a
@@ -1346,6 +1444,28 @@ class StudioRunner:
                     title=f"{template_key}:{stage.name}",
                     input_data=input_data,
                 )
+                # Read-side lesson injection via the shared LearningLoop.
+                # Studio bypasses orchestrator.execute_task, so we inject here.
+                if self._learning_loop is not None:
+                    try:
+                        injected_lessons = await self._learning_loop.inject_for_task(
+                            task,
+                            title=f"{template_key}:{stage.name}",
+                            task_id=task.task_id,
+                        )
+                        lessons_count = len(injected_lessons)
+                        injected_lesson_ids = list(
+                            getattr(task, "_injected_lesson_ids", []) or []
+                        )
+                    except Exception:
+                        logger.debug("lesson injection for stage failed", exc_info=True)
+                manifest["lessons_count"] = lessons_count
+                # Aggregate injected lesson ids across the whole project so
+                # post-ship user feedback can credit/blame them (H27).
+                if injected_lesson_ids:
+                    manifest.setdefault("injected_lesson_ids", []).extend(
+                        injected_lesson_ids
+                    )
                 # ``required_capability`` is not part of the base TaskRequest
                 # dataclass, but downstream agents/orchestrators may consult it
                 # for routing; attach it dynamically so the information is not
@@ -1397,6 +1517,15 @@ class StudioRunner:
                     stage_name=stage.name,
                     resume_index=stage_idx,
                 )
+                # Make the injected lesson ids available on the stage record
+                # for feedback attribution even after the build finishes.
+                if injected_lesson_ids:
+                    self._set_stage_record(
+                        manifest,
+                        stage,
+                        status="running",
+                        injected_lesson_ids=injected_lesson_ids,
+                    )
                 self._save_manifest(artifact_dir, manifest)
                 self._publish(
                     "PROJECT_STAGE_STARTED",
@@ -1432,6 +1561,7 @@ class StudioRunner:
                 except _asyncio.TimeoutError:
                     timeout_secs = 0 if _stage_to is None else int(_stage_to)
                     stage_error = f"stage timeout (>{timeout_secs}s)"
+                    self._pin_stack_from_scaffold(manifest, artifact_dir)
                     self._publish(
                         "PROJECT_STAGE_FAILED",
                         self._stage_failure_payload(
@@ -1507,9 +1637,11 @@ class StudioRunner:
                                 )
                         except Exception:
                             logger.exception("scoreboard record on stage timeout failed")
+                    self._record_lesson_outcome(task.task_id, success=False)
                     break
                 except Exception as e:  # noqa: BLE001 - surface failure into manifest
                     stage_error = str(e)
+                    self._pin_stack_from_scaffold(manifest, artifact_dir)
                     self._publish(
                         "PROJECT_STAGE_FAILED",
                         self._stage_failure_payload(
@@ -1580,6 +1712,7 @@ class StudioRunner:
                                 )
                         except Exception:
                             logger.exception("scoreboard record on stage error failed")
+                    self._record_lesson_outcome(task.task_id, success=False)
                     break
 
                 ok = bool(getattr(result, "success", True))
@@ -1721,6 +1854,8 @@ class StudioRunner:
                     # A stage returned success=False; treat the whole project
                     # as failed so the dashboard badge reflects reality.
                     manifest["status"] = "failed"
+                    if stage.name == "code":
+                        self._pin_stack_from_scaffold(manifest, artifact_dir)
                     stage_error = (
                         str(getattr(result, "error", "") or "")
                         or self._summarize_stage_output(output)
@@ -1758,6 +1893,7 @@ class StudioRunner:
                             slug, stage.name, stage.agent, stage_error, manifest
                         ),
                     )
+                    self._record_lesson_outcome(task.task_id, success=False)
                     break
 
                 # Merge the isolated code worktree back into scaffold/ as
@@ -1773,6 +1909,11 @@ class StudioRunner:
                             self._save_manifest(artifact_dir, manifest)
                     except Exception:
                         logger.exception("worktree merge-back failed")
+                    # H22: pin the detected stack as soon as the scaffold exists
+                    # so downstream failure events (contract/consistency blockers,
+                    # verifiers) report a real stack instead of "unknown".
+                    self._pin_stack_from_scaffold(manifest, artifact_dir)
+                    self._save_manifest(artifact_dir, manifest)
 
                 # Contract verifier fix loop: deterministic
                 # palette/tech_stack/placeholder findings → targeted
@@ -2295,6 +2436,7 @@ class StudioRunner:
                     files=stage_files,
                     next_action=manifest["next_action"],
                 )
+                self._record_lesson_outcome(task.task_id, success=True)
                 manifest["current_stage"] = None
                 manifest["current_agent"] = None
                 self._append_history(
@@ -6536,6 +6678,33 @@ class StudioRunner:
         }
 
     @staticmethod
+    def _pin_stack_from_scaffold(
+        manifest: Dict[str, Any], artifact_dir: Path
+    ) -> Optional[str]:
+        """Detect the stack from artifact_dir/scaffold and pin it on manifest.
+
+        Returns the detected stack (or the already-pinned one) so failure
+        payloads and experience-index rows don't report "unknown" for
+        code-stage failures that happen before the build-verifier stage.
+        """
+        stack = manifest.get("stack")
+        if stack:
+            return str(stack)
+        scaffold_dir = artifact_dir / "scaffold"
+        if not scaffold_dir.exists():
+            return None
+        try:
+            from skyn3t.agents.stack_detector import detect_stack_from_scaffold
+
+            stack = detect_stack_from_scaffold(scaffold_dir)
+        except Exception:
+            logger.debug("stack detection for failure payload failed", exc_info=True)
+            return None
+        if stack and stack != "unknown":
+            manifest["stack"] = stack
+        return stack
+
+    @staticmethod
     def _stage_failure_payload(
         slug: str,
         stage: str,
@@ -6557,6 +6726,20 @@ class StudioRunner:
             "stage_name": stage,
             "error_signature": str(error).lower().strip()[:120],
         }
+
+    def _record_lesson_outcome(self, task_id: Optional[str], *, success: bool) -> None:
+        """Credit/debit lessons injected into a Studio stage task (H20).
+
+        Studio bypasses orchestrator.execute_task, so TASK_COMPLETED/FAILED
+        never fire for these tasks and the LearningLoop cannot attribute the
+        outcome itself. Call this after each stage result is known.
+        """
+        if not task_id or self._scoreboard is None:
+            return
+        try:
+            self._scoreboard.record_outcome(task_id, success=success)
+        except Exception:
+            logger.debug("lesson outcome recording failed", exc_info=True)
 
     @staticmethod
     def _resume_start_index(manifest: Dict[str, Any]) -> int:
@@ -7800,6 +7983,7 @@ class StudioRunner:
         error: Optional[str] = None,
         next_action: Optional[str] = None,
         question_count: Optional[int] = None,
+        injected_lesson_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         stage_plan = self._build_stage_plan(stage)
         stage_name = str(stage_plan.get("name") or "")
@@ -7820,6 +8004,8 @@ class StudioRunner:
             record["completed_at"] = None
         if task_id is not None:
             record["task_id"] = task_id
+        if injected_lesson_ids is not None:
+            record["injected_lesson_ids"] = injected_lesson_ids
 
         if summary is not None:
             record["summary"] = summary

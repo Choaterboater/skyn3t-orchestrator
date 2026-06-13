@@ -28,10 +28,12 @@ from typing import Dict, List, Literal, Optional
 # Public dataclasses
 # ---------------------------------------------------------------------------
 
-# The big four packaging strategies. "fullstack" means web + server in one
-# project tree. "unknown" means we couldn't classify confidently — caller
-# should fall back to a docs-only packaging mode.
-Family = Literal["web", "server", "fullstack", "unknown"]
+# Packaging strategies. "fullstack" means web + server in one project tree.
+# "cli", "mobile", and "desktop" are recognized families even though the
+# built-in packaging templates currently only ship for web/server/fullstack;
+# detecting them lets the pipeline fail loudly instead of silently treating
+# a React Native or Tauri app as a generic web project.
+Family = Literal["web", "server", "fullstack", "cli", "mobile", "desktop", "unknown"]
 
 
 @dataclass
@@ -74,6 +76,11 @@ class StackDetection:
     def is_server(self) -> bool:
         return self.family in ("server", "fullstack")
 
+    @property
+    def is_packaged(self) -> bool:
+        """True when the project family has built-in packaging support."""
+        return self.family in ("web", "server", "fullstack")
+
 
 # ---------------------------------------------------------------------------
 # Manifest heuristics
@@ -87,6 +94,36 @@ class StackDetection:
 _CANONICAL_STACK_NAMES: Dict[str, str] = {
     "vite_react": "react_vite",
 }
+
+# CLI-stack signatures by package.json dependency.
+_CLI_STACK_BY_NODE_DEP: List[tuple[str, str]] = [
+    ("commander", "node_cli"),
+    ("yargs", "node_cli"),
+    ("minimist", "node_cli"),
+    ("inquirer", "node_cli"),
+    ("oclif", "node_cli"),
+    ("ink", "node_cli"),
+]
+
+_CLI_STACK_BY_PY_DEP: List[tuple[str, str]] = [
+    ("click", "python_cli"),
+    ("typer", "python_cli"),
+    ("rich", "python_cli"),
+]
+
+# Mobile-stack signatures.
+_MOBILE_STACK_BY_DEP: List[tuple[str, str]] = [
+    ("react-native", "react_native"),
+    ("expo", "expo"),
+    ("@capacitor/core", "capacitor"),
+]
+
+# Desktop-stack signatures.
+_DESKTOP_STACK_BY_DEP: List[tuple[str, str]] = [
+    ("electron", "electron"),
+    ("@tauri-apps/cli", "tauri"),
+    ("@tauri-apps/api", "tauri"),
+]
 
 # Web-stack signatures by package.json dep. Order matters — more specific
 # (next > react_vite > generic_react) so the most-informative one wins.
@@ -400,6 +437,58 @@ def detect(root: Path) -> StackDetection:
             if dep in _SERVICE_BY_DEP and _SERVICE_BY_DEP[dep] not in detection.services:
                 detection.services.append(_SERVICE_BY_DEP[dep])
 
+    # ---- CLI / mobile / desktop ----------------------------------------
+    # Only classify these when we didn't already find a web/server/fullstack
+    # signal — a React frontend with a CLI helper is still a web app.
+    if detection.family == "unknown":
+        # Node CLI / mobile / desktop deps all live in package.json.
+        if pkg_path.is_file():
+            for dep_name, stack_name in _CLI_STACK_BY_NODE_DEP:
+                if dep_name in deps:
+                    detection.stack = stack_name
+                    detection.family = "cli"
+                    detection.confidence_notes.append(f"detected CLI dep {dep_name}")
+                    break
+            if detection.family == "unknown":
+                for dep_name, stack_name in _MOBILE_STACK_BY_DEP:
+                    if dep_name in deps:
+                        detection.stack = stack_name
+                        detection.family = "mobile"
+                        detection.confidence_notes.append(f"detected mobile dep {dep_name}")
+                        break
+            if detection.family == "unknown":
+                for dep_name, stack_name in _DESKTOP_STACK_BY_DEP:
+                    if dep_name in deps:
+                        detection.stack = stack_name
+                        detection.family = "desktop"
+                        detection.confidence_notes.append(f"detected desktop dep {dep_name}")
+                        break
+        # Python CLI deps.
+        if detection.family == "unknown" and py_dep_names:
+            for dep_name, stack_name in _CLI_STACK_BY_PY_DEP:
+                if dep_name in py_dep_set:
+                    detection.stack = stack_name
+                    detection.family = "cli"
+                    detection.confidence_notes.append(f"detected Python CLI dep {dep_name}")
+                    break
+        # Flutter / native mobile markers.
+        if detection.family == "unknown":
+            if (project_root / "pubspec.yaml").is_file():
+                detection.stack = "flutter"
+                detection.family = "mobile"
+                detection.confidence_notes.append("detected Flutter pubspec.yaml")
+            elif (
+                (project_root / "ios" / "Runner.xcodeproj").is_dir()
+                or (project_root / "android" / "app").is_dir()
+            ):
+                detection.stack = "native_mobile"
+                detection.family = "mobile"
+                detection.confidence_notes.append("detected iOS/Android project markers")
+            elif (project_root / "src-tauri" / "tauri.conf.json").is_file():
+                detection.stack = "tauri"
+                detection.family = "desktop"
+                detection.confidence_notes.append("detected Tauri config")
+
     # ---- Dockerfile / compose ------------------------------------------
     for candidate in ("Dockerfile", "dockerfile"):
         if (project_root / candidate).is_file() or (root / candidate).is_file():
@@ -432,6 +521,10 @@ def detect(root: Path) -> StackDetection:
             )
         elif not detection.runtimes:
             detection.confidence_notes.append("no manifest files found")
+    elif detection.family in ("cli", "mobile", "desktop"):
+        detection.confidence_notes.append(
+            f"{detection.family} stack detected; built-in packaging templates are limited"
+        )
 
     return detection
 

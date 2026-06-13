@@ -316,3 +316,21 @@ class AuditLog:
                 "oldest_entry": self._entries[0].timestamp if self._entries else None,
                 "newest_entry": self._entries[-1].timestamp if self._entries else None,
             }
+
+
+# Singleton accessor so the web layer and agents share one audit chain.
+_audit_log_singleton: Optional[AuditLog] = None
+_audit_log_lock = threading.Lock()
+
+
+def get_audit_log() -> AuditLog:
+    """Return the process-wide audit log, lazily initialized from settings."""
+    global _audit_log_singleton
+    if _audit_log_singleton is None:
+        with _audit_log_lock:
+            if _audit_log_singleton is None:
+                from skyn3t.config.settings import get_settings
+
+                log_dir = getattr(get_settings(), "audit_log_dir", None)
+                _audit_log_singleton = AuditLog(log_dir=log_dir)
+    return _audit_log_singleton

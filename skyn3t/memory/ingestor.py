@@ -358,16 +358,29 @@ class ExperienceIngestor:
             "capability": capability,
             "content_hash": content_hash,
         }
+        auto_reject_reason = self._auto_reject_reason_for_insight(insight)
         metadata = self._with_governance_metadata(
             metadata,
             memory_layer="operator",
+            review_status="rejected" if auto_reject_reason else "approved",
             reusable=True,
             confidence=0.65,
-            auto_reject_reason=self._auto_reject_reason_for_insight(insight),
+            auto_reject_reason=auto_reject_reason,
         )
-        await self._persist_doc(title, content, agent_name, "insight", metadata, None)
+        if auto_reject_reason:
+            await self._persist_doc(title, content, agent_name, "insight", metadata, None)
+            self._record_seen(content_hash)
+            return None
+        embedding_id = await self.rag.add_knowledge_one(
+            content=content,
+            title=title,
+            source=agent_name,
+            doc_type="insight",
+            metadata=metadata,
+        )
+        await self._persist_doc(title, content, agent_name, "insight", metadata, embedding_id)
         self._record_seen(content_hash)
-        return None
+        return embedding_id
 
     async def ingest_failure_pattern(
         self,
@@ -393,16 +406,29 @@ class ExperienceIngestor:
             "affected_agents": affected_agents,
             "content_hash": content_hash,
         }
+        auto_reject_reason = self._auto_reject_reason_for_pattern(description, suggested_fix)
         metadata = self._with_governance_metadata(
             metadata,
             memory_layer="operator",
+            review_status="rejected" if auto_reject_reason else "approved",
             reusable=True,
             confidence=0.7,
-            auto_reject_reason=self._auto_reject_reason_for_pattern(description, suggested_fix),
+            auto_reject_reason=auto_reject_reason,
         )
-        await self._persist_doc(title, content, "reflection", "pattern", metadata, None)
+        if auto_reject_reason:
+            await self._persist_doc(title, content, "reflection", "pattern", metadata, None)
+            self._record_seen(content_hash)
+            return None
+        embedding_id = await self.rag.add_knowledge_one(
+            content=content,
+            title=title,
+            source="reflection",
+            doc_type="pattern",
+            metadata=metadata,
+        )
+        await self._persist_doc(title, content, "reflection", "pattern", metadata, embedding_id)
         self._record_seen(content_hash)
-        return None
+        return embedding_id
 
     async def ingest_project_event(
         self,

@@ -264,6 +264,12 @@ class Settings(BaseSettings):
     docker_cap_drop_all: bool = Field(default=True, alias="SKYN3T_DOCKER_CAP_DROP_ALL")
     docker_pool_recycle_after: int = Field(default=50, alias="SKYN3T_DOCKER_POOL_RECYCLE_AFTER")
 
+    # Retention / pruning (H24). 0 disables pruning for that entity.
+    retention_logs_days: int = Field(default=7, alias="SKYN3T_RETENTION_LOGS_DAYS")
+    retention_messages_days: int = Field(default=30, alias="SKYN3T_RETENTION_MESSAGES_DAYS")
+    retention_experience_days: int = Field(default=90, alias="SKYN3T_RETENTION_EXPERIENCE_DAYS")
+    retention_completed_tasks_days: int = Field(default=30, alias="SKYN3T_RETENTION_COMPLETED_TASKS_DAYS")
+
     # Public URL — used in notification embeds (Discord etc.) so users can
     # click through to the dashboard. Leave unset to fall back to
     # http://<web_host>:<web_port>, which is fine for local-only use but
@@ -274,7 +280,10 @@ class Settings(BaseSettings):
     # Web
     web_host: str = Field(default="0.0.0.0", alias="WEB_HOST")
     web_port: int = Field(default=6660, alias="WEB_PORT")
-    cors_origins: List[str] = Field(default=["*"], alias="CORS_ORIGINS")
+    cors_origins: List[str] = Field(
+        default=["http://localhost:5173", "http://localhost:5180"],
+        alias="CORS_ORIGINS",
+    )
     web_token: Optional[str] = Field(default=None, alias="SKYN3T_WEB_TOKEN")
     # SECURITY: by default the web control plane requires SKYN3T_WEB_TOKEN.
     # Setting this to true restores the legacy loopback-only behavior. It is

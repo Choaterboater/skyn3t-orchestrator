@@ -2477,6 +2477,7 @@ class CodeAgent(BaseAgent):
                     # copilot is better at Express. Mixing them gets us
                     # the best of both per file instead of forcing one.
                     file_client = client  # default = agent's primary
+                    routed = False
                     try:
                         from skyn3t.core.model_router import resolve_model_for_file
                         # Adaptive routing: pass the active stack +
@@ -2506,6 +2507,7 @@ class CodeAgent(BaseAgent):
                                 caller_name=self.name,
                                 backend_is_policy=True,
                             )
+                            routed = True
                     except Exception:
                         logger.debug(
                             "per-file backend routing failed for %s",
@@ -2524,6 +2526,14 @@ class CodeAgent(BaseAgent):
                         )
                     except Exception:
                         body_local = ""
+                    finally:
+                        # H15: close the per-file routed client so we don't
+                        # leak httpx connections / subprocess pools.
+                        if routed and file_client is not client:
+                            try:
+                                await file_client.aclose()
+                            except Exception:
+                                pass
                     marked_local = _extract_marked_files(body_local or "")
                     if marked_local:
                         body_match = (

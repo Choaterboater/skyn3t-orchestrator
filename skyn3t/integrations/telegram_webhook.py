@@ -43,12 +43,16 @@ async def telegram_webhook(
     MessagingRouter via TelegramChannel.send() later.
     """
     expected = _get_webhook_secret()
-    if expected:
-        # Constant-time compare to avoid trivial timing-attack noise.
-        # Telegram's header is a plain string, so secrets module is fine.
-        import hmac
-        if not hmac.compare_digest(expected, x_telegram_bot_api_secret_token or ""):
-            raise HTTPException(status_code=401, detail="invalid telegram secret token")
+    if not expected:
+        # H10: fail closed when the webhook secret is not configured.
+        logger.error("TELEGRAM_WEBHOOK_SECRET is not set; rejecting Telegram webhook")
+        raise HTTPException(status_code=503, detail="telegram webhook not configured")
+    # Constant-time compare to avoid trivial timing-attack noise.
+    # Telegram's header is a plain string, so hmac is fine.
+    import hmac
+
+    if not hmac.compare_digest(expected, x_telegram_bot_api_secret_token or ""):
+        raise HTTPException(status_code=401, detail="invalid telegram secret token")
 
     try:
         payload = await request.json()

@@ -255,3 +255,37 @@ async def test_learning_loop_records_injection_for_attribution(tmp_path):
     loop._credit_outcome(completion, success=True)
     sb.flush()
     assert sb.get_stats("lesson-x").helpful == 1
+
+
+@pytest.mark.asyncio
+async def test_learning_loop_tags_injected_lesson_ids_on_task(tmp_path):
+    from skyn3t.intelligence.learning_loop import LearningLoop
+
+    sb = LessonScoreboard(store_path=tmp_path / "s.json", flush_every=999)
+    rag = _StubRAG([
+        {"id": "lesson-a", "content": "a body", "metadata": {}},
+        {"id": "lesson-b", "content": "b body", "metadata": {}},
+    ])
+    loop = LearningLoop(event_bus=None, rag=rag, scoreboard=sb)
+
+    task = _StubTaskRequest(task_id="task-tag")
+    await loop.inject_for_task(task, title="do thing", task_id="task-tag")
+
+    assert getattr(task, "_injected_lesson_ids", []) == ["lesson-a", "lesson-b"]
+
+
+def test_record_feedback_updates_helpful_and_hurt(tmp_path):
+    sb = LessonScoreboard(store_path=tmp_path / "s.json", flush_every=999)
+    sb.record_feedback("lesson-1", helpful=True)
+    sb.record_feedback("lesson-1", helpful=True)
+    sb.record_feedback("lesson-2", helpful=False)
+
+    assert sb.get_stats("lesson-1").helpful == 2
+    assert sb.get_stats("lesson-1").hurt == 0
+    assert sb.get_stats("lesson-2").hurt == 1
+
+
+def test_record_feedback_ignores_empty_lesson_id(tmp_path):
+    sb = LessonScoreboard(store_path=tmp_path / "s.json", flush_every=999)
+    sb.record_feedback("", helpful=True)
+    assert sb.summary()["total_lessons_tracked"] == 0

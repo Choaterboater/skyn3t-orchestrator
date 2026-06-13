@@ -449,6 +449,15 @@ function ProjectDetailView({
           </section>
         )}
 
+        {["completed", "failed", "done", "passed"].includes(
+          String(data.status ?? "").toLowerCase(),
+        ) && (
+          <section>
+            <SectionTitle>Post-ship feedback</SectionTitle>
+            <FeedbackCard slug={slug} />
+          </section>
+        )}
+
         <section>
           <SectionTitle>Artifacts ({artifacts.length})</SectionTitle>
           <ArtifactList slug={slug} artifacts={artifacts} />
@@ -1391,6 +1400,45 @@ function ApprovalCard({ slug, data }: { slug: string; data: any }) {
         </div>
       )}
     </section>
+  );
+}
+
+function FeedbackCard({ slug }: { slug: string }) {
+  const fb = useMutation({
+    mutationFn: (helpful: boolean) => api.feedbackProject(slug, helpful),
+  });
+  const sent = fb.isSuccess;
+  const busy = fb.isPending;
+
+  return (
+    <div className="rounded-xl border border-border bg-bg-2/80 p-4 text-sm text-text-secondary">
+      <p className="mb-3">
+        Did the injected lessons help this build? Your feedback tunes the
+        lesson scoreboard.
+      </p>
+      {sent ? (
+        <p className="text-status-green text-xs">Thanks — feedback recorded.</p>
+      ) : (
+        <div className="flex gap-2">
+          <button
+            onClick={() => fb.mutate(true)}
+            disabled={busy}
+            className="rounded border border-status-green/40 bg-status-green/10 px-3 py-1.5 text-xs font-medium text-status-green hover:bg-status-green/20 disabled:opacity-50"
+          >
+            <i className="fa-solid fa-thumbs-up mr-1.5" />
+            Helpful
+          </button>
+          <button
+            onClick={() => fb.mutate(false)}
+            disabled={busy}
+            className="rounded border border-status-red/40 bg-status-red/10 px-3 py-1.5 text-xs font-medium text-status-red hover:bg-status-red/20 disabled:opacity-50"
+          >
+            <i className="fa-solid fa-thumbs-down mr-1.5" />
+            Not helpful
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
 

@@ -1,12 +1,11 @@
 """Persistent memory store for SkyN3t — the swarm's long-term memory."""
 
-import asyncio
 import json
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import and_, delete, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyn3t.core.models import (
@@ -41,7 +40,6 @@ class MemoryStore:
     """
 
     def __init__(self):
-        self._lock = asyncio.Lock()
         self._session_maker = get_session_maker()
 
     async def _session(self) -> AsyncSession:
@@ -60,39 +58,38 @@ class MemoryStore:
                          reports_to: Optional[str] = None,
                          lifecycle: Optional[str] = None) -> None:
         """Upsert an agent record."""
-        async with self._lock:
-            async with await self._session() as session:
-                async with session.begin():
-                    result = await session.execute(
-                        select(AgentModel).where(AgentModel.name == name)
-                    )
-                    existing = result.scalar_one_or_none()
-                    if existing:
-                        existing.agent_type = agent_type
-                        existing.provider = provider
-                        existing.status = AgentStatus(status) if status in [s.value for s in AgentStatus] else AgentStatus.IDLE
-                        existing.role = role
-                        existing.reports_to = reports_to
-                        existing.lifecycle = lifecycle
-                        existing.capabilities = capabilities
-                        existing.config = config
-                        existing.meta = meta
-                        existing.last_heartbeat = datetime.now(timezone.utc)
-                    else:
-                        session.add(AgentModel(
-                            id=agent_id,
-                            name=name,
-                            agent_type=agent_type,
-                            provider=provider,
-                            status=AgentStatus(status) if status in [s.value for s in AgentStatus] else AgentStatus.IDLE,
-                            role=role,
-                            reports_to=reports_to,
-                            lifecycle=lifecycle,
-                            capabilities=capabilities,
-                            config=config,
-                            meta=meta,
-                            last_heartbeat=datetime.now(timezone.utc),
-                        ))
+        async with await self._session() as session:
+            async with session.begin():
+                result = await session.execute(
+                    select(AgentModel).where(AgentModel.name == name)
+                )
+                existing = result.scalar_one_or_none()
+                if existing:
+                    existing.agent_type = agent_type
+                    existing.provider = provider
+                    existing.status = AgentStatus(status) if status in [s.value for s in AgentStatus] else AgentStatus.IDLE
+                    existing.role = role
+                    existing.reports_to = reports_to
+                    existing.lifecycle = lifecycle
+                    existing.capabilities = capabilities
+                    existing.config = config
+                    existing.meta = meta
+                    existing.last_heartbeat = datetime.now(timezone.utc)
+                else:
+                    session.add(AgentModel(
+                        id=agent_id,
+                        name=name,
+                        agent_type=agent_type,
+                        provider=provider,
+                        status=AgentStatus(status) if status in [s.value for s in AgentStatus] else AgentStatus.IDLE,
+                        role=role,
+                        reports_to=reports_to,
+                        lifecycle=lifecycle,
+                        capabilities=capabilities,
+                        config=config,
+                        meta=meta,
+                        last_heartbeat=datetime.now(timezone.utc),
+                    ))
 
     async def get_agent(self, name: str) -> Optional[Dict[str, Any]]:
         """Get an agent by name."""
@@ -152,51 +149,50 @@ class MemoryStore:
                         completed_at: Optional[datetime],
                         session_id: Optional[str] = None) -> None:
         """Upsert a task record."""
-        async with self._lock:
-            async with await self._session() as session:
-                async with session.begin():
-                    result = await session.execute(
-                        select(TaskModel).where(TaskModel.id == task_id)
-                    )
-                    existing = result.scalar_one_or_none()
-                    if existing:
-                        existing.title = title
-                        existing.description = description
-                        existing.status = TaskStatus(status) if status in [s.value for s in TaskStatus] else TaskStatus.PENDING
-                        existing.priority = priority
-                        existing.agent_id = agent_id
-                        existing.parent_task_id = parent_task_id
-                        existing.input_data = input_data
-                        existing.output_data = output_data
-                        existing.error_message = error_message
-                        existing.retry_count = retry_count
-                        existing.max_retries = max_retries
-                        existing.started_at = started_at
-                        existing.completed_at = completed_at
-                        if session_id:
-                            existing_meta = existing.input_data.get("_meta", {})
-                            existing_meta["session_id"] = session_id
-                            existing.input_data = {**existing.input_data, "_meta": existing_meta}
-                    else:
-                        task_input = dict(input_data)
-                        if session_id:
-                            task_input["_meta"] = {**(task_input.get("_meta") or {}), "session_id": session_id}
-                        session.add(TaskModel(
-                            id=task_id,
-                            title=title,
-                            description=description,
-                            status=TaskStatus(status) if status in [s.value for s in TaskStatus] else TaskStatus.PENDING,
-                            priority=priority,
-                            agent_id=agent_id,
-                            parent_task_id=parent_task_id,
-                            input_data=task_input,
-                            output_data=output_data,
-                            error_message=error_message,
-                            retry_count=retry_count,
-                            max_retries=max_retries,
-                            started_at=started_at,
-                            completed_at=completed_at,
-                        ))
+        async with await self._session() as session:
+            async with session.begin():
+                result = await session.execute(
+                    select(TaskModel).where(TaskModel.id == task_id)
+                )
+                existing = result.scalar_one_or_none()
+                if existing:
+                    existing.title = title
+                    existing.description = description
+                    existing.status = TaskStatus(status) if status in [s.value for s in TaskStatus] else TaskStatus.PENDING
+                    existing.priority = priority
+                    existing.agent_id = agent_id
+                    existing.parent_task_id = parent_task_id
+                    existing.input_data = input_data
+                    existing.output_data = output_data
+                    existing.error_message = error_message
+                    existing.retry_count = retry_count
+                    existing.max_retries = max_retries
+                    existing.started_at = started_at
+                    existing.completed_at = completed_at
+                    if session_id:
+                        existing_meta = existing.input_data.get("_meta", {})
+                        existing_meta["session_id"] = session_id
+                        existing.input_data = {**existing.input_data, "_meta": existing_meta}
+                else:
+                    task_input = dict(input_data)
+                    if session_id:
+                        task_input["_meta"] = {**(task_input.get("_meta") or {}), "session_id": session_id}
+                    session.add(TaskModel(
+                        id=task_id,
+                        title=title,
+                        description=description,
+                        status=TaskStatus(status) if status in [s.value for s in TaskStatus] else TaskStatus.PENDING,
+                        priority=priority,
+                        agent_id=agent_id,
+                        parent_task_id=parent_task_id,
+                        input_data=task_input,
+                        output_data=output_data,
+                        error_message=error_message,
+                        retry_count=retry_count,
+                        max_retries=max_retries,
+                        started_at=started_at,
+                        completed_at=completed_at,
+                    ))
 
     async def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
         """Get a task by ID."""
@@ -358,17 +354,16 @@ class MemoryStore:
         merged_context: Dict[str, Any] = dict(context or {})
         if session_id and "session_id" not in merged_context:
             merged_context["session_id"] = session_id
-        async with self._lock:
-            async with await self._session() as session:
-                async with session.begin():
-                    session.add(MessageModel(
-                        id=msg_id,
-                        source_agent=source_agent,
-                        target_agent=target_agent,
-                        content=content,
-                        message_type=message_type,
-                        context=merged_context,
-                    ))
+        async with await self._session() as session:
+            async with session.begin():
+                session.add(MessageModel(
+                    id=msg_id,
+                    source_agent=source_agent,
+                    target_agent=target_agent,
+                    content=content,
+                    message_type=message_type,
+                    context=merged_context,
+                ))
         return msg_id
 
     async def get_messages_between(self, agent_a: str, agent_b: str,
@@ -423,18 +418,17 @@ class MemoryStore:
         """Save a lesson or knowledge document."""
         from uuid import uuid4
         doc_id = str(uuid4())
-        async with self._lock:
-            async with await self._session() as session:
-                async with session.begin():
-                    session.add(KnowledgeDocument(
-                        id=doc_id,
-                        title=title,
-                        content=content,
-                        source=source,
-                        doc_type=doc_type,
-                        meta=meta or {},
-                        embedding_id=embedding_id,
-                    ))
+        async with await self._session() as session:
+            async with session.begin():
+                session.add(KnowledgeDocument(
+                    id=doc_id,
+                    title=title,
+                    content=content,
+                    source=source,
+                    doc_type=doc_type,
+                    meta=meta or {},
+                    embedding_id=embedding_id,
+                ))
         return doc_id
 
     async def save_knowledge_doc(
@@ -531,36 +525,35 @@ class MemoryStore:
         extra_meta: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Update review metadata for a knowledge document."""
-        async with self._lock:
-            async with await self._session() as session:
-                async with session.begin():
-                    result = await session.execute(
-                        select(KnowledgeDocument).where(KnowledgeDocument.id == doc_id)
-                    )
-                    doc = result.scalar_one_or_none()
-                    if doc is None:
-                        return None
-                    now = datetime.now(timezone.utc).isoformat()
-                    meta = dict(doc.meta or {})
-                    meta.update(extra_meta or {})
-                    meta["review_status"] = review_status
-                    meta["reviewed_by"] = reviewed_by
-                    meta["reviewed_at"] = now
-                    if review_status == "approved":
-                        meta["approved_at"] = now
-                        meta.pop("rejected_at", None)
-                        meta.pop("review_reason", None)
-                    elif review_status == "rejected":
-                        meta["rejected_at"] = now
-                        if reason:
-                            meta["review_reason"] = reason
-                    elif reason:
+        async with await self._session() as session:
+            async with session.begin():
+                result = await session.execute(
+                    select(KnowledgeDocument).where(KnowledgeDocument.id == doc_id)
+                )
+                doc = result.scalar_one_or_none()
+                if doc is None:
+                    return None
+                now = datetime.now(timezone.utc).isoformat()
+                meta = dict(doc.meta or {})
+                meta.update(extra_meta or {})
+                meta["review_status"] = review_status
+                meta["reviewed_by"] = reviewed_by
+                meta["reviewed_at"] = now
+                if review_status == "approved":
+                    meta["approved_at"] = now
+                    meta.pop("rejected_at", None)
+                    meta.pop("review_reason", None)
+                elif review_status == "rejected":
+                    meta["rejected_at"] = now
+                    if reason:
                         meta["review_reason"] = reason
-                    doc.meta = meta
-                    if embedding_id is not None:
-                        doc.embedding_id = embedding_id
-                await session.refresh(doc)
-                return self._serialize_knowledge_doc(doc)
+                elif reason:
+                    meta["review_reason"] = reason
+                doc.meta = meta
+                if embedding_id is not None:
+                    doc.embedding_id = embedding_id
+            await session.refresh(doc)
+            return self._serialize_knowledge_doc(doc)
 
     async def merge_knowledge_doc_meta(
         self,
@@ -568,20 +561,19 @@ class MemoryStore:
         extra_meta: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
         """Merge arbitrary metadata into a knowledge document."""
-        async with self._lock:
-            async with await self._session() as session:
-                async with session.begin():
-                    result = await session.execute(
-                        select(KnowledgeDocument).where(KnowledgeDocument.id == doc_id)
-                    )
-                    doc = result.scalar_one_or_none()
-                    if doc is None:
-                        return None
-                    meta = dict(doc.meta or {})
-                    meta.update(extra_meta)
-                    doc.meta = meta
-                await session.refresh(doc)
-                return self._serialize_knowledge_doc(doc)
+        async with await self._session() as session:
+            async with session.begin():
+                result = await session.execute(
+                    select(KnowledgeDocument).where(KnowledgeDocument.id == doc_id)
+                )
+                doc = result.scalar_one_or_none()
+                if doc is None:
+                    return None
+                meta = dict(doc.meta or {})
+                meta.update(extra_meta)
+                doc.meta = meta
+            await session.refresh(doc)
+            return self._serialize_knowledge_doc(doc)
 
     async def update_knowledge_doc(
         self,
@@ -593,25 +585,24 @@ class MemoryStore:
         embedding_id: Any = _KEEP,
     ) -> Optional[Dict[str, Any]]:
         """Update content/title/meta for a knowledge document."""
-        async with self._lock:
-            async with await self._session() as session:
-                async with session.begin():
-                    result = await session.execute(
-                        select(KnowledgeDocument).where(KnowledgeDocument.id == doc_id)
-                    )
-                    doc = result.scalar_one_or_none()
-                    if doc is None:
-                        return None
-                    if title is not None:
-                        doc.title = title
-                    if content is not None:
-                        doc.content = content
-                    if meta is not None:
-                        doc.meta = meta
-                    if embedding_id is not _KEEP:
-                        doc.embedding_id = embedding_id
-                await session.refresh(doc)
-                return self._serialize_knowledge_doc(doc, preview_only=False)
+        async with await self._session() as session:
+            async with session.begin():
+                result = await session.execute(
+                    select(KnowledgeDocument).where(KnowledgeDocument.id == doc_id)
+                )
+                doc = result.scalar_one_or_none()
+                if doc is None:
+                    return None
+                if title is not None:
+                    doc.title = title
+                if content is not None:
+                    doc.content = content
+                if meta is not None:
+                    doc.meta = meta
+                if embedding_id is not _KEEP:
+                    doc.embedding_id = embedding_id
+            await session.refresh(doc)
+            return self._serialize_knowledge_doc(doc, preview_only=False)
 
     async def find_knowledge_doc_by_meta(
         self,
@@ -714,26 +705,25 @@ class MemoryStore:
         """
         if not embedding_id:
             return
-        async with self._lock:
-            async with await self._session() as session:
-                async with session.begin():
-                    existing = await session.execute(
-                        select(ExperienceIndex).where(
-                            ExperienceIndex.embedding_id == embedding_id,
-                        )
+        async with await self._session() as session:
+            async with session.begin():
+                existing = await session.execute(
+                    select(ExperienceIndex).where(
+                        ExperienceIndex.embedding_id == embedding_id,
                     )
-                    if existing.scalar_one_or_none() is not None:
-                        return
-                    session.add(ExperienceIndex(
-                        embedding_id=embedding_id,
-                        task_id=task_id,
-                        stack=stack,
-                        stage=stage,
-                        error_signature=error_signature,
-                        fix_applied=fix_applied,
-                        fix_worked=fix_worked,
-                        success=success,
-                    ))
+                )
+                if existing.scalar_one_or_none() is not None:
+                    return
+                session.add(ExperienceIndex(
+                    embedding_id=embedding_id,
+                    task_id=task_id,
+                    stack=stack,
+                    stage=stage,
+                    error_signature=error_signature,
+                    fix_applied=fix_applied,
+                    fix_worked=fix_worked,
+                    success=success,
+                ))
 
     async def mark_fix_worked(
         self,
@@ -750,19 +740,18 @@ class MemoryStore:
         """
         if not embedding_id:
             return False
-        async with self._lock:
-            async with await self._session() as session:
-                async with session.begin():
-                    result = await session.execute(
-                        select(ExperienceIndex).where(
-                            ExperienceIndex.embedding_id == embedding_id,
-                        )
+        async with await self._session() as session:
+            async with session.begin():
+                result = await session.execute(
+                    select(ExperienceIndex).where(
+                        ExperienceIndex.embedding_id == embedding_id,
                     )
-                    row = result.scalar_one_or_none()
-                    if row is None:
-                        return False
-                    row.fix_worked = bool(worked)
-                    return True
+                )
+                row = result.scalar_one_or_none()
+                if row is None:
+                    return False
+                row.fix_worked = bool(worked)
+                return True
 
     async def mark_latest_unresolved_fix_worked(
         self,
@@ -783,32 +772,31 @@ class MemoryStore:
         sig = (error_signature or "").strip()
         if not sig:
             return None
-        async with self._lock:
-            async with await self._session() as session:
-                async with session.begin():
-                    # Sort by created_at + auto-increment id. SQLite's
-                    # CURRENT_TIMESTAMP has 1-second resolution; two
-                    # rows inserted in the same second tie on
-                    # created_at and need the PK as the tiebreaker
-                    # so "newest" is unambiguous.
-                    result = await session.execute(
-                        select(ExperienceIndex)
-                        .where(
-                            ExperienceIndex.error_signature == sig,
-                            ExperienceIndex.fix_applied.is_not(None),
-                            ExperienceIndex.fix_worked.is_(None),
-                        )
-                        .order_by(
-                            desc(ExperienceIndex.created_at),
-                            desc(ExperienceIndex.id),
-                        )
-                        .limit(1)
+        async with await self._session() as session:
+            async with session.begin():
+                # Sort by created_at + auto-increment id. SQLite's
+                # CURRENT_TIMESTAMP has 1-second resolution; two
+                # rows inserted in the same second tie on
+                # created_at and need the PK as the tiebreaker
+                # so "newest" is unambiguous.
+                result = await session.execute(
+                    select(ExperienceIndex)
+                    .where(
+                        ExperienceIndex.error_signature == sig,
+                        ExperienceIndex.fix_applied.is_not(None),
+                        ExperienceIndex.fix_worked.is_(None),
                     )
-                    row = result.scalar_one_or_none()
-                    if row is None:
-                        return None
-                    row.fix_worked = bool(worked)
-                    return row.embedding_id
+                    .order_by(
+                        desc(ExperienceIndex.created_at),
+                        desc(ExperienceIndex.id),
+                    )
+                    .limit(1)
+                )
+                row = result.scalar_one_or_none()
+                if row is None:
+                    return None
+                row.fix_worked = bool(worked)
+                return row.embedding_id
 
     async def rank_fixes_for_signature(
         self,
@@ -834,16 +822,15 @@ class MemoryStore:
         sig = (error_signature or "").strip()
         if not sig:
             return []
-        async with self._lock:
-            async with await self._session() as session:
-                result = await session.execute(
-                    select(ExperienceIndex).where(
-                        ExperienceIndex.error_signature == sig,
-                        ExperienceIndex.fix_applied.is_not(None),
-                        ExperienceIndex.fix_worked.is_not(None),
-                    )
+        async with await self._session() as session:
+            result = await session.execute(
+                select(ExperienceIndex).where(
+                    ExperienceIndex.error_signature == sig,
+                    ExperienceIndex.fix_applied.is_not(None),
+                    ExperienceIndex.fix_worked.is_not(None),
                 )
-                rows = result.scalars().all()
+            )
+            rows = result.scalars().all()
         if not rows:
             return []
         tallies: Dict[str, Dict[str, int]] = {}
@@ -893,16 +880,15 @@ class MemoryStore:
         sig = (error_signature or "").strip()
         if not sig:
             return []
-        async with self._lock:
-            async with await self._session() as session:
-                result = await session.execute(
-                    select(ExperienceIndex).where(
-                        ExperienceIndex.error_signature == sig,
-                        ExperienceIndex.fix_applied.is_not(None),
-                        ExperienceIndex.fix_worked.is_not(None),
-                    )
+        async with await self._session() as session:
+            result = await session.execute(
+                select(ExperienceIndex).where(
+                    ExperienceIndex.error_signature == sig,
+                    ExperienceIndex.fix_applied.is_not(None),
+                    ExperienceIndex.fix_worked.is_not(None),
                 )
-                rows = result.scalars().all()
+            )
+            rows = result.scalars().all()
         if not rows:
             return []
         tallies: Dict[str, Dict[str, int]] = {}
@@ -940,16 +926,15 @@ class MemoryStore:
                        meta: Optional[Dict[str, Any]] = None) -> None:
         """Save a system log entry."""
         from uuid import uuid4
-        async with self._lock:
-            async with await self._session() as session:
-                async with session.begin():
-                    session.add(SystemLog(
-                        id=str(uuid4()),
-                        level=level,
-                        source=source,
-                        message=message,
-                        meta=meta or {},
-                    ))
+        async with await self._session() as session:
+            async with session.begin():
+                session.add(SystemLog(
+                    id=str(uuid4()),
+                    level=level,
+                    source=source,
+                    message=message,
+                    meta=meta or {},
+                ))
 
     async def get_logs(self, level: Optional[str] = None, source: Optional[str] = None,
                        limit: int = 100) -> List[Dict[str, Any]]:
@@ -1097,30 +1082,29 @@ class MemoryStore:
 
     async def rebuild_fts_index(self) -> Dict[str, Any]:
         """Drop and rebuild the FTS5 index from existing data."""
-        async with self._lock:
-            async with await self._session() as session:
-                async with session.begin():
-                    from sqlalchemy import text
-                    await session.execute(text("DELETE FROM fts_search"))
-                    # Re-index messages
-                    msg_result = await session.execute(select(MessageModel))
-                    for msg in msg_result.scalars().all():
-                        await session.execute(text(
-                            "INSERT INTO fts_search(content, table_name, record_id) VALUES (:c, 'messages', :id)"
-                        ), {"c": msg.content, "id": msg.id})
-                    # Re-index tasks
-                    task_result = await session.execute(select(TaskModel))
-                    for task in task_result.scalars().all():
-                        content = f"{task.title or ''} {task.description or ''}"
-                        await session.execute(text(
-                            "INSERT INTO fts_search(content, table_name, record_id) VALUES (:c, 'tasks', :id)"
-                        ), {"c": content, "id": task.id})
-                    # Re-index logs
-                    log_result = await session.execute(select(SystemLog))
-                    for log in log_result.scalars().all():
-                        await session.execute(text(
-                            "INSERT INTO fts_search(content, table_name, record_id) VALUES (:c, 'logs', :id)"
-                        ), {"c": log.message, "id": log.id})
+        async with await self._session() as session:
+            async with session.begin():
+                from sqlalchemy import text
+                await session.execute(text("DELETE FROM fts_search"))
+                # Re-index messages
+                msg_result = await session.execute(select(MessageModel))
+                for msg in msg_result.scalars().all():
+                    await session.execute(text(
+                        "INSERT INTO fts_search(content, table_name, record_id) VALUES (:c, 'messages', :id)"
+                    ), {"c": msg.content, "id": msg.id})
+                # Re-index tasks
+                task_result = await session.execute(select(TaskModel))
+                for task in task_result.scalars().all():
+                    content = f"{task.title or ''} {task.description or ''}"
+                    await session.execute(text(
+                        "INSERT INTO fts_search(content, table_name, record_id) VALUES (:c, 'tasks', :id)"
+                    ), {"c": content, "id": task.id})
+                # Re-index logs
+                log_result = await session.execute(select(SystemLog))
+                for log in log_result.scalars().all():
+                    await session.execute(text(
+                        "INSERT INTO fts_search(content, table_name, record_id) VALUES (:c, 'logs', :id)"
+                    ), {"c": log.message, "id": log.id})
         return {"rebuilt": True}
 
     # ------------------------------------------------------------------
@@ -1130,49 +1114,48 @@ class MemoryStore:
     async def get_or_create_user(self, platform_id: str, platform: str,
                                  display_name: Optional[str] = None) -> Dict[str, Any]:
         """Get existing user or create a new one."""
-        async with self._lock:
-            async with await self._session() as session:
-                async with session.begin():
-                    result = await session.execute(
-                        select(UserModel).where(
-                            UserModel.platform_id == platform_id,
-                            UserModel.platform == platform,
-                        )
+        async with await self._session() as session:
+            async with session.begin():
+                result = await session.execute(
+                    select(UserModel).where(
+                        UserModel.platform_id == platform_id,
+                        UserModel.platform == platform,
                     )
-                    user = result.scalar_one_or_none()
-                    if user:
-                        if display_name and user.display_name != display_name:
-                            user.display_name = display_name
-                        return {
-                            "id": user.id,
-                            "platform_id": user.platform_id,
-                            "platform": user.platform,
-                            "display_name": user.display_name,
-                            "profile": json.loads(user.profile_json) if user.profile_json else {},
-                            "message_count": user.message_count,
-                            "session_count": user.session_count,
-                            "created_at": user.created_at.isoformat() if user.created_at else None,
-                            "updated_at": user.updated_at.isoformat() if user.updated_at else None,
-                        }
-                    user = UserModel(
-                        id=str(uuid.uuid4()),
-                        platform_id=platform_id,
-                        platform=platform,
-                        display_name=display_name,
-                        profile_json="{}",
-                    )
-                    session.add(user)
+                )
+                user = result.scalar_one_or_none()
+                if user:
+                    if display_name and user.display_name != display_name:
+                        user.display_name = display_name
                     return {
                         "id": user.id,
                         "platform_id": user.platform_id,
                         "platform": user.platform,
                         "display_name": user.display_name,
-                        "profile": {},
-                        "message_count": 0,
-                        "session_count": 0,
+                        "profile": json.loads(user.profile_json) if user.profile_json else {},
+                        "message_count": user.message_count,
+                        "session_count": user.session_count,
                         "created_at": user.created_at.isoformat() if user.created_at else None,
                         "updated_at": user.updated_at.isoformat() if user.updated_at else None,
                     }
+                user = UserModel(
+                    id=str(uuid.uuid4()),
+                    platform_id=platform_id,
+                    platform=platform,
+                    display_name=display_name,
+                    profile_json="{}",
+                )
+                session.add(user)
+                return {
+                    "id": user.id,
+                    "platform_id": user.platform_id,
+                    "platform": user.platform,
+                    "display_name": user.display_name,
+                    "profile": {},
+                    "message_count": 0,
+                    "session_count": 0,
+                    "created_at": user.created_at.isoformat() if user.created_at else None,
+                    "updated_at": user.updated_at.isoformat() if user.updated_at else None,
+                }
 
     async def get_user_profile(self, platform_id: str, platform: str) -> Optional[Dict[str, Any]]:
         """Get user profile by platform id."""
@@ -1201,41 +1184,39 @@ class MemoryStore:
     async def update_user_profile(self, platform_id: str, platform: str,
                                   profile: Dict[str, Any]) -> bool:
         """Merge profile updates into an existing user."""
-        async with self._lock:
-            async with await self._session() as session:
-                async with session.begin():
-                    result = await session.execute(
-                        select(UserModel).where(
-                            UserModel.platform_id == platform_id,
-                            UserModel.platform == platform,
-                        )
+        async with await self._session() as session:
+            async with session.begin():
+                result = await session.execute(
+                    select(UserModel).where(
+                        UserModel.platform_id == platform_id,
+                        UserModel.platform == platform,
                     )
-                    user = result.scalar_one_or_none()
-                    if not user:
-                        return False
-                    existing = json.loads(user.profile_json) if user.profile_json else {}
-                    existing.update(profile)
-                    user.profile_json = json.dumps(existing)
-                    return True
+                )
+                user = result.scalar_one_or_none()
+                if not user:
+                    return False
+                existing = json.loads(user.profile_json) if user.profile_json else {}
+                existing.update(profile)
+                user.profile_json = json.dumps(existing)
+                return True
 
     async def increment_user_stats(self, platform_id: str, platform: str,
                                    messages: int = 0, sessions: int = 0) -> bool:
         """Bump message/session counters for a user."""
-        async with self._lock:
-            async with await self._session() as session:
-                async with session.begin():
-                    result = await session.execute(
-                        select(UserModel).where(
-                            UserModel.platform_id == platform_id,
-                            UserModel.platform == platform,
-                        )
+        async with await self._session() as session:
+            async with session.begin():
+                result = await session.execute(
+                    select(UserModel).where(
+                        UserModel.platform_id == platform_id,
+                        UserModel.platform == platform,
                     )
-                    user = result.scalar_one_or_none()
-                    if not user:
-                        return False
-                    user.message_count += messages
-                    user.session_count += sessions
-                    return True
+                )
+                user = result.scalar_one_or_none()
+                if not user:
+                    return False
+                user.message_count += messages
+                user.session_count += sessions
+                return True
 
     # ------------------------------------------------------------------
     # Scheduled jobs
@@ -1250,34 +1231,33 @@ class MemoryStore:
                                  run_count: int = 0) -> None:
         """Upsert a scheduled job."""
         from skyn3t.core.models import ScheduledJob as ScheduledJobModel
-        async with self._lock:
-            async with await self._session() as session:
-                async with session.begin():
-                    result = await session.execute(
-                        select(ScheduledJobModel).where(ScheduledJobModel.id == job_id)
-                    )
-                    existing = result.scalar_one_or_none()
-                    if existing:
-                        existing.name = name
-                        existing.schedule_expr = schedule_expr
-                        existing.agent_name = agent_name
-                        existing.prompt = prompt
-                        existing.enabled = enabled
-                        existing.last_run = last_run
-                        existing.next_run = next_run
-                        existing.run_count = run_count
-                    else:
-                        session.add(ScheduledJobModel(
-                            id=job_id,
-                            name=name,
-                            schedule_expr=schedule_expr,
-                            agent_name=agent_name,
-                            prompt=prompt,
-                            enabled=enabled,
-                            last_run=last_run,
-                            next_run=next_run,
-                            run_count=run_count,
-                        ))
+        async with await self._session() as session:
+            async with session.begin():
+                result = await session.execute(
+                    select(ScheduledJobModel).where(ScheduledJobModel.id == job_id)
+                )
+                existing = result.scalar_one_or_none()
+                if existing:
+                    existing.name = name
+                    existing.schedule_expr = schedule_expr
+                    existing.agent_name = agent_name
+                    existing.prompt = prompt
+                    existing.enabled = enabled
+                    existing.last_run = last_run
+                    existing.next_run = next_run
+                    existing.run_count = run_count
+                else:
+                    session.add(ScheduledJobModel(
+                        id=job_id,
+                        name=name,
+                        schedule_expr=schedule_expr,
+                        agent_name=agent_name,
+                        prompt=prompt,
+                        enabled=enabled,
+                        last_run=last_run,
+                        next_run=next_run,
+                        run_count=run_count,
+                    ))
 
     async def get_scheduled_job(self, job_id: str) -> Optional[Dict[str, Any]]:
         """Get a scheduled job by ID."""
@@ -1329,14 +1309,174 @@ class MemoryStore:
     async def delete_scheduled_job(self, job_id: str) -> bool:
         """Delete a scheduled job."""
         from skyn3t.core.models import ScheduledJob as ScheduledJobModel
-        async with self._lock:
-            async with await self._session() as session:
-                async with session.begin():
-                    result = await session.execute(
-                        select(ScheduledJobModel).where(ScheduledJobModel.id == job_id)
+        async with await self._session() as session:
+            async with session.begin():
+                result = await session.execute(
+                    select(ScheduledJobModel).where(ScheduledJobModel.id == job_id)
+                )
+                job = result.scalar_one_or_none()
+                if not job:
+                    return False
+                await session.delete(job)
+                return True
+
+    # ------------------------------------------------------------------
+    # Retention / pruning (H24)
+    # ------------------------------------------------------------------
+
+    async def prune_system_logs(
+        self,
+        older_than_days: int,
+        keep_last: int = 1000,
+        levels: Optional[List[str]] = None,
+    ) -> int:
+        """Delete system logs older than ``older_than_days``, keeping at least
+        ``keep_last`` rows. Restrict to ``levels`` when provided."""
+        if older_than_days <= 0:
+            return 0
+        cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        cutoff = cutoff.replace(day=cutoff.day - older_than_days)
+        async with await self._session() as session:
+            async with session.begin():
+                keep_query = (
+                    select(SystemLog.id)
+                    .order_by(desc(SystemLog.created_at))
+                    .limit(keep_last)
+                )
+                if levels:
+                    keep_query = keep_query.where(SystemLog.level.in_(levels))
+                keep_result = await session.execute(keep_query)
+                keep_ids = {row[0] for row in keep_result.all()}
+
+                cond = SystemLog.created_at < cutoff
+                if levels:
+                    cond = and_(cond, SystemLog.level.in_(levels))
+                if keep_ids:
+                    cond = and_(cond, SystemLog.id.notin_(keep_ids))
+                result = await session.execute(delete(SystemLog).where(cond))
+                return getattr(result, "rowcount", 0) or 0
+
+    async def prune_messages(
+        self, older_than_days: int, keep_last: int = 1000
+    ) -> int:
+        """Delete old inter-agent messages, keeping the most recent ``keep_last``."""
+        if older_than_days <= 0:
+            return 0
+        cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        cutoff = cutoff.replace(day=cutoff.day - older_than_days)
+        async with await self._session() as session:
+            async with session.begin():
+                keep_result = await session.execute(
+                    select(MessageModel.id)
+                    .order_by(desc(MessageModel.created_at))
+                    .limit(keep_last)
+                )
+                keep_ids = {row[0] for row in keep_result.all()}
+                cond = MessageModel.created_at < cutoff
+                if keep_ids:
+                    cond = and_(cond, MessageModel.id.notin_(keep_ids))
+                result = await session.execute(delete(MessageModel).where(cond))
+                return getattr(result, "rowcount", 0) or 0
+
+    async def prune_experience_index(
+        self, older_than_days: int, keep_last: int = 1000
+    ) -> int:
+        """Delete old experience-index rows, keeping the most recent ``keep_last``."""
+        if older_than_days <= 0:
+            return 0
+        cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        cutoff = cutoff.replace(day=cutoff.day - older_than_days)
+        async with await self._session() as session:
+            async with session.begin():
+                keep_result = await session.execute(
+                    select(ExperienceIndex.id)
+                    .order_by(desc(ExperienceIndex.created_at))
+                    .limit(keep_last)
+                )
+                keep_ids = {row[0] for row in keep_result.all()}
+                cond = ExperienceIndex.created_at < cutoff
+                if keep_ids:
+                    cond = and_(cond, ExperienceIndex.id.notin_(keep_ids))
+                result = await session.execute(delete(ExperienceIndex).where(cond))
+                return getattr(result, "rowcount", 0) or 0
+
+    async def prune_completed_tasks(
+        self, older_than_days: int, keep_last: int = 500
+    ) -> int:
+        """Delete terminal tasks older than ``older_than_days``,
+        keeping the most recent ``keep_last``."""
+        if older_than_days <= 0:
+            return 0
+        cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        cutoff = cutoff.replace(day=cutoff.day - older_than_days)
+        terminal = {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value}
+        async with await self._session() as session:
+            async with session.begin():
+                keep_result = await session.execute(
+                    select(TaskModel.id)
+                    .where(TaskModel.status.in_(terminal))
+                    .order_by(desc(TaskModel.created_at))
+                    .limit(keep_last)
+                )
+                keep_ids = {row[0] for row in keep_result.all()}
+                cond = and_(
+                    TaskModel.status.in_(terminal),
+                    TaskModel.created_at < cutoff,
+                )
+                if keep_ids:
+                    cond = and_(cond, TaskModel.id.notin_(keep_ids))
+                result = await session.execute(delete(TaskModel).where(cond))
+                return getattr(result, "rowcount", 0) or 0
+
+    async def prune_all(
+        self,
+        *,
+        logs_days: int = 7,
+        messages_days: int = 30,
+        experience_days: int = 90,
+        completed_tasks_days: int = 30,
+    ) -> Dict[str, int]:
+        """Run all retention pruners with sensible defaults."""
+        return {
+            "logs": await self.prune_system_logs(logs_days),
+            "messages": await self.prune_messages(messages_days),
+            "experience_index": await self.prune_experience_index(experience_days),
+            "completed_tasks": await self.prune_completed_tasks(completed_tasks_days),
+        }
+
+    # ------------------------------------------------------------------
+    # Consciousness snapshots (H18)
+    # ------------------------------------------------------------------
+
+    async def save_consciousness_snapshot(
+        self, snapshot: Dict[str, Any], reason: str = "manual"
+    ) -> str:
+        """Persist a CollectiveConsciousness snapshot and return its id."""
+        from skyn3t.core.models import ConsciousnessSnapshot
+
+        snapshot_id = str(uuid.uuid4())
+        async with await self._session() as session:
+            async with session.begin():
+                session.add(
+                    ConsciousnessSnapshot(
+                        id=snapshot_id,
+                        reason=reason,
+                        snapshot=snapshot,
                     )
-                    job = result.scalar_one_or_none()
-                    if not job:
-                        return False
-                    await session.delete(job)
-                    return True
+                )
+        return snapshot_id
+
+    async def load_latest_consciousness_snapshot(
+        self,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the most recent consciousness snapshot blob, if any."""
+        from skyn3t.core.models import ConsciousnessSnapshot
+
+        async with await self._session() as session:
+            result = await session.execute(
+                select(ConsciousnessSnapshot)
+                .order_by(desc(ConsciousnessSnapshot.created_at))
+                .limit(1)
+            )
+            row = result.scalar_one_or_none()
+            return row.snapshot if row else None

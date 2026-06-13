@@ -294,6 +294,7 @@ class CortexBootstrap:
                     projects_root=projects_root,
                     proposals_root=proposals_root,
                     repo_root=repo_root,
+                    memory_store=self.orchestrator.memory_store,
                 ),
                 (),
                 (),

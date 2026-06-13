@@ -284,3 +284,88 @@ def test_ingestor_auto_rejects_low_signal_lessons_but_keeps_them(tmp_path) -> No
     rejected = store.saved_docs[0]
     assert rejected["meta"]["review_status"] == "rejected"
     assert rejected["meta"]["review_reason"] == "no actionable lesson content"
+
+
+def test_ingestor_embeds_insights_for_rag(tmp_path) -> None:
+    rag = _FakeRAG()
+    store = _FakeMemoryStore()
+    bus = MagicMock()
+    bus.subscribe = MagicMock()
+    ingestor = ExperienceIngestor(
+        event_bus=bus,
+        rag_engine=rag,
+        memory_store=store,
+        seen_hashes_path=tmp_path / "seen.json",
+    )
+
+    async def _go():
+        await ingestor.initialize()
+        return await ingestor.ingest_insight(
+            agent_name="researcher",
+            insight="This is a substantive insight about API design patterns.",
+            capability="research",
+        )
+
+    embedding_id = asyncio.run(_go())
+    assert embedding_id is not None
+    assert len(rag.docs) == 1
+    assert rag.docs[0]["doc_type"] == "insight"
+    assert len(store.saved_docs) == 1
+    assert store.saved_docs[0]["embedding_id"] == embedding_id
+    assert store.saved_docs[0]["meta"]["review_status"] == "approved"
+
+
+def test_ingestor_embeds_failure_patterns_for_rag(tmp_path) -> None:
+    rag = _FakeRAG()
+    store = _FakeMemoryStore()
+    bus = MagicMock()
+    bus.subscribe = MagicMock()
+    ingestor = ExperienceIngestor(
+        event_bus=bus,
+        rag_engine=rag,
+        memory_store=store,
+        seen_hashes_path=tmp_path / "seen.json",
+    )
+
+    async def _go():
+        await ingestor.initialize()
+        return await ingestor.ingest_failure_pattern(
+            pattern_name="missing-await",
+            description="Async functions called without await inside coroutines.",
+            suggested_fix="Add await or use asyncio.gather.",
+            affected_agents=["code_agent"],
+        )
+
+    embedding_id = asyncio.run(_go())
+    assert embedding_id is not None
+    assert len(rag.docs) == 1
+    assert rag.docs[0]["doc_type"] == "pattern"
+    assert len(store.saved_docs) == 1
+    assert store.saved_docs[0]["embedding_id"] == embedding_id
+    assert store.saved_docs[0]["meta"]["review_status"] == "approved"
+
+
+def test_ingestor_auto_rejects_low_signal_insights(tmp_path) -> None:
+    rag = _FakeRAG()
+    store = _FakeMemoryStore()
+    bus = MagicMock()
+    bus.subscribe = MagicMock()
+    ingestor = ExperienceIngestor(
+        event_bus=bus,
+        rag_engine=rag,
+        memory_store=store,
+        seen_hashes_path=tmp_path / "seen.json",
+    )
+
+    async def _go():
+        await ingestor.initialize()
+        await ingestor.ingest_insight(
+            agent_name="researcher",
+            insight="short",
+        )
+
+    asyncio.run(_go())
+    assert rag.docs == []
+    assert len(store.saved_docs) == 1
+    assert store.saved_docs[0]["embedding_id"] is None
+    assert store.saved_docs[0]["meta"]["review_status"] == "rejected"

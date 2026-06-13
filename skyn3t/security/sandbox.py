@@ -52,10 +52,18 @@ class SandboxConfig:
     env_vars: Dict[str, str] = field(default_factory=dict)
     blocked_env_vars: List[str] = field(default_factory=lambda: [
         "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN",
         "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
-        "GITHUB_TOKEN", "KIMI_API_KEY",
-        "SECRET_KEY", "PASSWORD", "TOKEN",
+        "KIMI_API_KEY", "OPENROUTER_API_KEY",
+        "GITHUB_TOKEN",
+        "SECRET_KEY", "SKYN3T_MASTER_KEY", "SKYN3T_WEB_TOKEN",
+        "DISCORD_TOKEN", "SKYN3T_DISCORD_ADMIN_SECRET",
+        "SKYN3T_TELEGRAM_TOKEN",
+        "PASSWORD",
     ])
+    # H1: Linux native sandbox is rlimits-only. By default require Docker for
+    # real isolation; tests can bypass with SKYN3T_ALLOW_WEAK_LINUX_SANDBOX=1.
+    linux_sandbox_require_docker: bool = True
 
     # Cleanup
     cleanup_temp: bool = True
@@ -212,9 +220,12 @@ class Sandbox:
     def _prepare_env(self) -> Dict[str, str]:
         """Prepare sanitized environment variables."""
         env = dict(os.environ)
-        # Remove blocked secrets
+        # Remove blocked secrets (exact key match — avoids over-stripping
+        # benign variables such as TELEGRAM_TOKEN when the block list says
+        # TOKEN).
+        blocked = {key.upper() for key in self.config.blocked_env_vars}
         for key in list(env.keys()):
-            if any(blocked.lower() in key.lower() for blocked in self.config.blocked_env_vars):
+            if key.upper() in blocked:
                 del env[key]
         # Apply overrides
         env.update(self.config.env_vars)
@@ -338,6 +349,24 @@ class Sandbox:
                     )
 
         env = self._prepare_env()
+
+        # H1: native Linux sandbox only has rlimits. Unless explicitly allowed
+        # for tests/development, require Docker for real process/network/fs
+        # isolation. macOS seatbelt is the only acceptable native path.
+        if (
+            self._linux
+            and self.config.linux_sandbox_require_docker
+            and not (self._macos and shutil.which("sandbox-exec"))
+            and not shutil.which("docker")
+            and os.getenv("SKYN3T_ALLOW_WEAK_LINUX_SANDBOX", "").strip().lower()
+            not in ("1", "true", "yes", "on")
+        ):
+            raise RuntimeError(
+                "Linux Sandbox requires Docker for real process/network/filesystem "
+                "isolation. Install Docker, or set SKYN3T_ALLOW_WEAK_LINUX_SANDBOX=1 "
+                "only for trusted local development."
+            )
+
         start_time = time.monotonic()
         syscalls: List[Dict[str, Any]] = []
         resource_usage: Dict[str, float] = {}
@@ -866,6 +895,7 @@ class DockerPoolBackend(ExecutionBackend):
         self.docker_path = docker_path
         self._containers: Dict[str, List[str]] = {}
         self._locks: Dict[str, asyncio.Lock] = {}
+        self._pool_init_locks: Dict[str, asyncio.Lock] = {}
         self._initialized: Dict[str, bool] = {}
         self._exec_counts: Dict[str, int] = {}
         self._shutdown = False
@@ -877,6 +907,15 @@ class DockerPoolBackend(ExecutionBackend):
     async def _ensure_pool(self, language: str) -> None:
         if self._initialized.get(language):
             return
+        # H17: serialize pool creation per language so concurrent execute()
+        # calls cannot race past the early-initialized check.
+        lock = self._pool_init_locks.setdefault(language, asyncio.Lock())
+        async with lock:
+            if self._initialized.get(language):
+                return
+            await self._create_pool(language)
+
+    async def _create_pool(self, language: str) -> None:
         from skyn3t.config.settings import get_settings
 
         settings = get_settings()

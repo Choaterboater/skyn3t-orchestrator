@@ -107,14 +107,18 @@ class AdaptiveRetryManager:
         error_sig: str,
         fix_applied: str,
         success: bool,
+        *,
+        task_id: str = "",
+        stack: str = "",
+        stage: str = "",
     ) -> None:
         """Record an attempt to the Experience Index."""
         if self.experience_store:
             try:
                 self.experience_store.record_experience_index(
-                    task_id="",
-                    stack="",
-                    stage="",
+                    task_id=task_id,
+                    stack=stack,
+                    stage=stage,
                     error_signature=error_sig,
                     fix_applied=fix_applied,
                     fix_worked=success,

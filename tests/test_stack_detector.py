@@ -337,3 +337,45 @@ class TestRobustness:
         result = detect(tmp_path)
         assert result.family == "unknown"
         assert result.confidence_notes  # Should explain why
+
+
+# ---------------------------------------------------------------------------
+# H28: CLI / mobile / desktop families
+# ---------------------------------------------------------------------------
+
+class TestExtendedFamilies:
+    def test_node_cli(self, tmp_path: Path) -> None:
+        _write_pkg(tmp_path, commander="^11")
+        result = detect(tmp_path)
+        assert result.family == "cli"
+        assert result.stack == "node_cli"
+
+    def test_python_cli(self, tmp_path: Path) -> None:
+        _write(tmp_path, "requirements.txt", "typer==0.12\n")
+        result = detect(tmp_path)
+        assert result.family == "cli"
+        assert result.stack == "python_cli"
+
+    def test_react_native_mobile(self, tmp_path: Path) -> None:
+        _write_pkg(tmp_path, **{"react-native": "^0.73"})
+        result = detect(tmp_path)
+        assert result.family == "mobile"
+        assert result.stack == "react_native"
+
+    def test_flutter_mobile(self, tmp_path: Path) -> None:
+        _write(tmp_path, "pubspec.yaml", "name: demo\ndependencies:\n  flutter:\n    sdk: flutter\n")
+        result = detect(tmp_path)
+        assert result.family == "mobile"
+        assert result.stack == "flutter"
+
+    def test_electron_desktop(self, tmp_path: Path) -> None:
+        _write_pkg(tmp_path, electron="^28")
+        result = detect(tmp_path)
+        assert result.family == "desktop"
+        assert result.stack == "electron"
+
+    def test_tauri_desktop(self, tmp_path: Path) -> None:
+        _write(tmp_path, "src-tauri/tauri.conf.json", '{"identifier": "com.demo.app"}')
+        result = detect(tmp_path)
+        assert result.family == "desktop"
+        assert result.stack == "tauri"

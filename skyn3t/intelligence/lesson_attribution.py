@@ -192,6 +192,30 @@ class LessonScoreboard:
             if self._unflushed >= self._flush_every:
                 self._flush_locked()
 
+    def record_feedback(self, lesson_id: str, *, helpful: bool) -> None:
+        """Direct user feedback on a lesson (post-ship, post-review, etc).
+
+        This is separate from task outcome attribution: it lets a human
+        tell the system that a particular lesson helped or hurt even when
+        the automated task outcome is unavailable or disagrees with the
+        human verdict.
+        """
+        if not lesson_id:
+            return
+        with self._lock:
+            stats = self._stats.get(lesson_id)
+            if stats is None:
+                stats = LessonStats(lesson_id=lesson_id)
+                self._stats[lesson_id] = stats
+            if helpful:
+                stats.helpful += 1
+            else:
+                stats.hurt += 1
+            stats.last_seen_at = time.time()
+            self._unflushed += 1
+            if self._unflushed >= self._flush_every:
+                self._flush_locked()
+
     # ------------------------------------------------------------------
     # Filtering at injection time
     # ------------------------------------------------------------------

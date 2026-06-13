@@ -184,6 +184,17 @@ class SystemLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
 
 
+class ConsciousnessSnapshot(Base):
+    """Serialized CollectiveConsciousness state for cross-restart hydration."""
+
+    __tablename__ = "consciousness_snapshots"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    reason: Mapped[str] = mapped_column(String(50), default="manual")
+    snapshot: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+
+
 class User(Base):
     """User profile for cross-session personalization."""
 

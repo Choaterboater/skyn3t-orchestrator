@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from skyn3t.adapters.mcp_tools import REPO_ROOT, tool_manifest
@@ -33,7 +34,10 @@ class MCPDriver:
     @staticmethod
     def _sha_of(path_str: str) -> Optional[str]:
         try:
+            if Path(path_str).is_absolute():
+                return None
             p = (REPO_ROOT / path_str).resolve()
+            p.relative_to(REPO_ROOT.resolve())
             if not p.exists() or not p.is_file():
                 return None
             return hashlib.sha256(p.read_bytes()).hexdigest()

@@ -592,6 +592,11 @@ async def _probe_version(binary: str) -> bool:
             proc.kill()
         except ProcessLookupError:
             pass
+        # H16: reap the child after killing it to avoid zombie processes.
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            pass
         return False
     except (FileNotFoundError, OSError):
         return False

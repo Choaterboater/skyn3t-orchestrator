@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from skyn3t.agents.reviewer import ReviewerAgent
+from skyn3t.core.agent import TaskRequest
 from skyn3t.core.events import EventBus
 
 # ---------------------------------------------------------------------------
@@ -476,3 +477,40 @@ class TestEdgeCases:
         # readme (3) + gitignore (2) + web zero-config (2) + server (2) + combo (1) = 10
         assert score == 10
         assert gaps == []
+
+
+@pytest.mark.asyncio
+async def test_objective_verification_failure_caps_score(tmp_path: Path) -> None:
+    """H26: a failed build verifier must cap the reviewer's score even if the
+    LLM/heuristic path would have scored highly."""
+    artifact = _make_web_artifact(tmp_path, with_settings=True, with_useconfig=True)
+    reviewer = _make_reviewer()
+
+    # Force a high LLM score; the cap should still win.
+    async def _fake_llm_review(*args, **kwargs):
+        return "great", 95, {}
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(reviewer, "_llm_review", _fake_llm_review)
+    try:
+        result = await reviewer.execute(
+            TaskRequest(
+                task_id="t1",
+                input_data={
+                    "brief": "Build a React todo app",
+                    "artifact_dir": str(artifact),
+                    "objective_verification": {
+                        "build": {"verdict": "no", "failure_hint": "syntax error"},
+                        "boot": {"verdict": "yes"},
+                        "integration": {"verdict": "skipped"},
+                    },
+                },
+            )
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert result.success
+    output = result.output or {}
+    assert output.get("score", 100) <= 49
+    assert output.get("verdict") == "no-go"

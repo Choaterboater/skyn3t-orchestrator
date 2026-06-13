@@ -211,10 +211,17 @@ class LearningLoop:
             texts = [text for _, text in candidates]
             # Record which lesson ids went into this task so we can attribute the
             # eventual outcome back to them.
+            ids = [lid for lid, _ in candidates if lid]
             if self.scoreboard is not None and task is not None and task_id:
-                self.scoreboard.record_injection(
-                    task_id, [lid for lid, _ in candidates if lid]
-                )
+                self.scoreboard.record_injection(task_id, ids)
+            # Preserve the ids on the task so callers that bypass the event-bus
+            # attribution path (e.g. StudioRunner) can still correlate human
+            # feedback with the injected lessons (H27).
+            if task is not None:
+                try:
+                    object.__setattr__(task, "_injected_lesson_ids", ids)
+                except (AttributeError, TypeError):
+                    pass
             task.input_data.setdefault("lessons", []).extend(texts)
             return texts
         finally:

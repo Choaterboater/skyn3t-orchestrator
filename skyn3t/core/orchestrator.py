@@ -8,6 +8,7 @@ import os
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, cast
 from uuid import uuid4
 
@@ -28,6 +29,7 @@ from skyn3t.memory.store import MemoryStore
 from skyn3t.memory.tuner import SelfTuningEngine
 from skyn3t.persistence.consciousness_snapshot import ConsciousnessSnapshot
 from skyn3t.persistence.recovery import RecoveryManager
+from skyn3t.security.permissions import PermissionEngine, Policy
 
 logger = logging.getLogger("skyn3t.core.orchestrator")
 
@@ -173,6 +175,15 @@ class Orchestrator:
         # Crash-recovery manager (lazy-initialized in start()).
         self._recovery_manager: Optional[RecoveryManager] = None
 
+        # Permission engine (H4): default permissive wildcard policy so the
+        # engine is enforced but existing deployments keep working. Operators
+        # can lock it down by supplying a POLICY_FILE.
+        self._permission_engine = PermissionEngine()
+        self._permission_engine.add_policy(
+            Policy(name="default-permissive", role="admin")
+        )
+        self._load_permission_policies()
+
         # Subscribe to system events
         self.event_bus.subscribe(self._on_task_created, EventType.TASK_CREATED)
         self.event_bus.subscribe(self._on_task_completed, EventType.TASK_COMPLETED)
@@ -187,6 +198,19 @@ class Orchestrator:
         # (telegram/discord/slack/etc.) so TASK_COMPLETED can route the answer
         # back through MessagingRouter.reply().
         self._messaging_reply_context: Dict[str, Dict[str, Any]] = {}
+
+    def _load_permission_policies(self) -> None:
+        """Load operator-supplied permission policies from POLICY_FILE."""
+        try:
+            from skyn3t.config.settings import get_settings
+
+            policy_file = getattr(get_settings(), "policy_file", None)
+            if not policy_file:
+                return
+            self._permission_engine.load_policies(Path(policy_file))
+            logger.info("loaded permission policies from %s", policy_file)
+        except Exception:
+            logger.exception("failed to load permission policies")
 
     # ------------------------------------------------------------------
     # Intelligence layer configuration
@@ -533,12 +557,18 @@ class Orchestrator:
         return self._snapshot_helper
 
     async def _maybe_restore_consciousness(self) -> None:
-        """Restore the latest compatible consciousness snapshot on boot."""
+        """Restore the latest compatible consciousness snapshot on boot.
+
+        Tries the file-based checkpoint first, then falls back to the SQLite
+        snapshot store so in-memory state survives restart even when the
+        checkpoint directory is cleared.
+        """
         from skyn3t.config.settings import get_settings
 
         settings = get_settings()
         if not getattr(settings, "restore_on_boot", True):
             return
+        restored = False
         try:
             helper = self._get_snapshot_helper()
             result = await helper.restore_latest(self)
@@ -548,8 +578,18 @@ class Orchestrator:
                     result.get("restored"),
                     result.get("skipped"),
                 )
+                restored = bool(result.get("restored"))
         except Exception:
-            logger.exception("consciousness restore failed")
+            logger.exception("file consciousness restore failed")
+
+        if not restored and self._memory is not None and self._consciousness is not None:
+            try:
+                blob = await self._memory.load_latest_consciousness_snapshot()
+                if blob:
+                    await self._consciousness.restore_snapshot(blob)
+                    logger.info("consciousness restored from SQLite snapshot")
+            except Exception:
+                logger.exception("SQLite consciousness restore failed")
 
     async def _maybe_periodic_snapshot(self) -> None:
         from skyn3t.config.settings import get_settings
@@ -581,6 +621,18 @@ class Orchestrator:
             )
         except Exception:
             logger.exception("consciousness snapshot creation failed")
+
+        # H18: also persist a lightweight SQLite snapshot so the file-based
+        # checkpoint is not the only copy of working memory / insights.
+        if self._memory is not None and self._consciousness is not None:
+            try:
+                blob = await self._consciousness.to_snapshot()
+                snap_id = await self._memory.save_consciousness_snapshot(
+                    blob, reason=reason
+                )
+                logger.debug("consciousness SQLite snapshot created: %s", snap_id)
+            except Exception:
+                logger.exception("consciousness SQLite snapshot creation failed")
 
     # ------------------------------------------------------------------
     # Autonomy cortex (self-healing, reflection, learning, meta, tuning)
@@ -1131,6 +1183,18 @@ class Orchestrator:
                 raise ValueError(
                     f"No suitable agent found for task '{task.title}'. "
                     f"Agent: {agent_name}, Capability: {capability}"
+                )
+
+            # H4: enforce permission policy before routing.
+            allowed, reason = self._permission_engine.can_execute_task(
+                agent_name=target_agent.name,
+                agent_type=target_agent.agent_type,
+                task_title=task.title,
+                task_input=task.input_data,
+            )
+            if not allowed:
+                raise PermissionError(
+                    f"Task rejected by permission policy for {target_agent.name}: {reason}"
                 )
 
             self.event_bus.publish(

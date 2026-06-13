@@ -12,12 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
+import skyn3t.integrations.messaging as messaging_mod
 from skyn3t.agents.research_agent import ResearchAgent
 from skyn3t.config.env_file import warn_env_file_permissions
 from skyn3t.core.agent import TaskRequest
@@ -25,8 +25,6 @@ from skyn3t.core.events import Event, EventBus, EventType
 from skyn3t.core.orchestrator import Orchestrator
 from skyn3t.persistence.checkpoint import CheckpointManager
 from skyn3t.persistence.recovery import RecoveryManager
-import skyn3t.integrations.messaging as messaging_mod
-
 
 # ─── C3 ──────────────────────────────────────────────────────────────────
 

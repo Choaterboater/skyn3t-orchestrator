@@ -249,6 +249,7 @@ class BuildVerifierAgent(BaseAgent):
         # upgrade a verdict; they can only fold a passing verdict to 'no'.
         visual_verification: Optional[Dict[str, Any]] = None
         test_run: Optional[Dict[str, Any]] = None
+        compose_verification: Optional[Dict[str, Any]] = None
         visual_hint: Optional[str] = None
         if verdict == "yes":
             test_run = await self._run_test_gate(
@@ -267,6 +268,13 @@ class BuildVerifierAgent(BaseAgent):
                 verdict = "no"
                 reasons = visual_verification.get("reasons") or []
                 visual_hint = "visual gate: " + ("; ".join(reasons) or "below visual threshold")
+
+            compose_verification = await self._run_compose_gate(scaffold_dir)
+            if compose_verification and compose_verification.get("verdict") == "no":
+                verdict = "no"
+                stderr = ((stderr + "\n") if stderr else "") + (
+                    "compose gate: " + str(compose_verification.get("summary") or "compose check failed")
+                )
 
         summary = self._summarize(probe, verdict, command)
         failure_hint = self._failure_hint(probe, verdict, stdout, stderr) if verdict == "no" else None
@@ -297,6 +305,7 @@ class BuildVerifierAgent(BaseAgent):
                 "entry_files": probe.entry_files,
                 "visual_verification": visual_verification,
                 "test_run": test_run,
+                "compose_verification": compose_verification,
             },
         )
 
@@ -353,15 +362,50 @@ class BuildVerifierAgent(BaseAgent):
         return "skipped", "", "", ""
 
     async def _verify_python(self, scaffold_dir: Path, probe: StackProbe) -> tuple[str, str, str, str]:
-        """py_compile every .py file. Fast, no network, catches syntax errors
-        + missing imports at compile time."""
+        """py_compile every .py file, then try to import each module.
+
+        py_compile catches syntax errors but not missing dependencies. The
+        import check is lightweight and runs without network installation, so
+        it deliberately fails open on ImportError rather than requiring a venv.
+        """
+        import sys
+
         py_files = [str(p) for p in scaffold_dir.rglob("*.py") if "__pycache__" not in p.parts]
         if not py_files:
             return "skipped", "(no .py files)", "", ""
         cmd = ["python3", "-m", "py_compile", *py_files]
         proc = await self._run(cmd, scaffold_dir)
-        verdict = "yes" if proc["returncode"] == 0 else "no"
-        return verdict, " ".join(cmd[:6]) + (" …" if len(cmd) > 6 else ""), proc["stdout"], proc["stderr"]
+        if proc["returncode"] != 0:
+            return "no", " ".join(cmd[:6]) + (" …" if len(cmd) > 6 else ""), proc["stdout"], proc["stderr"]
+
+        # H11: import check catches missing runtime deps that py_compile misses.
+        import_errors: List[str] = []
+        for f in py_files:
+            rel = Path(f).relative_to(scaffold_dir).with_suffix("")
+            parts = rel.parts
+            if parts and parts[0] == "__pycache__":
+                continue
+            mod = ".".join(parts)
+            if mod.endswith(".__init__"):
+                mod = mod[:-9]
+            if not mod:
+                continue
+            imp_cmd = [
+                sys.executable,
+                "-c",
+                f"import sys; sys.path.insert(0, {str(scaffold_dir)!r}); import {mod}",
+            ]
+            iproc = await self._run(imp_cmd, scaffold_dir)
+            if iproc["returncode"] != 0:
+                import_errors.append(f"{mod}: {iproc['stderr'][:200]}")
+        if import_errors:
+            return (
+                "no",
+                "python import check",
+                "",
+                "\n".join(import_errors),
+            )
+        return "yes", " ".join(cmd[:6]) + (" …" if len(cmd) > 6 else ""), proc["stdout"], proc["stderr"]
 
     async def _verify_node(
         self,
@@ -456,9 +500,10 @@ class BuildVerifierAgent(BaseAgent):
                 if network_error and (
                     offline_ok or execution_profile == "fast"
                 ):
+                    # H12: a network fallback cannot prove the build works.
                     return (
-                        "yes",
-                        " ".join(install_cmd) + " (network failure — falling back to syntax check)",
+                        "skipped",
+                        " ".join(install_cmd) + " (network failure — syntax-only check)",
                         proc["stdout"],
                         proc["stderr"],
                     )
@@ -1166,6 +1211,96 @@ class BuildVerifierAgent(BaseAgent):
             return verdict, " ".join(cmd), proc["stdout"], proc["stderr"]
         return "skipped", "(Xcode project; needs xcodebuild)", "", "Xcode-only project; full SDK verify out of scope"
 
+    async def _run_compose_gate(
+        self, scaffold_dir: Path
+    ) -> Optional[Dict[str, Any]]:
+        """H29: validate docker-compose.yml when present.
+
+        Runs ``docker compose config`` (syntax/merge validation) and, if
+        ``SKYN3T_VERIFY_COMPOSE_BUILD=1`` is set, ``docker compose build``.
+        Degrades to 'skipped' when Docker is unavailable so air-gapped hosts
+        don't get false negatives.
+        """
+        compose_file: Optional[Path] = None
+        for name in (
+            "docker-compose.yml",
+            "docker-compose.yaml",
+            "compose.yml",
+            "compose.yaml",
+        ):
+            candidate = scaffold_dir / name
+            if candidate.is_file():
+                compose_file = candidate
+                break
+        if compose_file is None:
+            return None
+
+        def _skipped(reason: str) -> Dict[str, Any]:
+            return {
+                "ran": False,
+                "verdict": "skipped",
+                "command": None,
+                "summary": reason,
+                "stdout": "",
+                "stderr": "",
+            }
+
+        docker = shutil.which("docker")
+        if not docker:
+            return _skipped("docker not available")
+
+        # Prefer 'docker compose' (v2) but fall back to legacy 'docker-compose'.
+        compose_cmd: List[str] = []
+        if _env_flag_on("SKYN3T_VERIFY_COMPOSE_V2", default=True):
+            compose_cmd = [docker, "compose", "-f", str(compose_file), "config"]
+        else:
+            legacy = shutil.which("docker-compose")
+            if legacy:
+                compose_cmd = [legacy, "-f", str(compose_file), "config"]
+            else:
+                return _skipped("docker-compose not available")
+
+        proc = await self._run(compose_cmd, scaffold_dir)
+        if proc["returncode"] != 0:
+            return {
+                "ran": True,
+                "verdict": "no",
+                "command": " ".join(compose_cmd),
+                "summary": "docker compose config failed",
+                "stdout": proc["stdout"],
+                "stderr": proc["stderr"],
+            }
+
+        if _env_flag_on("SKYN3T_VERIFY_COMPOSE_BUILD", default=False):
+            build_cmd = list(compose_cmd[:-1]) + ["build"]
+            bproc = await self._run(build_cmd, scaffold_dir)
+            if bproc["returncode"] != 0:
+                return {
+                    "ran": True,
+                    "verdict": "no",
+                    "command": " ".join(build_cmd),
+                    "summary": "docker compose build failed",
+                    "stdout": bproc["stdout"],
+                    "stderr": bproc["stderr"],
+                }
+            return {
+                "ran": True,
+                "verdict": "yes",
+                "command": " ".join(build_cmd),
+                "summary": "docker compose build succeeded",
+                "stdout": bproc["stdout"],
+                "stderr": "",
+            }
+
+        return {
+            "ran": True,
+            "verdict": "yes",
+            "command": " ".join(compose_cmd),
+            "summary": "docker compose config valid",
+            "stdout": proc["stdout"],
+            "stderr": "",
+        }
+
     # ------------------------------------------------------------------
     # Subprocess wrapper
     # ------------------------------------------------------------------
@@ -1185,7 +1320,12 @@ class BuildVerifierAgent(BaseAgent):
                     cwd=str(cwd),
                     capture_output=True,
                     text=True,
-                    env={**os.environ, "CI": "1"},
+                    env=(
+                        {**os.environ, "CI": "1"}
+                        if os.environ.get("SKYN3T_VERIFY_CI", "").lower()
+                        in ("1", "true", "yes", "on")
+                        else os.environ
+                    ),
                     timeout=self.timeout_seconds,
                 ),
                 timeout=self.timeout_seconds + 5,

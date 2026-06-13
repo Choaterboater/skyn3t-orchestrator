@@ -49,6 +49,7 @@ class AutoCleanup:
         decided_proposal_age_days: float = 30.0,
         stale_branch_age_days: float = 14.0,
         repo_root: Optional[Path] = None,
+        memory_store: Any = None,
     ):
         self.event_bus = event_bus
         self.projects_root = Path(projects_root or REPO_ROOT / "projects")
@@ -59,6 +60,7 @@ class AutoCleanup:
         self.failed_project_age_days = float(failed_project_age_days)
         self.decided_proposal_age_days = float(decided_proposal_age_days)
         self.stale_branch_age_days = float(stale_branch_age_days)
+        self.memory_store = memory_store
         self._task: Optional[asyncio.Task] = None
         self._running = False
 
@@ -89,6 +91,11 @@ class AutoCleanup:
         while self._running:
             try:
                 result = await asyncio.to_thread(self.run_once)
+                if self.memory_store is not None:
+                    try:
+                        result["memory_pruned"] = await self._prune_memory_store()
+                    except Exception:
+                        logger.exception("memory-store pruning failed")
                 self._publish(result)
             except asyncio.CancelledError:
                 break
@@ -130,6 +137,21 @@ class AutoCleanup:
             summary["errors"].append(f"skills: {e}")
         logger.info("auto-cleanup pass: %s", summary)
         return summary
+
+    async def _prune_memory_store(self) -> Dict[str, int]:
+        """Run retention pruners against the SQL memory store."""
+        from typing import cast
+
+        from skyn3t.config.settings import get_settings
+
+        settings = get_settings()
+        result = await self.memory_store.prune_all(
+            logs_days=getattr(settings, "retention_logs_days", 7),
+            messages_days=getattr(settings, "retention_messages_days", 30),
+            experience_days=getattr(settings, "retention_experience_days", 90),
+            completed_tasks_days=getattr(settings, "retention_completed_tasks_days", 30),
+        )
+        return cast(Dict[str, int], result)
 
     def _sweep_skills(self) -> int:
         """Curator pass on the skill library — Hermes-equivalent. Drops
