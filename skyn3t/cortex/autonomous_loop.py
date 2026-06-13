@@ -505,6 +505,18 @@ class AutonomousCoordinator:
         stack = str(payload.get("stack") or "web").strip() or "web"
         slug = str(payload.get("slug") or payload.get("project_slug") or "previous run").strip()
         original = str(payload.get("brief") or payload.get("title") or "").strip()
+        # Un-wrap any prior recovery-drill wrapper so repeated failures don't
+        # COMPOUND ("rebuild rebuild rebuild ...") and bury the real product spec
+        # under [:180] truncation. That self-mangled brief was itself a cause of
+        # the rebuilds failing — the model got a corrupted, repeated spec.
+        _WRAP = "Autonomous quality recovery drill: rebuild "
+        while original.startswith(_WRAP):
+            original = original[len(_WRAP):].strip()
+        for _marker in (" as a polished, runnable", ". Previous run "):
+            _idx = original.find(_marker)
+            if _idx > 0:
+                original = original[:_idx].strip()
+                break
         if not original:
             original = "the previous autonomous project brief"
         threshold = int(getattr(settings, "autonomous_min_reviewer_score", 85))
