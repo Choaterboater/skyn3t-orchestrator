@@ -2779,6 +2779,14 @@ class StudioRunner:
             )
             if should_run_verifiers:
                 skip_fix_loops = reviewer_failed
+                # The mechanical BUILD fixer must run on verdict=='no' even when
+                # the reviewer already failed. The reviewer runs BEFORE the build
+                # verifier, so ANY build break makes reviewer_failed True, which
+                # made the self-healing build-fix loop permanent dead code —
+                # builds shipped broken (e.g. named-vs-default import mismatch),
+                # scored ~53, and were never repaired. Decoupled so a failed
+                # build always gets _apply_build_fix_round + re-verify.
+                skip_build_fix = False
                 failed_verifier = "build"
 
                 build_result: Optional[Dict[str, Any]] = None
@@ -2819,7 +2827,7 @@ class StudioRunner:
                     # top-level verdict (so `verdict` above already reflects a
                     # 'no'); we promote them for the dashboard + failure_hint.
                     self._surface_verifier_subgates(manifest, "build_verification", build_result)
-                    if not skip_fix_loops:
+                    if not skip_build_fix:
                         # Entrypoint-stub failures get a deeper fix budget — the
                         # entrypoint is the highest-leverage file, so spend one
                         # extra round on it before giving up (change #4).
@@ -3085,6 +3093,22 @@ class StudioRunner:
                                 }
                                 manifest["integration_verification"] = build_result
                                 failed_verifier = "integration"
+
+                    # The build verifier runs AFTER the reviewer, so a reviewer
+                    # no-go on a broken scaffold is STALE once the build-fix loop
+                    # repairs it. Re-score on the now-building code so the final
+                    # outcome reflects reality, not the pre-repair verdict.
+                    if (
+                        reviewer_failed
+                        and manifest.get("build_fix_attempts")
+                        and str((manifest.get("build_verification") or {}).get("verdict")) == "yes"
+                    ):
+                        try:
+                            await self._rerun_reviewer_scoring(
+                                artifact_dir=artifact_dir, brief=brief, manifest=manifest,
+                            )
+                        except Exception:
+                            logger.exception("post-build-fix re-score failed")
 
                     if not skip_fix_loops and verdict == "no":
                         manifest["status"] = "failed"
