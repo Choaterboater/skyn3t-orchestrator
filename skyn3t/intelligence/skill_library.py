@@ -655,7 +655,16 @@ class SkillLibrary:
                 if tag_lc & protect_set:
                     kept.append(skill.name)
                     continue
-                stale = (now - skill.last_used_at) > max_stale_age_seconds
+                # Grace period: clock staleness from the LATER of last-used and
+                # created. Otherwise a freshly installed skill (last_used_at=0,
+                # never matched yet) looks 30+ days stale and the curator deletes
+                # it on the next cleanup pass — before it can ever be used or
+                # graded. That silently ate every imported skill ("not saving").
+                last_touch = max(
+                    skill.last_used_at or 0.0,
+                    getattr(skill, "created_at", 0.0) or 0.0,
+                )
+                stale = (now - last_touch) > max_stale_age_seconds
                 samples = skill.success_count + skill.failure_count
                 hurtful = (
                     samples >= min_samples_before_demote
