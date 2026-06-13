@@ -403,6 +403,47 @@ def pick_best_model_for_task(
     return None if not base_model else None
 
 
+# Round-robin cursor so successive free picks spread across the catalog instead
+# of pinning one model (owner: "owl-alpha shouldn't be the only free tier").
+_free_rotation: Dict[str, int] = {"i": 0}
+
+
+def list_free_models() -> List[str]:
+    """All usable ``:free`` catalog model ids (Claude excluded)."""
+    if _catalog_index is None or not _catalog_index:
+        load_catalog()
+    if not _catalog_index:
+        return []
+    out: List[str] = []
+    for mid in _catalog_index:
+        m = str(mid)
+        low = m.lower()
+        if not low.endswith(":free"):
+            continue
+        if "claude" in low or low.startswith("anthropic/"):
+            continue
+        out.append(m)
+    return sorted(out)
+
+
+def pick_free_model(task_kind: Optional[str] = None) -> Optional[str]:
+    """Pick a FREE model, biased to ``task_kind`` keywords, rotating for variety.
+
+    Used by Lane-A (autonomous drill) routing so free builds spread across the
+    whole free catalog instead of always landing on one model.
+    """
+    free = list_free_models()
+    if not free:
+        return None
+    kws = _TASK_KIND_KEYWORDS.get(task_kind or "", [])
+    pool = [m for m in free if any(k in m.lower() for k in kws)] if kws else []
+    if not pool:
+        pool = free
+    idx = _free_rotation["i"] % len(pool)
+    _free_rotation["i"] = (_free_rotation["i"] + 1) % 1_000_000
+    return pool[idx]
+
+
 def resolve_openrouter_model(tier_name: str, model_id: Optional[str]) -> Optional[str]:
     """Validate a tier model against the catalog; fall back when missing."""
     if not model_id:

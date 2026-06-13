@@ -81,3 +81,16 @@ def test_llm_client_allows_claude_when_flag_off(monkeypatch):
     from skyn3t.adapters.llm_client import LLMClient
 
     assert LLMClient(backend="claude_cli")._backend_name == "claude_cli"
+
+
+def test_free_model_picker_excludes_claude_and_rotates():
+    from skyn3t.core import openrouter_catalog as cat
+
+    free = cat.list_free_models()
+    if not free:
+        return  # catalog not present in this environment
+    assert all(m.lower().endswith(":free") for m in free)
+    assert not any("claude" in m.lower() or m.lower().startswith("anthropic/") for m in free)
+    if len(free) > 1:
+        picks = {cat.pick_free_model() for _ in range(min(6, len(free) * 2))}
+        assert len(picks) > 1, "free picker should rotate, not pin one model"

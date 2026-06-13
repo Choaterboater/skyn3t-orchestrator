@@ -493,6 +493,28 @@ def _lane_a_free_tier(stage: str) -> Optional[str]:
         return None
 
 
+def _task_kind_for_stage(stage: str) -> Optional[str]:
+    s = (stage or "").lower()
+    if s in {"code", "code_agent", "code_improver", "contract_verifier",
+             "consistency_reviewer"}:
+        return "backend"
+    if s == "designer":
+        return "ui"
+    if s in {"docs", "writer"}:
+        return "docs"
+    return "general"
+
+
+def _lane_a_free_model(stage: str) -> Optional[str]:
+    """A rotating FREE catalog model for a Lane-A stage (variety, no pinning)."""
+    try:
+        from skyn3t.core.openrouter_catalog import pick_free_model
+
+        return pick_free_model(_task_kind_for_stage(stage))
+    except Exception:
+        return None
+
+
 def _route_for_stage(stage_name: Optional[str]) -> Dict[str, Optional[str]]:
     if not stage_name:
         backend, model = _TIERS["cheap"]
@@ -505,9 +527,20 @@ def _route_for_stage(stage_name: Optional[str]) -> Dict[str, Optional[str]]:
             "persisted_via": None,
         }
     stage = stage_name.lower()
-    # Lane A: autonomous drills always run on a FREE tier — above persisted/env
-    # so throwaway practice builds never touch paid models or the subscription.
+    # Lane A: autonomous drills always run FREE — above persisted/env so
+    # throwaway practice builds never touch paid models or the subscription.
+    # Rotate across the free catalog for variety; fall back to the free tier.
     if _lane_is_autonomous():
+        free_model = _lane_a_free_model(stage)
+        if free_model:
+            return {
+                "stage": stage,
+                "tier": "or_docs",
+                "backend": "openrouter",
+                "model": free_model,
+                "source": "lane_a_free",
+                "persisted_via": None,
+            }
         free_tier = _lane_a_free_tier(stage)
         if free_tier and free_tier in _TIERS:
             backend, model = _tier_backend_model(free_tier)
