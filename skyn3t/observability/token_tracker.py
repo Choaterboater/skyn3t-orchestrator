@@ -163,17 +163,28 @@ class TokenTracker:
                 reverse=True,
             )
 
+    def _project_row(self, p: Dict[str, Any]) -> Dict[str, Any]:
+        stages_list = sorted(
+            (dict(s) for s in p["stages"].values()),
+            key=lambda x: x["total_tokens"],
+            reverse=True,
+        )
+        total_tokens = int(p.get("total_tokens") or 0)
+        try:
+            from skyn3t.observability.cost_estimate import estimate_cost_usd
+
+            estimated_cost_usd = round(estimate_cost_usd(total_tokens), 4)
+        except Exception:
+            estimated_cost_usd = 0.0
+        return {
+            **p,
+            "stages": stages_list,
+            "estimated_cost_usd": estimated_cost_usd,
+        }
+
     def per_project(self) -> List[Dict[str, Any]]:
         with self._lock:
-            rows: List[Dict[str, Any]] = []
-            for p in self._by_project.values():
-                # Stages dict → sorted list for stable UI rendering.
-                stages_list = sorted(
-                    (dict(s) for s in p["stages"].values()),
-                    key=lambda x: x["total_tokens"],
-                    reverse=True,
-                )
-                rows.append({**p, "stages": stages_list})
+            rows = [self._project_row(p) for p in self._by_project.values()]
             rows.sort(key=lambda x: x["last_used_at"], reverse=True)
             return rows
 
@@ -182,12 +193,7 @@ class TokenTracker:
             p = self._by_project.get(slug)
             if not p:
                 return None
-            stages_list = sorted(
-                (dict(s) for s in p["stages"].values()),
-                key=lambda x: x["total_tokens"],
-                reverse=True,
-            )
-            return {**p, "stages": stages_list}
+            return self._project_row(p)
 
     def totals(self) -> Dict[str, Any]:
         with self._lock:

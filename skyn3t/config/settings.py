@@ -82,6 +82,10 @@ class Settings(BaseSettings):
     telegram_token: Optional[str] = Field(default=None, alias="SKYN3T_TELEGRAM_TOKEN")
     telegram_user_id: Optional[str] = Field(default=None, alias="SKYN3T_TELEGRAM_USER_ID")
 
+    # Slack bot (Socket Mode when SLACK_APP_TOKEN is also set)
+    slack_bot_token: Optional[str] = Field(default=None, alias="SLACK_BOT_TOKEN")
+    slack_app_token: Optional[str] = Field(default=None, alias="SLACK_APP_TOKEN")
+
     # OpenRouter — single API key for dozens of models. Used as a
     # fallback when CLI subprocesses fail (App.jsx-stub failure mode)
     # and as a fast-path for known-problematic entrypoint files.
@@ -190,6 +194,9 @@ class Settings(BaseSettings):
     autonomous_build_max_retries: int = Field(
         default=3, alias="SKYN3T_AUTONOMOUS_BUILD_MAX_RETRIES"
     )
+    autonomous_queue_max_depth: int = Field(
+        default=100, alias="SKYN3T_AUTONOMOUS_QUEUE_MAX_DEPTH"
+    )
     autonomous_resume_interrupted: bool = Field(
         default=True, alias="SKYN3T_AUTONOMOUS_RESUME_INTERRUPTED"
     )
@@ -292,6 +299,9 @@ class Settings(BaseSettings):
     allow_unauthenticated_loopback: bool = Field(
         default=False, alias="SKYN3T_ALLOW_UNAUTHENTICATED_LOOPBACK"
     )
+    # SECURITY: /api/exec runs arbitrary code through the configured sandbox.
+    # Disabled by default; enable only on trusted dev hosts.
+    allow_exec_api: bool = Field(default=False, alias="SKYN3T_ALLOW_EXEC_API")
 
     # Security
     master_key: Optional[str] = Field(default=None, alias="SKYN3T_MASTER_KEY")

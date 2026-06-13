@@ -580,6 +580,18 @@ async def _init_integrations(
         except Exception:
             logger.exception("Telegram bot failed to start")
 
+    if settings.slack_bot_token:
+        try:
+            from skyn3t.integrations.slack_bot import SlackBot
+
+            slack_bot = SlackBot(event_bus, bot_token=settings.slack_bot_token)
+            app.state.slack_bot = slack_bot
+            slack_task = asyncio.create_task(slack_bot.start())
+            app.state.slack_bot_task = slack_task
+            logger.info("Slack bot starting in background")
+        except Exception:
+            logger.exception("Slack bot failed to start")
+
 
 app = FastAPI(
     title="SkyN3t Orchestrator",
@@ -2895,6 +2907,16 @@ async def exec_code(request: Request):
     """
     from skyn3t.config.settings import get_settings
     from skyn3t.security.sandbox import get_backend
+
+    settings = get_settings()
+    if not getattr(settings, "allow_exec_api", False):
+        return JSONResponse(
+            {
+                "error": "Remote code execution API is disabled. "
+                "Set SKYN3T_ALLOW_EXEC_API=1 to enable on trusted hosts."
+            },
+            status_code=403,
+        )
 
     try:
         body = await request.json()

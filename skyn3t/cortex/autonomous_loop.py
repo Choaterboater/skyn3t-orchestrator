@@ -212,7 +212,13 @@ class AutonomousCoordinator:
         self.orchestrator = orchestrator
         self.event_bus = event_bus
         self.state = _load_state()
-        self._pending: asyncio.Queue[AutonomousBrief] = asyncio.Queue()  # type: ignore
+        try:
+            from skyn3t.config.settings import get_settings
+
+            max_depth = max(1, int(getattr(get_settings(), "autonomous_queue_max_depth", 100)))
+        except Exception:
+            max_depth = 100
+        self._pending: asyncio.Queue[AutonomousBrief] = asyncio.Queue(maxsize=max_depth)  # type: ignore
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._wired = False
@@ -611,7 +617,18 @@ class AutonomousCoordinator:
             return False
         self.state.recent_brief_hashes.append(h)
         self.state.recent_brief_hashes = self.state.recent_brief_hashes[-40:]
-        await self._pending.put(item)
+        if self._pending.full():
+            self._publish_alert(
+                "AUTONOMOUS_BUILD_QUEUE_FULL",
+                brief=item.brief[:120],
+                source=item.source,
+                queue_depth=self._pending.qsize(),
+            )
+            return False
+        try:
+            self._pending.put_nowait(item)
+        except asyncio.QueueFull:
+            return False
         self._persist_queue_snapshot()
         self._publish_alert(
             "AUTONOMOUS_BUILD_QUEUED",
@@ -946,51 +963,9 @@ class AutonomousCoordinator:
 
     @staticmethod
     def _blended_token_rate() -> float:
-        """Blended $/token across the OpenRouter build tiers, from LIVE catalog
-        pricing. Returns 0.0 when those tiers are free models so free builds
-        register ~$0 (not a fabricated flat cost). Falls back to the legacy
-        1/250_000 heuristic only when pricing genuinely can't be resolved.
+        from skyn3t.observability.cost_estimate import blended_token_rate
 
-        This fixes the prior over-estimate (a flat ~$0.80/build regardless of
-        model), which inflated daily_spend_usd ~10x vs. the real bill and could
-        falsely trip the daily budget cap even on free models.
-        """
-        legacy = 1.0 / 250_000.0
-        try:
-            from skyn3t.core.model_router import _TIERS
-            from skyn3t.core.openrouter_catalog import load_catalog
-        except Exception:
-            return legacy
-        wanted = [
-            entry[1]
-            for t in ("or_cheap", "or_ui", "or_backend", "or_strong")
-            if (entry := _TIERS.get(t)) and entry[0] == "openrouter" and entry[1]
-        ]
-        if not wanted:
-            return legacy
-        try:
-            models = load_catalog().models or []
-        except Exception:
-            return legacy
-        pricing_by_id = {
-            m.get("id"): m.get("pricing")
-            for m in models
-            if m.get("id") and isinstance(m.get("pricing"), dict)
-        }
-        best = 0.0
-        found = False
-        for mid in wanted:
-            pr = pricing_by_id.get(mid)
-            if not isinstance(pr, dict):
-                continue
-            found = True
-            try:
-                p = float(pr.get("prompt") or 0.0)
-                c = float(pr.get("completion") or 0.0)
-            except (TypeError, ValueError):
-                p = c = 0.0
-            best = max(best, (p + c) / 2.0)
-        return best if found else legacy
+        return blended_token_rate()
 
     @staticmethod
     def _estimate_spend_from_tokens(
@@ -1030,7 +1005,16 @@ class AutonomousCoordinator:
                 3,
             )
             if chosen.attempt_count <= max_retries:
-                await self._pending.put(chosen)
+                try:
+                    self._pending.put_nowait(chosen)
+                except asyncio.QueueFull:
+                    self._publish_alert(
+                        "AUTONOMOUS_BUILD_QUEUE_FULL",
+                        brief=chosen.brief[:120],
+                        source=chosen.source,
+                        queue_depth=self._pending.qsize(),
+                        note="retry dropped",
+                    )
                 self._publish_alert(
                     "autonomous_build_retry",
                     brief=chosen.brief[:120],

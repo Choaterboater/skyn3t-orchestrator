@@ -1838,8 +1838,25 @@ async def test_execution_backend_patch_rejects_inline_without_optin(monkeypatch)
     assert "disabled" in body["error"].lower()
 
 
+def test_exec_endpoint_disabled_by_default(monkeypatch):
+    """POST /api/exec is off unless SKYN3T_ALLOW_EXEC_API=1."""
+    monkeypatch.delenv("SKYN3T_ALLOW_EXEC_API", raising=False)
+    monkeypatch.setenv("SKYN3T_ALLOW_UNAUTHENTICATED_LOOPBACK", "1")
+    get_settings.cache_clear()
+
+    client = TestClient(web_app.app)
+    response = client.post(
+        "/api/exec",
+        json={"code": "print(1)", "language": "python", "timeout": 10},
+    )
+
+    assert response.status_code == 403
+    assert "disabled" in response.json()["error"].lower()
+
+
 def test_exec_endpoint_rejects_inline_without_optin(monkeypatch):
     """C1: POST /api/exec must not run in-process when inline is not opted in."""
+    monkeypatch.setenv("SKYN3T_ALLOW_EXEC_API", "1")
     monkeypatch.setenv("SKYN3T_EXECUTION_BACKEND", "inline")
     monkeypatch.delenv("SKYN3T_ALLOW_INLINE_EXEC", raising=False)
     monkeypatch.setenv("SKYN3T_ALLOW_UNAUTHENTICATED_LOOPBACK", "1")

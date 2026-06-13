@@ -164,6 +164,8 @@ class TestGetBackend:
 
 class TestExecEndpoint:
     def test_exec_python_inline(self, monkeypatch) -> None:
+        monkeypatch.setenv("SKYN3T_ALLOW_EXEC_API", "1")
+        monkeypatch.setenv("SKYN3T_ALLOW_UNAUTHENTICATED_LOOPBACK", "1")
         monkeypatch.setenv("SKYN3T_EXECUTION_BACKEND", "inline")
         monkeypatch.setenv("SKYN3T_ALLOW_INLINE_EXEC", "1")
         from skyn3t.config.settings import get_settings
@@ -180,14 +182,26 @@ class TestExecEndpoint:
         assert data["success"] is True
         assert "4" in data["stdout"]
         assert data["backend"] == "InlineBackend"
+        get_settings.cache_clear()
 
-    def test_exec_rejects_missing_code(self) -> None:
+    def test_exec_rejects_missing_code(self, monkeypatch) -> None:
+        monkeypatch.setenv("SKYN3T_ALLOW_EXEC_API", "1")
+        monkeypatch.setenv("SKYN3T_ALLOW_UNAUTHENTICATED_LOOPBACK", "1")
+        from skyn3t.config.settings import get_settings
+
+        get_settings.cache_clear()
         client = TestClient(web_app.app)
         response = client.post("/api/exec", json={})
         assert response.status_code == 400
         assert "code is required" in response.json()["error"]
+        get_settings.cache_clear()
 
-    def test_exec_rejects_bad_json(self) -> None:
+    def test_exec_rejects_bad_json(self, monkeypatch) -> None:
+        monkeypatch.setenv("SKYN3T_ALLOW_EXEC_API", "1")
+        monkeypatch.setenv("SKYN3T_ALLOW_UNAUTHENTICATED_LOOPBACK", "1")
+        from skyn3t.config.settings import get_settings
+
+        get_settings.cache_clear()
         client = TestClient(web_app.app)
         response = client.post(
             "/api/exec",
@@ -195,6 +209,7 @@ class TestExecEndpoint:
             headers={"Content-Type": "application/json"},
         )
         assert response.status_code == 400
+        get_settings.cache_clear()
 
 
 class TestDockerHardening:

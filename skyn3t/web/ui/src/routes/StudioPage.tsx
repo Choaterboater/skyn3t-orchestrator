@@ -120,10 +120,15 @@ export default function StudioPage() {
               isLoading={detail.isLoading}
               error={detail.error}
               data={detail.data}
+              usage={usageBySlug.get(selected)}
               onDeleted={() => {
                 setSelected(null);
                 setMode("new");
                 qc.invalidateQueries({ queryKey: ["studio_projects"] });
+              }}
+              onCancelled={() => {
+                qc.invalidateQueries({ queryKey: ["studio_projects"] });
+                qc.invalidateQueries({ queryKey: ["studio_project", selected] });
               }}
             />
           )}
@@ -146,7 +151,10 @@ function ProjectList({
   error: unknown;
   selected: string | null;
   onPick: (slug: string) => void;
-  usageBySlug: Map<string, { total_tokens: number; calls: number }>;
+  usageBySlug: Map<
+    string,
+    { total_tokens: number; calls: number; estimated_cost_usd?: number }
+  >;
 }) {
   const sorted = useMemo(
     () =>
@@ -205,9 +213,17 @@ function ProjectList({
                   {usageBySlug.get(p.slug) && (
                     <span
                       className="shrink-0 text-accent"
-                      title={`${usageBySlug.get(p.slug)!.calls} LLM calls`}
+                      title={`${usageBySlug.get(p.slug)!.calls} LLM calls${
+                        usageBySlug.get(p.slug)!.estimated_cost_usd != null
+                          ? ` · ~$${usageBySlug.get(p.slug)!.estimated_cost_usd!.toFixed(3)}`
+                          : ""
+                      }`}
                     >
                       {fmtTokensCompact(usageBySlug.get(p.slug)!.total_tokens)}
+                      {usageBySlug.get(p.slug)!.estimated_cost_usd != null &&
+                      usageBySlug.get(p.slug)!.estimated_cost_usd! > 0
+                        ? ` · $${usageBySlug.get(p.slug)!.estimated_cost_usd!.toFixed(2)}`
+                        : ""}
                     </span>
                   )}
                 </div>
@@ -243,18 +259,30 @@ function ProjectDetailView({
   isLoading,
   error,
   data,
+  usage,
   onDeleted,
+  onCancelled,
 }: {
   slug: string;
   isLoading: boolean;
   error: unknown;
   data: any;
+  usage?: { total_tokens: number; calls: number; estimated_cost_usd?: number };
   onDeleted: () => void;
+  onCancelled: () => void;
 }) {
   const del = useMutation({
     mutationFn: () => api.deleteProject(slug),
     onSuccess: onDeleted,
   });
+  const cancel = useMutation({
+    mutationFn: () => api.cancelProject(slug),
+    onSuccess: onCancelled,
+  });
+
+  const cancellable =
+    !!data?.status &&
+    !["completed", "done", "failed", "cancelled"].includes(String(data.status));
 
   if (isLoading) {
     return <p className="text-text-secondary">Loading project…</p>;
@@ -294,6 +322,17 @@ function ProjectDetailView({
               <span className="rounded-full border border-border bg-bg-3 px-2 py-0.5 text-[0.65rem] uppercase tracking-wider text-text-dim">
                 {artifacts.length} artifact{artifacts.length === 1 ? "" : "s"}
               </span>
+              {usage && (
+                <span
+                  className="rounded-full border border-border bg-bg-3 px-2 py-0.5 text-[0.65rem] uppercase tracking-wider text-text-dim"
+                  title={`${usage.calls} LLM calls`}
+                >
+                  {fmtTokensCompact(usage.total_tokens)}
+                  {usage.estimated_cost_usd != null && usage.estimated_cost_usd > 0
+                    ? ` · ~$${usage.estimated_cost_usd.toFixed(3)}`
+                    : ""}
+                </span>
+              )}
               {penpotReady && (
                 <span className="rounded-full border border-accent-line bg-accent-soft px-2 py-0.5 text-[0.65rem] uppercase tracking-wider text-accent">
                   Design export ready · {designArtifacts.length}
@@ -333,6 +372,20 @@ function ProjectDetailView({
               <i className="fa-solid fa-download mr-1.5" />
               Download zip
             </a>
+            {cancellable && (
+              <button
+                onClick={() => {
+                  if (window.confirm(`Stop build for ${slug}?`)) {
+                    cancel.mutate();
+                  }
+                }}
+                disabled={cancel.isPending}
+                className="rounded border border-status-yellow/50 px-3 py-2 text-xs font-medium text-status-yellow hover:bg-status-yellow/10 disabled:opacity-60"
+              >
+                <i className="fa-solid fa-stop mr-1.5" />
+                Stop build
+              </button>
+            )}
             <button
               onClick={() => {
                 if (

@@ -616,6 +616,7 @@ export const api = {
         response_tokens: number;
         calls: number;
         last_used_at: number;
+        estimated_cost_usd?: number;
         stages: Array<{
           stage: string;
           total_tokens: number;
@@ -710,6 +711,11 @@ export const api = {
     fetchJson<{ ok: boolean }>(`/api/studio/projects/${encodeURIComponent(slug)}`, {
       method: "DELETE",
     }),
+  cancelProject: (slug: string) =>
+    fetchJson<{ ok: boolean; cancelled?: boolean }>(
+      `/api/studio/projects/${encodeURIComponent(slug)}/cancel`,
+      { method: "POST" },
+    ),
   // Approval gate (architect handoff): fetch architecture.md as plain
   // text, then approve / approve-with-edits / reject.
   fetchArchitecture: (slug: string) =>

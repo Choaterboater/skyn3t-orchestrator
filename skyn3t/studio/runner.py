@@ -6978,14 +6978,12 @@ class StudioRunner:
 
         Composite gate: a run only earns "done" when
           - reviewer verdict is "go" AND reviewer score >= threshold, AND
-          - build_verification verdict is "yes" (or "skipped"), AND
-          - boot_verification verdict is "yes" (or "skipped"), AND
-          - integration_verification verdict is "yes" (or "skipped").
+          - build_verification verdict is "yes", AND
+          - boot_verification verdict is "yes", AND
+          - integration_verification verdict is "yes".
 
-        Any failure of those three downgrades to "needs_fixes" (when
-        recoverable) or "failed" (when irrecoverable). The previous
-        version only looked at the reviewer verdict, so a 100/100
-        scaffold that didn't boot still got marked "done".
+        Any other verifier value (including "skipped" and "no") fails
+        closed and downgrades to "needs_fixes" or "failed".
         """
         quality = self._normalize_quality_summary(quality_summary)
 
