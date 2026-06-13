@@ -125,13 +125,10 @@ _DEFAULT_STAGE_POLICY: Dict[str, str] = {
     "marketer":           "or_cheap",
     "business_analyst":   "or_cheap",
 
-    # REASONING stages ride the Claude Code subscription (claude_cli):
-    # zero marginal cost, and quality matters most here. Opus where one
-    # mistake cascades (architecture, judging); sonnet where throughput
-    # matters (planning). CODING stages never route to claude (owner
-    # directive 2026-06-11) — OpenRouter specialists handle all
-    # code-gen, with claude only as last-resort failover when
-    # OpenRouter itself is down.
+    # REASONING stages: the configured tier is "balanced"/"strong" (claude),
+    # but the runtime sets SKYN3T_NO_CLAUDE=1 so the guard in _tier_backend_model
+    # rewrites every claude tier to a cheap+balanced OpenRouter tier (model
+    # chosen dynamically from the catalog). Owner directive 2026-06-12.
     "planner":            "balanced",
     "plan":               "balanced",
     "architect":          "strong",
@@ -336,6 +333,23 @@ _CLAUDE_CLI_FAILOVER_MODEL: Dict[str, str] = {
 }
 
 
+def _no_claude_enabled() -> bool:
+    """Owner directive 2026-06-12: never use Claude (CLI or API) — too expensive.
+
+    Enabled via ``SKYN3T_NO_CLAUDE=1`` (set in .env, always loaded at startup).
+    Env-gated rather than default-on so existing claude_cli-failover tests stay
+    valid; the running system always has the flag set.
+    """
+    raw = os.environ.get("SKYN3T_NO_CLAUDE", "").strip().lower()
+    return raw in ("1", "on", "true", "yes")
+
+
+def _no_claude_fallback_tier() -> str:
+    """Cheap + balanced OpenRouter tier that any Claude tier is rewritten to."""
+    t = os.environ.get("SKYN3T_NO_CLAUDE_TIER", "").strip()
+    return t if t in _TIERS else "or_cheap"
+
+
 def _tier_backend_model(
     tier_name: str,
     *,
@@ -343,7 +357,14 @@ def _tier_backend_model(
 ) -> Tuple[str, Optional[str]]:
     """Return (backend, model) for a tier, validating OpenRouter ids."""
     backend, model = _TIERS.get(tier_name, _TIERS["cheap"])
-    if backend == "openrouter" and _force_claude_cli_enabled():
+    no_claude = _no_claude_enabled()
+    # Hard guard: any tier resolving to Claude (subscription or API) is rewritten
+    # to a cheap+balanced OpenRouter tier; the model is then picked dynamically
+    # from the catalog. Catches defaults, persisted/env overrides, AND escalation.
+    if backend in ("claude_cli", "anthropic") and no_claude:
+        tier_name = _no_claude_fallback_tier()
+        backend, model = _TIERS.get(tier_name, _TIERS["or_cheap"])
+    if backend == "openrouter" and not no_claude and _force_claude_cli_enabled():
         return ("claude_cli", _CLAUDE_CLI_FAILOVER_MODEL.get(tier_name, "sonnet"))
     if backend == "openrouter" and model:
         try:

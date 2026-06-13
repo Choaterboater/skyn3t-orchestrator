@@ -44,3 +44,22 @@ def test_lane_a_free_tier_env_override(monkeypatch):
 
 def test_lane_a_free_tier_falls_back_to_or_docs():
     assert cheap_smart.lane_a_free_tier("code") == "or_docs"
+
+
+def test_no_claude_guard_rewrites_claude_tiers(monkeypatch):
+    monkeypatch.setenv("SKYN3T_NO_CLAUDE", "1")
+    from skyn3t.core.model_router import _tier_backend_model
+
+    for tier in ("balanced", "strong", "max"):
+        backend, _model = _tier_backend_model(tier)
+        assert backend == "openrouter", f"{tier} leaked to {backend}"
+
+
+def test_reasoning_stage_defaults_avoid_claude(monkeypatch):
+    monkeypatch.setenv("SKYN3T_NO_CLAUDE", "1")
+    from skyn3t.core.model_router import _tier_backend_model, default_tier_for_stage
+
+    for stage in ("planner", "architect", "reviewer"):
+        tier = default_tier_for_stage(stage)
+        backend, _model = _tier_backend_model(tier)
+        assert backend == "openrouter", f"{stage} -> {tier} -> {backend}"
