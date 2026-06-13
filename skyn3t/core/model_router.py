@@ -445,6 +445,26 @@ def _runtime_escalated_tier(stage: str) -> Optional[str]:
         return None
 
 
+def _lane_is_autonomous() -> bool:
+    """True when the active build is an autonomous drill (Lane A -> FREE)."""
+    try:
+        from skyn3t.intelligence.cheap_smart import current_lane
+
+        return current_lane() == "autonomous"
+    except Exception:
+        return False
+
+
+def _lane_a_free_tier(stage: str) -> Optional[str]:
+    """Free tier NAME for a Lane-A stage (dynamic model chosen from the catalog)."""
+    try:
+        from skyn3t.intelligence.cheap_smart import lane_a_free_tier
+
+        return lane_a_free_tier(stage)
+    except Exception:
+        return None
+
+
 def _route_for_stage(stage_name: Optional[str]) -> Dict[str, Optional[str]]:
     if not stage_name:
         backend, model = _TIERS["cheap"]
@@ -457,6 +477,20 @@ def _route_for_stage(stage_name: Optional[str]) -> Dict[str, Optional[str]]:
             "persisted_via": None,
         }
     stage = stage_name.lower()
+    # Lane A: autonomous drills always run on a FREE tier — above persisted/env
+    # so throwaway practice builds never touch paid models or the subscription.
+    if _lane_is_autonomous():
+        free_tier = _lane_a_free_tier(stage)
+        if free_tier and free_tier in _TIERS:
+            backend, model = _tier_backend_model(free_tier)
+            return {
+                "stage": stage,
+                "tier": free_tier,
+                "backend": backend,
+                "model": model,
+                "source": "lane_a_free",
+                "persisted_via": None,
+            }
     persisted = _load_persisted_overrides()
     if stage in persisted:
         tier = str(persisted[stage].get("tier") or "")

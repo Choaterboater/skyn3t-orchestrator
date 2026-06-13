@@ -1183,10 +1183,13 @@ class StudioRunner:
                 auto_apply_cheaper_routing,
                 cheap_smart_enabled,
                 clear_project_context,
+                set_lane_context,
                 set_project_context,
             )
 
             set_project_context(slug)
+            # Lane tag: autonomous drills -> FREE models, real projects -> cheap.
+            set_lane_context(bool(manifest.get("autonomous")))
             manifest["cheap_smart"] = cheap_smart_enabled()
             if cheap_smart_enabled():
                 applied = auto_apply_cheaper_routing()

@@ -27,6 +27,14 @@ _current_project_slug: contextvars.ContextVar[Optional[str]] = contextvars.Conte
     default=None,
 )
 
+# Set by StudioRunner per build: "autonomous" (throwaway drills -> FREE models)
+# or "real" (user/owner projects -> better-but-cheap). Read by model_router to
+# force the free tier for drills. Carries a lane LABEL only, never a model id.
+_current_lane: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "cheap_smart_lane",
+    default="real",
+)
+
 # slug -> {stage_name -> tier_name}
 _runtime_escalations: Dict[str, Dict[str, str]] = {}
 
@@ -66,9 +74,40 @@ def set_project_context(slug: Optional[str]) -> None:
     _current_project_slug.set(slug or None)
 
 
+def set_lane_context(is_autonomous: bool) -> None:
+    """Tag the active build's lane: autonomous drills run FREE, real projects cheap."""
+    _current_lane.set("autonomous" if is_autonomous else "real")
+
+
+def current_lane() -> str:
+    """Active build lane ("autonomous" or "real"); defaults to "real"."""
+    return _current_lane.get()
+
+
+def lane_a_free_tier(stage_name: Optional[str]) -> Optional[str]:
+    """Free OpenRouter tier for an autonomous-drill (Lane A) stage.
+
+    Operator-tunable via ``SKYN3T_LANE_A_FREE_TIERS`` (JSON stage->tier map with
+    an optional ``"default"``). Falls back to the known-free ``or_docs`` tier.
+    Returns a tier NAME only — the concrete model stays dynamic on the catalog.
+    """
+    mapping: Dict[str, str] = {}
+    raw = os.environ.get("SKYN3T_LANE_A_FREE_TIERS", "").strip()
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                mapping = {str(k).lower(): str(v) for k, v in data.items()}
+        except Exception:
+            logger.debug("SKYN3T_LANE_A_FREE_TIERS parse failed", exc_info=True)
+    stage = str(stage_name or "").strip().lower()
+    return mapping.get(stage) or mapping.get("default") or "or_docs"
+
+
 def clear_project_context(slug: Optional[str] = None) -> None:
     """Clear runtime escalation state for a finished project."""
     _current_project_slug.set(None)
+    _current_lane.set("real")
     if slug:
         _runtime_escalations.pop(slug, None)
 
