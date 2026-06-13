@@ -447,6 +447,15 @@ class LLMClient:
         req = LLMRequest(prompt=prompt, system=system, model=model or self.default_model,
                          max_tokens=max_tokens, temperature=temperature, cwd=cwd)
         elapsed = 0.0
+        # Optional context compression (env-gated, default off) — shrink noisy
+        # RAG/scrape/log payloads before the call. Done before the cache key so
+        # identical compressed prompts still cache-hit.
+        try:
+            from skyn3t.adapters.context_compressor import compress as _compress
+
+            req.prompt, req.system = _compress(req.prompt, req.system)
+        except Exception:
+            pass
         # Exact-match cache: only deterministic calls (temp==0), so we never
         # short-circuit intentional sampling (self-consistency / varied retries).
         _cache_key: Optional[str] = None

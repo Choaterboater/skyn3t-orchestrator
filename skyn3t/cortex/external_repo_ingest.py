@@ -314,8 +314,6 @@ class ExternalRepoDocIngestor:
         if response.status_code != 200:
             return None, f"http_{response.status_code}"
         content_type = str(response.headers.get("content-type") or "").lower()
-        if any(marker in content_type for marker in ("text/html", "application/json", "application/xml", "text/xml")):
-            return None, "unexpected_content_type"
         raw = response.content[:max_bytes]
         try:
             text = raw.decode("utf-8")
@@ -323,10 +321,28 @@ class ExternalRepoDocIngestor:
             return None, "decode_failed"
         if "\x00" in text:
             return None, "binary"
+        # Some hosts return rendered HTML (redirects, non-raw mirrors) instead of
+        # raw text — strip the tags to recover the readable content rather than
+        # dropping the source entirely. JSON/XML are already readable as text.
+        if "text/html" in content_type:
+            text = self._html_to_text(text)
         text = text.strip()
         if len(text) < _MIN_TEXT_CHARS:
             return None, "too_short"
         return text, ""
+
+    @staticmethod
+    def _html_to_text(html_text: str) -> str:
+        """Best-effort HTML → readable text (drop script/style, tags, entities)."""
+        import html as _html
+        import re
+
+        cleaned = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html_text)
+        cleaned = re.sub(r"(?s)<[^>]+>", " ", cleaned)
+        cleaned = _html.unescape(cleaned)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned
 
     @staticmethod
     def _raw_url(*, platform: str, repo: str, path: str) -> str:
