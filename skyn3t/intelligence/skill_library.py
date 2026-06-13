@@ -296,6 +296,44 @@ def scan_skill_markdown(text: str) -> List[str]:
     return hits
 
 
+# Filenames (sans extension, lower-cased) that are project docs, NOT skills.
+# Loose-markdown import skips these so a README never lands as an untitled
+# "skill" record.
+_LOOSE_SKILL_EXCLUDE_NAMES: frozenset[str] = frozenset(
+    {
+        "readme",
+        "contributing",
+        "license",
+        "changelog",
+        "code_of_conduct",
+        "security",
+        "claude",
+        "agents",
+        "context",
+    }
+)
+
+# Directories whose markdown is never a skill (docs site, deps, git internals).
+_LOOSE_SKILL_EXCLUDE_DIRS: frozenset[str] = frozenset(
+    {
+        "docs",
+        "node_modules",
+        ".git",
+    }
+)
+
+
+def _is_loose_skill_frontmatter(front: Dict[str, str]) -> bool:
+    """A loose ``.md`` looks like a skill when its frontmatter has a ``name``
+    AND at least one of ``tags`` / ``triggers`` / ``description``."""
+    if not str(front.get("name") or "").strip():
+        return False
+    return any(
+        str(front.get(key) or "").strip()
+        for key in ("tags", "triggers", "description")
+    )
+
+
 class SkillLibrary:
     """Persistent on-disk skill collection. Tag-indexed reads, atomic writes.
 
@@ -451,6 +489,47 @@ class SkillLibrary:
         candidates = [s for s in candidates if s.score >= min_score]
         candidates.sort(key=lambda s: (s.relevance(query), s.last_used_at), reverse=True)
         return candidates[: max(0, int(limit))]
+
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        min_score: float = 0.0,
+    ) -> List[Skill]:
+        """Relevance-ranked retrieval over ALL skills, keyed off ``query``.
+
+        Unlike :meth:`find` (exact tag match only), this scores every skill
+        with :meth:`Skill.relevance` so description/trigger-tagged skills —
+        e.g. imported Agent Skills whose only tags are ``agent-skill`` + their
+        dir name — actually surface when the query mentions what they do.
+
+        A skill is returned only when BOTH:
+
+        - its base helpfulness ``score`` is ``>= min_score`` (default 0, so
+          net-hurtful skills never surface), AND
+        - it has positive relevance to ``query`` ABOVE its own base score —
+          i.e. at least one query token matched a tag/name/description/
+          trigger/body field. This keeps the result empty when nothing is
+          actually relevant, so callers can append unconditionally.
+
+        Thread-safe via the same ``_scan``/``_lock`` pattern as :meth:`find`.
+        """
+        with self._lock:
+            candidates = self._scan()
+        scored: List[tuple[float, Skill]] = []
+        for s in candidates:
+            if s.score < min_score:
+                continue
+            rel = s.relevance(query)
+            # relevance() starts from the base score and only adds for token
+            # matches; require a real match (rel strictly above the base) so
+            # zero-overlap skills are excluded rather than flooding the prompt.
+            if rel <= s.score:
+                continue
+            scored.append((rel, s))
+        scored.sort(key=lambda pair: (pair[0], pair[1].last_used_at), reverse=True)
+        return [s for _, s in scored[: max(0, int(limit))]]
 
     def upsert(self, skill: Skill, *, count_mode: str = "add") -> Path:
         """Write a skill atomically. Returns the path written.
@@ -609,6 +688,116 @@ class SkillLibrary:
             else:
                 imported.append(path.stem)
         return {"imported": imported, "skipped": skipped, "flagged": flagged}
+
+    def import_skill_repo(
+        self,
+        root: Path | str,
+        *,
+        source: str = "agent_skills_import",
+        reject_unsafe: bool = True,
+    ) -> Dict[str, Any]:
+        """Import a skill repo, tolerating multiple on-disk layouts.
+
+        Repos in the wild package skills in (at least) two shapes:
+
+        1. **Agent Skills standard** — one or more ``SKILL.md`` directories
+           anywhere in the tree. This is the canonical format and is tried
+           first via :meth:`import_agent_skills`.
+        2. **Loose markdown** — skills shipped as plain ``.md`` files (no
+           ``SKILL.md`` dir), each with frontmatter carrying a ``name`` plus
+           at least one of ``tags`` / ``triggers`` / ``description``. Only
+           tried when ZERO ``SKILL.md`` files exist, so a standard repo is
+           never mis-parsed by the looser heuristic.
+
+        Returns a dict with keys:
+
+        - ``imported``: list of skill slugs written.
+        - ``skipped``: list of source paths that failed import or were
+          rejected as unsafe.
+        - ``flagged``: list of ``"<name>: <rule ids>"`` for files that
+          tripped the safety scan.
+        - ``found_format``: one of ``"skill_md"`` (path 1 produced skills),
+          ``"loose_md"`` (path 2 produced skills), or ``"none"`` (nothing
+          installable was found).
+        """
+        root = Path(root)
+
+        # --- Path 1: standard SKILL.md directories ---------------------
+        has_skill_md = any(True for _ in root.rglob("SKILL.md"))
+        if has_skill_md:
+            result = self.import_agent_skills(
+                root, source=source, reject_unsafe=reject_unsafe
+            )
+            found = "skill_md" if result["imported"] else "none"
+            return {
+                "imported": result["imported"],
+                "skipped": result["skipped"],
+                "flagged": result["flagged"],
+                "found_format": found,
+            }
+
+        # --- Path 2: loose skill-format markdown -----------------------
+        imported: List[str] = []
+        skipped: List[str] = []
+        flagged: List[str] = []
+        for md_path in sorted(root.rglob("*.md")):
+            if not self._is_candidate_loose_skill(md_path, root):
+                continue
+            try:
+                text = md_path.read_text(encoding="utf-8")
+            except Exception:
+                logger.exception("loose skill read failed: %s", md_path)
+                skipped.append(str(md_path))
+                continue
+            front, _ = _split_frontmatter(text)
+            if not _is_loose_skill_frontmatter(front):
+                continue
+            findings = scan_skill_markdown(text)
+            if findings:
+                flagged.append(f"{md_path.stem}: {', '.join(findings)}")
+                if reject_unsafe:
+                    skipped.append(str(md_path))
+                    continue
+            try:
+                skill = Skill.from_markdown(text)
+            except Exception:
+                logger.exception("loose skill parse failed: %s", md_path)
+                skipped.append(str(md_path))
+                continue
+            skill.source = source
+            skill.tags = sorted(set(skill.tags) | {"agent-skill", "loose-md"})
+            try:
+                path = self.upsert(skill)
+            except Exception:
+                logger.exception("loose skill upsert failed: %s", md_path)
+                skipped.append(str(md_path))
+                continue
+            imported.append(path.stem)
+
+        return {
+            "imported": imported,
+            "skipped": skipped,
+            "flagged": flagged,
+            "found_format": "loose_md" if imported else "none",
+        }
+
+    @staticmethod
+    def _is_candidate_loose_skill(md_path: Path, root: Path) -> bool:
+        """Filter loose ``.md`` files down to plausible skill documents.
+
+        Excludes well-known project docs by filename (README, LICENSE, …)
+        and anything living under ``docs/`` / ``node_modules/`` / ``.git/``.
+        """
+        stem_lc = md_path.stem.lower()
+        if stem_lc in _LOOSE_SKILL_EXCLUDE_NAMES:
+            return False
+        try:
+            rel_parts = {part.lower() for part in md_path.relative_to(root).parts[:-1]}
+        except ValueError:
+            rel_parts = {part.lower() for part in md_path.parts[:-1]}
+        if rel_parts & _LOOSE_SKILL_EXCLUDE_DIRS:
+            return False
+        return True
 
     def summary(self) -> Dict:
         """Aggregate stats for the dashboard."""

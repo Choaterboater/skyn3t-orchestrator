@@ -187,6 +187,83 @@ def test_find_relevant_uses_description_and_triggers(tmp_path):
     assert hits[0].name == "adaptyv-foundry"
 
 
+def test_search_surfaces_imported_skill_without_matching_topic_tag(tmp_path):
+    """An imported Agent-Skill is tagged only `agent-skill` + its dir name,
+    so the code_agent topic-tag list never matches it via find(). search()
+    must still surface it by relevance to the build query — proving the
+    description/trigger-tagged skill is now retrievable."""
+    lib = SkillLibrary(root=tmp_path / "skills")
+    # Imported skill: tags are agent-skill + dir name only (no topic tags).
+    lib.upsert(
+        Skill(
+            name="test-driven-development",
+            description="Use this skill to write tests first / TDD when building a service.",
+            triggers=["testing", "tdd"],
+            tags=["agent-skill", "test-driven-development"],
+            body="# TDD\nWrite a failing test first, then implement.",
+        )
+    )
+    # An unrelated skill that should NOT match the query.
+    lib.upsert(
+        Skill(
+            name="ios-swiftui",
+            description="iOS SwiftUI layout patterns.",
+            tags=["agent-skill", "ios-swiftui"],
+            body="# SwiftUI",
+        )
+    )
+
+    # The exact topic-tag list code_agent uses — none of these match the
+    # imported skill's tags, so find() returns nothing for it.
+    topic_tags = [
+        "code_agent", "react", "polling", "websocket", "integration",
+        "ux", "dashboard", "service-card", "kpi", "sparkline",
+        "status", "drawer", "topbar", "ui-pattern",
+    ]
+    for tag in topic_tags:
+        assert all(
+            s.name != "test-driven-development" for s in lib.find(tag=tag)
+        ), f"unexpected tag match on {tag!r}"
+
+    hits = lib.search("build a python service with tests")
+    names = [s.name for s in hits]
+    assert "test-driven-development" in names
+    # The unrelated skill must not surface for this query.
+    assert "ios-swiftui" not in names
+
+
+def test_search_returns_empty_when_nothing_relevant(tmp_path):
+    """search() yields nothing when no token overlaps — so the code_agent
+    relevance pass appends nothing and behavior is unchanged."""
+    lib = SkillLibrary(root=tmp_path / "skills")
+    lib.upsert(
+        Skill(
+            name="ios-swiftui",
+            description="iOS SwiftUI layout patterns.",
+            tags=["agent-skill", "ios-swiftui"],
+            body="# SwiftUI",
+        )
+    )
+    assert lib.search("zzzqqq nonsense unrelated") == []
+
+
+def test_search_excludes_net_hurtful_skills(tmp_path):
+    """A relevant but net-hurtful skill (score below min_score) is hidden."""
+    lib = SkillLibrary(root=tmp_path / "skills")
+    lib.upsert(
+        Skill(
+            name="bad-tdd",
+            description="TDD testing service",
+            triggers=["testing", "tdd"],
+            tags=["agent-skill", "test-driven-development"],
+            body="# bad",
+            success_count=0,
+            failure_count=5,
+        )
+    )
+    assert lib.search("build a python service with tests") == []
+
+
 def test_find_returns_empty_on_unknown_tag(tmp_path):
     lib = SkillLibrary(root=tmp_path / "skills")
     lib.upsert(Skill(name="a", tags=["next"]))
@@ -416,6 +493,76 @@ def test_import_agent_skills_rejects_unsafe_skill(tmp_path):
     assert summary["imported"] == []
     assert summary["skipped"] == [str(skill_dir)]
     assert summary["flagged"]
+
+
+# ─── import_skill_repo (multi-format) ──────────────────────────────────
+
+
+def test_import_skill_repo_imports_skill_md_dirs(tmp_path):
+    """A repo with two SKILL.md dirs imports both via the skill_md path."""
+    lib = SkillLibrary(root=tmp_path / "skills")
+    repo = tmp_path / "repo"
+    for name in ("alpha", "beta"):
+        d = repo / "skills" / name
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: Use {name} when relevant.\n---\n\n# {name}\n",
+            encoding="utf-8",
+        )
+    result = lib.import_skill_repo(repo)
+    assert result["found_format"] == "skill_md"
+    assert len(result["imported"]) == 2
+    names = {s.name for s in lib.find(tag="agent-skill", min_score=-1.0, limit=50)}
+    assert {"alpha", "beta"} <= names
+
+
+def test_import_skill_repo_imports_loose_md_skipping_readme(tmp_path):
+    """A loose skill .md plus a README.md imports only the real skill."""
+    lib = SkillLibrary(root=tmp_path / "skills")
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    (repo / "git-helper.md").write_text(
+        "---\n"
+        "name: git-helper\n"
+        "tags: [git, vcs]\n"
+        "description: Help with git rebases and conflict resolution.\n"
+        "---\n\n"
+        "# Git helper\n\nUse `git rebase` carefully.\n",
+        encoding="utf-8",
+    )
+    (repo / "README.md").write_text(
+        "# Awesome Skills\n\nA collection of skills. See each file.\n",
+        encoding="utf-8",
+    )
+    result = lib.import_skill_repo(repo)
+    assert result["found_format"] == "loose_md"
+    assert result["imported"] == ["git-helper"]
+    live = lib.find(tag="loose-md", min_score=-1.0, limit=50)
+    assert [s.name for s in live] == ["git-helper"]
+    # The README must not have landed as a skill.
+    all_names = {s.name for s in lib.find(min_score=-1.0, limit=50)}
+    assert "Awesome Skills" not in all_names
+    assert "untitled" not in all_names
+
+
+def test_import_skill_repo_returns_none_for_docs_only_repo(tmp_path):
+    """A repo with only README/docs yields found_format 'none', no imports."""
+    lib = SkillLibrary(root=tmp_path / "skills")
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    (repo / "README.md").write_text("# agentskills\n\nDocs here.\n", encoding="utf-8")
+    (repo / "CONTRIBUTING.md").write_text("# Contributing\n", encoding="utf-8")
+    docs = repo / "docs"
+    docs.mkdir(parents=True)
+    # A markdown under docs/ that *looks* like a skill must still be excluded.
+    (docs / "guide.md").write_text(
+        "---\nname: guide\ntags: [docs]\ndescription: A docs guide.\n---\n\n# Guide\n",
+        encoding="utf-8",
+    )
+    result = lib.import_skill_repo(repo)
+    assert result["found_format"] == "none"
+    assert result["imported"] == []
+    assert lib.find(min_score=-1.0, limit=50) == []
 
 
 def test_get_default_library_singleton(monkeypatch, tmp_path):

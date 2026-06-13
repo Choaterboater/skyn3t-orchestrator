@@ -3134,14 +3134,21 @@ async def install_skill(request: Request):
                     {"error": "git clone failed", "detail": stderr.decode()[-500:]},
                     status_code=400,
                 )
-            # Skill repos are usually COLLECTIONS (skills/<cat>/<name>/SKILL.md),
-            # not a single skill — import EVERY SKILL.md in the tree, not just
-            # the first. Unsafe ones are scanned + flagged by import_agent_skills.
-            result = lib.import_agent_skills(tmp)
-            if not result["imported"]:
+            # Skill repos ship skills in more than one shape: the Agent
+            # Skills standard (skills/<cat>/<name>/SKILL.md collections) AND
+            # loose markdown files with skill frontmatter. import_skill_repo
+            # handles both and tells us which format it found so we can give a
+            # clear "nothing here" error when a repo has no skills at all.
+            result = lib.import_skill_repo(tmp)
+            found_format = result.get("found_format", "none")
+            if found_format == "none":
                 return JSONResponse(
                     {
-                        "error": "no installable SKILL.md found in repo",
+                        "error": (
+                            "no installable skills found in this repo "
+                            "(no SKILL.md and no skill-format markdown)"
+                        ),
+                        "found_format": found_format,
                         "flagged": result.get("flagged", []),
                     },
                     status_code=400,
@@ -3151,6 +3158,7 @@ async def install_skill(request: Request):
                 "installed_count": len(result["imported"]),
                 "flagged": result.get("flagged", []),
                 "skipped_count": len(result.get("skipped", [])),
+                "found_format": found_format,
             }
 
     return JSONResponse({"error": f"source not found: {source}"}, status_code=400)

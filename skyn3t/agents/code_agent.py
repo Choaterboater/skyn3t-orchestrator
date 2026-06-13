@@ -1897,6 +1897,40 @@ class CodeAgent(BaseAgent):
                             break
                     if len(skill_lines) >= 8:
                         break
+                # Relevance pass: tag-matching alone never surfaces imported
+                # Agent-Skills (tagged only `agent-skill` + their dir name),
+                # so their description/trigger-tagged guidance was inert.
+                # Rank ALL skills by relevance to a compact query built from
+                # the brief + stack + planned file paths/purposes, and merge
+                # into the SAME dedup-by-name set. search() returns nothing
+                # when no skill is actually relevant, so behavior is identical
+                # to before when the library has no matching skills. Guarded in
+                # its own try/except (and via getattr) so a library without
+                # search() — or any error inside it — never discards the
+                # tag-based results already collected above.
+                _search = getattr(lib, "search", None)
+                if callable(_search) and len(skill_lines) < 8:
+                    try:
+                        query_bits: List[str] = [brief or "", stack or ""]
+                        for _spec in (file_specs or [])[:12]:
+                            if isinstance(_spec, dict):
+                                query_bits.append(str(_spec.get("path") or ""))
+                                query_bits.append(str(_spec.get("purpose") or ""))
+                        query = " ".join(b for b in query_bits if b)[:2000]
+                        for skill in _search(query, limit=8):
+                            if len(skill_lines) >= 8:
+                                break
+                            if skill.name in seen:
+                                continue
+                            seen.add(skill.name)
+                            snippet = (skill.body or "").strip()
+                            if not snippet:
+                                continue
+                            if len(snippet) > 3500:
+                                snippet = snippet[:3500] + "\n…[truncated]"
+                            skill_lines.append(f"### Skill: {skill.name}\n{snippet}")
+                    except Exception:
+                        logger.debug("skill relevance pass failed", exc_info=True)
                 if skill_lines:
                     build_system = (
                         build_system
