@@ -778,9 +778,8 @@ MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
 async def add_security_headers(request: Request, call_next):
     """Attach a baseline CSP and other security headers to every response."""
     response = await call_next(request)
-    # CSP is tuned to the dashboard's actual third-party hosts (Font Awesome
-    # CDN, Google Fonts, jsDelivr for Chart.js, plus Cytoscape on jsdelivr).
-    # If you remove a CDN dep from dashboard.html, remove it here too.
+    # CSP is tuned to the SPA's actual third-party hosts (Font Awesome CDN,
+    # Google Fonts). If you remove a CDN dep from the UI, remove it here too.
     csp = (
         "default-src 'self'; "
         "script-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com 'unsafe-inline'; "
@@ -868,36 +867,32 @@ async def enforce_web_access(request: Request, call_next):
     return await call_next(request)
 
 
-_DASHBOARD_PATH = Path(__file__).parent / "dashboard.html"
 _SPA_DIST = Path(__file__).parent / "ui" / "dist"
 
 
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
     """Stub favicon route. Browsers always request /favicon.ico; without an
-    explicit handler the catch-all served the dashboard HTML and burned a
-    full template render per page load."""
+    explicit handler the catch-all would 404 or serve HTML on every page load."""
     return Response(status_code=204)
-
-
-@app.get("/legacy", response_class=HTMLResponse)
-async def legacy_dashboard():
-    """The original single-file dashboard.html. Kept as an escape hatch
-    while the Vite+React SPA finishes covering every view. Tagged
-    'legacy' on purpose — new work should go in skyn3t/web/ui/."""
-    return FileResponse(str(_DASHBOARD_PATH), media_type="text/html")
 
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    """Serve the new Vite+React SPA when it's been built, otherwise fall
-    back to the legacy dashboard so a fresh checkout still shows
-    something. Run `npm --prefix skyn3t/web/ui run build` to populate
-    the dist/ directory."""
+    """Serve the Vite+React SPA when it's been built.
+
+    Run `npm --prefix skyn3t/web/ui run build` to populate the dist/
+    directory. If the build is missing, return a minimal placeholder so
+    health/security-header checks still pass.
+    """
     index = _SPA_DIST / "index.html"
     if index.exists():
         return FileResponse(str(index), media_type="text/html")
-    return FileResponse(str(_DASHBOARD_PATH), media_type="text/html")
+    return HTMLResponse(
+        content="<html><body><h1>SkyN3t UI not built</h1>"
+        "<p>Run <code>npm --prefix skyn3t/web/ui run build</code>.</p></body></html>",
+        status_code=200,
+    )
 
 
 # Serve SPA static assets (JS/CSS/images) when the build exists.
@@ -3985,7 +3980,7 @@ async def get_examples():
                 "subtitle": "Sweep across the UI to refine spacing, typography, and color",
                 "icon": "fa-palette",
                 "template": "frontend_redesign",
-                "brief": "Redesign skyn3t/web/dashboard.html — refine spacing, typography hierarchy, and visual consistency. Polish forms, cards, and the swarm map. Keep all DOM IDs and JS handlers intact.",
+                "brief": "Redesign skyn3t/web/ui/src/routes/StudioPage.tsx — refine spacing, typography hierarchy, and visual consistency. Polish forms, cards, and the mission pulse panel. Keep all component props and routes intact.",
             },
             {
                 "id": "habit-tracker",
@@ -4796,4 +4791,8 @@ async def spa_fallback(full_path: str):
     index = _SPA_DIST / "index.html"
     if index.exists():
         return FileResponse(str(index), media_type="text/html")
-    return FileResponse(str(_DASHBOARD_PATH), media_type="text/html")
+    return HTMLResponse(
+        content="<html><body><h1>SkyN3t UI not built</h1>"
+        "<p>Run <code>npm --prefix skyn3t/web/ui run build</code>.</p></body></html>",
+        status_code=200,
+    )

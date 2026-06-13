@@ -7,10 +7,8 @@ import react from "@vitejs/plugin-react";
 // proxied to the FastAPI backend at :6660 so cookies/auth flow
 // naturally — no separate CORS config needed in dev.
 //
-// Build: `npm run build` emits to dist/. FastAPI's web/app.py can
-// optionally mount that dir at /static and serve the SPA shell from
-// index.html. The old dashboard.html stays as a fallback until we
-// reach feature parity.
+// Build: `npm run build` emits to dist/. FastAPI's web/app.py serves
+// the SPA shell from index.html at `/`.
 export default defineConfig({
   plugins: [react()],
   server: {

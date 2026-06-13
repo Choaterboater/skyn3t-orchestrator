@@ -91,14 +91,14 @@ _TARGET_HINTS: tuple[tuple[set[str], tuple[str, ...]], ...] = (
             "skyn3t/cortex/handlers.py",
             "skyn3t/cortex/feature_suggester.py",
             "skyn3t/cortex/proposals.py",
-            "skyn3t/web/dashboard.html",
+            "skyn3t/web/ui/src/routes/StudioPage.tsx",
         ),
     ),
     (
         {"api", "endpoint", "http", "server", "web"},
         (
             "skyn3t/web/app.py",
-            "skyn3t/web/dashboard.html",
+            "skyn3t/web/ui/src/routes/StudioPage.tsx",
         ),
     ),
     (
@@ -122,7 +122,7 @@ _TARGET_HINTS: tuple[tuple[set[str], tuple[str, ...]], ...] = (
         (
             "skyn3t/rag/rag_engine.py",
             "skyn3t/web/app.py",
-            "skyn3t/web/dashboard.html",
+            "skyn3t/web/ui/src/routes/StudioPage.tsx",
         ),
     ),
 )

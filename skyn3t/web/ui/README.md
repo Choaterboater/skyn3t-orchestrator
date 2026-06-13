@@ -2,7 +2,7 @@
 
 A real Vite + React + Tailwind SPA over the FastAPI backend.
 
-The old `skyn3t/web/dashboard.html` (10k+ line single file with six stacked redesign passes) is still served at `/` for back-compat. This new UI is being ported one page at a time and lives at `skyn3t/web/ui/`.
+This is the primary SkyN3t UI. The legacy `skyn3t/web/dashboard.html` has been removed; FastAPI serves the built SPA from `skyn3t/web/ui/dist/index.html` at `/`.
 
 ## Quick start
 

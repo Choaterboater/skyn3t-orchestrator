@@ -12,9 +12,9 @@ STUDIO_EXAMPLES: List[Dict[str, Any]] = [
         "icon": "fa-palette",
         "template": "frontend_redesign",
         "brief": (
-            "Redesign skyn3t/web/dashboard.html — refine spacing, typography hierarchy, "
-            "and visual consistency. Polish forms, cards, and the swarm map. Keep all "
-            "DOM IDs and JS handlers intact."
+            "Redesign skyn3t/web/ui/src/routes/StudioPage.tsx — refine spacing, "
+            "typography hierarchy, and visual consistency. Polish forms, cards, and "
+            "the mission pulse panel. Keep all component props and routes intact."
         ),
     },
     {

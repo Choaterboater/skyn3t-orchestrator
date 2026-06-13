@@ -227,7 +227,7 @@ def tool_manifest() -> str:
     lines.append("# Calling convention")
     lines.append("Reply with a fenced ```tool block per call:")
     lines.append("```tool")
-    lines.append('{"name": "apply_replacement", "args": {"path": "skyn3t/web/dashboard.html", "find": "...", "replace": "..."}}')
+    lines.append('{"name": "apply_replacement", "args": {"path": "skyn3t/web/app.py", "find": "...", "replace": "..."}}')
     lines.append("```")
     lines.append("Multiple tool calls allowed. After your tool calls, reply DONE on its own line.")
     return "\n".join(lines)

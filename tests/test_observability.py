@@ -26,6 +26,7 @@ from skyn3t.observability.metrics import (
     reset_collector,
     timed,
 )
+from skyn3t.observability.token_tracker import TokenTracker, get_default_tracker
 from skyn3t.observability.tracing import (
     ConsoleExporter,
     SpanStatus,
@@ -281,3 +282,91 @@ class TestHealth:
         asyncio.run(registry.run_all())
         last = registry.get_last_results()
         assert "ok" in last
+
+
+# ---------------------------------------------------------------------------
+# Token tracker
+# ---------------------------------------------------------------------------
+class TestTokenTracker:
+    def _exchange(self, **kwargs):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(payload=kwargs)
+
+    def test_tracker_rolls_up_agent_and_project(self):
+        tracker = TokenTracker()
+        tracker._on_exchange(
+            self._exchange(
+                agent="coder",
+                project_slug="proj-1",
+                project_stage="code",
+                prompt_chars=400,
+                response_chars=200,
+                backend="openrouter",
+                model="qwen3",
+            )
+        )
+        totals = tracker.totals()
+        assert totals["total_tokens"] > 0
+        assert totals["total_calls"] == 1
+        assert totals["agents_tracked"] == 1
+        assert totals["projects_tracked"] == 1
+
+        agent = tracker.per_agent()[0]
+        assert agent["agent"] == "coder"
+        assert agent["calls"] == 1
+        assert agent["backend"] == "openrouter"
+
+        project = tracker.for_project("proj-1")
+        assert project is not None
+        assert project["slug"] == "proj-1"
+        assert project["calls"] == 1
+        assert len(project["stages"]) == 1
+        assert project["stages"][0]["stage"] == "code"
+
+    def test_tracker_missing_project_returns_none(self):
+        tracker = TokenTracker()
+        assert tracker.for_project("does-not-exist") is None
+
+    def test_tracker_snapshot_roundtrip(self):
+        tracker = TokenTracker()
+        tracker._on_exchange(
+            self._exchange(
+                agent="coder",
+                project_slug="proj-2",
+                project_stage="code",
+                prompt_chars=100,
+                response_chars=100,
+            )
+        )
+        snap = tracker.to_snapshot()
+        tracker2 = TokenTracker()
+        tracker2.restore_snapshot(snap)
+        assert tracker2.for_project("proj-2")["calls"] == 1
+
+    def test_default_tracker_singleton(self):
+        t1 = get_default_tracker()
+        t2 = get_default_tracker()
+        assert t1 is t2
+
+    def test_tracker_subscribe_idempotent(self):
+        tracker = TokenTracker()
+        # No real event bus needed for idempotency check.
+        tracker._subscribed = True
+        tracker.subscribe(None)
+        assert tracker._subscribed is True
+
+
+# ---------------------------------------------------------------------------
+# Metrics endpoint
+# ---------------------------------------------------------------------------
+def test_metrics_endpoint_returns_prometheus_text():
+    from fastapi.testclient import TestClient
+
+    from skyn3t.web import app as web_app
+
+    client = TestClient(web_app.app)
+    response = client.get("/metrics")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert b"skyn3t" in response.content or b"#" in response.content

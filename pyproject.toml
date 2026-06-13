@@ -119,3 +119,11 @@ norecursedirs = ["data", ".git", ".venv"]
 markers = [
     "slow: marks tests as slower-running integration/e2e checks",
 ]
+
+[tool.coverage.run]
+source = ["skyn3t"]
+
+[tool.coverage.report]
+fail_under = 60
+show_missing = true
+skip_covered = false

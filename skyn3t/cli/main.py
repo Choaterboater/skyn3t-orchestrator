@@ -424,8 +424,10 @@ memory_app = typer.Typer(help="Memory inspection commands", no_args_is_help=True
 skills_app = typer.Typer(help="Skill registry commands", no_args_is_help=True)
 models_app = typer.Typer(help="LLM model catalog commands", no_args_is_help=True)
 domain_app = typer.Typer(help="Domain corpus and safe evolution commands", no_args_is_help=True)
+security_app = typer.Typer(help="Security and secret-management commands", no_args_is_help=True)
 
 app.add_typer(studio_app, name="studio")
+app.add_typer(security_app, name="security")
 app.add_typer(agent_app, name="agent")
 app.add_typer(task_app, name="task")
 app.add_typer(pipeline_app, name="pipeline")
@@ -509,6 +511,54 @@ app.add_typer(memory_app, name="memory")
 app.add_typer(skills_app, name="skills")
 app.add_typer(models_app, name="models")
 app.add_typer(domain_app, name="domain")
+
+
+@security_app.command("migrate-env-to-keyring")
+def security_migrate_env_to_keyring(
+    dotenv: Optional[str] = typer.Option(".env", "--dotenv", help="Path to .env file"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would migrate without changing files"),
+    no_backup: bool = typer.Option(False, "--no-backup", help="Skip writing a .env backup"),
+) -> None:
+    """Move secret-looking values from .env into the system keychain."""
+    from skyn3t.security.keychain import migrate_dotenv_secrets
+
+    try:
+        migrated, skipped = migrate_dotenv_secrets(
+            Path(dotenv or ".env"),
+            dry_run=dry_run,
+            backup=not no_backup,
+        )
+    except RuntimeError as exc:
+        _error(str(exc))
+        raise typer.Exit(1)
+    except FileNotFoundError as exc:
+        _error(str(exc))
+        raise typer.Exit(1)
+
+    if dry_run:
+        console.print("[yellow]Dry run — no files or keychain entries changed.[/yellow]")
+    console.print(f"[green]Migrated {len(migrated)} secret(s).[/green]")
+    for name, action in migrated.items():
+        console.print(f"  • {name}: {action}")
+    if skipped:
+        console.print(f"[yellow]Skipped/failed {len(skipped)} item(s).[/yellow]")
+
+
+@security_app.command("rotate-keychain-secret")
+def security_rotate_keychain_secret(
+    name: str = typer.Argument(..., help="Secret name"),
+    value: Optional[str] = typer.Argument(None, help="New value (omit to prompt)"),
+) -> None:
+    """Rotate a secret stored in the system keychain."""
+    from skyn3t.security.keychain import rotate_keychain_secret
+
+    if value is None:
+        value = typer.prompt(f"New value for {name}", hide_input=True)
+    if rotate_keychain_secret(name, value):
+        console.print(f"[green]Rotated {name} in keychain.[/green]")
+    else:
+        _error(f"Failed to rotate {name}.")
+        raise typer.Exit(1)
 
 
 @domain_app.command("queries")

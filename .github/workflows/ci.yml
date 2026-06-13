@@ -30,5 +30,28 @@ jobs:
       - name: Type-check
         run: mypy skyn3t
 
-      - name: Test
-        run: pytest tests/ --ignore=tests/test_observability.py -q
+      - name: Test with coverage floor
+        run: pytest tests/ -q --cov=skyn3t --cov-report=term
+
+  spa-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: skyn3t/web/ui
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: skyn3t/web/ui/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build SPA
+        run: npm run build
