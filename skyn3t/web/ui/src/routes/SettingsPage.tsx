@@ -1076,7 +1076,11 @@ function InstallSkillCard() {
           {install.isSuccess && !resultErr && (
             <p className="text-status-green">
               <i className="fa-solid fa-check mr-1" />
-              installed {install.data?.installed ?? trimmed}
+              installed{" "}
+              {Array.isArray(install.data?.installed)
+                ? `${install.data?.installed_count ?? install.data.installed.length} skill(s) from repo`
+                : (install.data?.installed ?? trimmed)}
+              {install.data?.flagged?.length ? ` · ${install.data.flagged.length} flagged` : ""}
               {install.data?.warnings?.length ? ` · ${install.data.warnings.length} warning(s)` : ""}
             </p>
           )}

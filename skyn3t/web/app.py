@@ -3128,23 +3128,30 @@ async def install_skill(request: Request):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await proc.communicate()
+            _, stderr = await proc.communicate()
             if proc.returncode != 0:
                 return JSONResponse(
-                    {"error": "git clone failed", "detail": stderr.decode()},
+                    {"error": "git clone failed", "detail": stderr.decode()[-500:]},
                     status_code=400,
                 )
-            skill_md = Path(tmp) / "SKILL.md"
-            if not skill_md.exists():
-                subdirs = [d for d in Path(tmp).iterdir() if d.is_dir()]
-                if subdirs:
-                    skill_md = subdirs[0] / "SKILL.md"
-            if not skill_md.exists():
-                return JSONResponse({"error": "No SKILL.md found"}, status_code=400)
-            path, findings = lib.import_agent_skill(skill_md.parent)
-            if path:
-                return {"installed": path.stem, "warnings": findings}
-            return JSONResponse({"error": "install failed", "flagged": findings}, status_code=400)
+            # Skill repos are usually COLLECTIONS (skills/<cat>/<name>/SKILL.md),
+            # not a single skill — import EVERY SKILL.md in the tree, not just
+            # the first. Unsafe ones are scanned + flagged by import_agent_skills.
+            result = lib.import_agent_skills(tmp)
+            if not result["imported"]:
+                return JSONResponse(
+                    {
+                        "error": "no installable SKILL.md found in repo",
+                        "flagged": result.get("flagged", []),
+                    },
+                    status_code=400,
+                )
+            return {
+                "installed": result["imported"],
+                "installed_count": len(result["imported"]),
+                "flagged": result.get("flagged", []),
+                "skipped_count": len(result.get("skipped", [])),
+            }
 
     return JSONResponse({"error": f"source not found: {source}"}, status_code=400)
 

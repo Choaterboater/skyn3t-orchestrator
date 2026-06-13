@@ -535,10 +535,12 @@ export type SkillHubCatalog = {
 };
 
 export type SkillInstallResult = {
-  installed?: string;
+  installed?: string | string[];
+  installed_count?: number;
   warnings?: string[];
   error?: string;
   flagged?: string[];
+  skipped_count?: number;
   [k: string]: any;
 };
 
