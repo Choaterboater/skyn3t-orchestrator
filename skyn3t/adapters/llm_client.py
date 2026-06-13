@@ -180,6 +180,48 @@ def _settings_fallbacks() -> dict[str, Optional[str]]:
         }
 
 
+# ── Exact-match response cache ───────────────────────────────────────────────
+# Deterministic (temperature==0) completions are replayed verbatim on retries,
+# re-runs, and parallel agents. Caching them short-circuits duplicate network
+# spend — the cheapest cost win for the cheap/free directive. Bounded FIFO.
+_RESPONSE_CACHE: Dict[str, str] = {}
+_RESPONSE_CACHE_ORDER: List[str] = []
+_RESPONSE_CACHE_MAX = 512
+
+
+def _response_cache_enabled() -> bool:
+    return os.environ.get("SKYN3T_LLM_RESPONSE_CACHE", "1").strip().lower() not in {
+        "0", "off", "false", "no",
+    }
+
+
+def _response_cache_key(
+    backend: Any, model: Any, system: Any, prompt: Any,
+    max_tokens: Any, temperature: Any,
+) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    for part in (str(backend or ""), str(model or ""), str(system or ""),
+                 str(prompt or ""), str(max_tokens), str(temperature)):
+        h.update(part.encode("utf-8", "ignore"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+def _response_cache_get(key: str) -> Optional[str]:
+    return _RESPONSE_CACHE.get(key)
+
+
+def _response_cache_put(key: str, value: str) -> None:
+    if key in _RESPONSE_CACHE:
+        return
+    _RESPONSE_CACHE[key] = value
+    _RESPONSE_CACHE_ORDER.append(key)
+    if len(_RESPONSE_CACHE_ORDER) > _RESPONSE_CACHE_MAX:
+        _RESPONSE_CACHE.pop(_RESPONSE_CACHE_ORDER.pop(0), None)
+
+
 class LLMClient:
     """Unified LLM facade with graceful fallbacks.
 
@@ -405,6 +447,17 @@ class LLMClient:
         req = LLMRequest(prompt=prompt, system=system, model=model or self.default_model,
                          max_tokens=max_tokens, temperature=temperature, cwd=cwd)
         elapsed = 0.0
+        # Exact-match cache: only deterministic calls (temp==0), so we never
+        # short-circuit intentional sampling (self-consistency / varied retries).
+        _cache_key: Optional[str] = None
+        if temperature == 0 and _response_cache_enabled():
+            _cache_key = _response_cache_key(
+                self._backend_name, req.model, req.system, req.prompt,
+                max_tokens, temperature,
+            )
+            cached = _response_cache_get(_cache_key)
+            if cached is not None:
+                return cached
         try:
             impl = await self._get_impl()
             # Provider-aware augmentation: prepend retrieved docs notes to the
@@ -425,6 +478,12 @@ class LLMClient:
             else:
                 out = cast(str, await impl.complete(req))
             elapsed = time.monotonic() - start
+            if (
+                _cache_key is not None
+                and out
+                and (self._backend_name or "") != "deterministic"
+            ):
+                _response_cache_put(_cache_key, out)
         except Exception as e:
             logger.warning(
                 "llm complete failed; caller=%s backend=%s error=%s",
