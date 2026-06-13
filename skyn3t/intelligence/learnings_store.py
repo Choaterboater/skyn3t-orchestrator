@@ -45,14 +45,87 @@ class LearningsStore:
         *,
         library: Any = None,
         prefs_path: Optional[Path] = None,
-        min_skill_score: float = 0.2,
+        min_skill_score: float = -0.5,
+        data_dir: str = "data",
     ) -> int:
-        """Gather curated learnings into the store. Returns the entry count."""
+        """Gather curated learnings into the store. Returns the entry count.
+
+        Pulls from EVERY signal the system already produces so the corpus grows
+        as the system runs: skills, winning build shapes, model-tournament
+        winners per task, and per-stack build success rates.
+        """
+        d = Path(data_dir)
         entries: List[Dict[str, Any]] = []
         entries.extend(self._skill_entries(library, min_skill_score))
         entries.extend(self._build_pattern_entries(prefs_path))
+        entries.extend(self._model_tournament_entries(d / "model_tournament.json"))
+        entries.extend(self._build_success_entries(d / "build_success_rate.json"))
         self._write(entries)
         return len(entries)
+
+    def _model_tournament_entries(self, path: Path) -> List[Dict[str, Any]]:
+        """Best PASSING model per task-domain from the tournament (Claude/CLI excl)."""
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        trials = data.get("trials") if isinstance(data, dict) else None
+        if not isinstance(trials, list):
+            return []
+        best: Dict[str, Any] = {}
+        for t in trials:
+            if not isinstance(t, dict) or not t.get("passed"):
+                continue
+            mid = str(t.get("model_id") or "")
+            low = mid.lower()
+            if not mid or "claude" in low or low in {"sonnet", "opus", "haiku", "fable"}:
+                continue
+            score = float(t.get("score") or 0.0)
+            for tag in (t.get("domain_tags") or ["general"]):
+                cur = best.get(tag)
+                if cur is None or score > cur[1]:
+                    best[tag] = (mid, score, float(t.get("quality_per_dollar") or 0.0))
+        out = []
+        for tag, (mid, score, qpd) in best.items():
+            out.append({
+                "kind": "model_winner", "key": f"model:{tag}",
+                "title": f"Best model for {tag} tasks",
+                "content": (
+                    f"For {tag} tasks, {mid} performed best (score {score:.0f}, "
+                    f"quality/$ {qpd:.0f}). Prefer it for {tag} work."
+                ),
+                "score": min(1.0, score / 100.0), "tags": [tag, "model", "routing"],
+            })
+        return out
+
+    def _build_success_entries(self, path: Path) -> List[Dict[str, Any]]:
+        """Per-stack build reliability from build_success_rate.json."""
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        stacks = data.get("stacks") if isinstance(data, dict) else None
+        if not isinstance(stacks, dict):
+            return []
+        out = []
+        for stack, s in stacks.items():
+            if not isinstance(s, dict):
+                continue
+            succ, fail = int(s.get("success") or 0), int(s.get("failure") or 0)
+            total = succ + fail
+            if total < 3:
+                continue
+            rate = succ / total
+            out.append({
+                "kind": "build_success", "key": f"success:{stack}",
+                "title": f"{stack} build reliability",
+                "content": (
+                    f"Builds for stack '{stack}': {succ}/{total} pass ({rate:.0%}) — "
+                    f"{'reliable' if rate > 0.6 else 'fragile, needs extra verification'}."
+                ),
+                "score": rate, "tags": [stack, "build_success"],
+            })
+        return out
 
     def _skill_entries(self, library: Any, min_score: float) -> List[Dict[str, Any]]:
         try:
