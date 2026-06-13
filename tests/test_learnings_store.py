@@ -46,7 +46,8 @@ def test_compile_and_guidance(tmp_path):
         _FakeSkill("good skill", "do X then Y", 8, 1),
         _FakeSkill("bad skill", "", 0, 5),  # score -1 -> filtered out
     ])
-    n = store.compile(library=lib, prefs_path=prefs, min_skill_score=0.2)
+    # data_dir -> tmp (no model_tournament/build_success files) to isolate the test
+    n = store.compile(library=lib, prefs_path=prefs, min_skill_score=0.2, data_dir=str(tmp_path))
     assert n == 2
     assert store.json_path.exists() and store.md_path.exists()
 
