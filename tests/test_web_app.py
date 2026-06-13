@@ -1591,6 +1591,248 @@ async def test_execution_backend_patch_writes_env(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_budget_get_reports_defaults(monkeypatch, tmp_path):
+    from skyn3t.config.settings import get_settings
+
+    # Isolate from the repo's real .env (which sets a non-default budget) by
+    # running against an empty .env with the env vars unset → field defaults.
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    for var in (
+        "SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD",
+        "SKYN3T_MAX_BUILD_COST_USD",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    get_settings.cache_clear()
+
+    result = await web_app.budget_get()
+
+    assert result["daily_budget_usd"] == 5.0
+    assert result["max_build_cost_usd"] == 1.0
+    assert result["defaults"] == {"daily_budget_usd": 5.0, "max_build_cost_usd": 1.0}
+
+
+@pytest.mark.asyncio
+async def test_budget_patch_writes_env(monkeypatch, tmp_path):
+    from skyn3t.config.settings import get_settings
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("SKYN3T_MAX_BUILD_COST_USD=1\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    # Take ownership so monkeypatch restores these on teardown — budget_patch
+    # mutates os.environ directly, which would otherwise leak into later tests.
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD", "5")
+    monkeypatch.setenv("SKYN3T_MAX_BUILD_COST_USD", "1")
+    get_settings.cache_clear()
+
+    result = await web_app.budget_patch(
+        {"daily_budget_usd": 12.5, "max_build_cost_usd": 2}
+    )
+
+    assert result["ok"] is True
+    assert result["reset"] is False
+    assert result["daily_budget_usd"] == 12.5
+    assert result["max_build_cost_usd"] == 2.0
+    # Exact line match (not a prefix substring) so an untrimmed "2.0" would fail.
+    lines = env_path.read_text(encoding="utf-8").splitlines()
+    assert "SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD=12.5" in lines
+    assert "SKYN3T_MAX_BUILD_COST_USD=2" in lines
+    assert os.environ["SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD"] == "12.5"
+    # Settings reload picks up the new values.
+    assert get_settings().autonomous_build_daily_budget_usd == 12.5
+    assert get_settings().max_build_cost_usd == 2.0
+
+
+@pytest.mark.asyncio
+async def test_budget_patch_reset_restores_defaults(monkeypatch, tmp_path):
+    from skyn3t.config.settings import get_settings
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD=99\n"
+        "SKYN3T_MAX_BUILD_COST_USD=42\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD", "99")
+    monkeypatch.setenv("SKYN3T_MAX_BUILD_COST_USD", "42")
+    get_settings.cache_clear()
+
+    result = await web_app.budget_patch({"reset": True})
+
+    assert result["ok"] is True
+    assert result["reset"] is True
+    assert result["daily_budget_usd"] == 5.0
+    assert result["max_build_cost_usd"] == 1.0
+    lines = env_path.read_text(encoding="utf-8").splitlines()
+    assert "SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD=5" in lines
+    assert "SKYN3T_MAX_BUILD_COST_USD=1" in lines
+
+
+@pytest.mark.asyncio
+async def test_budget_patch_rejects_negative(monkeypatch, tmp_path):
+    from skyn3t.config.settings import get_settings
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    get_settings.cache_clear()
+
+    result = await web_app.budget_patch({"max_build_cost_usd": -3})
+
+    assert isinstance(result, web_app.JSONResponse)
+    assert result.status_code == 400
+    # Nothing persisted on rejection.
+    assert "SKYN3T_MAX_BUILD_COST_USD" not in env_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_budget_patch_rejects_empty_payload(monkeypatch, tmp_path):
+    from skyn3t.config.settings import get_settings
+
+    monkeypatch.chdir(tmp_path)
+    get_settings.cache_clear()
+
+    result = await web_app.budget_patch({})
+
+    assert isinstance(result, web_app.JSONResponse)
+    assert result.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_budget_patch_rejects_non_numeric(monkeypatch, tmp_path):
+    from skyn3t.config.settings import get_settings
+
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    get_settings.cache_clear()
+
+    result = await web_app.budget_patch({"daily_budget_usd": "abc"})
+
+    assert isinstance(result, web_app.JSONResponse)
+    assert result.status_code == 400
+    assert b"must be a number" in result.body
+
+
+@pytest.mark.asyncio
+async def test_budget_patch_rejects_bool(monkeypatch, tmp_path):
+    """bool is an int subclass; {"daily_budget_usd": true} must not become $1."""
+    from skyn3t.config.settings import get_settings
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    get_settings.cache_clear()
+
+    result = await web_app.budget_patch({"daily_budget_usd": True})
+
+    assert isinstance(result, web_app.JSONResponse)
+    assert result.status_code == 400
+    assert "SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD" not in env_path.read_text(
+        encoding="utf-8"
+    )
+
+
+@pytest.mark.asyncio
+async def test_budget_patch_rejects_non_finite(monkeypatch, tmp_path):
+    from skyn3t.config.settings import get_settings
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    get_settings.cache_clear()
+
+    for bad in (float("inf"), float("nan")):
+        result = await web_app.budget_patch({"max_build_cost_usd": bad})
+        assert isinstance(result, web_app.JSONResponse)
+        assert result.status_code == 400
+    assert "SKYN3T_MAX_BUILD_COST_USD" not in env_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_budget_patch_string_reset_does_not_reset(monkeypatch, tmp_path):
+    """A non-true ``reset`` is not a reset; with no numeric fields it's a 400."""
+    from skyn3t.config.settings import get_settings
+
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    get_settings.cache_clear()
+
+    result = await web_app.budget_patch({"reset": "false"})
+
+    assert isinstance(result, web_app.JSONResponse)
+    assert result.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_budget_patch_partial_update_preserves_other(monkeypatch, tmp_path):
+    from skyn3t.config.settings import get_settings
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD=8\n"
+        "SKYN3T_MAX_BUILD_COST_USD=3\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD", "8")
+    monkeypatch.setenv("SKYN3T_MAX_BUILD_COST_USD", "3")
+    get_settings.cache_clear()
+
+    result = await web_app.budget_patch({"daily_budget_usd": 10})
+
+    assert result["ok"] is True
+    assert result["daily_budget_usd"] == 10.0
+    # The untouched per-app cap is preserved in both .env and the snapshot.
+    assert result["max_build_cost_usd"] == 3.0
+    lines = env_path.read_text(encoding="utf-8").splitlines()
+    assert "SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD=10" in lines
+    assert "SKYN3T_MAX_BUILD_COST_USD=3" in lines
+
+
+@pytest.mark.asyncio
+async def test_budget_patch_reset_overrides_explicit_values(monkeypatch, tmp_path):
+    from skyn3t.config.settings import get_settings
+
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD", "5")
+    monkeypatch.setenv("SKYN3T_MAX_BUILD_COST_USD", "1")
+    get_settings.cache_clear()
+
+    result = await web_app.budget_patch(
+        {"reset": True, "daily_budget_usd": 99, "max_build_cost_usd": 99}
+    )
+
+    assert result["reset"] is True
+    # reset wins — the explicit 99s are discarded for the defaults.
+    assert result["daily_budget_usd"] == 5.0
+    assert result["max_build_cost_usd"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_budget_patch_large_value_round_trips_no_scientific_notation(
+    monkeypatch, tmp_path
+):
+    from skyn3t.config.settings import get_settings
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD", "5")
+    monkeypatch.setenv("SKYN3T_MAX_BUILD_COST_USD", "1")
+    get_settings.cache_clear()
+
+    result = await web_app.budget_patch({"daily_budget_usd": 1_500_000})
+
+    assert result["daily_budget_usd"] == 1_500_000.0
+    lines = env_path.read_text(encoding="utf-8").splitlines()
+    # No scientific notation, no precision loss (the old f"{v:g}" wrote 1.5e+06).
+    assert "SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD=1500000" in lines
+    assert get_settings().autonomous_build_daily_budget_usd == 1_500_000.0
+
+
+@pytest.mark.asyncio
 async def test_studio_project_penpot_manifest_returns_design_handoff(monkeypatch, tmp_path):
     project_dir = tmp_path / "demo"
     project_dir.mkdir(parents=True)

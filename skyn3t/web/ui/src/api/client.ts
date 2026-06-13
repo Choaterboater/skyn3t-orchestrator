@@ -81,6 +81,12 @@ export type ExecutionBackendView = {
   auto_retry: boolean;
 };
 
+export type BudgetView = {
+  daily_budget_usd: number;
+  max_build_cost_usd: number;
+  defaults: { daily_budget_usd: number; max_build_cost_usd: number };
+};
+
 export type RoutingRecommendation = {
   stage: string;
   current_tier: string;
@@ -701,6 +707,16 @@ export const api = {
       "/api/execution/backend",
       { method: "PATCH", body: JSON.stringify({ backend }) },
     ),
+  budget: () => fetchJson<BudgetView>("/api/budget"),
+  patchBudget: (payload: {
+    daily_budget_usd?: number;
+    max_build_cost_usd?: number;
+    reset?: boolean;
+  }) =>
+    fetchJson<BudgetView & { ok?: boolean; reset?: boolean }>("/api/budget", {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
   projects: () =>
     fetchJson<{ projects: ProjectRow[] }>("/api/studio/projects").then(
       (d) => d.projects ?? [],

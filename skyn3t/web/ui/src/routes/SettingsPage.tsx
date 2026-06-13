@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   api,
   HttpError,
+  type BudgetView,
   type ExecutionBackendView,
   type GithubScoutConfig,
   type MetaStatus,
@@ -28,10 +29,11 @@ import Sparkline from "../components/Sparkline";
    key-write endpoint (only PATCH /api/execution/backend persists env today).
    ========================================================================== */
 
-type SectionId = "backends" | "integrations" | "agents" | "autonomy";
+type SectionId = "backends" | "budget" | "integrations" | "agents" | "autonomy";
 
 const SECTIONS: Array<{ id: SectionId; label: string; icon: string; blurb: string }> = [
   { id: "backends", label: "LLM & Sandbox", icon: "fa-solid fa-microchip", blurb: "Backends · execution · keys" },
+  { id: "budget", label: "Budget & Cost", icon: "fa-solid fa-dollar-sign", blurb: "Spend cap · per-app max" },
   { id: "integrations", label: "Skills & Scout", icon: "fa-solid fa-puzzle-piece", blurb: "Hub · install · GitHub scout" },
   { id: "agents", label: "Agents", icon: "fa-solid fa-robot", blurb: "Forge new operators" },
   { id: "autonomy", label: "Autonomy", icon: "fa-solid fa-tower-broadcast", blurb: "Meta-cognition loop" },
@@ -60,6 +62,7 @@ export default function SettingsPage() {
   // Scroll-spy: highlight the rail item whose section is centered in view.
   const refs = useRef<Record<SectionId, HTMLElement | null>>({
     backends: null,
+    budget: null,
     integrations: null,
     agents: null,
     autonomy: null,
@@ -141,6 +144,9 @@ export default function SettingsPage() {
         <div className="space-y-6 min-w-0">
           <Section id="backends" refs={refs}>
             <BackendsSection />
+          </Section>
+          <Section id="budget" refs={refs}>
+            <BudgetSection />
           </Section>
           <Section id="integrations" refs={refs}>
             <IntegrationsSection />
@@ -382,6 +388,210 @@ function EnvKeyGuidanceCard() {
         </p>
       </div>
     </PanelCard>
+  );
+}
+
+/* =============================================================================
+   SECTION 1b — Budget & cost caps (spend amount + per-app maximum)
+
+   Two settings, one card: the daily spend budget the autonomy loop may use,
+   and the hard cost cap for a single app build. Both persist to .env via
+   PATCH /api/budget; "reset to defaults" restores the field defaults. A value
+   of 0 means "unlimited" — surfaced inline so the operator isn't surprised.
+   ========================================================================== */
+
+function BudgetSection() {
+  const budgetQ = useQuery({ queryKey: ["budget"], queryFn: api.budget });
+
+  return (
+    <PanelCard>
+      <PanelHeader
+        title="Budget & cost caps"
+        icon="fa-solid fa-dollar-sign"
+        description={
+          <>
+            Set a dollar budget and the maximum price per app build. Persisted to{" "}
+            <code className="font-mono text-xs bg-bg-3 px-1 rounded">.env</code> and applied on the next build.{" "}
+            <span className="text-text-dim">Use 0 for unlimited.</span>
+          </>
+        }
+        actions={
+          <StatusPill
+            status={budgetQ.isError ? "disabled" : budgetQ.isLoading ? "pending" : "online"}
+            label={
+              budgetQ.data
+                ? `$${fmtUsd(budgetQ.data.daily_budget_usd)}/day · $${fmtUsd(budgetQ.data.max_build_cost_usd)}/app`
+                : budgetQ.isError
+                  ? "error"
+                  : budgetQ.isLoading
+                    ? "loading"
+                    : "—"
+            }
+          />
+        }
+      />
+      {budgetQ.isLoading && <LoadingRow label="Loading budget…" />}
+      {budgetQ.isError && <ErrorRow err={budgetQ.error} />}
+      {budgetQ.data && <BudgetForm view={budgetQ.data} />}
+    </PanelCard>
+  );
+}
+
+/** Trim trailing zeros for display: 5 -> "5", 0.5 -> "0.5", 1.25 -> "1.25". */
+function fmtUsd(n: number): string {
+  if (!Number.isFinite(n)) return "0";
+  return String(Math.round(n * 100) / 100);
+}
+
+function DollarInput({
+  id,
+  label,
+  hint,
+  value,
+  onChange,
+  invalid,
+  errorId,
+}: {
+  id: string;
+  label: string;
+  hint: string;
+  value: string;
+  onChange: (v: string) => void;
+  invalid: boolean;
+  /** id of the shared validation message, announced when this field is invalid */
+  errorId?: string;
+}) {
+  // Announce the hint always, and the constraint error when invalid, so a
+  // screen-reader user hears why the field is flagged (matches AgentsSection).
+  const describedBy =
+    [`${id}-hint`, invalid && errorId ? errorId : null].filter(Boolean).join(" ") || undefined;
+  return (
+    <div className="space-y-1.5">
+      <label htmlFor={id} className="section-label block">
+        {label}
+      </label>
+      <div className="relative">
+        <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-text-dim font-mono text-sm">
+          $
+        </span>
+        <input
+          id={id}
+          type="number"
+          min={0}
+          step="0.5"
+          inputMode="decimal"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          aria-invalid={invalid}
+          aria-describedby={describedBy}
+          className={[
+            "w-full data-input font-mono pl-7 focus-visible:ring-2 focus-visible:ring-accent/60",
+            invalid ? "ring-1 ring-status-red/60" : "",
+          ].join(" ")}
+        />
+      </div>
+      <p id={`${id}-hint`} className="text-[0.65rem] text-text-dim">
+        {hint}
+      </p>
+    </div>
+  );
+}
+
+function BudgetForm({ view }: { view: BudgetView }) {
+  const qc = useQueryClient();
+  const [daily, setDaily] = useState(String(view.daily_budget_usd));
+  const [perApp, setPerApp] = useState(String(view.max_build_cost_usd));
+
+  // Re-sync local drafts whenever the server value changes (after save/reset).
+  useEffect(() => {
+    setDaily(String(view.daily_budget_usd));
+    setPerApp(String(view.max_build_cost_usd));
+  }, [view.daily_budget_usd, view.max_build_cost_usd]);
+
+  const save = useMutation({
+    mutationFn: (payload: { daily_budget_usd?: number; max_build_cost_usd?: number; reset?: boolean }) =>
+      api.patchBudget(payload),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["budget"] }),
+  });
+
+  const dailyNum = Number(daily);
+  const perAppNum = Number(perApp);
+  const dailyValid = daily.trim() !== "" && Number.isFinite(dailyNum) && dailyNum >= 0;
+  const perAppValid = perApp.trim() !== "" && Number.isFinite(perAppNum) && perAppNum >= 0;
+  const allValid = dailyValid && perAppValid;
+  const dirty = dailyNum !== view.daily_budget_usd || perAppNum !== view.max_build_cost_usd;
+
+  // Distinguish the reset action from a save so only the right button spins.
+  const resetting = save.isPending && Boolean(save.variables?.reset);
+  const saving = save.isPending && !save.variables?.reset;
+
+  return (
+    <div className="p-4 space-y-4">
+      <div className="grid gap-4 sm:grid-cols-2">
+        <DollarInput
+          id="budget-daily"
+          label="Spend budget (per day)"
+          hint="Total the autonomy loop may spend each day. 0 = unlimited."
+          value={daily}
+          onChange={setDaily}
+          invalid={!dailyValid}
+          errorId="budget-validation-error"
+        />
+        <DollarInput
+          id="budget-per-app"
+          label="Max price per app"
+          hint="Hard cost cap for a single app build. 0 = unlimited."
+          value={perApp}
+          onChange={setPerApp}
+          invalid={!perAppValid}
+          errorId="budget-validation-error"
+        />
+      </div>
+
+      <div className="flex flex-wrap items-center gap-3 pt-1 border-t border-border">
+        <button
+          type="button"
+          className="btn-primary mt-3"
+          disabled={save.isPending || !allValid || !dirty}
+          onClick={() => save.mutate({ daily_budget_usd: dailyNum, max_build_cost_usd: perAppNum })}
+        >
+          {saving ? "saving…" : "save to .env"}
+        </button>
+        <button
+          type="button"
+          className="btn-ghost mt-3"
+          disabled={save.isPending}
+          onClick={() => {
+            if (window.confirm("Reset spend budget and max price per app to defaults?")) {
+              save.mutate({ reset: true });
+            }
+          }}
+        >
+          <i className="fa-solid fa-rotate-left mr-1.5" />
+          {resetting ? "resetting…" : "reset to defaults"}
+        </button>
+        <span className="text-[0.7rem] text-text-dim font-mono mt-3">
+          defaults · ${fmtUsd(view.defaults.daily_budget_usd)}/day · ${fmtUsd(view.defaults.max_build_cost_usd)}/app
+        </span>
+        {!allValid && (
+          <span id="budget-validation-error" className="text-status-yellow text-xs mt-3">
+            <i className="fa-solid fa-circle-exclamation mr-1" />
+            enter an amount ≥ 0
+          </span>
+        )}
+        {save.isError && (
+          <span className="text-status-red text-xs mt-3">{errText(save.error, "save failed")}</span>
+        )}
+        {/* Only honest while the draft still matches what was persisted — once
+            the operator edits again, the confirmation must clear. */}
+        {save.isSuccess && !save.isPending && !dirty && (
+          <span className="text-status-green text-xs mt-3">
+            <i className="fa-solid fa-check mr-1" />
+            {save.data?.reset ? "reset to defaults" : "saved"}
+          </span>
+        )}
+      </div>
+    </div>
   );
 }
 

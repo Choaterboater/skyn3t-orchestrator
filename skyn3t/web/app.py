@@ -1749,6 +1749,111 @@ async def execution_backend_patch(payload: Dict[str, Any]):
     }
 
 
+# Spend controls. These map to two existing settings fields:
+#   daily_budget_usd   -> SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD (settings.py)
+#   max_build_cost_usd -> SKYN3T_MAX_BUILD_COST_USD (the per-app/per-build cap)
+# Defaults mirror skyn3t/config/settings.py so the UI "reset" restores the
+# exact field defaults. 0 means "unlimited" for both (the build gate treats
+# a budget/cap of <= 0 as no limit).
+_BUDGET_DEFAULTS: Dict[str, float] = {
+    "daily_budget_usd": 5.0,
+    "max_build_cost_usd": 1.0,
+}
+_BUDGET_ENV_KEYS: Dict[str, str] = {
+    "daily_budget_usd": "SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD",
+    "max_build_cost_usd": "SKYN3T_MAX_BUILD_COST_USD",
+}
+
+
+def _budget_snapshot() -> Dict[str, Any]:
+    from skyn3t.config.settings import get_settings
+
+    settings = get_settings()
+    return {
+        "daily_budget_usd": float(
+            getattr(settings, "autonomous_build_daily_budget_usd", 5.0)
+        ),
+        "max_build_cost_usd": float(getattr(settings, "max_build_cost_usd", 1.0)),
+        "defaults": dict(_BUDGET_DEFAULTS),
+    }
+
+
+@app.get("/api/budget")
+async def budget_get():
+    """Spend budget (per day) and the maximum cost per app build."""
+    return _budget_snapshot()
+
+
+@app.patch("/api/budget")
+async def budget_patch(payload: Dict[str, Any]):
+    """Persist the spend budget and per-app cost cap to .env.
+
+    Accepts any of ``daily_budget_usd`` / ``max_build_cost_usd`` (USD, a finite
+    amount >= 0; 0 = unlimited), or ``reset: true`` to restore both to their
+    built-in defaults. Settings are reloaded so the change takes effect on the
+    next autonomous build gate check.
+    """
+    import math
+    import os
+
+    from skyn3t.config.env_file import env_file_path, upsert_env_setting
+    from skyn3t.config.settings import get_settings
+
+    updates: Dict[str, float] = {}
+    # Only a literal JSON ``true`` resets — otherwise a stray string like
+    # "false" (truthy in Python) would wipe the operator's limits.
+    reset = payload.get("reset") is True
+    if reset:
+        updates = dict(_BUDGET_DEFAULTS)
+    else:
+        for key in _BUDGET_DEFAULTS:
+            raw = payload.get(key)
+            if raw is None:
+                continue
+            # bool is an int subclass, so float(True) == 1.0 — reject booleans
+            # explicitly instead of silently reading {"daily_budget_usd": true}
+            # as a $1 budget.
+            if isinstance(raw, bool):
+                return JSONResponse(
+                    {"error": f"'{key}' must be a number, got {raw!r}"},
+                    status_code=400,
+                )
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": f"'{key}' must be a number, got {raw!r}"},
+                    status_code=400,
+                )
+            if not math.isfinite(value) or value < 0:
+                return JSONResponse(
+                    {"error": f"'{key}' must be a finite amount >= 0"},
+                    status_code=400,
+                )
+            updates[key] = value
+
+    if not updates:
+        return JSONResponse(
+            {
+                "error": "nothing to update",
+                "hint": "send daily_budget_usd and/or max_build_cost_usd, or reset:true",
+            },
+            status_code=400,
+        )
+
+    env_path = env_file_path()
+    for key, value in updates.items():
+        # This is money: persist at cent precision, never scientific notation,
+        # trailing zeros trimmed (5.0 -> "5", 0.5 -> "0.5", 1500000.0 ->
+        # "1500000"). The ".2f" always emits a "." so the rstrip pair is safe.
+        text = f"{value:.2f}".rstrip("0").rstrip(".") or "0"
+        upsert_env_setting(env_path, _BUDGET_ENV_KEYS[key], text)
+        os.environ[_BUDGET_ENV_KEYS[key]] = text
+
+    get_settings.cache_clear()
+    return {"ok": True, "reset": reset, "env_path": str(env_path), **_budget_snapshot()}
+
+
 @app.post("/api/agents/{name}/enable")
 async def agent_enable(name: str):
     if not orchestrator:
