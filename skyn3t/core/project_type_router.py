@@ -31,6 +31,7 @@ point of routing in the first place.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from typing import Sequence, Tuple
@@ -250,15 +251,26 @@ def _catalog_aware_ladder(project_type: str, ladder: Tuple[str, ...]) -> Tuple[s
     task_kind = _PROFILE_TASK_KIND.get(project_type, "general")
     try:
         from skyn3t.core.openrouter_catalog import (
+            cheapest_paid_models,
             free_first_ladder,
+            list_free_models,
             pick_best_model_for_task,
             resolve_openrouter_model,
         )
 
-        # Owner policy: FREE models first (the catalog has many; rotate through
-        # them on rate-limits), cheapest paid only as last-resort fallback. This
-        # is what lets autonomous builds actually run on the over-limit key.
-        resolved.extend(free_first_ladder(task_kind))
+        # When FUNDED (not free-only), lead with RELIABLE cheap PAID models
+        # (deepseek-v4-flash class). Free models churn on truncated "unusable
+        # body" responses + 429s — that left files as TODO stubs and failed the
+        # reviewer. In free-only mode keep the free-first rotation (the $0-key
+        # policy). The other set is appended as fallback (deduped below).
+        free_only = os.environ.get("SKYN3T_FREE_ONLY", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        if free_only:
+            resolved.extend(free_first_ladder(task_kind))
+        else:
+            resolved.extend(cheapest_paid_models(task_kind, limit=4))
+            resolved.extend(list_free_models()[:3])
         # Then the catalog/evolution winner and the curated static ladder as
         # additional fallbacks (deduped below, so free stays first).
         best = pick_best_model_for_task(tier, task_kind, prefer_evolution=True)
