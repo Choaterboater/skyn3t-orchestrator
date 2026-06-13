@@ -63,3 +63,21 @@ def test_reasoning_stage_defaults_avoid_claude(monkeypatch):
         tier = default_tier_for_stage(stage)
         backend, _model = _tier_backend_model(tier)
         assert backend == "openrouter", f"{stage} -> {tier} -> {backend}"
+
+
+def test_llm_client_coerces_claude_backend_to_openrouter(monkeypatch):
+    """No path may spawn `claude -p`: even an explicit claude_cli backend (used
+    by agent fallback chains) is coerced to OpenRouter under SKYN3T_NO_CLAUDE."""
+    monkeypatch.setenv("SKYN3T_NO_CLAUDE", "1")
+    from skyn3t.adapters.llm_client import LLMClient
+
+    for backend in ("claude_cli", "anthropic", "auto"):
+        client = LLMClient(backend=backend)
+        assert client._backend_name == "openrouter", f"{backend} not coerced"
+
+
+def test_llm_client_allows_claude_when_flag_off(monkeypatch):
+    monkeypatch.delenv("SKYN3T_NO_CLAUDE", raising=False)
+    from skyn3t.adapters.llm_client import LLMClient
+
+    assert LLMClient(backend="claude_cli")._backend_name == "claude_cli"

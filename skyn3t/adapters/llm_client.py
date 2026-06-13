@@ -234,6 +234,20 @@ class LLMClient:
             # the Claude CLI — fall back to its sonnet default.
             if self.default_model and "/" in self.default_model:
                 self.default_model = "sonnet"
+        # No-Claude policy (owner 2026-06-12): never use Claude — CLI or API —
+        # even when a caller passes backend="claude_cli"/"anthropic" explicitly
+        # (agent fallback chains, e.g. CodeImprover.DEFAULT_FALLBACK_CHAIN, do).
+        # Coerce to OpenRouter so NO path can spawn `claude -p` or hit the
+        # Anthropic API. This is the single chokepoint every backend flows
+        # through. Reversible via SKYN3T_NO_CLAUDE=0.
+        if os.environ.get("SKYN3T_NO_CLAUDE", "").strip().lower() in {
+            "1", "true", "yes", "on"
+        } and self._backend_name in {"claude_cli", "anthropic", "auto"}:
+            self._backend_name = "openrouter"
+            # A bare claude model id ("sonnet"/"opus") is meaningless to
+            # OpenRouter — drop it so the OpenRouter default/catalog model loads.
+            if self.default_model and "/" not in self.default_model:
+                self.default_model = None
         # Cross-model debate: callers can list backends to skip (e.g. the
         # retry path passes the backend the prior attempt used). The auto
         # chain then naturally falls through to a different model.
