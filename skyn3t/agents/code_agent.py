@@ -1139,9 +1139,9 @@ class CodeAgent(BaseAgent):
                 _ladder = list(ladder_for_file_and_brief(rel, brief or ""))
             except Exception:
                 _ladder = [
-                    "openrouter/owl-alpha",
-                    "deepseek/deepseek-v3.2",
-                    "xiaomi/mimo-v2-flash",
+                    "openai/gpt-oss-120b:free",
+                    "qwen/qwen3-coder:free",
+                    "qwen/qwen3-next-80b-a3b-instruct:free",
                 ]
             from skyn3t.adapters import LLMClient as _LLMCRegen
             for _model in _ladder[:3]:
@@ -2358,9 +2358,9 @@ class CodeAgent(BaseAgent):
                                 )
                             except Exception:
                                 _fp_ladder = [
-                                    "openrouter/owl-alpha",
-                                    "deepseek/deepseek-v3.2",
-                                    "xiaomi/mimo-v2-flash",
+                                    "openai/gpt-oss-120b:free",
+                                    "qwen/qwen3-coder:free",
+                                    "qwen/qwen3-next-80b-a3b-instruct:free",
                                 ]
                             # Use a SHORT focused prompt for OpenRouter.
                             # The full file_prompt is 18-25KB which is
@@ -2373,10 +2373,16 @@ class CodeAgent(BaseAgent):
                                 f"BRIEF:\n{(brief or '').strip()[:1200]}\n\n"
                                 f"PURPOSE OF THIS FILE: {purpose or 'Top-level entrypoint implementing the brief.'}\n"
                                 f"STACK: {stack or 'react_vite'}\n\n"
-                                f"Output ONLY the file body. No fences, no markdown, no commentary. "
-                                f"Imports at the top, default export at the bottom for React components. "
-                                f"Write a complete, runnable implementation that matches the brief — "
-                                f"not a stub, not a placeholder, not a TODO comment."
+                                # Pin the entrypoint to import the PLANNED component
+                                # files instead of inventing imports for files that
+                                # were never scaffolded — the dominant ENOENT /
+                                # missing-file build-failure class. Same rules the
+                                # slow path injects; "" when not an entry file.
+                                + (entrypoint_instructions + "\n\n" if entrypoint_instructions else "")
+                                + "Output ONLY the file body. No fences, no markdown, no commentary. "
+                                "Imports at the top, default export at the bottom for React components. "
+                                "Write a complete, runnable implementation that matches the brief — "
+                                "not a stub, not a placeholder, not a TODO comment."
                             )
                             body_local = ""
                             _accepted_model = ""
@@ -2873,20 +2879,24 @@ class CodeAgent(BaseAgent):
                                     )
                                 except Exception:
                                     _model_ladder = [
-                                        "openrouter/owl-alpha",
-                                        "xiaomi/mimo-v2-flash",
-                                        "deepseek/deepseek-v3.2",
-                                        "xiaomi/mimo-v2.5-pro",
+                                        "openai/gpt-oss-120b:free",
+                                        "qwen/qwen3-coder:free",
+                                        "qwen/qwen3-next-80b-a3b-instruct:free",
+                                        "meta-llama/llama-3.3-70b-instruct:free",
                                     ]
                                 _focused_prompt_or = (
                                     f"Implement the file `{rel}` for this product brief:\n\n"
                                     f"BRIEF:\n{(brief or '').strip()[:1500]}\n\n"
                                     f"PURPOSE OF THIS FILE: {purpose or 'no purpose specified'}\n"
                                     f"STACK: {stack or 'react_vite'}\n\n"
-                                    f"Output ONLY the file body (no fences, no markdown, no commentary). "
-                                    f"Write a complete, runnable implementation — not a stub, not a placeholder. "
-                                    f"Imports at the top, default export at the bottom for React components. "
-                                    f"Match the brief's actual product — do not invent unrelated functionality."
+                                    # Pin entrypoints to import the PLANNED component
+                                    # files (dominant missing-import failure class);
+                                    # "" for non-entry files.
+                                    + (entrypoint_instructions + "\n\n" if entrypoint_instructions else "")
+                                    + "Output ONLY the file body (no fences, no markdown, no commentary). "
+                                    "Write a complete, runnable implementation — not a stub, not a placeholder. "
+                                    "Imports at the top, default export at the bottom for React components. "
+                                    "Match the brief's actual product — do not invent unrelated functionality."
                                 )
                                 _or_body = ""
                                 _or_model = ""
@@ -3040,7 +3050,7 @@ class CodeAgent(BaseAgent):
                     try:
                         from skyn3t.adapters import LLMClient as _LLMCLR
                         last_client = _LLMCLR(
-                            default_model="openrouter/owl-alpha",
+                            default_model=None,  # -> free catalog model (no-claude default)
                             backend="openrouter",
                             event_bus=self.event_bus,
                             caller_name=self.name,
