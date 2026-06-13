@@ -593,10 +593,13 @@ def _route_for_stage(stage_name: Optional[str]) -> Dict[str, Optional[str]]:
             "persisted_via": None,
         }
     stage = stage_name.lower()
-    # Lane A: autonomous drills always run FREE — above persisted/env so
-    # throwaway practice builds never touch paid models or the subscription.
-    # Rotate across the free catalog for variety; fall back to the free tier.
-    if _lane_is_autonomous():
+    # Lane A: autonomous drills run FREE *only in free-only mode*. The forced-free
+    # rule was a $0-key-era workaround, but free models are so rate-limited that
+    # autonomous builds died in a wall of 429s. With a funded key (FREE_ONLY=0)
+    # autonomous now uses the normal cheap paid ladder (deepseek-v4-flash class),
+    # still hard-capped by SKYN3T_AUTONOMOUS_BUILD_DAILY_BUDGET_USD, so drills
+    # actually COMPLETE instead of throttling. Set FREE_ONLY=1 to force free again.
+    if _lane_is_autonomous() and _free_only_enabled():
         free_model = _lane_a_free_model(stage)
         if free_model:
             return {

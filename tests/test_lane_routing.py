@@ -1,15 +1,19 @@
 """Lane-aware routing: autonomous drills run FREE, real projects route normally.
 
 The model_router consults a per-build lane contextvar set by the Studio runner.
-Autonomous (throwaway drill) builds are forced onto a free OpenRouter tier above
-all paid/persisted routing; real builds fall through to the normal ladder.
+In free-only mode, autonomous (throwaway drill) builds are forced onto a free
+OpenRouter tier above all paid/persisted routing; with a funded key they use the
+normal cheap paid ladder (capped by the daily autonomous budget). Real builds
+always fall through to the normal ladder.
 """
 
 from skyn3t.core.model_router import _TIERS, _route_for_stage
 from skyn3t.intelligence import cheap_smart
 
 
-def test_autonomous_lane_forces_free_tier():
+def test_autonomous_lane_forces_free_tier(monkeypatch):
+    # Autonomous forces FREE only in free-only mode (the $0-key policy).
+    monkeypatch.setenv("SKYN3T_FREE_ONLY", "1")
     cheap_smart.set_lane_context(True)
     try:
         route = _route_for_stage("code")
@@ -20,6 +24,19 @@ def test_autonomous_lane_forces_free_tier():
     assert route["tier"] in _TIERS
     # The default free tier resolves to a :free catalog model.
     assert ":free" in str(route["model"])
+
+
+def test_autonomous_lane_uses_paid_ladder_when_funded(monkeypatch):
+    # With a funded key (free-only OFF), autonomous drills use the normal cheap
+    # paid ladder instead of the rate-limited free tier — capped by the daily
+    # autonomous budget — so they actually complete instead of 429-walling.
+    monkeypatch.delenv("SKYN3T_FREE_ONLY", raising=False)
+    cheap_smart.set_lane_context(True)
+    try:
+        route = _route_for_stage("code")
+    finally:
+        cheap_smart.clear_project_context()
+    assert route["source"] != "lane_a_free"
 
 
 def test_real_lane_skips_the_free_branch():
