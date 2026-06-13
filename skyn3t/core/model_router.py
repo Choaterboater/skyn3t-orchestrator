@@ -307,6 +307,35 @@ def _adaptive_repick_allowed(tier_name: str) -> bool:
         return False
 
 
+def _force_claude_cli_enabled() -> bool:
+    """When set, OpenRouter tiers fail over to the Claude Code subscription.
+
+    Use when the OpenRouter key is exhausted/blocked (HTTP 403 "Key limit
+    exceeded") but the local ``claude`` CLI is authenticated. Reversible: unset
+    ``SKYN3T_LLM_FORCE_CLAUDE_CLI`` once OpenRouter has budget again.
+    """
+    return os.environ.get("SKYN3T_LLM_FORCE_CLAUDE_CLI", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+# claude_cli model each OpenRouter tier maps to under forced failover. Sonnet
+# everywhere keeps subscription burn bounded for high-volume code stages; the
+# native claude_cli tiers (balanced/strong/max) are untouched.
+_CLAUDE_CLI_FAILOVER_MODEL: Dict[str, str] = {
+    "or_strong": "sonnet",
+    "or_backend": "sonnet",
+    "or_ui": "sonnet",
+    "or_cheap": "sonnet",
+    "or_docs": "sonnet",
+    "cheap": "sonnet",
+    "ui": "sonnet",
+}
+
+
 def _tier_backend_model(
     tier_name: str,
     *,
@@ -314,6 +343,8 @@ def _tier_backend_model(
 ) -> Tuple[str, Optional[str]]:
     """Return (backend, model) for a tier, validating OpenRouter ids."""
     backend, model = _TIERS.get(tier_name, _TIERS["cheap"])
+    if backend == "openrouter" and _force_claude_cli_enabled():
+        return ("claude_cli", _CLAUDE_CLI_FAILOVER_MODEL.get(tier_name, "sonnet"))
     if backend == "openrouter" and model:
         try:
             from skyn3t.core.model_evolution import (

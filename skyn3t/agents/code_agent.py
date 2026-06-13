@@ -2313,6 +2313,11 @@ class CodeAgent(BaseAgent):
                         _os_route.environ.get(
                             "SKYN3T_ENTRYPOINT_OPENROUTER_FIRST", "1"
                         ).strip().lower() not in ("0", "false", "no", "off")
+                        # When OpenRouter is failed over to claude_cli (key
+                        # exhausted), skip the OpenRouter ladder entirely.
+                        and _os_route.environ.get(
+                            "SKYN3T_LLM_FORCE_CLAUDE_CLI", ""
+                        ).strip().lower() not in ("1", "true", "yes", "on")
                     )
                     # OPENROUTER_API_KEY may live in os.environ OR in .env
                     # (loaded by pydantic-settings into the Settings object).

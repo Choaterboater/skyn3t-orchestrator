@@ -222,6 +222,18 @@ class LLMClient:
             or settings_fallbacks.get("llm_backend")
             or "auto"
         ).lower()
+        # Global failover: when the OpenRouter key is exhausted (HTTP 403 "Key
+        # limit exceeded"), SKYN3T_LLM_FORCE_CLAUDE_CLI=1 reroutes every
+        # OpenRouter/auto caller to the authenticated Claude Code CLI so the
+        # system keeps running. Reversible — unset once OpenRouter has budget.
+        if self._backend_name in {"openrouter", "auto"} and os.environ.get(
+            "SKYN3T_LLM_FORCE_CLAUDE_CLI", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}:
+            self._backend_name = "claude_cli"
+            # An OpenRouter-style model id ("vendor/model") is meaningless to
+            # the Claude CLI — fall back to its sonnet default.
+            if self.default_model and "/" in self.default_model:
+                self.default_model = "sonnet"
         # Cross-model debate: callers can list backends to skip (e.g. the
         # retry path passes the backend the prior attempt used). The auto
         # chain then naturally falls through to a different model.

@@ -32,6 +32,21 @@ def _isolated_routing_policy(monkeypatch, tmp_path):
     catalog._catalog_loaded_at = 0.0
 
 
+def test_force_claude_cli_fails_over_openrouter_tiers(monkeypatch, _isolated_routing_policy):
+    """SKYN3T_LLM_FORCE_CLAUDE_CLI reroutes OpenRouter tiers to claude_cli.
+
+    Lets the system keep working on the Claude Code subscription when the
+    OpenRouter key is exhausted (HTTP 403 "Key limit exceeded").
+    """
+    _isolated_routing_policy.set_many({"code": "or_strong"})
+    monkeypatch.delenv("SKYN3T_LLM_FORCE_CLAUDE_CLI", raising=False)
+    assert describe_stage_route("code")["backend"] == "openrouter"
+
+    monkeypatch.setenv("SKYN3T_LLM_FORCE_CLAUDE_CLI", "1")
+    route = describe_stage_route("code")
+    assert route["backend"] == "claude_cli"
+
+
 def test_persisted_policy_overrides_env_file(monkeypatch, tmp_path, _isolated_routing_policy):
     env_path = tmp_path / "routing-env.json"
     env_path.write_text(json.dumps({"reviewer": "balanced"}), encoding="utf-8")
