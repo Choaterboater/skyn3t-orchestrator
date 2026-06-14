@@ -125,7 +125,8 @@ async def test_test_gate_disabled_by_env(tmp_path, monkeypatch):
     scaffold.mkdir()
     (scaffold / "package.json").write_text(
         json.dumps({"name": "demo", "version": "0.0.0",
-                    "scripts": {"test": "vitest run"}})
+                    "scripts": {"test": "vitest run"},
+                    "devDependencies": {"vitest": "^1.6.0"}})
     )
     agent = BuildVerifierAgent()
     await agent.initialize()
@@ -144,7 +145,8 @@ async def test_test_gate_skipped_when_install_disabled_offline(tmp_path, monkeyp
     scaffold.mkdir()
     (scaffold / "package.json").write_text(
         json.dumps({"name": "demo", "version": "0.0.0",
-                    "scripts": {"test": "vitest run"}})
+                    "scripts": {"test": "vitest run"},
+                    "devDependencies": {"vitest": "^1.6.0"}})
     )
     agent = BuildVerifierAgent()
     await agent.initialize()
@@ -163,7 +165,8 @@ async def test_test_gate_failure_folds_verdict_to_no(tmp_path, monkeypatch):
     scaffold.mkdir()
     (scaffold / "package.json").write_text(
         json.dumps({"name": "demo", "version": "0.0.0",
-                    "scripts": {"build": "echo ok", "test": "vitest run"}})
+                    "scripts": {"build": "echo ok", "test": "vitest run"},
+                    "devDependencies": {"vitest": "^1.6.0"}})
     )
 
     async def _fake_test_gate(self, *_a, **_kw):
