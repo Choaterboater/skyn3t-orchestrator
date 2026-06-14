@@ -405,6 +405,8 @@ class Settings(BaseSettings):
         "secret_storage_path",
         "audit_log_dir",
         "policy_file",
+        "model_routing_path",
+        "snapshot_dir",
         mode="before",
     )
     @classmethod
@@ -420,6 +422,23 @@ class Settings(BaseSettings):
         if not p.is_absolute():
             p = _REPO_ROOT / p
         return p.resolve()
+
+    @field_validator("vector_db_path", mode="before")
+    @classmethod
+    def parse_str_path(cls, v: Any) -> Any:
+        # Same repo-anchoring as parse_paths, but this field is typed `str`
+        # (used as a directory path), so return a str. Without it the relative
+        # "./data/vector_db" default splits into data/data/vector_db on an
+        # off-repo launch — the same cwd bug as the skills dir.
+        # NOTE: database_url's sqlite path ("...:///./data/skyn3t.db") has the
+        # same cwd-relativity but needs URL surgery + live-DB migration care,
+        # so it is intentionally left as a separate follow-up.
+        if v is None:
+            return v
+        p = Path(v).expanduser()
+        if not p.is_absolute():
+            p = _REPO_ROOT / p
+        return str(p.resolve())
 
     def ensure_directories(self) -> None:
         """Create necessary data directories."""
