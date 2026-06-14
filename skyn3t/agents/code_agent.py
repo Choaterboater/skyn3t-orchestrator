@@ -325,6 +325,50 @@ def _inline_redefined_planned(
         return []
 
 
+def _component_spec_directive(rel_path: str, context: str) -> str:
+    """For a UI component file, lift THAT component's exact spec rows out of the
+    design context and surface them as an emphatic verbatim directive.
+
+    components.md is already in the per-file context, but as one row among many
+    the model tends to hardcode its own classes instead of applying the spec —
+    the dominant 80->85 reviewer deduction ("uses hardcoded classes instead of
+    the specified Tailwind classes from components.md"). Elevating the matching
+    row(s) for the specific component being generated targets that adherence gap.
+    """
+    rl = rel_path.lower()
+    if not (
+        rl.endswith((".jsx", ".tsx"))
+        and ("/components/" in rl or "/pages/" in rl or rl.startswith("src/"))
+    ):
+        return ""
+    name = Path(rel_path).stem
+    if not name or name.lower() in {"app", "main", "index", "router", "routes"}:
+        return ""
+    hits: list[str] = []
+    for line in context.split("\n"):
+        s = line.strip()
+        if not s or name not in line:
+            continue
+        # Keep only spec-bearing lines (table rows, headings, or lines carrying
+        # class/token hints) so we surface the design contract, not prose.
+        if (
+            s.startswith(("|", "#", "-", "*"))
+            or "class" in s.lower()
+            or "[var(" in s
+            or "tailwind" in s.lower()
+        ):
+            hits.append(s)
+        if len(hits) >= 6:
+            break
+    if not hits:
+        return ""
+    spec = "\n".join(hits)
+    return (
+        f"## DESIGN SPEC — apply VERBATIM for `{name}` (use these exact "
+        f"classes/tokens; do NOT hardcode, rename, or invent styles):\n{spec}\n"
+    )
+
+
 def _relevant_context(prior_context: str, rel_path: str) -> str:
     """Filter prior_context down to just the sections this file needs.
 
@@ -417,6 +461,13 @@ def _relevant_context(prior_context: str, rel_path: str) -> str:
     if any(rl.endswith(ep) for ep in _ENTRYPOINT_FILES) and len(result) > _ENTRYPOINT_CONTEXT_HARD_CAP:
         head = result[: _ENTRYPOINT_CONTEXT_HARD_CAP].rstrip()
         result = head + "\n\n[...context truncated to keep entrypoint prompt small enough for CLI backends...]"
+
+    # Elevate THIS component's exact design-spec rows to the top so the model
+    # applies them verbatim instead of hardcoding its own classes. Prepended
+    # AFTER the entrypoint cap so the directive itself is never truncated.
+    directive = _component_spec_directive(rel_path, result)
+    if directive:
+        result = directive + "\n" + result
 
     return result
 

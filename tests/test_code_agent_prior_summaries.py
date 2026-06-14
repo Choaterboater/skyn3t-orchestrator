@@ -176,3 +176,32 @@ class TestEntrypointImportInstructions:
         # Beyond 12 referenced via summary, not listed
         assert "components/C19.jsx" not in out
         assert "and 8 more" in out
+
+
+_DESIGN_CTX = (
+    "### components.md\n\n"
+    "| Component | Classes |\n"
+    "| StatusPill | `inline-flex items-center px-2 py-0.5 "
+    "border-[var(--brand-primary)] text-[10px] uppercase` |\n"
+    "| DeviceCard | `rounded-lg bg-[var(--brand-bg)] p-4` |\n\n"
+    "### brand.md\n\nDark NOC theme.\n"
+)
+
+
+def test_component_spec_directive_elevates_the_components_exact_classes():
+    """80->85 adherence fix: a UI component file must get its OWN spec row
+    surfaced at the top with a 'use verbatim' instruction, so the model stops
+    hardcoding classes instead of applying components.md."""
+    out = _relevant_context(_DESIGN_CTX, "src/components/StatusPill.jsx")
+    assert out.lstrip().startswith("## DESIGN SPEC")
+    assert "apply VERBATIM for `StatusPill`" in out
+    assert "do NOT hardcode" in out
+    head = out.split("### components.md")[0]
+    assert "border-[var(--brand-primary)]" in head
+    assert "DeviceCard" not in head
+
+
+def test_component_spec_directive_skips_non_components():
+    assert "DESIGN SPEC" not in _relevant_context(_DESIGN_CTX, "vite.config.js")
+    assert "DESIGN SPEC" not in _relevant_context(_DESIGN_CTX, "src/App.jsx")
+    assert "DESIGN SPEC" not in _relevant_context(_DESIGN_CTX, "server/routes/api.js")
