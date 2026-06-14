@@ -63,8 +63,11 @@ class RoutingProfile:
 UI_HEAVY = RoutingProfile(
     project_type="ui_heavy",
     ladder=(
-        "qwen/qwen3.7-plus",
+        # deepseek-v4-flash first: ~5s + reliable. qwen3.7-plus was first here
+        # and timed out (~43s) / returned truncated bodies on real builds,
+        # stalling every UI file before the fallthrough. Demoted to fallback.
         "deepseek/deepseek-v4-flash",
+        "qwen/qwen3.7-plus",
         "qwen/qwen3-coder-flash",
         "openrouter/owl-alpha",
     ),
@@ -85,8 +88,10 @@ BACKEND = RoutingProfile(
 DATA_VIZ = RoutingProfile(
     project_type="data_viz",
     ladder=(
-        "qwen/qwen3.7-plus",
+        # deepseek-v4-flash first (fast + reliable); qwen3.7-plus demoted to
+        # fallback — it timed out / truncated on real builds (see ui_heavy).
         "deepseek/deepseek-v4-flash",
+        "qwen/qwen3.7-plus",
         "qwen/qwen3-coder-flash",
         "openrouter/owl-alpha",
     ),
