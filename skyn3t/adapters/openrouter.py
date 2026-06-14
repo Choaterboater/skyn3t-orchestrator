@@ -4,16 +4,16 @@ import asyncio
 import logging
 import os
 import random
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from skyn3t.adapters.llm_client import LLMRequest
 
 logger = logging.getLogger("skyn3t.adapters.openrouter")
 
-# Last-resort fallback model. The OpenRouter key is FREE-ONLY ($0 paid
-# budget), so this default MUST be a free id — deepseek-v3.2 (the old
-# default) is PAID and would 403 on the free-only key. Use SKYN3T_OPENROUTER_MODEL
-# env var to override globally, or pass model= per call for fine-grained routing.
+# Last-resort fallback model. Keep this default free-safe even when the normal
+# tier router is allowed to use cheap paid models; it is used only when no
+# caller-specific model/tier is supplied. Use SKYN3T_OPENROUTER_MODEL to
+# override globally, or pass model= per call for fine-grained routing.
 DEFAULT_MODEL = "openai/gpt-oss-120b:free"
 BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -23,14 +23,69 @@ BASE_URL = "https://openrouter.ai/api/v1"
 # (observed: 224 in one build). Bounding total in-flight requests + the existing
 # retry-after backoff lets builds actually complete. Tunable; raise once you know
 # the key's real rate ceiling. Created lazily so it binds to the running loop.
-_MAX_CONCURRENCY = max(1, int(os.environ.get("SKYN3T_OPENROUTER_MAX_CONCURRENCY", "4") or 4))
+DEFAULT_MAX_CONCURRENCY = 4
+_MAX_CONCURRENCY_SETTING = "SKYN3T_OPENROUTER_MAX_CONCURRENCY"
 _request_semaphore: Optional["asyncio.Semaphore"] = None
+_request_semaphore_limit: Optional[int] = None
+_request_semaphore_loop_id: Optional[int] = None
+
+
+def openrouter_max_concurrency() -> int:
+    """Return the effective process-wide OpenRouter concurrency cap."""
+    try:
+        from skyn3t.config.settings import get_settings
+
+        raw: Any = getattr(
+            get_settings(), "openrouter_max_concurrency", DEFAULT_MAX_CONCURRENCY
+        )
+    except Exception:
+        raw = os.environ.get(_MAX_CONCURRENCY_SETTING, DEFAULT_MAX_CONCURRENCY)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid %s; using default %d",
+            _MAX_CONCURRENCY_SETTING,
+            DEFAULT_MAX_CONCURRENCY,
+        )
+        value = DEFAULT_MAX_CONCURRENCY
+    if value < 1:
+        logger.warning("%s must be >= 1; using 1", _MAX_CONCURRENCY_SETTING)
+        value = 1
+    return value
+
+
+def openrouter_runtime_status() -> Dict[str, Any]:
+    """Non-secret OpenRouter runtime settings for health/debug surfaces."""
+    limit = openrouter_max_concurrency()
+    if os.environ.get(_MAX_CONCURRENCY_SETTING):
+        source = "environment"
+    elif limit != DEFAULT_MAX_CONCURRENCY:
+        source = "settings"
+    else:
+        source = "default"
+    return {
+        "max_concurrency": limit,
+        "setting": _MAX_CONCURRENCY_SETTING,
+        "source": source,
+        "default_max_concurrency": DEFAULT_MAX_CONCURRENCY,
+        "active_semaphore_limit": _request_semaphore_limit,
+    }
 
 
 def _get_request_semaphore() -> "asyncio.Semaphore":
-    global _request_semaphore
-    if _request_semaphore is None:
-        _request_semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)
+    global _request_semaphore, _request_semaphore_limit, _request_semaphore_loop_id
+    limit = openrouter_max_concurrency()
+    loop_id = id(asyncio.get_running_loop())
+    if (
+        _request_semaphore is None
+        or _request_semaphore_limit != limit
+        or _request_semaphore_loop_id != loop_id
+    ):
+        _request_semaphore = asyncio.Semaphore(limit)
+        _request_semaphore_limit = limit
+        _request_semaphore_loop_id = loop_id
+        logger.info("openrouter concurrency limit=%d", limit)
     return _request_semaphore
 
 

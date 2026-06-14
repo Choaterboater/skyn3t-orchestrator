@@ -1576,6 +1576,110 @@ class TestStudioRunner:
         assert manifest["boot_verification"]["verdict"] == "yes"
         assert manifest["integration_verification"]["verdict"] == "yes"
 
+    async def test_reviewer_rescore_receives_objective_verification(
+        self, event_bus, tmp_path, monkeypatch
+    ):
+        from skyn3t.studio.runner import StudioRunner
+
+        reviewer_objectives: list[dict] = []
+
+        class ReviewerStageAgent:
+            async def initialize(self) -> None:
+                return None
+
+            async def execute(self, task: TaskRequest) -> TaskResult:
+                artifact_dir = Path(task.input_data["artifact_dir"]).resolve()
+                review_path = artifact_dir / "review.md"
+                review_path.write_text("# Review\n", encoding="utf-8")
+                scaffold_dir = artifact_dir / "scaffold"
+                scaffold_dir.mkdir(parents=True, exist_ok=True)
+                (scaffold_dir / "package.json").write_text(
+                    '{"name":"demo"}\n',
+                    encoding="utf-8",
+                )
+                objective = task.input_data.get("objective_verification") or {}
+                reviewer_objectives.append(objective)
+                build_verdict = str(((objective.get("build") or {}).get("verdict") or ""))
+                score = 49 if build_verdict == "no" else 53
+                return TaskResult(
+                    task_id=task.task_id,
+                    success=True,
+                    output={
+                        "verdict": "no-go",
+                        "score": score,
+                        "summary": f"Reviewer score {score}.",
+                        "files": [str(review_path)],
+                    },
+                )
+
+        class PassThroughStageAgent:
+            async def initialize(self) -> None:
+                return None
+
+            async def execute(self, task, stdin_data=None):
+                return TaskResult(
+                    task_id=task.task_id,
+                    success=True,
+                    output={"verdict": "pass", "blocker_count": 0},
+                )
+
+        def fake_get_agent(name, *args, **kwargs):
+            if name == "ReviewerAgent":
+                return ReviewerStageAgent()
+            if name in ("ConsistencyReviewerAgent", "ContractVerifierAgent", "PackagingAgent"):
+                return PassThroughStageAgent()
+            raise AssertionError(f"unexpected agent {name}")
+
+        monkeypatch.setattr("skyn3t.studio.runner.get_agent", fake_get_agent)
+        monkeypatch.setattr(
+            "skyn3t.studio.runner.get_template",
+            lambda _key: SimpleNamespace(
+                title="Quality template",
+                description="Review a scaffold.",
+                stages=[
+                    SimpleNamespace(
+                        name="reviewer",
+                        agent="ReviewerAgent",
+                        capability="review",
+                        handoff_to=None,
+                        input_extra={},
+                    )
+                ],
+            ),
+        )
+
+        runner = StudioRunner(event_bus=event_bus, projects_root=tmp_path)
+
+        async def fake_build(scaffold_dir: str, brief: str, *, execution_profile: str = "balanced"):
+            return {
+                "verdict": "no",
+                "stack": "node",
+                "summary": "build failed",
+                "failure_hint": "named import does not match default export",
+                "command": "npm run build",
+            }
+
+        async def no_fix_round(*args, **kwargs):
+            return False
+
+        async def fake_retry(manifest, brief, slug):
+            return None
+
+        monkeypatch.setenv("SKYN3T_AUTO_RETRY", "0")
+        monkeypatch.setattr(runner, "_run_build_verifier", fake_build)
+        monkeypatch.setattr(runner, "_apply_build_fix_round", no_fix_round)
+        monkeypatch.setattr(runner, "_maybe_auto_retry", fake_retry)
+
+        manifest = await runner.start("demo", "Build a dashboard", slug="quality-build-no")
+
+        assert len(reviewer_objectives) == 2
+        assert reviewer_objectives[0].get("build") is None
+        assert reviewer_objectives[1]["build"]["verdict"] == "no"
+        assert manifest["quality_summary"]["score"] == 49
+        assert manifest["build_verification"]["verdict"] == "no"
+        assert manifest["status"] == "failed"
+        assert manifest["error"] == "build failed"
+
     async def test_boot_failure_uses_boot_retry_hint(
         self, event_bus, tmp_path, monkeypatch
     ):

@@ -86,6 +86,14 @@ def load_seeds(path: str = "data/seeds.yaml") -> List[Dict[str, Any]]:
     return [s for s in seeds if isinstance(s, dict) and s.get("repo")]
 
 
+def _skip_counts(skipped: List[Dict[str, Any]]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for item in skipped:
+        reason = str(item.get("reason") or "unknown")
+        counts[reason] = counts.get(reason, 0) + 1
+    return counts
+
+
 class GitHubIngestorAgent(BaseAgent):
     """Agent that fetches public-repo content from GitHub and ingests it into RAG."""
 
@@ -167,6 +175,9 @@ class GitHubIngestorAgent(BaseAgent):
                 self.metadata["authenticated"] = True
             except ImportError:
                 self._github_client = None
+                logger.info(
+                    "github_ingestor: PyGithub unavailable; falling back to httpx client"
+                )
 
         if self._github_client is None:
             try:
@@ -184,6 +195,9 @@ class GitHubIngestorAgent(BaseAgent):
                 self.metadata["authenticated"] = bool(self.github_token)
             except ImportError:
                 self._http_client = None
+                logger.info(
+                    "github_ingestor: httpx unavailable; trying anonymous PyGithub client"
+                )
 
         if self._github_client is None and self._http_client is None:
             try:
@@ -194,7 +208,13 @@ class GitHubIngestorAgent(BaseAgent):
                 self.metadata["authenticated"] = False
             except ImportError:
                 self.metadata["client"] = None
+                self.metadata["authenticated"] = False
 
+        self.metadata["client_available"] = self._client_available()
+        if not self.metadata["client_available"]:
+            logger.warning(
+                "github_ingestor: no GitHub client available; install httpx or PyGithub"
+            )
         self.metadata["initialized"] = True
 
     async def health_check(self) -> bool:
@@ -719,10 +739,13 @@ class GitHubIngestorAgent(BaseAgent):
                 )
 
         if not self._client_available():
+            self.metadata["last_status"] = "missing_client"
+            logger.warning("github_ingestor: cannot run because no GitHub client is available")
             return TaskResult(
                 task_id=task.task_id,
                 success=False,
                 error="github client not available",
+                metadata={"status": "missing_client"},
             )
 
         data = task.input_data or {}
@@ -732,6 +755,13 @@ class GitHubIngestorAgent(BaseAgent):
             paths = [paths]
         max_files = int(data.get("max_files", 20))
         max_bytes_per_file = int(data.get("max_bytes_per_file", 200_000))
+        rag_available = self.rag is not None
+        self.metadata["rag_available"] = rag_available
+        if not rag_available:
+            self.metadata["last_status"] = "missing_rag"
+            logger.warning(
+                "github_ingestor: RAG unavailable; fetched GitHub content will not be stored"
+            )
 
         ingested: List[Dict[str, Any]] = []
         skipped: List[Dict[str, Any]] = []
@@ -741,10 +771,16 @@ class GitHubIngestorAgent(BaseAgent):
         if mode == "seed_list":
             seeds = load_seeds(self.seeds_path)
             if not seeds:
+                self.metadata["last_status"] = "missing_seeds"
+                logger.warning(
+                    "github_ingestor: no usable GitHub ingest seeds found at %s",
+                    self.seeds_path,
+                )
                 return TaskResult(
                     task_id=task.task_id,
                     success=False,
                     error=f"no seeds available at {self.seeds_path}",
+                    metadata={"status": "missing_seeds", "seeds_path": self.seeds_path},
                 )
             for seed in seeds:
                 repo = seed.get("repo")
@@ -781,14 +817,20 @@ class GitHubIngestorAgent(BaseAgent):
                     error=f"search failed: {e}",
                 )
             if not repos:
+                status = "no_search_results_missing_rag" if not rag_available else "no_search_results"
+                self.metadata["last_status"] = status
                 return TaskResult(
                     task_id=task.task_id,
                     success=True,
                     output={
                         "ingested": [],
                         "skipped": [],
+                        "skip_counts": {},
+                        "rate_limited": False,
+                        "rag_available": rag_available,
                         "summary": "Ingested 0 files from 0 repos (no search results)",
                     },
+                    metadata={"status": status, "rag_available": rag_available},
                 )
             for repo in repos:
                 plan.append((repo, list(paths), f"search:{query}", data.get("kind")))
@@ -833,7 +875,8 @@ class GitHubIngestorAgent(BaseAgent):
                 if "rate limit" in str(e).lower():
                     rate_limited = True
                     logger.warning(
-                        "aborting ingest for rate-limit at repo=%s: %s", repo, e
+                        "github_ingestor: aborting ingest due to GitHub rate limit at repo=%s",
+                        repo,
                     )
                     break
                 logger.warning("ingest failed for %s: %s", repo, e)
@@ -852,6 +895,22 @@ class GitHubIngestorAgent(BaseAgent):
         )
         if rate_limited:
             summary += " (rate-limited; partial)"
+        if not rag_available:
+            summary += " (RAG unavailable; not stored)"
+
+        skip_counts = _skip_counts(skipped)
+        if skipped:
+            logger.info(
+                "github_ingestor: skipped %d files/repo entries: %s",
+                len(skipped),
+                skip_counts,
+            )
+        if rate_limited:
+            self.metadata["last_status"] = "rate_limited"
+        elif not rag_available:
+            self.metadata["last_status"] = "completed_missing_rag"
+        else:
+            self.metadata["last_status"] = "completed"
 
         self._emit(
             "INGEST_COMPLETE",
@@ -859,6 +918,8 @@ class GitHubIngestorAgent(BaseAgent):
                 "ingested": len(ingested),
                 "skipped": len(skipped),
                 "rate_limited": rate_limited,
+                "skip_counts": skip_counts,
+                "rag_available": rag_available,
                 "summary": summary,
             },
         )
@@ -870,6 +931,14 @@ class GitHubIngestorAgent(BaseAgent):
             output={
                 "ingested": ingested,
                 "skipped": skipped,
+                "skip_counts": skip_counts,
+                "rate_limited": rate_limited,
+                "rag_available": rag_available,
                 "summary": summary,
+            },
+            metadata={
+                "status": self.metadata["last_status"],
+                "rag_available": rag_available,
+                "rate_limited": rate_limited,
             },
         )

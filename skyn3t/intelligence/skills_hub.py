@@ -15,14 +15,43 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger("skyn3t.intelligence.skills_hub")
 
 _SKIP_MD = {"README.md", "readme.md", "INDEX.md", "index.md"}
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _resolve_hub_path(raw_path: str | Path) -> Optional[Path]:
+    path = Path(raw_path).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+
+    repo_root = _REPO_ROOT.resolve()
+    candidate = (repo_root / path).resolve()
+    try:
+        candidate.relative_to(repo_root)
+    except ValueError:
+        logger.warning("Ignoring skills hub path that escapes repo root: %s", raw_path)
+        return None
+    return candidate
 
 
 def hub_roots() -> List[Path]:
     """Return configured hub directories (repo-relative)."""
     raw = os.environ.get("SKYN3T_SKILLS_HUB_PATHS", "").strip()
     if raw:
-        return [Path(p.strip()) for p in raw.split(",") if p.strip()]
-    return [Path("examples/skills_seed"), Path("skills")]
+        roots: List[Path] = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            resolved = _resolve_hub_path(part)
+            if resolved is not None:
+                roots.append(resolved)
+        return roots
+    defaults = ["examples/skills_seed", "skills"]
+    return [
+        resolved
+        for raw_default in defaults
+        if (resolved := _resolve_hub_path(raw_default)) is not None
+    ]
 
 
 def list_hub_entries() -> Dict[str, Any]:

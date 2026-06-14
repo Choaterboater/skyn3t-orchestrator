@@ -9,6 +9,7 @@ from skyn3t.observability.health import (
     HealthCheck,
     HealthRegistry,
     HealthStatus,
+    _check_cli_tools,
     get_health_registry,
     reset_health_registry,
 )
@@ -282,6 +283,36 @@ class TestHealth:
         asyncio.run(registry.run_all())
         last = registry.get_last_results()
         assert "ok" in last
+
+    def test_cli_tools_accepts_python3_when_python_is_absent(self, monkeypatch):
+        paths = {
+            "python3": "/usr/bin/python3",
+            "git": "/usr/bin/git",
+            "docker": "/usr/bin/docker",
+        }
+        monkeypatch.setattr(
+            "skyn3t.observability.health.shutil.which",
+            lambda name: paths.get(name),
+        )
+
+        result = asyncio.run(_check_cli_tools())
+
+        assert result.status == HealthStatus.HEALTHY
+        assert "python" not in result.details["missing"]
+        assert result.details["resolved"]["python"]["command"] == "python3"
+
+    def test_cli_tools_reports_python_missing_when_no_alias_exists(self, monkeypatch):
+        paths = {"git": "/usr/bin/git", "docker": "/usr/bin/docker"}
+        monkeypatch.setattr(
+            "skyn3t.observability.health.shutil.which",
+            lambda name: paths.get(name),
+        )
+
+        result = asyncio.run(_check_cli_tools())
+
+        assert result.status == HealthStatus.DEGRADED
+        assert "python" in result.details["missing"]
+        assert result.error == "Missing tools: ['python']"
 
 
 # ---------------------------------------------------------------------------

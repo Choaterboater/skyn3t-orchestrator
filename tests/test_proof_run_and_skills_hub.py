@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -9,7 +10,7 @@ import pytest
 
 from skyn3t.config.settings import get_settings
 from skyn3t.cortex.autonomous_loop import AutonomousCoordinator
-from skyn3t.intelligence.skills_hub import install_from_hub, list_hub_entries
+from skyn3t.intelligence.skills_hub import hub_roots, install_from_hub, list_hub_entries
 from skyn3t.studio.proof_run import resolve_scaffold_dir, run_scaffold_proof
 
 
@@ -64,8 +65,33 @@ def test_resolve_scaffold_dir(monkeypatch, tmp_path):
 
 def test_list_hub_entries_includes_seed():
     catalog = list_hub_entries()
-    assert "examples/skills_seed" in (catalog.get("roots") or [])
+    repo_root = Path(__file__).resolve().parents[1]
+    assert str((repo_root / "examples" / "skills_seed").resolve()) in (
+        catalog.get("roots") or []
+    )
     assert (catalog.get("total") or 0) >= 1
+
+
+def test_hub_roots_are_repo_relative_when_cwd_changes(monkeypatch, tmp_path):
+    monkeypatch.delenv("SKYN3T_SKILLS_HUB_PATHS", raising=False)
+    monkeypatch.chdir(tmp_path)
+    repo_root = Path(__file__).resolve().parents[1]
+
+    assert hub_roots() == [
+        (repo_root / "examples" / "skills_seed").resolve(),
+        (repo_root / "skills").resolve(),
+    ]
+
+
+def test_hub_roots_resolve_relative_env_from_repo_root(monkeypatch, tmp_path):
+    monkeypatch.setenv("SKYN3T_SKILLS_HUB_PATHS", "custom_hub,examples/skills_seed")
+    monkeypatch.chdir(tmp_path)
+    repo_root = Path(__file__).resolve().parents[1]
+
+    assert hub_roots() == [
+        (repo_root / "custom_hub").resolve(),
+        (repo_root / "examples" / "skills_seed").resolve(),
+    ]
 
 
 def test_install_from_hub_imports_seed_skills(tmp_path, monkeypatch):

@@ -92,6 +92,9 @@ class Settings(BaseSettings):
     # fallback when CLI subprocesses fail (App.jsx-stub failure mode)
     # and as a fast-path for known-problematic entrypoint files.
     openrouter_api_key: Optional[str] = Field(default=None, alias="OPENROUTER_API_KEY")
+    openrouter_max_concurrency: int = Field(
+        default=4, alias="SKYN3T_OPENROUTER_MAX_CONCURRENCY"
+    )
     max_build_cost_usd: float = Field(default=1.0, alias="SKYN3T_MAX_BUILD_COST_USD")
     model_routing_path: Path = Field(
         default=Path("./data/model_routing.json"),
@@ -362,6 +365,21 @@ class Settings(BaseSettings):
             return []
         text = str(v).strip()
         return [text] if text else []
+
+    @field_validator("openrouter_max_concurrency", mode="before")
+    @classmethod
+    def parse_openrouter_max_concurrency(cls, v: Any) -> int:
+        if v is None or str(v).strip() == "":
+            return 4
+        try:
+            value = int(v)
+        except (TypeError, ValueError):
+            logger.warning("Invalid SKYN3T_OPENROUTER_MAX_CONCURRENCY; using default 4")
+            return 4
+        if value < 1:
+            logger.warning("SKYN3T_OPENROUTER_MAX_CONCURRENCY must be >= 1; using 1")
+            return 1
+        return value
 
     @field_validator(
         "data_dir",

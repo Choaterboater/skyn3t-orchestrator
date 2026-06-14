@@ -278,6 +278,46 @@ def test_collect_stub_signal_real_entrypoint_not_stub(tmp_path: Path) -> None:
     assert markers == []
 
 
+def test_entrypoint_named_import_rewritten_for_default_export(tmp_path: Path) -> None:
+    out = _mk_scaffold(tmp_path)
+    app = out / "src" / "App.jsx"
+    card = out / "src" / "components" / "Card.jsx"
+    app.write_text(
+        "import { Card } from './components/Card.jsx';\n"
+        "export default function App() { return <Card />; }\n",
+        encoding="utf-8",
+    )
+    card.write_text(
+        "export default function Card() { return <article />; }\n",
+        encoding="utf-8",
+    )
+
+    fixed = CodeAgent._fix_entrypoint_import_export_mismatches(out, [str(app), str(card)])
+
+    assert fixed == [str(app)]
+    assert "import Card from './components/Card.jsx';" in app.read_text(encoding="utf-8")
+
+
+def test_entrypoint_default_import_rewritten_for_named_export(tmp_path: Path) -> None:
+    out = _mk_scaffold(tmp_path)
+    app = out / "src" / "main.jsx"
+    chart = out / "src" / "components" / "Chart.jsx"
+    app.write_text(
+        "import Chart from './components/Chart.jsx';\n"
+        "export default function App() { return <Chart />; }\n",
+        encoding="utf-8",
+    )
+    chart.write_text(
+        "export function Chart() { return <section />; }\n",
+        encoding="utf-8",
+    )
+
+    fixed = CodeAgent._fix_entrypoint_import_export_mismatches(out, [str(app), str(chart)])
+
+    assert fixed == [str(app)]
+    assert "import { Chart } from './components/Chart.jsx';" in app.read_text(encoding="utf-8")
+
+
 def test_collect_stub_signal_fail_open_on_bad_input(tmp_path: Path) -> None:
     out = _mk_scaffold(tmp_path)
     # Non-list file_specs and None files_written must not raise.

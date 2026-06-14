@@ -139,6 +139,46 @@ class TestSkillsCLI:
         assert "Installed" in result.output
         assert lib.find(tag="local")
 
+    def test_install_local_repo_with_multiple_skills(self, tmp_path: Path, monkeypatch) -> None:
+        from typer.testing import CliRunner
+
+        from skyn3t.cli.main import app
+
+        repo_dir = tmp_path / "skills_repo"
+        (repo_dir / "api_health").mkdir(parents=True)
+        (repo_dir / "react_ui").mkdir(parents=True)
+        (repo_dir / "api_health" / "SKILL.md").write_text(
+            "---\n"
+            "name: api-health-skill\n"
+            "description: Use this skill for FastAPI health checks.\n"
+            "tags: [fastapi]\n"
+            "triggers: [health, fastapi]\n"
+            "---\n\n"
+            "# Health\nAlways include /health tests.\n",
+            encoding="utf-8",
+        )
+        (repo_dir / "react_ui" / "SKILL.md").write_text(
+            "---\n"
+            "name: react-ui-skill\n"
+            "description: Use this skill for React status dashboards.\n"
+            "tags: [react]\n"
+            "triggers: [dashboard, react]\n"
+            "---\n\n"
+            "# Dashboard\nShow loading and empty states.\n",
+            encoding="utf-8",
+        )
+        lib = SkillLibrary(root=tmp_path / "skills")
+        monkeypatch.setattr(
+            "skyn3t.intelligence.skill_library.get_default_library",
+            lambda: lib,
+        )
+        runner = CliRunner()
+        result = runner.invoke(app, ["skills", "install", str(repo_dir)])
+        assert result.exit_code == 0
+        assert "Installed 2 skill" in result.output
+        assert {s.name for s in lib.all()} == {"api-health-skill", "react-ui-skill"}
+        assert any(s.name == "api-health-skill" for s in lib.find_relevant("fastapi health"))
+
     def test_remove(self, tmp_path: Path, monkeypatch) -> None:
         from typer.testing import CliRunner
 
@@ -203,6 +243,36 @@ class TestSkillsAPI:
         data = response.json()
         assert "installed" in data
         assert lib.find(tag="api")
+
+    def test_install_skill_local_repo_loose_markdown(self, tmp_path, monkeypatch) -> None:
+        repo_dir = tmp_path / "loose_repo"
+        repo_dir.mkdir()
+        (repo_dir / "uvicorn-health.md").write_text(
+            "---\n"
+            "name: uvicorn-health-skill\n"
+            "description: Use this skill for uvicorn FastAPI health checks.\n"
+            "tags: [fastapi]\n"
+            "triggers: [uvicorn, health]\n"
+            "---\n\n"
+            "# Uvicorn health\nAdd a lightweight health endpoint.\n",
+            encoding="utf-8",
+        )
+        (repo_dir / "README.md").write_text("# Not a skill\n", encoding="utf-8")
+        lib = SkillLibrary(root=tmp_path / "skills")
+        monkeypatch.setattr(
+            "skyn3t.intelligence.skill_library.get_default_library",
+            lambda: lib,
+        )
+        client = TestClient(web_app.app)
+        response = client.post(
+            "/api/skills/install",
+            json={"source": str(repo_dir)},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["installed"] == ["uvicorn-health-skill"]
+        assert data["found_format"] == "loose_md"
+        assert any(s.name == "uvicorn-health-skill" for s in lib.find_relevant("uvicorn health"))
 
     def test_delete_skill(self, tmp_path, monkeypatch) -> None:
         lib = SkillLibrary(root=tmp_path)

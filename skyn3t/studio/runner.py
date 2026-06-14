@@ -2778,7 +2778,11 @@ class StudioRunner:
                 )
             )
             if should_run_verifiers:
-                skip_fix_loops = reviewer_failed
+                # Objective repair is driven by objective verifier results,
+                # not by the earlier ReviewerAgent verdict. The reviewer runs
+                # before these gates, so using reviewer_failed here suppresses
+                # the exact boot/integration fixes broken scaffolds need.
+                skip_fix_loops = False
                 # The mechanical BUILD fixer must run on verdict=='no' even when
                 # the reviewer already failed. The reviewer runs BEFORE the build
                 # verifier, so ANY build break makes reviewer_failed True, which
@@ -3094,21 +3098,25 @@ class StudioRunner:
                                 manifest["integration_verification"] = build_result
                                 failed_verifier = "integration"
 
-                    # The build verifier runs AFTER the reviewer, so a reviewer
-                    # no-go on a broken scaffold is STALE once the build-fix loop
-                    # repairs it. Re-score on the now-building code so the final
-                    # outcome reflects reality, not the pre-repair verdict.
-                    if (
-                        reviewer_failed
-                        and manifest.get("build_fix_attempts")
-                        and str((manifest.get("build_verification") or {}).get("verdict")) == "yes"
+                    # The objective verifiers run AFTER the reviewer, so the
+                    # first reviewer score is stale as soon as build/boot/
+                    # integration results exist. Re-score with those objective
+                    # records so a non-building scaffold is capped by ReviewerAgent
+                    # instead of lingering as a misleading ~53 near-pass.
+                    objective_records = {
+                        "build": manifest.get("build_verification"),
+                        "boot": manifest.get("boot_verification"),
+                        "integration": manifest.get("integration_verification"),
+                    }
+                    if reviewer_failed and any(
+                        isinstance(record, dict) for record in objective_records.values()
                     ):
                         try:
                             await self._rerun_reviewer_scoring(
                                 artifact_dir=artifact_dir, brief=brief, manifest=manifest,
                             )
                         except Exception:
-                            logger.exception("post-build-fix re-score failed")
+                            logger.exception("post-verification re-score failed")
 
                     if not skip_fix_loops and verdict == "no":
                         manifest["status"] = "failed"
@@ -4725,6 +4733,11 @@ class StudioRunner:
                     input_data={
                         "brief": brief,
                         "artifact_dir": str(artifact_dir),
+                        "objective_verification": {
+                            "build": manifest.get("build_verification"),
+                            "boot": manifest.get("boot_verification"),
+                            "integration": manifest.get("integration_verification"),
+                        },
                     },
                 )
             )

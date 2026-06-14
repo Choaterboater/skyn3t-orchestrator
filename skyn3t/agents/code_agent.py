@@ -3559,6 +3559,16 @@ class CodeAgent(BaseAgent):
         """
     )
 
+    _ENTRYPOINT_ESM_IMPORT_RE = _RE.compile(
+        r"""(?xm)
+        ^(?P<indent>\s*)import\s+
+        (?P<clause>(?!type\b)[^'";\n]+?)\s+
+        from\s+
+        (?P<quote>['"])(?P<target>\.{1,2}/[^'"\n]+)(?P=quote)
+        (?P<semi>[ \t]*;?)
+        """
+    )
+
     # Common extensions to try when resolving a bare `./Foo` import.
     _RESOLVE_EXTS: Tuple[str, ...] = (
         ".jsx", ".tsx", ".ts", ".js", ".mjs", ".cjs", ".css", ".scss",
@@ -3740,6 +3750,16 @@ class CodeAgent(BaseAgent):
                 + ("…" if len(backfilled) > 5 else ""),
             )
             files_written = files_written + [b for b in backfilled if b not in files_written]
+        fixed_imports = self._fix_entrypoint_import_export_mismatches(
+            out_dir, files_written
+        )
+        if fixed_imports:
+            logger.info(
+                "fixed %d entrypoint import/export mismatch(es): %s",
+                len(fixed_imports),
+                ", ".join(_Path(f).name for f in fixed_imports[:5])
+                + ("…" if len(fixed_imports) > 5 else ""),
+            )
         return files_written
 
     @staticmethod
@@ -3763,6 +3783,136 @@ class CodeAgent(BaseAgent):
                 if idx.is_file():
                     return idx
         return None
+
+    @classmethod
+    def _fix_entrypoint_import_export_mismatches(cls, out_dir, files_written) -> list[str]:
+        """Rewrite entrypoint imports when named/default style disagrees with exports."""
+        from pathlib import Path as _Path
+
+        out_dir = _Path(out_dir).resolve()
+        fixed: list[str] = []
+        scan_exts = {".jsx", ".tsx", ".js", ".ts", ".mjs"}
+        for written in list(files_written or []):
+            try:
+                p = _Path(written)
+                if not p.is_absolute():
+                    p = (out_dir / p).resolve()
+                if not p.is_file() or p.suffix.lower() not in scan_exts:
+                    continue
+                if p.name.lower() not in _ENTRYPOINT_FILES:
+                    continue
+                original = p.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+
+            replacements: list[tuple[int, int, str]] = []
+            for match in cls._ENTRYPOINT_ESM_IMPORT_RE.finditer(original):
+                clause = (match.group("clause") or "").strip()
+                target = match.group("target") or ""
+                try:
+                    base = (p.parent / target).resolve()
+                    base.relative_to(out_dir)
+                except Exception:
+                    continue
+                resolved = cls._resolve_import_path(base)
+                if resolved is None or resolved.suffix.lower() not in scan_exts:
+                    continue
+                try:
+                    target_body = resolved.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                exports = cls._module_export_shape(target_body)
+                default_name, named_imports = cls._import_clause_shape(clause)
+                new_clause: Optional[str] = None
+
+                if (
+                    default_name is None
+                    and len(named_imports) == 1
+                    and exports["has_default"]
+                ):
+                    imported, local = named_imports[0]
+                    if imported not in exports["named"]:
+                        new_clause = local
+                elif (
+                    default_name is not None
+                    and not named_imports
+                    and not exports["has_default"]
+                    and default_name in exports["named"]
+                ):
+                    new_clause = f"{{ {default_name} }}"
+
+                if not new_clause or new_clause == clause:
+                    continue
+                quote = match.group("quote") or "'"
+                semi = match.group("semi") or ""
+                replacement = (
+                    f"{match.group('indent') or ''}import {new_clause} "
+                    f"from {quote}{target}{quote}{semi}"
+                )
+                replacements.append((match.start(), match.end(), replacement))
+
+            if not replacements:
+                continue
+            updated = original
+            for start, end, replacement in reversed(replacements):
+                updated = updated[:start] + replacement + updated[end:]
+            try:
+                p.write_text(updated, encoding="utf-8")
+                fixed.append(str(p))
+            except OSError:
+                logger.warning("entrypoint import/export fix write failed: %s", p)
+        return fixed
+
+    @staticmethod
+    def _import_clause_shape(clause: str) -> tuple[Optional[str], list[tuple[str, str]]]:
+        """Return ``(default_local_name, [(imported_name, local_name), ...])``."""
+        clause = (clause or "").strip()
+        if not clause or clause.startswith("*"):
+            return None, []
+        default_name: Optional[str] = None
+        named: list[tuple[str, str]] = []
+        named_block: Optional[str] = None
+        if clause.startswith("{"):
+            named_block = clause
+        elif ", {" in clause:
+            default_name = clause.split(",", 1)[0].strip() or None
+            named_block = clause.split(",", 1)[1].strip()
+        else:
+            default_name = clause.strip() or None
+        if named_block and named_block.startswith("{") and named_block.endswith("}"):
+            inner = named_block[1:-1]
+            for part in inner.split(","):
+                item = part.strip()
+                if not item:
+                    continue
+                pieces = _RE.split(r"\s+as\s+", item, maxsplit=1)
+                imported = pieces[0].strip()
+                local = pieces[1].strip() if len(pieces) == 2 else imported
+                if imported and local:
+                    named.append((imported, local))
+        return default_name, named
+
+    @staticmethod
+    def _module_export_shape(body: str) -> dict[str, Any]:
+        named: set[str] = set()
+        for rx in (
+            r"\bexport\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)",
+            r"\bexport\s+class\s+([A-Za-z_$][\w$]*)",
+            r"\bexport\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)",
+        ):
+            named.update(_RE.findall(rx, body or ""))
+        for match in _RE.finditer(r"\bexport\s*\{([^}]+)\}", body or ""):
+            for part in match.group(1).split(","):
+                item = part.strip()
+                if not item:
+                    continue
+                item = _RE.split(r"\s+as\s+", item, maxsplit=1)[-1].strip()
+                if _RE.match(r"^[A-Za-z_$][\w$]*$", item):
+                    named.add(item)
+        return {
+            "has_default": bool(_RE.search(r"\bexport\s+default\b", body or "")),
+            "named": named,
+        }
 
     @staticmethod
     def _placeholder_local_import(rel_path: str) -> str:

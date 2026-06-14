@@ -53,6 +53,11 @@ class HealthCheck:
 # Registry
 # ---------------------------------------------------------------------------
 HealthCheckFn = Callable[[], Awaitable[HealthCheck]]
+_CLI_TOOL_CANDIDATES: Dict[str, tuple[str, ...]] = {
+    "python": ("python3", "python"),
+    "git": ("git",),
+    "docker": ("docker",),
+}
 
 
 class HealthRegistry:
@@ -247,13 +252,21 @@ async def _check_cpu() -> HealthCheck:
 
 async def _check_cli_tools() -> HealthCheck:
     """Check availability of essential CLI tools."""
-    tools = ["python", "git", "docker"]
     available = []
     missing = []
+    resolved: Dict[str, Dict[str, str]] = {}
 
-    for tool in tools:
-        if shutil.which(tool):
-            available.append(tool)
+    for tool, candidates in _CLI_TOOL_CANDIDATES.items():
+        found_command = None
+        found_path = None
+        for command in candidates:
+            if path := shutil.which(command):
+                found_command = command
+                found_path = path
+                break
+        if found_command and found_path:
+            available.append(found_command)
+            resolved[tool] = {"command": found_command, "path": found_path}
         else:
             missing.append(tool)
 
@@ -262,7 +275,14 @@ async def _check_cli_tools() -> HealthCheck:
     return HealthCheck(
         name="cli_tools",
         status=status,
-        details={"available": available, "missing": missing},
+        details={
+            "available": available,
+            "missing": missing,
+            "resolved": resolved,
+            "accepted_commands": {
+                tool: list(candidates) for tool, candidates in _CLI_TOOL_CANDIDATES.items()
+            },
+        },
         error=f"Missing tools: {missing}" if missing else None,
     )
 

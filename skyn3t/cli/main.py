@@ -2045,7 +2045,12 @@ def agent_list() -> None:
 @agent_app.command("add")
 def agent_add(
     name: str = typer.Argument(..., help="Unique agent name"),
-    provider: str = typer.Option("claude", "--provider", "-p", help="Provider (claude, github)"),
+    provider: str = typer.Option(
+        "claude",
+        "--provider",
+        "-p",
+        help="Provider (claude, github, github_ingestor)",
+    ),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Model name (Claude only)"),
     local: bool = typer.Option(False, "--local", "-l", help="Run locally without server"),
 ) -> None:
@@ -2053,6 +2058,10 @@ def agent_add(
     provider = (provider or "claude").lower()
     if provider == "anthropic":
         provider = "claude"
+    if provider in ("github-ingestor", "github_ingest"):
+        provider = "github_ingestor"
+    if provider == "github-explorer":
+        provider = "github_explorer"
     payload = {
         "name": name,
         "provider": provider,
@@ -2097,13 +2106,21 @@ def agent_add(
                 event_bus=event_bus,
                 config={"model": model} if model else {},
             )
-        elif provider == "github":
+        elif provider in ("github", "github_explorer"):
             from skyn3t.agents.github_explorer import GitHubExplorerAgent
             agent = GitHubExplorerAgent(name=name, event_bus=event_bus)
+        elif provider == "github_ingestor":
+            from skyn3t.agents.github_ingestor import GitHubIngestorAgent
+            agent = GitHubIngestorAgent(
+                name=name,
+                event_bus=event_bus,
+                rag=getattr(orchestrator, "_rag", None),
+            )
         else:
             _error(
                 f"Provider '[bold]{provider}[/bold]' not fully implemented.\n"
-                "Supported: [cyan]claude[/cyan], [cyan]github[/cyan]"
+                "Supported: [cyan]claude[/cyan], [cyan]github[/cyan], "
+                "[cyan]github_ingestor[/cyan]"
             )
             raise typer.Exit(1)
 
@@ -2776,6 +2793,75 @@ def github_explore(
         f"GitHub exploration task submitted\n"
         f"• Repository: [bold cyan]{repo}[/bold cyan]\n"
         f"• Task Type: {task_type}\n"
+        f"• Task ID: [bold]{task_id}[/bold]\n\n"
+        f"Check result: [bold]skyn3t task status {task_id}[/bold]"
+    )
+
+
+@github_app.command("ingest")
+def github_ingest(
+    mode: Optional[str] = typer.Option(
+        None,
+        "--mode",
+        "-m",
+        help="Ingest mode: seed_list, single_repo, or search. Inferred when omitted.",
+    ),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Repository in owner/repo format"),
+    query: Optional[str] = typer.Option(None, "--query", "-q", help="GitHub search query"),
+    paths: Optional[str] = typer.Option(
+        None,
+        "--paths",
+        "-p",
+        help="Comma-separated file paths or directory prefixes to ingest",
+    ),
+    max_files: int = typer.Option(20, "--max-files", help="Maximum files to ingest"),
+    max_bytes_per_file: int = typer.Option(
+        200_000,
+        "--max-bytes-per-file",
+        help="Maximum bytes fetched per file",
+    ),
+) -> None:
+    """🐙 Ingest GitHub repository content into RAG memory."""
+    selected_mode = (mode or "").strip().lower()
+    if not selected_mode:
+        selected_mode = "single_repo" if repo else "search" if query else "seed_list"
+
+    if selected_mode == "single_repo" and not repo:
+        _error("single_repo mode requires --repo owner/repo")
+        raise typer.Exit(1)
+    if selected_mode == "search" and not query:
+        _error("search mode requires --query")
+        raise typer.Exit(1)
+
+    payload: Dict[str, Any] = {
+        "mode": selected_mode,
+        "max_files": max_files,
+        "max_bytes_per_file": max_bytes_per_file,
+    }
+    if repo:
+        payload["repo"] = repo
+    if query:
+        payload["query"] = query
+    if paths:
+        payload["paths"] = [item.strip() for item in paths.split(",") if item.strip()]
+
+    try:
+        with _client() as client:
+            resp = client.post("/api/github/ingest", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.ConnectError:
+        _server_unavailable()
+        raise typer.Exit(1)
+    except httpx.HTTPStatusError as exc:
+        _error(f"Server error: {exc.response.text}")
+        raise typer.Exit(1)
+
+    task_id = data.get("task_id")
+    _success(
+        f"GitHub ingest task submitted\n"
+        f"• Mode: [bold cyan]{selected_mode}[/bold cyan]\n"
+        f"• Agent: github_ingestor\n"
         f"• Task ID: [bold]{task_id}[/bold]\n\n"
         f"Check result: [bold]skyn3t task status {task_id}[/bold]"
     )
@@ -3617,7 +3703,7 @@ def skills_reject_draft(
 def skills_install(source: str) -> None:
     """Install a skill from a local path or URL.
 
-    SOURCE can be a local directory containing SKILL.md or a git URL.
+    SOURCE can be a local Agent Skill directory, skill repo/tree, or a git URL.
     """
     import shutil
     import tempfile
@@ -3629,15 +3715,33 @@ def skills_install(source: str) -> None:
     source_path = Path(source)
 
     if source_path.exists() and source_path.is_dir():
-        path, findings = lib.import_agent_skill(source_path)
-        if path:
-            _success(f"Installed skill from {source}")
-            if findings:
-                console.print(f"[yellow]Warnings: {', '.join(findings)}[/yellow]")
-        else:
-            _error(f"Could not install skill from {source}")
-            if findings:
-                console.print(f"[red]Flagged: {', '.join(findings)}[/red]")
+        root_skill = source_path / "SKILL.md"
+        skill_files = sorted(source_path.rglob("SKILL.md"))
+        if root_skill.is_file() and skill_files == [root_skill]:
+            path, findings = lib.import_agent_skill(source_path)
+            if path:
+                _success(f"Installed skill from {source}")
+                if findings:
+                    console.print(f"[yellow]Warnings: {', '.join(findings)}[/yellow]")
+            else:
+                _error(f"Could not install skill from {source}")
+                if findings:
+                    console.print(f"[red]Flagged: {', '.join(findings)}[/red]")
+            return
+
+        result = lib.import_skill_repo(source_path)
+        found_format = result.get("found_format", "none")
+        if found_format == "none":
+            _error("No installable skills found in local directory")
+            flagged = result.get("flagged") or []
+            if flagged:
+                console.print(f"[red]Flagged: {', '.join(flagged)}[/red]")
+            return
+        installed = result.get("imported") or []
+        _success(f"Installed {len(installed)} skill(s) from {source}")
+        flagged = result.get("flagged") or []
+        if flagged:
+            console.print(f"[yellow]Warnings: {', '.join(flagged)}[/yellow]")
         return
 
     # Try git clone

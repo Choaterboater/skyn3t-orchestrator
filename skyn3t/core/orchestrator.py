@@ -299,9 +299,16 @@ class Orchestrator:
         rag = getattr(self, "_rag", None)
         if rag is None:
             return
-        for name in ("github_ingestor", "explorer", "project_memory", "docs_ingestor"):
-            agent = self.agents.get(name)
-            if agent is not None and getattr(agent, "rag", None) is None:
+        rag_agent_aliases = {
+            "github_explorer",
+            "github_ingestor",
+            "explorer",
+            "project_memory",
+            "docs_ingestor",
+        }
+        for name, agent in self.agents.items():
+            identifiers = {name, getattr(agent, "agent_type", "")}
+            if identifiers & rag_agent_aliases and getattr(agent, "rag", None) is None:
                 setattr(agent, "rag", rag)
 
     async def _execute_plan_task(self, task: TaskRequest, agent_name: Optional[str]) -> str:

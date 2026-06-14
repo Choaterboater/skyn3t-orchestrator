@@ -1351,6 +1351,10 @@ async def register_new_agent(data: Dict[str, Any]):
     provider = str(data.get("provider", "claude") or "claude").lower()
     if provider == "anthropic":
         provider = "claude"
+    if provider in ("github-ingestor", "github_ingest"):
+        provider = "github_ingestor"
+    if provider == "github-explorer":
+        provider = "github_explorer"
     model = data.get("model")
     cli_agent = data.get("cli_agent", False)
 
@@ -1386,17 +1390,24 @@ async def register_new_agent(data: Dict[str, Any]):
                 )
             else:
                 return {"error": f"Unsupported CLI provider: {provider}"}
-        elif provider == "github":
+        elif provider in ("github", "github_explorer"):
             from skyn3t.agents.github_explorer import GitHubExplorerAgent
             agent = GitHubExplorerAgent(
                 name=name,
                 event_bus=bus,
             )
+        elif provider == "github_ingestor":
+            from skyn3t.agents.github_ingestor import GitHubIngestorAgent
+            agent = GitHubIngestorAgent(
+                name=name,
+                event_bus=bus,
+                rag=getattr(orchestrator, "_rag", None),
+            )
         else:
             return {
                 "error": (
                     f"Unsupported provider: {provider}. "
-                    "Use claude, kimi, copilot, or github."
+                    "Use claude, kimi, copilot, github, github_explorer, or github_ingestor."
                 )
             }
 
@@ -2240,10 +2251,15 @@ async def agent_delete(name: str):
 
 @app.get("/api/llm/backends")
 async def llm_backends():
-    return {"backends": [
-        "auto", "claude_cli", "kimi_cli", "copilot_cli", "openai_cli",
-        "anthropic", "openrouter", "deterministic",
-    ]}
+    from skyn3t.adapters.openrouter import openrouter_runtime_status
+
+    return {
+        "backends": [
+            "auto", "claude_cli", "kimi_cli", "copilot_cli", "openai_cli",
+            "anthropic", "openrouter", "deterministic",
+        ],
+        "openrouter": openrouter_runtime_status(),
+    }
 
 
 @app.get("/api/llm/models")
@@ -2380,6 +2396,55 @@ async def submit_task(agent_name: str, task_data: Dict[str, Any]):
 
     task_id = await orchestrator.submit_task(task, agent_name=agent_name)
     return {"task_id": task_id, "status": "submitted"}
+
+
+@app.post("/api/github/ingest")
+async def run_github_ingest(data: Dict[str, Any] | None = None):
+    """Submit a GitHubIngestorAgent task through a dedicated endpoint."""
+    from skyn3t.core.agent import TaskRequest
+
+    if not orchestrator:
+        return {"error": "Orchestrator not initialized"}
+    if "github_ingestor" not in orchestrator.agents:
+        return JSONResponse({"error": "github_ingestor agent not registered"}, status_code=404)
+
+    payload = data or {}
+    mode = str(payload.get("mode") or "").strip().lower()
+    if not mode:
+        if payload.get("repo"):
+            mode = "single_repo"
+        elif payload.get("query"):
+            mode = "search"
+        else:
+            mode = "seed_list"
+
+    input_data: Dict[str, Any] = {"mode": mode}
+    for key in (
+        "repo",
+        "query",
+        "paths",
+        "max_files",
+        "max_bytes_per_file",
+        "search_limit",
+        "why",
+        "kind",
+    ):
+        if key in payload and payload[key] is not None:
+            input_data[key] = payload[key]
+
+    task = TaskRequest(
+        title=str(payload.get("title") or f"GitHub ingest ({mode})"),
+        description=str(payload.get("description") or "Ingest GitHub content into RAG"),
+        input_data=input_data,
+        priority=int(payload.get("priority", 1)),
+    )
+    task_id = await orchestrator.submit_task(task, agent_name="github_ingestor")
+    return {
+        "task_id": task_id,
+        "status": "submitted",
+        "agent": "github_ingestor",
+        "input": input_data,
+    }
 
 
 @app.post("/api/agents/{agent_name}/exec")
@@ -3114,10 +3179,35 @@ async def install_skill(request: Request):
     source_path = Path(source)
 
     if source_path.exists() and source_path.is_dir():
-        path, findings = lib.import_agent_skill(source_path)
-        if path:
-            return {"installed": path.stem, "warnings": findings}
-        return JSONResponse({"error": "install failed", "flagged": findings}, status_code=400)
+        root_skill = source_path / "SKILL.md"
+        skill_files = sorted(source_path.rglob("SKILL.md"))
+        if root_skill.is_file() and skill_files == [root_skill]:
+            path, findings = lib.import_agent_skill(source_path)
+            if path:
+                return {"installed": path.stem, "warnings": findings}
+            return JSONResponse({"error": "install failed", "flagged": findings}, status_code=400)
+
+        result = lib.import_skill_repo(source_path)
+        found_format = result.get("found_format", "none")
+        if found_format == "none":
+            return JSONResponse(
+                {
+                    "error": (
+                        "no installable skills found in this directory "
+                        "(no SKILL.md and no skill-format markdown)"
+                    ),
+                    "found_format": found_format,
+                    "flagged": result.get("flagged", []),
+                },
+                status_code=400,
+            )
+        return {
+            "installed": result["imported"],
+            "installed_count": len(result["imported"]),
+            "flagged": result.get("flagged", []),
+            "skipped_count": len(result.get("skipped", [])),
+            "found_format": found_format,
+        }
 
     if source.startswith(("http://", "https://", "git@")):
         with tempfile.TemporaryDirectory() as tmp:

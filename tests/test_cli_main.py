@@ -474,6 +474,52 @@ def test_cli_agent_add_maps_anthropic_alias_to_claude(monkeypatch):
     assert "Provider: claude" in result.stdout
 
 
+def test_cli_github_ingest_posts_to_ingest_endpoint(monkeypatch):
+    calls = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, path, json=None, **kwargs):
+            calls["path"] = path
+            calls["json"] = json
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {"task_id": "task-123", "status": "submitted"},
+            )
+
+    monkeypatch.setattr(cli_main, "_client", lambda: FakeClient())
+
+    result = runner.invoke(
+        app,
+        [
+            "github",
+            "ingest",
+            "--repo",
+            "octo/demo",
+            "--paths",
+            "README.md,src",
+            "--max-files",
+            "3",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls["path"] == "/api/github/ingest"
+    assert calls["json"] == {
+        "mode": "single_repo",
+        "max_files": 3,
+        "max_bytes_per_file": 200_000,
+        "repo": "octo/demo",
+        "paths": ["README.md", "src"],
+    }
+    assert "GitHub ingest task submitted" in result.stdout
+
+
 def test_cli_proposal_list_requests_system_origin(monkeypatch):
     calls = {}
 
