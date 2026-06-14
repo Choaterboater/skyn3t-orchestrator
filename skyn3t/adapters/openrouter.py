@@ -4,9 +4,10 @@ import asyncio
 import logging
 import os
 import random
+import time
 from typing import Any, Dict, Optional
 
-from skyn3t.adapters.llm_client import LLMRequest
+from skyn3t.adapters.llm_client import LLMRequest, TransientLLMError
 
 logger = logging.getLogger("skyn3t.adapters.openrouter")
 
@@ -28,6 +29,59 @@ _MAX_CONCURRENCY_SETTING = "SKYN3T_OPENROUTER_MAX_CONCURRENCY"
 _request_semaphore: Optional["asyncio.Semaphore"] = None
 _request_semaphore_limit: Optional[int] = None
 _request_semaphore_loop_id: Optional[int] = None
+
+# PHASE 3: adaptive 429-aware concurrency. On a 429 we MULTIPLICATIVELY shrink
+# the EFFECTIVE in-flight cap (halve, floor 1) for a cooldown window so the
+# build self-throttles to the provider's real ceiling instead of bursting; once
+# the window expires the configured cap is restored in full. We never mutate a
+# live asyncio.Semaphore (unsupported — Semaphores can't be resized): we only
+# lower the `limit` that `_get_request_semaphore` computes, and its EXISTING
+# lazy per-loop rebind swaps in a smaller Semaphore. Simple, safe, self-
+# restoring; no custom async primitive. Set the cooldown to 0 to disable.
+_THROTTLE_COOLDOWN_SECONDS = float(
+    os.environ.get("SKYN3T_OPENROUTER_THROTTLE_COOLDOWN", "20")
+)
+_throttle_floor: int = 0  # 0 = no active cooldown; >0 = current reduced cap
+_throttle_until: float = 0.0  # monotonic deadline for the active cooldown
+
+
+def _now() -> float:
+    """Monotonic clock for cooldown bookkeeping (no event loop required)."""
+    return time.monotonic()
+
+
+def _note_throttle_if_429(status_code: int) -> None:
+    """Record a 429 → halve the effective concurrency cap (floor 1) for the
+    cooldown window. Idempotent within a window: repeated 429s keep shrinking
+    (down to the floor of 1) and refresh the deadline.
+    """
+    global _throttle_floor, _throttle_until
+    if status_code != 429 or _THROTTLE_COOLDOWN_SECONDS <= 0:
+        return
+    configured = openrouter_max_concurrency()
+    current = _effective_concurrency()
+    new_floor = max(1, min(current, configured) // 2)
+    _throttle_floor = new_floor
+    _throttle_until = _now() + _THROTTLE_COOLDOWN_SECONDS
+    logger.warning(
+        "openrouter 429 → cooldown: effective concurrency capped at %d for %.0fs",
+        new_floor,
+        _THROTTLE_COOLDOWN_SECONDS,
+    )
+
+
+def _effective_concurrency() -> int:
+    """The configured concurrency cap, reduced to the throttle floor during an
+    active 429 cooldown. Once the cooldown expires it clears the floor and
+    restores the full configured cap (multiplicative-decrease / full restore).
+    """
+    global _throttle_floor, _throttle_until
+    configured = openrouter_max_concurrency()
+    if _throttle_floor and _now() < _throttle_until:
+        return max(1, min(_throttle_floor, configured))
+    # Cooldown expired (or never active) → clear and restore.
+    _throttle_floor = 0
+    return configured
 
 
 def openrouter_max_concurrency() -> int:
@@ -70,12 +124,23 @@ def openrouter_runtime_status() -> Dict[str, Any]:
         "source": source,
         "default_max_concurrency": DEFAULT_MAX_CONCURRENCY,
         "active_semaphore_limit": _request_semaphore_limit,
+        # PHASE 3 observability: the cap actually in force right now (reduced
+        # during a 429 cooldown) and the active throttle floor (None when idle).
+        "effective_concurrency": _effective_concurrency(),
+        "throttle_floor": _throttle_floor or None,
+        "throttle_cooldown_seconds": _THROTTLE_COOLDOWN_SECONDS,
     }
 
 
 def _get_request_semaphore() -> "asyncio.Semaphore":
     global _request_semaphore, _request_semaphore_limit, _request_semaphore_loop_id
-    limit = openrouter_max_concurrency()
+    # PHASE 3: use the EFFECTIVE cap (reduced during a 429 cooldown). The
+    # rebind-on-limit-change logic below swaps in a smaller Semaphore when the
+    # cooldown shrinks the cap, and a larger one when it restores. In-flight
+    # requests keep their slot on the OLD Semaphore object (captured at
+    # ``async with`` time); new acquirers use the new one — safe and self-
+    # correcting within one request cycle.
+    limit = _effective_concurrency()
     loop_id = id(asyncio.get_running_loop())
     if (
         _request_semaphore is None
@@ -134,7 +199,11 @@ class OpenRouterBackend:
         }
         # Retry on 429 + 5xx with exponential backoff and jitter. Never retry
         # on 4xx other than 429 — those are caller errors and won't fix on retry.
-        max_attempts = 6
+        # PHASE 1: deeper backoff. The old ceiling (8s x 6 attempts ~= 23s) was
+        # shorter than a real provider throttle window, so a sustained 429 fell
+        # through to the deterministic-stub fallback and permanently failed the
+        # build. 8 attempts capped at 30s waits out ~90s of throttling. Tunable.
+        max_attempts = int(os.environ.get("SKYN3T_OPENROUTER_MAX_RETRIES", "8"))
         last_exc: Optional[Exception] = None
         for attempt in range(1, max_attempts + 1):
             try:
@@ -145,19 +214,35 @@ class OpenRouterBackend:
             except Exception as exc:  # network-level
                 last_exc = exc
                 if attempt == max_attempts:
-                    raise
-                delay = min(2 ** (attempt - 1), 8) + random.random()
+                    # PHASE 2: a connect/read timeout or connection error that
+                    # exhausted all retries is TRANSIENT. Raise the typed error
+                    # so callers bounded-retry instead of letting it fall
+                    # through to the deterministic-stub sentinel.
+                    raise TransientLLMError(
+                        f"openrouter network error after {max_attempts} "
+                        f"attempts: {exc}"
+                    ) from exc
+                delay = min(2 ** (attempt - 1), 30) + random.random()
                 await asyncio.sleep(delay)
                 continue
             if r.status_code in (429,) or 500 <= r.status_code < 600:
+                # PHASE 3: record EVERY 429 (not just the final attempt) so the
+                # adaptive cooldown shrinks the effective concurrency promptly.
+                _note_throttle_if_429(r.status_code)
                 if attempt == max_attempts:
-                    r.raise_for_status()
+                    # PHASE 2: a 429 throttle / 5xx overload that survived all
+                    # retries is TRANSIENT — raise the typed error instead of
+                    # r.raise_for_status() (whose httpx.HTTPStatusError used to
+                    # be swallowed into the written-as-code stub sentinel).
+                    raise TransientLLMError(
+                        f"openrouter {r.status_code} after {max_attempts} attempts"
+                    )
                 # Honor Retry-After when present.
                 ra = r.headers.get("retry-after")
                 try:
-                    delay = float(ra) if ra else min(2 ** (attempt - 1), 8) + random.random()
+                    delay = float(ra) if ra else min(2 ** (attempt - 1), 30) + random.random()
                 except ValueError:
-                    delay = min(2 ** (attempt - 1), 8) + random.random()
+                    delay = min(2 ** (attempt - 1), 30) + random.random()
                 await asyncio.sleep(delay)
                 continue
             r.raise_for_status()
@@ -174,8 +259,9 @@ class OpenRouterBackend:
                 raise RuntimeError("openrouter: empty choices")
             msg = choices[0].get("message") or {}
             return (msg.get("content") or "").strip()
-        # Unreachable, but satisfies the type checker.
-        raise RuntimeError(f"openrouter: exhausted retries ({last_exc})")
+        # Unreachable, but satisfies the type checker. Treat as transient for
+        # consistency with the exhausted-retry exits above.
+        raise TransientLLMError(f"openrouter: exhausted retries ({last_exc})")
 
     async def aclose(self) -> None:
         try:

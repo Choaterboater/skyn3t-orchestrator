@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
 
+from skyn3t.adapters.llm_client import TransientLLMError
+
 logger = logging.getLogger("skyn3t.agents.targeted_fix")
 
 # Per-file regen timeout. Used to be a flat 90s, which fired
@@ -640,6 +642,16 @@ async def apply_targeted_fix(
     created: List[str] = []
     preserved: List[str] = []
     errors: List[str] = []
+    # PHASE 2: track whether any per-issue regen raised a TransientLLMError
+    # (an adapter-level 429/5xx/timeout that exhausted its own retries). We still
+    # preserve the existing file per-issue (so a partly-throttled round keeps the
+    # fixes it DID land), but if the WHOLE round produced no real change AND a
+    # transient throttle was the cause, we re-raise TransientLLMError at the end
+    # so the caller's bounded retry can wait the provider out instead of
+    # accepting a preserve-only "noop" round. (Local per-file regen TIMEOUTS keep
+    # their established preserve-and-continue behavior — see the TimeoutError
+    # branch below.)
+    transient_seen = False
 
     # Resolve once so containment checks below have a stable parent.
     scaffold_root = scaffold_dir.resolve()
@@ -834,6 +846,11 @@ async def apply_targeted_fix(
                     timeout=regen_timeout,
                 )
             except asyncio.TimeoutError:
+                # A per-file regen timeout keeps its established preserve-and-
+                # continue behavior (the budget is already scaled to file size;
+                # retrying the whole round rarely helps). Only an exhausted
+                # adapter-level throttle (TransientLLMError, below) triggers the
+                # caller's bounded wait-and-retry.
                 _preserve_existing_on_regenerate_failure(
                     issue,
                     f"timeout after {regen_timeout:.0f}s",
@@ -845,6 +862,14 @@ async def apply_targeted_fix(
                 )
                 continue
             except Exception as exc:
+                # The LLM client may RAISE on an unrecoverable backend error.
+                # A TransientLLMError (429/5xx/timeout that exhausted retries) is
+                # a TEMPORARY throttle — flag it so an all-transient round is
+                # re-raised to the caller for a bounded wait-and-retry. We still
+                # preserve the existing file per-issue below so any real fixes
+                # already landed in this round are kept.
+                if isinstance(exc, TransientLLMError):
+                    transient_seen = True
                 # The LLM client may RAISE on an unrecoverable backend error.
                 # That is a transient regen failure, not a real fix — try the
                 # deterministic manifest template before giving up so a
@@ -944,6 +969,19 @@ async def apply_targeted_fix(
 
         # Unknown action
         errors.append(f"Unknown fix action '{issue.suggested_action}' for {issue.path}")
+
+    # PHASE 2: if the entire round produced NO real change and the cause was a
+    # transient throttle (429/5xx/timeout), re-raise so the caller's bounded
+    # wait-and-retry can wait the provider out. We only do this when nothing was
+    # changed/created — a partly-successful round keeps its real fixes (and its
+    # preserves) and returns normally. Callers that don't expect this still
+    # catch it via their existing broad except (TransientLLMError is a
+    # RuntimeError), degrading to today's "no fix this round" behavior.
+    if transient_seen and not changed and not created:
+        raise TransientLLMError(
+            "targeted fix: all regenerations failed transiently "
+            "(rate-limited / timed out); existing files preserved"
+        )
 
     # After any new files were written, scan them for unresolved local
     # imports and backfill via manifest_for. canary-133 (47/100) hit

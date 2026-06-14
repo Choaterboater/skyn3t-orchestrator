@@ -14,6 +14,57 @@ from skyn3t.security.secrets import redact_text
 logger = logging.getLogger("skyn3t.adapters.llm_client")
 
 
+class TransientLLMError(RuntimeError):
+    """A *transient* backend failure (429 throttle / 5xx overload / timeout)
+    that survived all adapter-level retries.
+
+    This is deliberately DISTINCT from a PERMANENT no-backend condition (403
+    key-exhausted, ``OPENROUTER_API_KEY not set``, or the resolved backend being
+    ``deterministic``). For permanent conditions ``LLMClient.complete`` still
+    returns the ``[deterministic-stub]`` sentinel (the honest "no backend"
+    signal). For a transient throttle it RAISES this instead, so the build-fix /
+    consistency-fix callers can bounded-retry and wait the provider out, rather
+    than silently writing the stub sentinel into a file as if it were code.
+
+    Subclasses ``RuntimeError`` so existing broad ``except Exception`` /
+    ``except RuntimeError`` handlers still catch it — the only new behavior is
+    the targeted re-raise inside ``complete`` and the bounded retry in callers.
+    """
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    """True when ``exc`` is a transient backend failure that callers should
+    bounded-retry rather than treat as a permanent no-backend condition.
+
+    Transient: an explicit :class:`TransientLLMError` (raised by the OpenRouter
+    adapter once it exhausts its own 429/5xx/timeout retries), any HTTP 429 or
+    5xx surfaced as an ``httpx.HTTPStatusError``, or a read/connect timeout
+    (``asyncio.TimeoutError`` from ``complete``'s own ``wait_for`` or an
+    ``httpx.TimeoutException``). Everything else (403 key-exhausted, generic
+    errors) is treated as permanent.
+
+    ``httpx`` is imported lazily under a guard because ``llm_client`` may run in
+    CLI-only deployments where ``httpx`` is not installed.
+    """
+    if isinstance(exc, TransientLLMError):
+        return True
+    if isinstance(exc, asyncio.TimeoutError):
+        return True
+    try:
+        import httpx
+    except Exception:
+        return False
+    if isinstance(exc, httpx.TimeoutException):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            code = exc.response.status_code
+        except Exception:
+            return False
+        return code == 429 or 500 <= code < 600
+    return False
+
+
 # Module-level fallback event bus. The first agent that creates an LLMClient
 # with an event_bus seeds this for all later ad-hoc constructions, so even
 # clients built outside the BaseAgent.llm path can publish LLM_EXCHANGE events.
@@ -527,6 +578,13 @@ class LLMClient:
             )
             failed_backend = (self._backend_name or "").strip().lower()
             self._last_failed_backend = failed_backend or None
+            # Classify the failure: a TRANSIENT throttle (429 / 5xx overload /
+            # timeout that exhausted the adapter's own retries) must NOT silently
+            # become the deterministic-stub sentinel — that turns a temporary
+            # provider throttle into a permanent written-as-code build failure.
+            # We re-raise TransientLLMError so the fix-callers can bounded-retry.
+            # PERMANENT failures (403 no-key, no backend) keep the sentinel.
+            transient = _is_transient_error(e)
             if (
                 _allow_backend_failover
                 and failed_backend
@@ -561,8 +619,30 @@ class LLMClient:
                         cwd=cwd,
                         _allow_backend_failover=False,
                     )
+                except TransientLLMError as fe:
+                    # The failover backend is ALSO transiently throttled. Do not
+                    # mask this as the deterministic stub — propagate so the
+                    # fix-caller's bounded retry can wait the provider out.
+                    raise TransientLLMError(
+                        f"openrouter/failover transiently unavailable: {fe}"
+                    ) from fe
                 except Exception:
                     logger.warning("llm failover retry failed", exc_info=True)
+                    # Failover failed for a non-transient reason. If the ORIGINAL
+                    # failure was transient, the throttle is still the honest
+                    # diagnosis — raise rather than write the stub.
+                    if transient:
+                        raise TransientLLMError(
+                            f"llm backend transiently unavailable: {e}"
+                        ) from e
+            # Genuine transient throttle with no usable failover answer →
+            # RAISE, never write the deterministic-stub sentinel as code. Only
+            # PERMANENT conditions (403/no-key/no-backend/deterministic) fall
+            # through to the sentinel below.
+            if transient:
+                raise TransientLLMError(
+                    f"llm backend transiently unavailable: {e}"
+                ) from e
             return self._fallback(req)
 
         # Publish an LLM_EXCHANGE event for dashboards/observability. We

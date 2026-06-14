@@ -821,3 +821,82 @@ def test_content_is_stub_detects_all_markers():
     )
     # A large file that merely mentions the word is not a stub (ceiling).
     assert not _content_is_stub("// Auto-generated placeholder mention\n" + "x;\n" * 300)
+
+
+# ─── PHASE 2: transient-error propagation ──────────────────────────────
+
+
+def test_apply_targeted_fix_reraises_transient_when_all_fail(tmp_path: Path):
+    """A round where EVERY regen failed transiently (429/5xx/timeout) must
+    re-raise TransientLLMError so the caller can bounded-retry — it must NOT
+    quietly return a preserve-only "noop" FixResult."""
+    from skyn3t.adapters.llm_client import TransientLLMError
+
+    scaffold = tmp_path / "scaffold"
+    (scaffold / "src").mkdir(parents=True)
+    target = scaffold / "src" / "App.jsx"
+    target.write_text("export default function App() { return <div>ok</div>; }\n")
+
+    class ThrottledLLM:
+        async def complete(self, prompt, max_tokens, temperature):  # noqa: ARG002
+            raise TransientLLMError("openrouter 429 after 8 attempts")
+
+    issues = [
+        FileIssue(
+            path="src/App.jsx",
+            error_message="unexpected build failure",
+            suggested_action="regenerate",
+        )
+    ]
+
+    import pytest
+
+    with pytest.raises(TransientLLMError):
+        asyncio.run(
+            apply_targeted_fix(
+                scaffold_dir=scaffold, issues=issues, llm_client=ThrottledLLM()
+            )
+        )
+    # The existing file is preserved on disk (never overwritten with a stub).
+    assert target.read_text(encoding="utf-8").startswith("export default function App")
+
+
+def test_apply_targeted_fix_keeps_progress_on_partial_transient(tmp_path: Path):
+    """If at least one file was really fixed, a transient error on a DIFFERENT
+    file does NOT discard the round — it returns normally with the real fix."""
+    from skyn3t.adapters.llm_client import TransientLLMError
+
+    scaffold = tmp_path / "scaffold"
+    (scaffold / "src").mkdir(parents=True)
+    good = scaffold / "src" / "Good.jsx"
+    good.write_text("export default function Good() { return <div>old</div>; }\n")
+    bad = scaffold / "src" / "Bad.jsx"
+    bad.write_text("export default function Bad() { return <div>old</div>; }\n")
+
+    class MixedLLM:
+        async def complete(self, prompt, max_tokens, temperature):  # noqa: ARG002
+            if "Bad.jsx" in prompt:
+                raise TransientLLMError("openrouter 429 after 8 attempts")
+            return "export default function Good() { return <div>new</div>; }\n"
+
+    issues = [
+        FileIssue(
+            path="src/Good.jsx",
+            error_message="fix me",
+            suggested_action="regenerate",
+        ),
+        FileIssue(
+            path="src/Bad.jsx",
+            error_message="fix me too",
+            suggested_action="regenerate",
+        ),
+    ]
+
+    result = asyncio.run(
+        apply_targeted_fix(
+            scaffold_dir=scaffold, issues=issues, llm_client=MixedLLM()
+        )
+    )
+    # Real fix kept; the throttled file preserved; no exception raised.
+    assert "src/Good.jsx" in result.files_changed
+    assert "src/Bad.jsx" in result.files_preserved

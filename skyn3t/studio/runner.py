@@ -47,6 +47,51 @@ logger = logging.getLogger("skyn3t.studio")
 
 _BUILD_FIX_LLM_TIMEOUT_SECONDS = 120.0
 
+# PHASE 2: bounded wait-and-retry for the fix-callers when the LLM backend is
+# TRANSIENTLY throttled (429/5xx/timeout that exhausted the adapter's retries
+# and surfaced as TransientLLMError). A sustained throttle must NOT permanently
+# fail the build — we wait a short, growing backoff and try the whole fix again
+# a couple of times before giving up (after which the existing preserve / "no
+# fix this round" path runs as the honest final fallback). Tunable via env.
+_TRANSIENT_FIX_RETRIES = int(os.environ.get("SKYN3T_TRANSIENT_FIX_RETRIES", "2"))
+_TRANSIENT_FIX_SLEEP_SECONDS = float(
+    os.environ.get("SKYN3T_TRANSIENT_FIX_SLEEP_SECONDS", "5")
+)
+
+
+async def _with_transient_retry(coro_factory, *, what: str):
+    """Call ``coro_factory()`` (an async-returning callable) and, on a
+    :class:`TransientLLMError`, wait a short growing backoff and retry up to
+    ``_TRANSIENT_FIX_RETRIES`` more times. Re-raises the final TransientLLMError
+    when the budget is exhausted so the caller's existing except handler can
+    degrade to today's "no fix this round" behavior. Never swallows non-
+    transient errors — those propagate immediately.
+    """
+    from skyn3t.adapters import TransientLLMError
+
+    attempt = 0
+    while True:
+        try:
+            return await coro_factory()
+        except TransientLLMError:
+            if attempt >= _TRANSIENT_FIX_RETRIES:
+                logger.warning(
+                    "%s: gave up after %d transient-throttle retries",
+                    what,
+                    _TRANSIENT_FIX_RETRIES,
+                )
+                raise
+            delay = _TRANSIENT_FIX_SLEEP_SECONDS * (attempt + 1)
+            logger.warning(
+                "%s: transient throttle; waiting %.0fs then retrying (%d/%d)",
+                what,
+                delay,
+                attempt + 1,
+                _TRANSIENT_FIX_RETRIES,
+            )
+            await asyncio.sleep(delay)
+            attempt += 1
+
 
 class StackShapeMismatchError(RuntimeError):
     """Raised when post-code stack validation finds inconsistent files.
@@ -2392,11 +2437,16 @@ class StudioRunner:
                                         caller_name="consistency_fix",
                                         backend_is_policy=bool(backend),
                                     )
-                                    fix_result = await apply_targeted_fix(
-                                        scaffold_dir=scaffold_dir,
-                                        issues=issues,
-                                        llm_client=client,
-                                        brief=brief,
+                                    # PHASE 2: bounded wait-and-retry on a
+                                    # transient throttle.
+                                    fix_result = await _with_transient_retry(
+                                        lambda: apply_targeted_fix(
+                                            scaffold_dir=scaffold_dir,
+                                            issues=issues,
+                                            llm_client=client,
+                                            brief=brief,
+                                        ),
+                                        what="consistency reviewer fix",
                                     )
                                     if (
                                         consistency_signature
@@ -4180,13 +4230,18 @@ class StudioRunner:
                     )
             client = LLMClient(event_bus=self.event_bus, caller_name="build_fix")
             try:
-                result = await apply_targeted_fix(
-                    scaffold_dir=scaffold_dir,
-                    issues=issues,
-                    llm_client=client,
-                    brief=brief,
-                    stack=stack,
-                    fix_hints=fix_hints,
+                # PHASE 2: bounded wait-and-retry — a transient throttle waits
+                # the provider out rather than permanently failing this round.
+                result = await _with_transient_retry(
+                    lambda: apply_targeted_fix(
+                        scaffold_dir=scaffold_dir,
+                        issues=issues,
+                        llm_client=client,
+                        brief=brief,
+                        stack=stack,
+                        fix_hints=fix_hints,
+                    ),
+                    what=f"build fix round {attempt}",
                 )
             except Exception:
                 logger.exception("targeted fix engine failed on round %d", attempt)
@@ -4267,13 +4322,18 @@ class StudioRunner:
         )
 
         try:
-            out = await client.complete(
-                prompt,
-                system=system,
-                max_tokens=8000,
-                temperature=0.2,
-                timeout=_BUILD_FIX_LLM_TIMEOUT_SECONDS,
-                _allow_backend_failover=False,
+            # PHASE 2: bounded wait-and-retry on a transient throttle so the
+            # legacy whole-scaffold fallback isn't permanently lost to a 429.
+            out = await _with_transient_retry(
+                lambda: client.complete(
+                    prompt,
+                    system=system,
+                    max_tokens=8000,
+                    temperature=0.2,
+                    timeout=_BUILD_FIX_LLM_TIMEOUT_SECONDS,
+                    _allow_backend_failover=False,
+                ),
+                what=f"whole-scaffold fix round {attempt}",
             )
         except Exception:
             logger.exception("LLM call during fix round %d failed", attempt)
@@ -6537,12 +6597,34 @@ class StudioRunner:
                 )
             if consistency_issues:
                 client = LLMClient(event_bus=self.event_bus, caller_name="consistency_fix")
-                fix_result = await apply_targeted_fix(
-                    scaffold_dir=scaffold_dir,
-                    issues=consistency_issues,
-                    llm_client=client,
-                    brief=brief,
-                )
+                from skyn3t.adapters import TransientLLMError
+                from skyn3t.agents.targeted_fix import FixResult
+                try:
+                    # PHASE 2: bounded wait-and-retry on a transient throttle.
+                    fix_result = await _with_transient_retry(
+                        lambda: apply_targeted_fix(
+                            scaffold_dir=scaffold_dir,
+                            issues=consistency_issues,
+                            llm_client=client,
+                            brief=brief,
+                        ),
+                        what="post-code consistency fix",
+                    )
+                except TransientLLMError:
+                    # Throttle survived the bounded retry — degrade to today's
+                    # behavior (no fix this round, continue the build) rather
+                    # than crashing. Existing files are preserved on disk.
+                    logger.warning(
+                        "post-code consistency fix skipped: backend "
+                        "transiently unavailable after bounded retry"
+                    )
+                    fix_result = FixResult(
+                        ok=False,
+                        files_changed=[],
+                        files_created=[],
+                        errors=["llm backend transiently unavailable"],
+                        fix_label="noop",
+                    )
                 manifest["consistency_fix"] = {
                     "changed": fix_result.files_changed,
                     "created": fix_result.files_created,

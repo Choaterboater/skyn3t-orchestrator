@@ -8,9 +8,11 @@ import pytest
 import skyn3t.adapters.llm_client as llm_client_module
 from skyn3t.adapters.llm_client import (
     LLMClient,
+    TransientLLMError,
     _append_sandbox_artifacts,
     _collect_sandbox_artifacts,
     _drop_cross_provider_model_name,
+    _is_transient_error,
 )
 from skyn3t.core.events import EventBus, EventType
 
@@ -378,3 +380,117 @@ def test_collect_sandbox_artifacts_harvests_new_files(tmp_path: Path):
 def test_append_sandbox_artifacts_prefers_single_file_when_stdout_empty():
     out = _append_sandbox_artifacts("", [("server/index.js", "console.log('ok');\n")])
     assert out == "console.log('ok');"
+
+
+# ── PHASE 2: transient vs permanent failure contract ─────────────────────────
+
+
+def test_is_transient_error_classifies_types():
+    import httpx
+
+    assert _is_transient_error(TransientLLMError("x")) is True
+    assert _is_transient_error(asyncio.TimeoutError()) is True
+    assert _is_transient_error(httpx.ReadTimeout("slow")) is True
+
+    request = httpx.Request("POST", "https://example/api")
+    resp_429 = httpx.Response(429, request=request)
+    err_429 = httpx.HTTPStatusError("rate", request=request, response=resp_429)
+    assert _is_transient_error(err_429) is True
+
+    resp_503 = httpx.Response(503, request=request)
+    err_503 = httpx.HTTPStatusError("overload", request=request, response=resp_503)
+    assert _is_transient_error(err_503) is True
+
+    resp_403 = httpx.Response(403, request=request)
+    err_403 = httpx.HTTPStatusError("no key", request=request, response=resp_403)
+    assert _is_transient_error(err_403) is False
+
+    assert _is_transient_error(RuntimeError("generic")) is False
+
+
+@pytest.mark.asyncio
+async def test_complete_reraises_transient_no_failover(monkeypatch):
+    """A transient backend error with no usable failover must RAISE
+    TransientLLMError, never return the deterministic-stub sentinel."""
+
+    class ThrottledBackend:
+        async def complete(self, req):  # noqa: ARG002
+            raise TransientLLMError("openrouter 429 after 8 attempts")
+
+    async def fake_get_impl(self):
+        # Simulate: only one backend, every failover also resolves to the
+        # same throttled backend.
+        self._backend_name = "openrouter"
+        return ThrottledBackend()
+
+    monkeypatch.setattr(LLMClient, "_get_impl", fake_get_impl)
+
+    client = LLMClient(backend="openrouter", caller_name="build_fix")
+    with pytest.raises(TransientLLMError):
+        await client.complete("hello")
+
+
+@pytest.mark.asyncio
+async def test_complete_reraises_transient_no_failover_path(monkeypatch):
+    """With failover disabled, a transient error propagates directly."""
+
+    class ThrottledBackend:
+        async def complete(self, req):  # noqa: ARG002
+            raise TransientLLMError("openrouter 503 after 8 attempts")
+
+    async def fake_get_impl(self):
+        self._backend_name = "openrouter"
+        return ThrottledBackend()
+
+    monkeypatch.setattr(LLMClient, "_get_impl", fake_get_impl)
+
+    client = LLMClient(backend="openrouter", caller_name="build_fix")
+    with pytest.raises(TransientLLMError):
+        await client.complete("hello", _allow_backend_failover=False)
+
+
+@pytest.mark.asyncio
+async def test_complete_transient_then_failover_success_returns(monkeypatch):
+    """A transient primary backend but a healthy failover returns the answer
+    (does NOT raise) — the build keeps going."""
+
+    class ThrottledBackend:
+        async def complete(self, req):  # noqa: ARG002
+            raise TransientLLMError("openrouter 429 after 8 attempts")
+
+    class HealthyBackend:
+        async def complete(self, req):  # noqa: ARG002
+            return "failover answer"
+
+    async def fake_get_impl(self):
+        if self._skip_backends:
+            self._backend_name = "copilot_cli"
+            return HealthyBackend()
+        self._backend_name = "openrouter"
+        return ThrottledBackend()
+
+    monkeypatch.setattr(LLMClient, "_get_impl", fake_get_impl)
+
+    client = LLMClient(backend="openrouter", caller_name="build_fix")
+    out = await client.complete("hello")
+    assert out == "failover answer"
+
+
+@pytest.mark.asyncio
+async def test_complete_permanent_error_still_returns_sentinel(monkeypatch):
+    """A PERMANENT failure (generic RuntimeError, no backend) keeps returning
+    the deterministic-stub sentinel — unchanged behavior."""
+
+    class DeadBackend:
+        async def complete(self, req):  # noqa: ARG002
+            raise RuntimeError("OPENROUTER_API_KEY not set")
+
+    async def fake_get_impl(self):
+        self._backend_name = "openrouter"
+        return DeadBackend()
+
+    monkeypatch.setattr(LLMClient, "_get_impl", fake_get_impl)
+
+    client = LLMClient(backend="openrouter", caller_name="build_fix")
+    out = await client.complete("hello")
+    assert out.startswith("[deterministic-stub]")
