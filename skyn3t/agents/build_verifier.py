@@ -724,6 +724,13 @@ class BuildVerifierAgent(BaseAgent):
         combined = ((proc.get("stdout") or "") + "\n" + (proc.get("stderr") or "")).strip()
         tail = "\n".join(combined.splitlines()[-30:])
         passed = proc["returncode"] == 0
+        # Exit 127 = the test runner binary was not found (e.g. a `test` script
+        # referencing vitest/jest that was never declared/installed). The test
+        # infra could not even start — a setup gap, NOT a test failure — so it
+        # must degrade to 'skipped' rather than fold an otherwise-building app to
+        # 'no'. (This was folding ~1/3 of real autonomous builds to failed.)
+        if not passed and proc["returncode"] == 127:
+            return _skipped("test runner not found (exit 127); test gate skipped")
         return {
             "ran": True,
             "passed": passed,
@@ -1380,6 +1387,26 @@ class BuildVerifierAgent(BaseAgent):
 
         proc = await self._run(compose_cmd, scaffold_dir)
         if proc["returncode"] != 0:
+            # A down/unreachable Docker daemon (Docker Desktop not running, no
+            # socket, perms) is an ENVIRONMENT problem, not a defect in the
+            # generated compose file. The which("docker") check above only
+            # proves the BINARY exists, not that the daemon is up — so catch the
+            # daemon-down case here and degrade to 'skipped' rather than fold an
+            # otherwise-building app to 'no'. Only a genuine config/parse error
+            # (daemon reachable) stays a hard 'no'.
+            err = ((proc.get("stderr") or "") + (proc.get("stdout") or "")).lower()
+            daemon_down = any(
+                m in err for m in (
+                    "cannot connect to the docker daemon",
+                    "is the docker daemon running",
+                    "docker desktop",
+                    "econnrefused",
+                    "dial unix",
+                    "permission denied while trying to connect",
+                )
+            )
+            if daemon_down:
+                return _skipped("docker daemon unavailable; compose gate skipped")
             return {
                 "ran": True,
                 "verdict": "no",

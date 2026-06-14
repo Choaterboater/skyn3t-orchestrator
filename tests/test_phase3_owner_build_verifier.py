@@ -190,6 +190,69 @@ async def test_test_gate_failure_folds_verdict_to_no(tmp_path, monkeypatch):
     assert "test gate" in (out["stderr"] or "")
 
 
+@pytest.mark.asyncio
+async def test_test_gate_runner_not_found_skips_not_fails(tmp_path, monkeypatch):
+    """exit 127 = the test runner binary was not found (undeclared vitest). That
+    is a setup gap, not a test failure, so the gate must DEGRADE to 'skipped'
+    and leave a passing build at 'yes' — not fold it to 'no'."""
+    monkeypatch.setenv("SKYN3T_VERIFY_NPM_INSTALL", "1")
+    monkeypatch.setenv("SKYN3T_VERIFY_TESTS", "1")
+    monkeypatch.setenv("SKYN3T_VERIFY_VISUAL", "0")
+    scaffold = tmp_path / "scaffold"
+    scaffold.mkdir()
+    (scaffold / "node_modules").mkdir()  # so the gate skips the install step
+    (scaffold / "package.json").write_text(
+        json.dumps({"name": "demo", "version": "0.0.0",
+                    "scripts": {"test": "vitest run"}})
+    )
+
+    async def _fake_verify(scaffold_dir, probe, *, execution_profile="balanced"):
+        return "yes", "npm run build", "ok", ""
+
+    async def _fake_run(cmd, cwd, *_a, **_kw):
+        return {"returncode": 127, "stdout": "", "stderr": "sh: vitest: command not found"}
+
+    agent = BuildVerifierAgent()
+    await agent.initialize()
+    monkeypatch.setattr(agent, "_run_verify", _fake_verify)
+    monkeypatch.setattr(agent, "_run", _fake_run)
+    res = await agent.execute(TaskRequest(input_data={"scaffold_dir": str(scaffold)}))
+    out = res.output
+    assert out["verdict"] == "yes"                       # NOT folded to no
+    assert out["test_run"]["verdict"] == "skipped"
+    assert "127" in out["test_run"]["summary"]
+
+
+@pytest.mark.asyncio
+async def test_compose_gate_daemon_down_skips_not_fails(tmp_path, monkeypatch):
+    """A down Docker daemon is an environment problem, not a defect in the
+    generated compose file — the gate must DEGRADE to 'skipped', not 'no'."""
+    scaffold = tmp_path / "scaffold"
+    scaffold.mkdir()
+    (scaffold / "docker-compose.yml").write_text(
+        "services:\n  web:\n    image: nginx\n"
+    )
+    monkeypatch.setattr(
+        "skyn3t.agents.build_verifier.shutil.which",
+        lambda name, *_a, **_kw: "/usr/bin/docker" if name == "docker" else None,
+    )
+
+    async def _fake_run(cmd, cwd, *_a, **_kw):
+        return {
+            "returncode": 1, "stdout": "",
+            "stderr": "Cannot connect to the Docker daemon at "
+                      "unix:///var/run/docker.sock. Is the docker daemon running?",
+        }
+
+    agent = BuildVerifierAgent()
+    await agent.initialize()
+    monkeypatch.setattr(agent, "_run", _fake_run)
+    res = await agent._run_compose_gate(scaffold)
+    assert res is not None
+    assert res["verdict"] == "skipped"
+    assert "daemon" in res["summary"].lower()
+
+
 # ----------------------------------------------------------------------
 # Visual gate
 # ----------------------------------------------------------------------
