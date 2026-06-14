@@ -151,7 +151,11 @@ def test_gateway_deliver_validates_required_fields(client):
 
 
 # ── /api/browser/status ───────────────────────────────────────────────────
-def test_browser_status_reports_readiness_without_launching(client):
+def test_browser_status_reports_readiness_without_launching(client, monkeypatch):
+    monkeypatch.setattr("skyn3t.agents.browser_agent._playwright_importable", lambda: False)
+    monkeypatch.delenv("BROWSERBASE_API_KEY", raising=False)
+    monkeypatch.delenv("BROWSER_USE_API_KEY", raising=False)
+    
     resp = client.get("/api/browser/status")
     assert resp.status_code == 200
     body = resp.json()
