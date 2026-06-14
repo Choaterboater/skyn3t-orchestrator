@@ -29,10 +29,14 @@ class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     model_config = SettingsConfigDict(
-        # Absolute env_file so .env loads no matter the CWD (a bare ".env" is
-        # resolved against os.getcwd() by pydantic-settings and silently skipped
-        # off-repo).
-        env_file=str(_REPO_ROOT / ".env"),
+        # Relative env_file (resolved against CWD). The server runs at cwd=repo so
+        # .env loads normally, and tests rely on this being relative to isolate
+        # from the real .env via chdir. What actually makes path resolution
+        # cwd-INDEPENDENT (the skills-dir collapse fix) is parse_paths anchoring
+        # relative path *defaults* to _REPO_ROOT below — the env_file does not
+        # need to be absolute for that, and making it absolute leaked the real
+        # .env into tests (e.g. overrode the budget field default).
+        env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
