@@ -1407,6 +1407,65 @@ def test_no_server_directory_skips_check(tmp_path: Path) -> None:
     assert not drift_issues
 
 
+def test_consistency_ignores_vendored_todo_but_catches_real_source(
+    tmp_path: Path,
+) -> None:
+    """Vendored third-party content (node_modules, dist, .min.js, .map) must
+    not produce any issues, while a real authored source stub is still caught.
+
+    Regression: the engine used to rglob node_modules/dist and escalate
+    vendored TODO/FIXME content into todo_stub errors (280 on one scaffold),
+    hard-failing real builds.
+    """
+    scaffold = tmp_path / "scaffold"
+
+    # Vendored content that MUST be ignored entirely.
+    _write(
+        scaffold / "node_modules" / "left-pad" / "index.js",
+        "// TODO: this third-party package has its own TODOs\n"
+        "module.exports = function () { /* FIXME upstream */ };\n",
+    )
+    _write(
+        scaffold / "node_modules" / "left-pad" / "package.json",
+        json.dumps({"name": "left-pad", "dependencies": {"some-vendor-dep": "1.0.0"}}),
+    )
+    _write(
+        scaffold / "dist" / "bundle.min.js",
+        "// TODO[skyn3t]: code generation failed\n"
+        "export default function App(){return null}\n",
+    )
+    _write(
+        scaffold / "src" / "foo.js.map",
+        '{"version":3,"sources":["foo.js"],"mappings":"// TODO not real"}\n',
+    )
+
+    # Real authored source that MUST still be flagged as a stub.
+    _write(
+        scaffold / "src" / "App.jsx",
+        "// TODO[skyn3t]: code generation failed\n"
+        "export default function App() { return null; }\n",
+    )
+
+    report = check_consistency(scaffold, brief="")
+
+    # Zero issues may reference any vendored path.
+    vendored_markers = ("node_modules", "dist/", "bundle.min.js", ".js.map")
+    vendored_issues = [
+        i for i in report.issues
+        if any(marker in i.file for marker in vendored_markers)
+    ]
+    assert vendored_issues == [], (
+        f"vendored paths leaked into issues: {[i.file for i in vendored_issues]}"
+    )
+
+    # The real source stub is still caught — exactly one todo_stub at src/App.jsx.
+    todo_stubs = [i for i in report.issues if i.category == "todo_stub"]
+    assert len(todo_stubs) == 1, [
+        (i.file, i.message) for i in todo_stubs
+    ]
+    assert todo_stubs[0].file == "src/App.jsx"
+
+
 def test_no_tech_stack_json_skips_check(tmp_path: Path) -> None:
     scaffold = tmp_path / "scaffold"
     _write(scaffold / "src" / "App.jsx", "export default function App() {}")

@@ -117,6 +117,48 @@ _ORGANIC_STUB_PATTERNS = (
     re.compile(r"(?im)^\s*(//|#).*?\bauto-?generated\s+placeholder\b"),
 )
 
+# Directories that hold third-party / build-output content. Anything under
+# one of these is NOT scaffold source we authored, so the consistency engine
+# must never read, flag, or union deps from it. Scanning node_modules used to
+# escalate 280 vendored TODO/FIXME errors into UnresolvedScaffoldStubError and
+# hard-fail real builds.
+_VENDOR_DIR_NAMES = {
+    "node_modules", "dist", "build", "out", "vendor", "coverage",
+    ".git", ".next", ".nuxt", ".svelte-kit", ".vite", ".cache",
+    "__pycache__", ".venv", "venv",
+}
+# Build-output / minified / sourcemap file shapes — third-party even when
+# they sit outside a vendor directory.
+_VENDOR_FILE_SUFFIXES = (".min.js", ".min.css", ".map")
+
+
+def _is_vendored(path: Path, scaffold_dir: Path) -> bool:
+    """True when `path` is third-party / build output, not authored source.
+
+    Vendored when any relative path part is a known vendor directory, the
+    file name ends with a vendor suffix, or the path lies outside
+    scaffold_dir entirely.
+    """
+    try:
+        rel = path.relative_to(scaffold_dir)
+    except ValueError:
+        # Outside the scaffold (e.g. a resolved symlink target) — vendored.
+        return True
+    if any(part in _VENDOR_DIR_NAMES for part in rel.parts):
+        return True
+    name = path.name
+    return name.endswith(_VENDOR_FILE_SUFFIXES)
+
+
+def _iter_source_files(scaffold_dir: Path):
+    """Yield authored source files under scaffold_dir, skipping vendored ones."""
+    for path in scaffold_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        if _is_vendored(path, scaffold_dir):
+            continue
+        yield path
+
 
 def _router_var_name(route_file: Path) -> str:
     stem = route_file.stem
@@ -140,6 +182,8 @@ def _find_missing_router_mounts(scaffold_dir: Path) -> List[ConsistencyIssue]:
     for path in routes_dir.rglob("*"):
         if path.suffix not in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs") or not path.is_file():
             continue
+        if _is_vendored(path, scaffold_dir):
+            continue
         try:
             source = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
@@ -154,6 +198,8 @@ def _find_missing_router_mounts(scaffold_dir: Path) -> List[ConsistencyIssue]:
     mounted_routes: Set[str] = set()
     for path in server_dir.rglob("*"):
         if path.suffix not in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs") or not path.is_file():
+            continue
+        if _is_vendored(path, scaffold_dir):
             continue
         if path.is_relative_to(routes_dir):
             continue
@@ -397,6 +443,8 @@ def _read_package_json_deps(scaffold_dir: Path) -> Set[str]:
     """Read dependency names from package.json files in the scaffold."""
     deps: Set[str] = set()
     for pkg_path in scaffold_dir.rglob("package.json"):
+        if _is_vendored(pkg_path, scaffold_dir):
+            continue
         try:
             with open(pkg_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -589,6 +637,8 @@ def _scan_tech_stack_claim_drift(scaffold_dir: Path) -> List[ConsistencyIssue]:
         sqlite_referenced = False
         # Check package.json deps (server side: import 'better-sqlite3').
         for pkg in scaffold_dir.rglob("package.json"):
+            if _is_vendored(pkg, scaffold_dir):
+                continue
             try:
                 pkg_data = json.loads(pkg.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
@@ -604,6 +654,8 @@ def _scan_tech_stack_claim_drift(scaffold_dir: Path) -> List[ConsistencyIssue]:
         if not sqlite_referenced:
             for path in scaffold_dir.rglob("*"):
                 if path.suffix not in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"):
+                    continue
+                if _is_vendored(path, scaffold_dir):
                     continue
                 try:
                     source = path.read_text(encoding="utf-8")
@@ -719,6 +771,8 @@ def _scan_for_tailwind_without_config(scaffold_dir: Path) -> List[ConsistencyIss
     # Collect package.json dependency unions across the scaffold.
     deps: Set[str] = set()
     for pkg_path in scaffold_dir.rglob("package.json"):
+        if _is_vendored(pkg_path, scaffold_dir):
+            continue
         try:
             data = json.loads(pkg_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -736,13 +790,18 @@ def _scan_for_tailwind_without_config(scaffold_dir: Path) -> List[ConsistencyIss
     has_tailwind_config = any(
         (scaffold_dir / f"tailwind.config{ext}").is_file()
         for ext in (".js", ".cjs", ".mjs", ".ts")
-    ) or any(scaffold_dir.rglob("tailwind.config.*"))
+    ) or any(
+        not _is_vendored(p, scaffold_dir)
+        for p in scaffold_dir.rglob("tailwind.config.*")
+    )
 
     # Check for @tailwind directives in CSS files (alternative way to
     # know Tailwind is in use, e.g. via PostCSS without an explicit
     # dependency in this package.json).
     has_tailwind_directive = False
     for css in scaffold_dir.rglob("*.css"):
+        if _is_vendored(css, scaffold_dir):
+            continue
         try:
             text = css.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
@@ -758,6 +817,8 @@ def _scan_for_tailwind_without_config(scaffold_dir: Path) -> List[ConsistencyIss
     tailwind_users: List[str] = []
     for path in scaffold_dir.rglob("*"):
         if path.suffix not in (".jsx", ".tsx", ".html"):
+            continue
+        if _is_vendored(path, scaffold_dir):
             continue
         try:
             source = path.read_text(encoding="utf-8")
@@ -955,6 +1016,8 @@ def _scan_for_hallucinations(scaffold_dir: Path, allowed_services: Set[str]) -> 
             continue
         if path.suffix not in (".js", ".jsx", ".ts", ".tsx", ".md", ".txt"):
             continue
+        if _is_vendored(path, scaffold_dir):
+            continue
         try:
             text = path.read_text(encoding="utf-8").lower()
         except (OSError, UnicodeDecodeError):
@@ -1005,10 +1068,12 @@ def _scan_for_design_quality(scaffold_dir: Path) -> List[ConsistencyIssue]:
     css_files = [
         p for p in scaffold_dir.rglob("*")
         if p.is_file() and p.suffix in (".css", ".scss")
+        and not _is_vendored(p, scaffold_dir)
     ]
     ui_files = [
         p for p in scaffold_dir.rglob("*")
         if p.is_file() and p.suffix in (".js", ".jsx", ".ts", ".tsx", ".html")
+        and not _is_vendored(p, scaffold_dir)
     ]
     if not css_files and not ui_files:
         return issues
@@ -1263,6 +1328,8 @@ def _scan_cross_artifact_drift(
             if not path.is_file():
                 continue
             if path.suffix not in (".css", ".scss", ".jsx", ".tsx", ".js", ".ts", ".html"):
+                continue
+            if _is_vendored(path, scaffold_dir):
                 continue
             try:
                 scaffold_used.update(_extract_hexes(path.read_text(encoding="utf-8")))
@@ -2160,12 +2227,11 @@ def check_consistency(scaffold_dir: Path, brief: str = "") -> ConsistencyReport:
 
     # ── 1. Build file index ──────────────────────────────────────────────
     file_index: Dict[str, Path] = {}
-    for path in scaffold_dir.rglob("*"):
-        if path.is_file():
-            rel = path.relative_to(scaffold_dir).as_posix()
-            file_index[rel] = path
-            # Also index without extension for extensionless imports
-            file_index[rel.rsplit(".", 1)[0]] = path
+    for path in _iter_source_files(scaffold_dir):
+        rel = path.relative_to(scaffold_dir).as_posix()
+        file_index[rel] = path
+        # Also index without extension for extensionless imports
+        file_index[rel.rsplit(".", 1)[0]] = path
 
     # ── 2. Read package.json deps ────────────────────────────────────────
     npm_deps = _read_package_json_deps(scaffold_dir)
