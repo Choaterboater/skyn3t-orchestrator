@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
+import mimetypes
 import os
 import random
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from skyn3t.adapters.llm_client import LLMRequest, TransientLLMError
 
@@ -154,6 +156,45 @@ def _get_request_semaphore() -> "asyncio.Semaphore":
     return _request_semaphore
 
 
+def _image_to_data_url(path: str) -> str:
+    """Read a local image file and return an OpenAI-style data URL.
+
+    ``data:<mime>;base64,<b64>``. MIME is guessed from the suffix and falls
+    back to ``image/png`` (the format the visual gate captures). Raised
+    errors propagate to the caller so a missing/unreadable image surfaces as
+    a normal exception rather than silently sending a broken part.
+    """
+    mime, _ = mimetypes.guess_type(path)
+    if not mime or not mime.startswith("image/"):
+        mime = "image/png"
+    with open(path, "rb") as fh:
+        b64 = base64.b64encode(fh.read()).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+def _build_user_content(req: LLMRequest) -> Any:
+    """Build the OpenRouter ``user`` message content.
+
+    Text-only (the overwhelming common case): return the bare ``req.prompt``
+    string — byte-identical to the prior behavior so no existing codegen /
+    fix-loop call regresses. When ``req.images`` is non-empty: return the
+    OpenAI/OpenRouter multimodal parts list with the prompt as a ``text``
+    part followed by one ``image_url`` part per local image path.
+    """
+    images: List[str] = list(getattr(req, "images", None) or [])
+    if not images:
+        return req.prompt
+    parts: List[Dict[str, Any]] = [{"type": "text", "text": req.prompt}]
+    for img in images:
+        parts.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": _image_to_data_url(img)},
+            }
+        )
+    return parts
+
+
 class OpenRouterBackend:
     def __init__(self, api_key: Optional[str] = None, *, base_url: str = BASE_URL):
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
@@ -190,7 +231,9 @@ class OpenRouterBackend:
         messages = []
         if req.system:
             messages.append({"role": "system", "content": req.system})
-        messages.append({"role": "user", "content": req.prompt})
+        # Text-only stays a bare string (unchanged); when req.images is set
+        # this becomes a multimodal parts list with inline base64 image_url(s).
+        messages.append({"role": "user", "content": _build_user_content(req)})
         payload = {
             "model": model,
             "messages": messages,

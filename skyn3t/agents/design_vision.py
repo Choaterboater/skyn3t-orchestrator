@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import shutil
 import time
 from dataclasses import asdict, dataclass, field
@@ -25,6 +26,17 @@ from pathlib import Path
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
+
+# Fast, reliable, multimodal default. Measured ~2.5s/call against the live
+# OpenRouter key (see the honest note returned to the orchestrator). Do NOT
+# default to google/gemini-2.5-flash — it was measured at 229s (catastrophic
+# for the visual gate, which would time out). Override per-deployment with
+# SKYN3T_VISION_MODEL (e.g. openai/gpt-4.1-mini, google/gemma-3-27b-it).
+DEFAULT_VISION_MODEL = "openai/gpt-4o-mini"
+
+
+def _vision_model() -> str:
+    return os.environ.get("SKYN3T_VISION_MODEL") or DEFAULT_VISION_MODEL
 
 
 _CLI_TIMEOUT_SECONDS = 90.0  # vision is slower than text — give it room
@@ -525,6 +537,165 @@ def _build_score_prompt(image_path: Path, brief: str, mood: str) -> str:
     )
 
 
+# API variant of the score prompt. The CLI template embeds an absolute IMAGE
+# PATH because the CLIs read the file from disk; for the OpenRouter API path
+# the screenshot is sent inline as an image_url part, so we reference "the
+# attached screenshot" instead of a path the model can't open. Same rubric.
+_SCORE_USER_PROMPT_TEMPLATE_API = """Score the ATTACHED screenshot as a finished software UI.
+{context_block}
+Return STRICT JSON matching this shape (no prose, no markdown fences):
+
+{{
+  "score": 0-100,
+  "verdict": "pass" | "fail",
+  "reasons": ["short concrete observations driving the score"],
+  "generic_ai_tells": ["any generic-AI tells you can see — empty list if none"]
+}}
+
+Scoring rubric (be strict):
+- 80-100: distinctive, intentional, production-grade. Considered type scale, deliberate color use, real layout rhythm, a signature detail.
+- 50-79: competent but safe. Works, nothing memorable.
+- 0-49: generic-AI output, broken layout, unstyled, or default-template look.
+
+Mark these GENERIC-AI TELLS when present (each one drags the score down):
+- Centered single column floating on a flat purple/indigo gradient.
+- Three evenly-spaced rounded cards with a tiny icon + filler heading.
+- Default system font paired with a violet/indigo accent and nothing else.
+- Emoji used as primary iconography.
+- Unmotivated drop shadows / uniform border-radius with no hierarchy.
+- Visibly unstyled (browser-default) or horizontally-overflowing content.
+
+verdict is "fail" when score < 60 OR any layout-breaking tell is present.
+Output ONLY the JSON object. No preamble. No conclusion."""
+
+
+def _build_score_prompt_api(brief: str, mood: str) -> str:
+    ctx: List[str] = []
+    if brief:
+        ctx.append(f"PRODUCT BRIEF (what this app is meant to be): {brief.strip()[:600]}")
+    if mood:
+        ctx.append(f"INTENDED AESTHETIC / MOOD: {mood.strip()[:200]}")
+    context_block = ("\n" + "\n".join(ctx) + "\n") if ctx else ""
+    return _SCORE_USER_PROMPT_TEMPLATE_API.format(context_block=context_block)
+
+
+# ── Per-image score cache ────────────────────────────────────────────────
+# Mirrors the extract() cache pattern (_extractions_dir / _sha_of_file) but
+# keyed for the SCORE payload, so re-grading an identical screenshot is free.
+# Key = image SHA + the model id (a model change must invalidate, since a
+# different critic gives a different score) + brief/mood (context shifts the
+# rubric). Stored as JSON under data/design_references/score_cache/<key>.json.
+
+
+def _score_cache_dir() -> Path:
+    try:
+        from skyn3t.config.settings import get_settings
+        return Path(get_settings().data_dir) / "design_references" / "score_cache"
+    except Exception:  # noqa: BLE001
+        return Path("data/design_references/score_cache")
+
+
+def _score_cache_key(sha: str, *, model: str, brief: str, mood: str) -> str:
+    h = hashlib.sha256()
+    h.update(sha.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(model.encode("utf-8"))
+    h.update(b"\x00")
+    h.update((brief or "").encode("utf-8"))
+    h.update(b"\x00")
+    h.update((mood or "").encode("utf-8"))
+    return h.hexdigest()
+
+
+def _cached_score(key: str) -> Optional[dict]:
+    p = _score_cache_dir() / f"{key}.json"
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        logger.warning("design-vision score cache read failed for %s", key, exc_info=True)
+        return None
+    return _coerce_score_payload(data) if isinstance(data, dict) else None
+
+
+def _save_score(key: str, payload: dict) -> None:
+    out = _score_cache_dir()
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        path = out / f"{key}.json"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001
+        # Cache write is best-effort; never let it break the gate.
+        logger.debug("design-vision score cache write failed for %s", key, exc_info=True)
+
+
+async def _try_openrouter_score(
+    image_path: Path, *, brief: str, mood: str
+) -> Optional[dict]:
+    """Score the screenshot via an OpenRouter multimodal model.
+
+    This is the LIVE path on this deployment (SKYN3T_NO_CLAUDE=1, no vision
+    CLI logged in). The screenshot is sent inline as a base64 image_url part.
+    Returns the coerced score dict, or ``None`` on ANY failure (missing key,
+    403 key-exhausted, transient 429/timeout, non-JSON response) so the
+    graceful-None contract holds and the build gate is never broken.
+    """
+    try:
+        from skyn3t.adapters.openrouter import OpenRouterBackend
+    except Exception:  # noqa: BLE001 — httpx/adapter unavailable
+        return None
+
+    api_key: Optional[str] = None
+    try:
+        from skyn3t.config.settings import get_settings
+        api_key = getattr(get_settings(), "openrouter_api_key", None)
+    except Exception:  # noqa: BLE001
+        api_key = None
+    api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        return None
+
+    from skyn3t.adapters.llm_client import LLMRequest
+
+    model = _vision_model()
+    prompt = _build_score_prompt_api(brief, mood)
+    backend = None
+    try:
+        backend = OpenRouterBackend(api_key=api_key)
+        req = LLMRequest(
+            prompt=prompt,
+            system=_SCORE_SYSTEM_PROMPT,
+            model=model,
+            images=[str(image_path)],
+            # Temperature 0 → deterministic, so the per-image score cache is
+            # stable across re-runs. Small token cap: the JSON is tiny.
+            temperature=0.0,
+            max_tokens=500,
+        )
+        out = await backend.complete(req)
+    except Exception as e:  # noqa: BLE001 — key-exhausted / 429 / timeout / parse
+        logger.warning("openrouter vision score failed (%s): %s", model, e)
+        return None
+    finally:
+        if backend is not None:
+            try:
+                await backend.aclose()
+            except Exception:  # noqa: BLE001
+                logger.debug("openrouter aclose failed", exc_info=True)
+
+    try:
+        parsed = json.loads(_strip_json_fences(out))
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "openrouter vision returned non-JSON score (%s): %s", model, (out or "")[:200]
+        )
+        return None
+    return _coerce_score_payload(parsed) if isinstance(parsed, dict) else None
+
+
 def _coerce_score_payload(data: dict) -> Optional[dict]:
     """Normalize a parsed CLI response into the score_screenshot shape.
 
@@ -623,21 +794,48 @@ async def score_screenshot(
     brief: str = "",
     mood: str = "",
 ) -> Optional[dict]:
-    """Score a rendered screenshot 0-100 via the vision CLI ladder.
+    """Score a rendered screenshot 0-100 via a vision model.
 
     Returns ``{'score': int 0-100, 'verdict': 'pass'|'fail',
     'reasons': List[str], 'generic_ai_tells': List[str]}`` or ``None``.
 
+    Order: try the OpenRouter multimodal path FIRST (the live deployment runs
+    SKYN3T_NO_CLAUDE=1 with no vision CLI logged in, so the CLI ladder is dead
+    here), then fall back to the Claude/Copilot/Kimi CLIs. A successful score
+    is cached by image SHA + model + brief/mood so re-grading an identical
+    screenshot is free.
+
     Mirrors extract()'s graceful-None contract: returns ``None`` when the
-    image is missing or NO vision-capable CLI produces a usable score, so
-    build_verifier treats None as 'rubric unavailable' and gates on cheap
-    heuristics only — never blocking.
+    image is missing or NO scorer produces a usable score, so build_verifier
+    treats None as 'rubric unavailable' and gates on cheap heuristics only —
+    never blocking the build.
     """
     image_path = Path(image_path)
     if not image_path.exists():
         logger.warning("design-vision score: image missing: %s", image_path)
         return None
 
+    # Cache lookup (best-effort; failures degrade to a live call).
+    cache_key: Optional[str] = None
+    try:
+        sha = _sha_of_file(image_path)
+        cache_key = _score_cache_key(
+            sha, model=_vision_model(), brief=brief, mood=mood
+        )
+        hit = _cached_score(cache_key)
+        if hit is not None:
+            return hit
+    except Exception:  # noqa: BLE001
+        cache_key = None
+
+    # 1) OpenRouter multimodal path (primary on this deployment).
+    coerced = await _try_openrouter_score(image_path, brief=brief, mood=mood)
+    if coerced is not None:
+        if cache_key is not None:
+            _save_score(cache_key, coerced)
+        return coerced
+
+    # 2) CLI ladder fallback (Claude / Copilot / Kimi, if any is installed).
     prompt = _build_score_prompt(image_path, brief, mood)
     for try_fn in (_try_claude_cli_score, _try_copilot_cli_score, _try_kimi_cli_score):
         try:
@@ -649,7 +847,12 @@ async def score_screenshot(
             continue
         coerced = _coerce_score_payload(data)
         if coerced is not None:
+            if cache_key is not None:
+                _save_score(cache_key, coerced)
             return coerced
 
-    logger.info("design-vision score: no vision CLI produced a score for %s", image_path.name)
+    logger.info(
+        "design-vision score: no vision backend produced a score for %s",
+        image_path.name,
+    )
     return None

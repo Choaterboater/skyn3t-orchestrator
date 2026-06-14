@@ -173,6 +173,14 @@ class LLMRequest:
     # for ensuring the path exists. CLI artifact harvesting is skipped
     # when this is set so we never pollute the caller's directory.
     cwd: Optional[str] = None
+    # Optional local image paths (PNG/JPEG/...) to attach to the request as
+    # vision input. ONLY the metered multimodal API backends (currently the
+    # OpenRouter adapter) act on this: when non-empty they base64-encode each
+    # file into an OpenAI-style image_url content part. Every other backend
+    # (all CLIs, the Anthropic API path) ignores it entirely — they read only
+    # ``prompt``/``system``/``cwd`` — so defaulting to an empty list keeps all
+    # existing text-only callers byte-identical and non-breaking.
+    images: List[str] = field(default_factory=list)
 
 
 # Subprocess timeouts (seconds)
