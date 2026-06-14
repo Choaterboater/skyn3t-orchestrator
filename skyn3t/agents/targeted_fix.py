@@ -36,9 +36,9 @@ logger = logging.getLogger("skyn3t.agents.targeted_fix")
 # with output length on streaming CLI backends. The shared LLM client
 # already enforces its own streaming-idle + hard-cap window, so a
 # generous outer ceiling here just lets the inner one do its job.
-_REGENERATE_TIMEOUT_BASE_SECONDS = 90.0
-_REGENERATE_TIMEOUT_PER_KB_SECONDS = 12.0
-_REGENERATE_TIMEOUT_MAX_SECONDS = 300.0
+_REGENERATE_TIMEOUT_BASE_SECONDS = 150.0
+_REGENERATE_TIMEOUT_PER_KB_SECONDS = 20.0
+_REGENERATE_TIMEOUT_MAX_SECONDS = 360.0
 
 
 def _regenerate_timeout_for(existing_content: str) -> float:

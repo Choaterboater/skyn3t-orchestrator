@@ -102,7 +102,17 @@ class OpenRouterBackend:
         self._httpx = httpx
         self._client = httpx.AsyncClient(
             base_url=base_url,
-            timeout=120.0,
+            # Granular timeout: fail FAST on a dead connection (connect=15s) but
+            # give slow models a generous READ window — a flat 120s was cutting
+            # off legitimate-but-slow completions mid-response (httpx.ReadTimeout),
+            # which the retry loop below then exhausted, starving codegen and the
+            # build-fix loop. Tunable via SKYN3T_OPENROUTER_READ_TIMEOUT.
+            timeout=httpx.Timeout(
+                connect=15.0,
+                read=float(os.environ.get("SKYN3T_OPENROUTER_READ_TIMEOUT", "300")),
+                write=60.0,
+                pool=15.0,
+            ),
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "HTTP-Referer": "https://skyn3t.local",
