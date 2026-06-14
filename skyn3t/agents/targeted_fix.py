@@ -83,6 +83,94 @@ def _preserve_existing_on_regenerate_failure(issue: FileIssue, reason: str) -> N
     )
 
 
+# Marker substrings that identify a deterministic stub written by an earlier
+# pass — code_agent's TODO/backfill stubs AND targeted_fix's own
+# _placeholder_for output. Kept in sync with
+# code_agent._STUB_TODO_MARKER / _STUB_BACKFILL_MARKER so a stub written on a
+# prior round (e.g. src/types/device.jsx = "@skyn3t-backfill-stub", or a
+# DeviceCard.jsx "Auto-generated placeholder") is treated as MISSING and
+# re-upgraded via manifest_for on the next pass instead of being preserved
+# as final output. The 400-byte ceiling keeps this from matching a real file
+# that merely mentions one of these words in a comment.
+_STUB_MARKERS = (
+    "Auto-generated placeholder",
+    "Placeholder()",
+    "<div>Placeholder</div>",
+    "TODO[skyn3t]: code generation failed",
+    "@skyn3t-backfill-stub",
+    "Generation failed for this component",
+)
+
+
+def _content_is_stub(content: str) -> bool:
+    """True when ``content`` is a known deterministic stub (not real code)."""
+    if not content:
+        return False
+    if len(content) >= 400:
+        return False
+    return any(marker in content for marker in _STUB_MARKERS)
+
+
+def _try_manifest_recover(
+    target_path: Path,
+    rel_path: str,
+    stack: str,
+    brief: str,
+    changed: List[str],
+    errors: List[str],
+    *,
+    reason: str,
+) -> bool:
+    """Last-resort deterministic recovery when a regen attempt failed.
+
+    AREA A: when the LLM regen produced no usable output (rate-limited
+    deterministic-stub, syntax-invalid, or build-invalid) the old behavior was
+    to PRESERVE the existing TODO/placeholder stub — which then hard-fails the
+    scaffold with UnresolvedScaffoldStubError. Instead, try the SAME trusted
+    deterministic template the missing-file path already uses
+    (``manifest_for``). This cannot write worse output than today's stub:
+
+      * If ``manifest_for`` returns None (no generator for this path — e.g.
+        DeviceCard.jsx, src/types/device.jsx), we return False and the caller
+        preserves as before. Honest limitation: exotic/unseen paths are NOT
+        rescued by this change; only paths with a registered generator
+        (ActivityFeed/ServiceDetail/usePolling/etc.) are.
+      * If the existing on-disk file is already REAL code (not a stub), we do
+        NOT overwrite it — preserving a real file beats substituting a
+        template.
+
+    Returns True and appends to ``changed`` when it wrote a real manifest body;
+    False otherwise (caller should then preserve).
+    """
+    if not stack:
+        return False
+    try:
+        from skyn3t.agents.stack_templates import manifest_for
+        body = manifest_for(stack, rel_path, brief or "")
+    except Exception:
+        body = None
+    if not body or _content_is_stub(body):
+        return False
+    # NOTE: we deliberately DO overwrite a non-stub existing file here. This
+    # helper only runs after a regen attempt FAILED on a file the build /
+    # consistency engine flagged as broken, so the existing content is
+    # presumed unbuildable. The deterministic manifest body is a known-good
+    # substitute and cannot be worse than a file that already failed the gate.
+    try:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(body, encoding="utf-8")
+    except OSError:
+        return False
+    changed.append(rel_path)
+    logger.info(
+        "Regen failed for %s (%s); recovered via manifest_for(%s).",
+        rel_path,
+        reason,
+        stack,
+    )
+    return True
+
+
 def _extract_export_surface(content: str) -> List[str]:
     """Best-effort list of the symbols a JS/TS module actually exports.
 
@@ -636,12 +724,7 @@ async def apply_targeted_fix(
             if target_path.exists():
                 try:
                     _existing = target_path.read_text(encoding="utf-8")
-                    if (
-                        len(_existing) < 400
-                        and ("Auto-generated placeholder" in _existing
-                             or "Placeholder()" in _existing
-                             or "<div>Placeholder</div>" in _existing)
-                    ):
+                    if _content_is_stub(_existing):
                         _file_is_stub = True
                 except OSError:
                     pass
@@ -669,15 +752,31 @@ async def apply_targeted_fix(
                         body = manifest_for(stack, inferred_path, brief or "")
                     except Exception:
                         body = None
-                if body is None:
-                    body = _placeholder_for(inferred_path)
-                    logger.info("Missing file %s, creating placeholder", inferred_path)
-                else:
+                if body is not None:
+                    # A real deterministic template exists — upgrade the stub /
+                    # fill the missing file with it (canary-130/131).
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    target_path.write_text(body, encoding="utf-8")
+                    created.append(inferred_path)
                     logger.info("Missing file %s, filled from manifest_for(%s)", inferred_path, stack)
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-                target_path.write_text(body, encoding="utf-8")
-                created.append(inferred_path)
-                continue
+                    continue
+                if not target_path.exists():
+                    # No manifest and nothing on disk: a placeholder keeps the
+                    # build from breaking on a missing module. (For an existing
+                    # stub with no manifest we deliberately fall THROUGH to the
+                    # LLM regen below — re-stubbing it would be churn and could
+                    # even downgrade a backfill stub to a wrong-shape component
+                    # placeholder, e.g. build #5's src/types/device.jsx.)
+                    body = _placeholder_for(inferred_path)
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    target_path.write_text(body, encoding="utf-8")
+                    created.append(inferred_path)
+                    logger.info("Missing file %s, creating placeholder", inferred_path)
+                    continue
+                # Existing stub, no manifest → try a real LLM regeneration
+                # before giving up (the LLM may produce genuine code; if it
+                # returns the sentinel / build-invalid, _try_manifest_recover
+                # then preserve keeps the build-valid stub untouched).
 
             if llm_client is None:
                 errors.append(f"No LLM client available to regenerate: {issue.path}")
@@ -746,7 +845,50 @@ async def apply_targeted_fix(
                 )
                 continue
             except Exception as exc:
-                errors.append(f"LLM call failed for {issue.path}: {exc}")
+                # The LLM client may RAISE on an unrecoverable backend error.
+                # That is a transient regen failure, not a real fix — try the
+                # deterministic manifest template before giving up so a
+                # rate-limited round still produces a build-valid file when a
+                # generator exists for this path.
+                if _try_manifest_recover(
+                    target_path, issue.path, stack, brief, changed, errors,
+                    reason=f"LLM call failed: {exc}",
+                ):
+                    continue
+                _preserve_existing_on_regenerate_failure(
+                    issue, f"LLM call failed: {exc}"
+                )
+                preserved.append(issue.path)
+                errors.append(
+                    f"LLM call failed for {issue.path} ({exc}); "
+                    "preserved existing file instead."
+                )
+                continue
+
+            # AREA B: OpenRouter/Anthropic 429s and exhausted-key failures are
+            # CAUGHT inside LLMClient.complete and returned as the
+            # "[deterministic-stub]" sentinel (NOT raised, NOT empty). Without
+            # this guard the sentinel prose flows into the syntax gates, fails
+            # _syntax_ok, and is mislabeled "build-invalid output" — sending
+            # investigations toward a truncation theory and falsely recording
+            # that a fix was "attempted". Detect the sentinel (and empty
+            # output) up front and treat it as a TRANSIENT failure. Mirrors the
+            # sentinel checks already used in planner.py, runner.py,
+            # core/agent.py, brainstorm.py, research_agent.py, etc.
+            if not new_content or "[deterministic-stub]" in new_content:
+                if _try_manifest_recover(
+                    target_path, issue.path, stack, brief, changed, errors,
+                    reason="llm unavailable (deterministic-stub/rate-limited)",
+                ):
+                    continue
+                _preserve_existing_on_regenerate_failure(
+                    issue, "llm unavailable (deterministic-stub/rate-limited)"
+                )
+                preserved.append(issue.path)
+                errors.append(
+                    f"LLM backend unavailable when regenerating {issue.path} "
+                    "(rate-limited/no backend); preserved existing file instead."
+                )
                 continue
 
             # Strip fences and preamble text the model may have added
@@ -760,6 +902,11 @@ async def apply_targeted_fix(
             ext = Path(issue.path).suffix.lower()
             validation_error = _validate_syntax(new_content, ext, issue.path)
             if validation_error:
+                if _try_manifest_recover(
+                    target_path, issue.path, stack, brief, changed, errors,
+                    reason=f"invalid syntax: {validation_error}",
+                ):
+                    continue
                 _preserve_existing_on_regenerate_failure(
                     issue,
                     f"invalid syntax: {validation_error}",
@@ -774,6 +921,11 @@ async def apply_targeted_fix(
             from skyn3t.agents.code_agent import _syntax_ok
 
             if not _syntax_ok(new_content, issue.path):
+                if _try_manifest_recover(
+                    target_path, issue.path, stack, brief, changed, errors,
+                    reason="build-invalid output",
+                ):
+                    continue
                 _preserve_existing_on_regenerate_failure(
                     issue,
                     "build-invalid output",

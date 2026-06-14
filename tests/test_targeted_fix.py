@@ -595,3 +595,229 @@ def test_apply_targeted_fix_preserves_existing_file_for_syntax_invalid_output(tm
     assert result.fix_label == "noop"
     assert any("Invalid regenerated content for src/App.jsx" in e for e in result.errors)
     assert target.read_text(encoding="utf-8") == original
+
+
+# ─── AREA B: deterministic-stub / rate-limit sentinel on regenerate ─────
+
+
+_DETERMINISTIC_STUB = (
+    "[deterministic-stub]\n"
+    "context: Fix the following error in this react_vite file:\n"
+    "thoughts: working without an LLM backend; returning a minimal scaffold.\n"
+    "set ANTHROPIC_API_KEY, install `claude` CLI, or set OPENROUTER_API_KEY for real generation."
+)
+
+
+def test_regenerate_deterministic_stub_is_transient_not_build_invalid(tmp_path: Path):
+    """AREA B: when LLMClient returns the [deterministic-stub] sentinel (its
+    429/exhausted-key fallback), apply_targeted_fix must treat it as a
+    TRANSIENT 'llm unavailable' failure — NOT mislabel it 'build-invalid
+    output' — and (no manifest available) preserve the existing file."""
+    scaffold = tmp_path / "scaffold"
+    (scaffold / "src" / "components").mkdir(parents=True)
+    target = scaffold / "src" / "components" / "DeviceCard.jsx"
+    original = "export default function DeviceCard() { return <div>real</div>; }\n"
+    target.write_text(original)
+
+    class StubLLM:
+        async def complete(self, prompt: str, max_tokens: int, temperature: float) -> str:  # noqa: ARG002
+            return _DETERMINISTIC_STUB
+
+    issues = [
+        FileIssue(
+            path="src/components/DeviceCard.jsx",
+            error_message="regenerate me",
+            suggested_action="regenerate",
+        )
+    ]
+    result = asyncio.run(
+        apply_targeted_fix(
+            scaffold_dir=scaffold,
+            issues=issues,
+            llm_client=StubLLM(),
+            stack="react_vite",
+        )
+    )
+    assert "src/components/DeviceCard.jsx" not in result.files_changed
+    assert "src/components/DeviceCard.jsx" in result.files_preserved
+    # Honest label: transient unavailability, not "build-invalid".
+    assert any("unavailable" in e.lower() for e in result.errors)
+    assert not any("build-invalid" in e.lower() for e in result.errors)
+    # Existing real file is left intact.
+    assert target.read_text(encoding="utf-8") == original
+
+
+def test_regenerate_429_raise_is_transient_and_recovers_via_manifest(tmp_path: Path):
+    """AREA A+B regression: a client that RAISES (real 429 path before the
+    LLMClient fallback) on a path that HAS a deterministic generator must end
+    with a real, non-stub file via manifest_for — NOT a preserved stub — so
+    the build does not hard-fail with UnresolvedScaffoldStubError."""
+    scaffold = tmp_path / "scaffold"
+    (scaffold / "src" / "components").mkdir(parents=True)
+    target = scaffold / "src" / "components" / "ActivityFeed.jsx"
+    # The file on disk is the backfill stub from a prior round.
+    target.write_text(
+        "// @skyn3t-backfill-stub: for missing import.\n"
+        "export default function ActivityFeed() {\n  return null;\n}\n"
+    )
+
+    class Raises429:
+        async def complete(self, prompt: str, max_tokens: int, temperature: float) -> str:  # noqa: ARG002
+            raise RuntimeError("Client error '429 Too Many Requests'")
+
+    issues = [
+        FileIssue(
+            path="src/components/ActivityFeed.jsx",
+            error_message="regenerate me",
+            suggested_action="regenerate",
+        )
+    ]
+    result = asyncio.run(
+        apply_targeted_fix(
+            scaffold_dir=scaffold,
+            issues=issues,
+            llm_client=Raises429(),
+            stack="react_vite",
+        )
+    )
+    # ActivityFeed.jsx has a real manifest_for generator, so the stub-on-disk
+    # is upgraded BEFORE the regen even runs (stub treated as missing), then
+    # the 429 never matters. Either way the final file is real, not a stub.
+    final = target.read_text(encoding="utf-8")
+    assert "@skyn3t-backfill-stub" not in final
+    assert "Auto-generated placeholder" not in final
+    assert "src/components/ActivityFeed.jsx" in (
+        result.files_changed + result.files_created
+    )
+
+
+def test_regenerate_stub_on_disk_is_upgraded_via_manifest_before_llm(tmp_path: Path):
+    """AREA A: a stub written on a prior round (backfill marker) must be
+    treated as MISSING and re-upgraded via manifest_for, NOT preserved. Uses a
+    path WITH a generator (ServiceDetail.jsx)."""
+    scaffold = tmp_path / "scaffold"
+    (scaffold / "src" / "components").mkdir(parents=True)
+    target = scaffold / "src" / "components" / "ServiceDetail.jsx"
+    target.write_text(
+        "// @skyn3t-backfill-stub: for missing import.\n"
+        "export default function ServiceDetail() {\n  return null;\n}\n"
+    )
+
+    class StubLLM:
+        async def complete(self, prompt: str, max_tokens: int, temperature: float) -> str:  # noqa: ARG002
+            return _DETERMINISTIC_STUB
+
+    issues = [
+        FileIssue(
+            path="src/components/ServiceDetail.jsx",
+            error_message="regenerate me",
+            suggested_action="regenerate",
+        )
+    ]
+    result = asyncio.run(
+        apply_targeted_fix(
+            scaffold_dir=scaffold,
+            issues=issues,
+            llm_client=StubLLM(),
+            stack="react_vite",
+        )
+    )
+    final = target.read_text(encoding="utf-8")
+    assert "@skyn3t-backfill-stub" not in final
+    assert "src/components/ServiceDetail.jsx" in result.files_created + result.files_changed
+
+
+def test_regenerate_build_invalid_recovers_via_manifest_when_available(tmp_path: Path):
+    """AREA A: a build-invalid regen on a real (non-stub) file that HAS a
+    manifest generator should be rescued by writing the deterministic template
+    instead of preserving — turning a no-fix into a real fix."""
+    scaffold = tmp_path / "scaffold"
+    (scaffold / "src" / "components").mkdir(parents=True)
+    target = scaffold / "src" / "components" / "ActivityFeed.jsx"
+    # Real (non-stub) file the build flagged as broken. The regen attempt then
+    # also fails (prose), so recovery substitutes the known-good template.
+    target.write_text(
+        "export default function ActivityFeed() {\n"
+        "  return <ul>BROKEN_ORIGINAL</ul>;\n"
+        "}\n"
+    )
+
+    class BuildInvalidLLM:
+        async def complete(self, prompt: str, max_tokens: int, temperature: float) -> str:  # noqa: ARG002
+            # build-invalid: prose with no JSX signals would fail _syntax_ok,
+            # but it must be non-empty and non-sentinel to reach that gate.
+            return "this is not code at all just an explanation paragraph."
+
+    issues = [
+        FileIssue(
+            path="src/components/ActivityFeed.jsx",
+            error_message="regenerate me",
+            suggested_action="regenerate",
+        )
+    ]
+    result = asyncio.run(
+        apply_targeted_fix(
+            scaffold_dir=scaffold,
+            issues=issues,
+            llm_client=BuildInvalidLLM(),
+            stack="react_vite",
+        )
+    )
+    final = target.read_text(encoding="utf-8")
+    # Recovered via manifest — the real ActivityFeed template (not the prose,
+    # not the broken original that the build flagged).
+    assert "this is not code" not in final
+    assert "BROKEN_ORIGINAL" not in final
+    assert "src/components/ActivityFeed.jsx" in result.files_changed
+
+
+def test_regenerate_build_invalid_preserves_when_no_manifest(tmp_path: Path):
+    """AREA A honest limitation: for a path with NO generator (DeviceCard.jsx),
+    a build-invalid regen still PRESERVES — manifest_for returns None so we
+    cannot do better than today. This documents the partial rescue."""
+    scaffold = tmp_path / "scaffold"
+    (scaffold / "src" / "components").mkdir(parents=True)
+    target = scaffold / "src" / "components" / "DeviceCard.jsx"
+    original = "export default function DeviceCard() { return <div>real</div>; }\n"
+    target.write_text(original)
+
+    class BuildInvalidLLM:
+        async def complete(self, prompt: str, max_tokens: int, temperature: float) -> str:  # noqa: ARG002
+            return "this is not code at all just an explanation paragraph."
+
+    issues = [
+        FileIssue(
+            path="src/components/DeviceCard.jsx",
+            error_message="regenerate me",
+            suggested_action="regenerate",
+        )
+    ]
+    result = asyncio.run(
+        apply_targeted_fix(
+            scaffold_dir=scaffold,
+            issues=issues,
+            llm_client=BuildInvalidLLM(),
+            stack="react_vite",
+        )
+    )
+    assert "src/components/DeviceCard.jsx" in result.files_preserved
+    assert "src/components/DeviceCard.jsx" not in result.files_changed
+    assert target.read_text(encoding="utf-8") == original
+
+
+def test_content_is_stub_detects_all_markers():
+    from skyn3t.agents.targeted_fix import _content_is_stub
+
+    assert _content_is_stub(
+        "// @skyn3t-backfill-stub: for missing import.\nexport default function x(){return null;}\n"
+    )
+    assert _content_is_stub(
+        "// Auto-generated placeholder\nexport default function Placeholder(){return <div>Placeholder</div>;}\n"
+    )
+    assert _content_is_stub("// TODO[skyn3t]: code generation failed for x\n")
+    # Real code is not a stub.
+    assert not _content_is_stub(
+        "export default function DeviceCard({ device }) { return <article>{device.name}</article>; }\n"
+    )
+    # A large file that merely mentions the word is not a stub (ceiling).
+    assert not _content_is_stub("// Auto-generated placeholder mention\n" + "x;\n" * 300)

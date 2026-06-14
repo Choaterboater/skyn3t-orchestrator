@@ -165,6 +165,78 @@ async def test_backfill_refuses_paths_outside_scaffold(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_backfill_types_module_is_not_jsx_for_jsx_importer(tmp_path: Path) -> None:
+    """Build #5 regression: App.jsx imports `./types/device` (no extension).
+
+    A module under a `types/` directory is a TYPE module, never a React
+    component — backfilling it as `src/types/device.jsx` (a React-component
+    stub) is doubly wrong. It must land as a plain module (`.js` for a JSX
+    importer, `.ts` for a TS importer) and not get a JSX/component stub body.
+    """
+    out_dir = tmp_path / "scaffold"
+    _write(
+        out_dir / "src" / "App.jsx",
+        "import { Device } from './types/device';\n"
+        "export default function App(){return null;}\n",
+    )
+    agent = _new_agent()
+    await agent._backfill_unresolved_local_imports(
+        out_dir=out_dir,
+        files_written=[str(out_dir / "src" / "App.jsx")],
+        stack="react_vite",
+        brief="Build a TypeScript dashboard of device cards",
+    )
+    # Must NOT be the wrong .jsx component stub.
+    assert not (out_dir / "src" / "types" / "device.jsx").exists()
+    js_target = out_dir / "src" / "types" / "device.js"
+    assert js_target.is_file()
+    body = js_target.read_text()
+    # A types module stub must not render JSX / a React component.
+    assert "return <div>" not in body
+    assert "<div>Placeholder</div>" not in body
+
+
+@pytest.mark.asyncio
+async def test_backfill_types_module_is_ts_for_ts_importer(tmp_path: Path) -> None:
+    """A `.tsx` importer of a `types/` module backfills `.ts`, never `.jsx`."""
+    out_dir = tmp_path / "scaffold"
+    _write(
+        out_dir / "src" / "App.tsx",
+        "import { Device } from './types/device';\n"
+        "export default function App(){return null;}\n",
+    )
+    agent = _new_agent()
+    await agent._backfill_unresolved_local_imports(
+        out_dir=out_dir,
+        files_written=[str(out_dir / "src" / "App.tsx")],
+        stack="react_vite",
+        brief="",
+    )
+    assert not (out_dir / "src" / "types" / "device.jsx").exists()
+    assert (out_dir / "src" / "types" / "device.ts").is_file()
+
+
+@pytest.mark.asyncio
+async def test_backfill_component_import_still_jsx(tmp_path: Path) -> None:
+    """Guard: a normal component import from a .jsx file is still .jsx (the
+    types/ special-case must not change component backfill)."""
+    out_dir = tmp_path / "scaffold"
+    _write(
+        out_dir / "src" / "App.jsx",
+        "import Widget from './components/Widget';\nexport default Widget;\n",
+    )
+    agent = _new_agent()
+    await agent._backfill_unresolved_local_imports(
+        out_dir=out_dir,
+        files_written=[str(out_dir / "src" / "App.jsx")],
+        stack="react_vite",
+        brief="",
+    )
+    assert (out_dir / "src" / "components" / "Widget.jsx").is_file()
+    assert not (out_dir / "src" / "components" / "Widget.js").exists()
+
+
+@pytest.mark.asyncio
 async def test_backfill_writes_activity_feed_and_service_detail(tmp_path: Path) -> None:
     """The canary-119 trifecta: App.jsx imports 3 missing components,
     all should be backfilled via the deterministic homelab generators.

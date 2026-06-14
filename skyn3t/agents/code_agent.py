@@ -3746,7 +3746,18 @@ class CodeAgent(BaseAgent):
                 if base.suffix:
                     target_path = base
                 else:
-                    pick_ext = ".jsx" if p.suffix.lower() in (".jsx", ".tsx") else ".js"
+                    # A module under a `types/` directory is a TYPE module, never
+                    # JSX — backfilling it as `.jsx` (build #5's
+                    # src/types/device.jsx) produces a React-component stub for a
+                    # types import, which is doubly wrong. Prefer a plain module
+                    # extension that matches the importer's language (TS importer
+                    # → `.ts`, otherwise `.js`).
+                    base_posix = base.as_posix().lower()
+                    is_type_module = "/types/" in base_posix or base.stem.lower() in ("types", "type")
+                    if is_type_module:
+                        pick_ext = ".ts" if p.suffix.lower() in (".ts", ".tsx") else ".js"
+                    else:
+                        pick_ext = ".jsx" if p.suffix.lower() in (".jsx", ".tsx") else ".js"
                     target_path = base.with_suffix(pick_ext)
 
                 # Compute the scaffold-relative path for the dispatch lookup.
