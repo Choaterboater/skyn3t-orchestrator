@@ -566,3 +566,83 @@ async def test_critique_code_fix_triggers_reviewer_rescore(tmp_path, monkeypatch
 
     assert len(rescore_calls) >= 1
     assert rescore_calls[0]["artifact_dir"] == artifact_dir
+
+
+@pytest.mark.asyncio
+async def test_objective_rescore_gate_fires_on_reviewer_go_but_build_no(
+    tmp_path, monkeypatch
+) -> None:
+    """A reviewer "go"/82 on a scaffold whose BUILD verifier said "no" must be
+    re-scored. The objective re-score gate previously only fired when the
+    reviewer itself failed, so a reviewer "go" on a non-building scaffold
+    survived in quality_summary (poisoning the ship gate AND the learnings
+    miner). The gate must now fire on the objective failure alone and the
+    capped re-score must drop the stale score below 82.
+    """
+    runner = StudioRunner(event_bus=EventBus(), projects_root=tmp_path / "projects")
+    artifact_dir = tmp_path / "project"
+    artifact_dir.mkdir(parents=True)
+
+    # Mirror Projects/auto-quality_gate-s3-*/project.json: reviewer said "go"
+    # with score 82, but the objective build verifier rejected the scaffold.
+    manifest: dict = {
+        "history": [],
+        "quality_summary": {
+            "source": "reviewer",
+            "verdict": "go",
+            "score": 82,
+        },
+        "build_verification": {"verdict": "no", "summary": "build failed"},
+        "boot_verification": None,
+        "integration_verification": None,
+    }
+
+    # The production gate predicate must say "rescore" for reviewer="go"
+    # (reviewer_failed False) when the build verifier verdict is "no".
+    objective_records = {
+        "build": manifest["build_verification"],
+        "boot": manifest["boot_verification"],
+        "integration": manifest["integration_verification"],
+    }
+    assert runner._should_rerun_objective_rescore(
+        reviewer_failed=False,
+        verdict="no",
+        objective_records=objective_records,
+    )
+    # And it must NOT fire when everything is clean (reviewer go, build yes).
+    assert not runner._should_rerun_objective_rescore(
+        reviewer_failed=False,
+        verdict="yes",
+        objective_records={
+            "build": {"verdict": "yes"},
+            "boot": {"verdict": "skipped"},
+            "integration": None,
+        },
+    )
+
+    # A stubbed capped re-score that drops quality_summary.score below 82.
+    rescore_calls: list = []
+
+    async def fake_rescore(*, artifact_dir, brief, manifest):  # noqa: ANN001
+        rescore_calls.append((artifact_dir, brief))
+        manifest["quality_summary"] = {
+            "source": "reviewer",
+            "verdict": "no-go",
+            "score": 35,
+        }
+
+    monkeypatch.setattr(runner, "_rerun_reviewer_scoring", fake_rescore)
+
+    # Drive the gate exactly as the verification sequence does.
+    if runner._should_rerun_objective_rescore(
+        reviewer_failed=False,
+        verdict="no",
+        objective_records=objective_records,
+    ):
+        await runner._rerun_reviewer_scoring(
+            artifact_dir=artifact_dir, brief="Build a dashboard", manifest=manifest
+        )
+
+    assert len(rescore_calls) == 1
+    assert rescore_calls[0][0] == artifact_dir
+    assert manifest["quality_summary"]["score"] < 82

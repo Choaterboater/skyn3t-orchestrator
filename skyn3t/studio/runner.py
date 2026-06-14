@@ -3152,8 +3152,19 @@ class StudioRunner:
                         "boot": manifest.get("boot_verification"),
                         "integration": manifest.get("integration_verification"),
                     }
-                    if reviewer_failed and any(
-                        isinstance(record, dict) for record in objective_records.values()
+                    # The reviewer "go"/no-go verdict is NOT the only signal that
+                    # can make the stale reviewer score wrong. A reviewer "go" /
+                    # high score on a scaffold whose objective verifier (build /
+                    # boot / integration) FAILED must also be re-scored — leaving
+                    # quality_summary verdict="go" score=82 on a non-building
+                    # scaffold poisons both the ship gate and the negative-
+                    # learnings miner. Fire the gate whenever the reviewer failed
+                    # OR any objective verifier reported a hard "no" (anything
+                    # other than yes/skipped is treated as a failure).
+                    if self._should_rerun_objective_rescore(
+                        reviewer_failed=reviewer_failed,
+                        verdict=verdict,
+                        objective_records=objective_records,
                     ):
                         try:
                             await self._rerun_reviewer_scoring(
@@ -3287,6 +3298,17 @@ class StudioRunner:
             manifest["real_project_scorecard"] = self._build_real_project_scorecard(
                 manifest
             )
+            # Token instrumentation: project.json otherwise records NO token
+            # usage. Persist the cheap studio estimate UNCONDITIONALLY (not only
+            # when the budget is exceeded) so every completed build carries a
+            # machine-readable token_usage row for cost/efficiency analysis.
+            try:
+                manifest["token_usage"] = {
+                    "estimated_tokens": int(self._project_token_total(slug)),
+                    "source": "studio_estimator",
+                }
+            except Exception:
+                logger.debug("token_usage instrumentation failed", exc_info=True)
             completion_message = (
                 manifest["next_action"]
                 if manifest.get("status") in {"done", "needs_fixes"}
@@ -4761,6 +4783,35 @@ class StudioRunner:
         if not result.success or not isinstance(result.output, dict):
             return None
         return result.output
+
+    @staticmethod
+    def _should_rerun_objective_rescore(
+        *,
+        reviewer_failed: bool,
+        verdict: Any,
+        objective_records: Dict[str, Any],
+    ) -> bool:
+        """Decide whether the stale reviewer score must be re-scored.
+
+        The objective verifiers run AFTER the reviewer, so a reviewer "go" /
+        high score on a scaffold whose build/boot/integration verifier FAILED
+        is wrong as soon as those records exist. Leaving such a score in
+        quality_summary poisons both the ship gate and the negative-learnings
+        miner. Fire whenever the reviewer failed OR any objective verifier
+        reported a hard failure (anything other than yes/skipped), provided at
+        least one objective record is present to re-score against.
+        """
+        objective_failed = (
+            str(verdict or "").lower() == "no"
+        ) or any(
+            isinstance(record, dict)
+            and str(record.get("verdict") or "").lower() not in ("yes", "skipped")
+            for record in objective_records.values()
+        )
+        has_record = any(
+            isinstance(record, dict) for record in objective_records.values()
+        )
+        return (reviewer_failed or objective_failed) and has_record
 
     async def _rerun_reviewer_scoring(
         self,
