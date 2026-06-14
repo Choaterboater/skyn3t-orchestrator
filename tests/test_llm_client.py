@@ -332,6 +332,32 @@ def test_drop_cross_provider_model_name(model, expected):
     assert _drop_cross_provider_model_name(model) == expected
 
 
+@pytest.mark.asyncio
+async def test_policy_failover_respects_no_claude(monkeypatch):
+    attempts = []
+
+    async def fake_try_named_backend(self, name):
+        attempts.append(name)
+        return False
+
+    monkeypatch.setenv("SKYN3T_NO_CLAUDE", "1")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "")
+    monkeypatch.setattr(LLMClient, "_try_named_backend", fake_try_named_backend)
+
+    client = LLMClient(
+        backend="openrouter",
+        default_model="openrouter/owl-alpha",
+        backend_is_policy=True,
+        openrouter_api_key=None,
+    )
+
+    impl = await client._get_impl()
+
+    assert attempts == ["openrouter"]
+    assert client.backend == "deterministic"
+    assert impl is not None
+
+
 def test_collect_sandbox_artifacts_harvests_new_files(tmp_path: Path):
     root = tmp_path / "cwd"
     root.mkdir(parents=True, exist_ok=True)

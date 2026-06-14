@@ -422,7 +422,12 @@ class BrainstormAgent(BaseAgent):
     async def _consult(self, brief: str, member: Dict[str, Any]) -> Optional[str]:
         try:
             from skyn3t.adapters import LLMClient
-            client = LLMClient(default_model=member.get("model"), backend=member.get("backend"))
+            client = LLMClient(
+                default_model=member.get("model"),
+                backend=member.get("backend"),
+                event_bus=self.event_bus,
+                caller_name=self.name,
+            )
             prompt = (
                 "Reframe the following brief as one fresh, concrete problem framing. "
                 "Think briefly: what's the SHARPEST framing that the user might NOT have considered? "

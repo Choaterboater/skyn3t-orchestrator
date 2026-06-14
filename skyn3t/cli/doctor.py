@@ -164,6 +164,33 @@ def run_doctor(api_base: str) -> DoctorReport:
                     details={"backends": backend_names},
                 )
             )
+
+            readiness_resp = client.get("/api/llm/readiness")
+            readiness_resp.raise_for_status()
+            readiness = readiness_resp.json() or {}
+            readiness_status = str(readiness.get("status") or "unknown")
+            checks.append(
+                DoctorCheck(
+                    name="llm-readiness",
+                    status="ok"
+                    if readiness_status == "ready"
+                    else "warn"
+                    if readiness_status == "degraded"
+                    else "fail",
+                    summary=(
+                        "LLM readiness passed for real project builds."
+                        if readiness.get("real_project_ready")
+                        else "LLM readiness has blockers for real project builds."
+                    ),
+                    details={
+                        "status": readiness_status,
+                        "real_available_backends": readiness.get("real_available_backends") or [],
+                        "blockers": readiness.get("blockers") or [],
+                        "warnings": readiness.get("warnings") or [],
+                        "learnings": readiness.get("learnings") or {},
+                    },
+                )
+            )
     except httpx.ConnectError:
         checks.append(
             DoctorCheck(

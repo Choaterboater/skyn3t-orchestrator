@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -36,6 +37,25 @@ from skyn3t.core.agent import AgentCapability, BaseAgent, TaskRequest, TaskResul
 from skyn3t.core.events import EventBus
 
 logger = logging.getLogger("skyn3t.agents.build_verifier")
+
+_NODE_BUILTINS = {
+    "assert", "async_hooks", "buffer", "child_process", "cluster", "console",
+    "constants", "crypto", "dgram", "diagnostics_channel", "dns", "domain",
+    "events", "fs", "http", "http2", "https", "inspector", "module", "net",
+    "os", "path", "perf_hooks", "process", "punycode", "querystring",
+    "readline", "repl", "stream", "string_decoder", "timers", "tls", "tty",
+    "url", "util", "v8", "vm", "worker_threads", "zlib",
+}
+_BARE_IMPORT_RE = re.compile(
+    r"""(?:from\s+|import\s*\(|require\s*\(|import\s+)(['"])([^'"]+)\1"""
+)
+_TEST_RUNNER_BINS = {
+    "vitest": "vitest",
+    "jest": "jest",
+    "mocha": "mocha",
+    "playwright": "@playwright/test",
+    "cypress": "cypress",
+}
 
 # Hard ceiling — no verify step should ever take longer than this. We don't
 # want a hung `npm install` to wedge the pipeline.
@@ -458,6 +478,9 @@ class BuildVerifierAgent(BaseAgent):
             return "no", "package.json shape", "", "\n".join(shape_errors)
 
         scripts = (pkg.get("scripts") or {}) if isinstance(pkg, dict) else {}
+        dep_errors = self._node_dependency_preflight(scaffold_dir, pkg, scripts)
+        if dep_errors:
+            return "no", "dependency preflight", "", "\n".join(dep_errors)
         node_bin = shutil.which("node")
 
         # Gate 2: syntax check via `node --check` on every .js/.mjs/.cjs.
@@ -552,6 +575,64 @@ class BuildVerifierAgent(BaseAgent):
         if install_disabled:
             gate_summary.append("install disabled by env")
         return "yes", " · ".join(gate_summary) or "node parse", "node project verified", ""
+
+    @staticmethod
+    def _package_root(specifier: str) -> Optional[str]:
+        spec = (specifier or "").strip()
+        if (
+            not spec
+            or spec.startswith((".", "/", "@/"))
+            or spec.startswith("node:")
+            or spec in _NODE_BUILTINS
+            or spec.split("/", 1)[0] in _NODE_BUILTINS
+        ):
+            return None
+        if spec.startswith("@"):
+            parts = spec.split("/")
+            return "/".join(parts[:2]) if len(parts) >= 2 else spec
+        return spec.split("/", 1)[0]
+
+    @staticmethod
+    def _node_dependency_preflight(
+        scaffold_dir: Path,
+        pkg: Dict[str, Any],
+        scripts: Dict[str, Any],
+    ) -> List[str]:
+        declared: set[str] = set()
+        for section in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+            value = pkg.get(section)
+            if isinstance(value, dict):
+                declared.update(str(name) for name in value)
+
+        missing: Dict[str, set[str]] = {}
+        for path in scaffold_dir.rglob("*"):
+            if (
+                not path.is_file()
+                or path.suffix not in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+                or "node_modules" in path.parts
+            ):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            for _quote, spec in _BARE_IMPORT_RE.findall(text):
+                root = BuildVerifierAgent._package_root(spec)
+                if root and root not in declared:
+                    rel = path.relative_to(scaffold_dir).as_posix()
+                    missing.setdefault(root, set()).add(rel)
+
+        for script_name, raw_cmd in scripts.items():
+            cmd = str(raw_cmd or "")
+            for binary, package_name in _TEST_RUNNER_BINS.items():
+                if re.search(rf"(^|[\s;&|]){re.escape(binary)}($|[\s;&|])", cmd):
+                    if package_name not in declared:
+                        missing.setdefault(package_name, set()).add(f"package.json scripts.{script_name}")
+
+        return [
+            f"Missing package dependency `{name}` referenced by {', '.join(sorted(locations))}"
+            for name, locations in sorted(missing.items())
+        ]
 
     # ------------------------------------------------------------------
     # Phase 3 gate: test runner (npm test / vitest)

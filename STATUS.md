@@ -34,11 +34,21 @@ and approval-gated autonomous improvement loops.
   local or git multi-skill repo containing many `SKILL.md` files or loose skill
   frontmatter markdown. Relevant skills are surfaced to build planning as
   non-binding advice.
+- **Learnings playbook:** the active LLM learning corpus is configured with
+  `SKYN3T_LEARNINGS_DIR=/Volumes/Projects/skynetllm`, containing
+  `playbook.json` and `playbook.md` (`smb://ugnas/Projects/skynetllm/`).
+  It stores curated model winners, build-pattern shapes, and skill guidance
+  that should be retrieved into Studio prompts through the unified LLM path.
 - **GitHub memory:** `GitHubIngestorAgent` can be registered as
   `github_ingestor`, submitted through `POST /api/github/ingest`, or invoked via
   `skyn3t github ingest`. The orchestrator wires shared RAG into GitHub ingestor
   and explorer aliases; ingest results report missing client/seeds, rate limits,
   skip counts, and whether RAG storage was available.
+- **Safe GitHub learning:** external repos are learning sources, not mutation
+  targets. `skyn3t/intelligence/domain_corpus.py` includes
+  `assess_github_learning_source()` so public/approved status, license review,
+  redaction, read-only originals, and local candidate-copy workflow are explicit
+  before a repo is promoted as a pattern source.
 - **Build loop:** objective build/boot/integration verifier records now feed a
   reviewer re-score. Self-heal/fix loops are driven by objective verifier
   failures instead of the earlier reviewer verdict. CodeAgent also repairs
@@ -53,6 +63,8 @@ and approval-gated autonomous improvement loops.
   tier policy and current/newer/cheaper catalog scoring.
 - `skyn3t/intelligence/skill_library.py`, `skyn3t/intelligence/skills_hub.py` —
   installed skills, hub roots, repo import.
+- `skyn3t/intelligence/learnings_store.py` — compiled learnings playbook; point
+  `SKYN3T_LEARNINGS_DIR` at `/Volumes/Projects/skynetllm` for the NAS corpus.
 - `skyn3t/agents/github_ingestor.py`, `skyn3t/core/orchestrator.py` — GitHub RAG
   ingest and shared-memory wiring.
 

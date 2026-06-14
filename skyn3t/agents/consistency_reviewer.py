@@ -726,7 +726,6 @@ class ConsistencyReviewerAgent(BaseAgent):
             return client
         # Try to construct one from config
         try:
-            from skyn3t.adapters.llm_client import LLMClient
-            return LLMClient()
+            return self.get_llm()
         except Exception:
             return None

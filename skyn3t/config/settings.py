@@ -100,6 +100,11 @@ class Settings(BaseSettings):
         default=Path("./data/model_routing.json"),
         alias="SKYN3T_MODEL_ROUTING_PATH",
     )
+    learnings_dir: Path = Field(
+        default=Path("./data/learnings"),
+        alias="SKYN3T_LEARNINGS_DIR",
+    )
+    learnings_model: str = Field(default="gemma3:4b", alias="SKYN3T_LEARNINGS_MODEL")
 
     # Legacy master switch for automatic Cortex handling. When false,
     # system proposals stay fully review-gated and selective auto-triage

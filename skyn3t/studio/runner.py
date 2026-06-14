@@ -388,13 +388,19 @@ class StudioRunner:
             # Dynamic mode: empty stages → ask the planner.
             if not template.stages and template_key == "auto":
                 from skyn3t.studio.planner import plan_pipeline
-                # Build an LLM client for the planner. Use the brainstorm agent's config
-                # as a sensible default; falls back to deterministic if unavailable.
+                # Build an LLM client for the planner through the stage router so
+                # readiness and route telemetry match real generation.
                 llm_client = None
                 try:
                     from skyn3t.adapters import LLMClient
-                    llm_client = LLMClient(default_model=None, backend=None,
-                                           event_bus=self.event_bus, caller_name="planner")
+                    backend, model = self._resolve_stage_route("planner", brief=effective_brief)
+                    llm_client = LLMClient(
+                        default_model=model,
+                        backend=backend,
+                        event_bus=self.event_bus,
+                        caller_name="planner",
+                        backend_is_policy=bool(backend),
+                    )
                 except Exception:
                     pass
                 planned = await plan_pipeline(
@@ -500,6 +506,9 @@ class StudioRunner:
             manifest["execution_profile"] = execution_profile
             manifest["mission_setup"] = setup
             manifest["repo_target"] = repo
+            if extra.get("benchmark_case"):
+                manifest["benchmark_case"] = str(extra.get("benchmark_case") or "")
+                manifest["benchmark_stack"] = str(extra.get("benchmark_stack") or "")
             if extra.get("autonomous") or str(extra.get("source") or "") == "autonomous":
                 manifest["autonomous"] = True
                 manifest["trigger_source"] = str(
@@ -692,8 +701,14 @@ class StudioRunner:
                 from skyn3t.adapters import LLMClient
                 from skyn3t.studio.planner import plan_pipeline
                 from skyn3t.studio.templates import StageSpec, Template
-                llm_client = LLMClient(default_model=None, backend=None,
-                                       event_bus=self.event_bus, caller_name="planner")
+                backend, model = self._resolve_stage_route("planner", brief=effective_brief)
+                llm_client = LLMClient(
+                    default_model=model,
+                    backend=backend,
+                    event_bus=self.event_bus,
+                    caller_name="planner",
+                    backend_is_policy=bool(backend),
+                )
                 planned = await plan_pipeline(
                     brief=effective_brief,
                     llm_client=llm_client,
@@ -1088,11 +1103,13 @@ class StudioRunner:
             from skyn3t.adapters import LLMClient
             from skyn3t.studio.planner import plan_pipeline
             from skyn3t.studio.templates import StageSpec, Template
+            backend, model = self._resolve_stage_route("planner", brief=manifest["brief"])
             llm_client = LLMClient(
-                default_model=None,
-                backend=None,
+                default_model=model,
+                backend=backend,
                 event_bus=self.event_bus,
                 caller_name="planner",
+                backend_is_policy=bool(backend),
             )
             planned = await plan_pipeline(
                 brief=manifest["brief"],
@@ -1292,6 +1309,7 @@ class StudioRunner:
             # build, captured from the code-stage TaskResult so the verdict
             # block can credit/debit each skill's success/failure tally.
             injected_skills: List[str] = []
+            injected_learnings: List[str] = []
             token_budget_limit = self._studio_token_budget_limit()
             if token_budget_limit > 0:
                 manifest["token_budget"] = {
@@ -1764,6 +1782,16 @@ class StudioRunner:
                         injected_skills = list(output.get("injected_skills") or [])
                     except Exception:
                         injected_skills = []
+                    if injected_skills:
+                        manifest.setdefault("injected_skills", []).extend(injected_skills)
+                    try:
+                        injected_learnings = list(output.get("injected_learnings") or [])
+                    except Exception:
+                        injected_learnings = []
+                    if injected_learnings:
+                        manifest.setdefault("injected_learnings", []).extend(
+                            injected_learnings
+                        )
                     # Phase-3 stub hard-gate signal (code_stage.planned_imports_signal):
                     # persist the planned-imports sidecar so the consistency
                     # engine's _scan_planned_component_unused can read it, and
@@ -2188,8 +2216,15 @@ class StudioRunner:
                                         )
                                         for path, bucket in merged.items()
                                     ]
+                                    backend, model = self._resolve_stage_route(
+                                        "code_improver", brief=brief
+                                    )
                                     client = LLMClient(
-                                        event_bus=self.event_bus, caller_name="contract_fix"
+                                        default_model=model,
+                                        backend=backend,
+                                        event_bus=self.event_bus,
+                                        caller_name="contract_fix",
+                                        backend_is_policy=bool(backend),
                                     )
                                     fix_result = await apply_targeted_fix(
                                         scaffold_dir=scaffold_dir,
@@ -2343,8 +2378,15 @@ class StudioRunner:
                                 issues = review_issues
                                 if issues:
                                     scaffold_dir = artifact_dir / "scaffold"
+                                    backend, model = self._resolve_stage_route(
+                                        "code_improver", brief=brief
+                                    )
                                     client = LLMClient(
-                                        event_bus=self.event_bus, caller_name="consistency_fix"
+                                        default_model=model,
+                                        backend=backend,
+                                        event_bus=self.event_bus,
+                                        caller_name="consistency_fix",
+                                        backend_is_policy=bool(backend),
                                     )
                                     fix_result = await apply_targeted_fix(
                                         scaffold_dir=scaffold_dir,
@@ -2473,6 +2515,8 @@ class StudioRunner:
                     summary=stage_summary or manifest["next_action"],
                     files=stage_files,
                     next_action=manifest["next_action"],
+                    injected_skills=injected_skills if stage.name == "code" else None,
+                    injected_learnings=injected_learnings if stage.name == "code" else None,
                 )
                 self._record_lesson_outcome(task.task_id, success=True)
                 manifest["current_stage"] = None
@@ -3240,6 +3284,9 @@ class StudioRunner:
                     )
                 )
                 self._record_build_success_rate(manifest)
+            manifest["real_project_scorecard"] = self._build_real_project_scorecard(
+                manifest
+            )
             completion_message = (
                 manifest["next_action"]
                 if manifest.get("status") in {"done", "needs_fixes"}
@@ -3294,6 +3341,7 @@ class StudioRunner:
                     "verdict": (manifest.get("quality_summary") or {}).get("verdict") or "",
                     "reviewer_score": (manifest.get("quality_summary") or {}).get("score"),
                     "quality_summary": manifest.get("quality_summary") or {},
+                    "real_project_scorecard": manifest.get("real_project_scorecard") or {},
                     "build_verification": manifest.get("build_verification") or {},
                     "boot_verification": manifest.get("boot_verification") or {},
                     "integration_verification": manifest.get("integration_verification") or {},
@@ -3303,6 +3351,7 @@ class StudioRunner:
                     # Injection signal for the each-build-improves-next metric
                     # (Owner G): how many skills/lessons this build received.
                     "injected_skills_count": len(injected_skills),
+                    "injected_learnings_count": len(injected_learnings),
                     "lessons_count": int(manifest.get("lessons_count") or 0),
                     "message": completion_message,
                     "error": manifest.get("error") or "",
@@ -5338,9 +5387,15 @@ class StudioRunner:
                                         suggested_action="regenerate",
                                     )
                                 )
+                        backend, model = self._resolve_stage_route(
+                            "code_improver", brief=brief
+                        )
                         client = LLMClient(
+                            default_model=model,
+                            backend=backend,
                             event_bus=self.event_bus,
                             caller_name="code_critique_fix",
+                            backend_is_policy=bool(backend),
                         )
                         fix_result = await apply_targeted_fix(
                             scaffold_dir=scaffold_dir,
@@ -7212,6 +7267,79 @@ class StudioRunner:
             summary or "Reviewer marked the project as no-go.",
         )
 
+    def _build_real_project_scorecard(self, manifest: Dict[str, Any]) -> Dict[str, Any]:
+        quality = self._normalize_quality_summary(manifest.get("quality_summary")) or {}
+        try:
+            reviewer_score = int(quality.get("score")) if quality.get("score") is not None else None
+        except (TypeError, ValueError):
+            reviewer_score = None
+        threshold = self._reviewer_score_threshold(manifest)
+        penalties: Dict[str, int] = {}
+        reasons: List[str] = []
+
+        def _penalize(bucket: str, points: int, reason: str) -> None:
+            penalties[bucket] = penalties.get(bucket, 0) + int(points)
+            reasons.append(reason)
+
+        for key, label in (
+            ("build_verification", "build"),
+            ("boot_verification", "boot"),
+            ("integration_verification", "integration"),
+        ):
+            record = manifest.get(key)
+            if not isinstance(record, dict):
+                continue
+            verdict = str(record.get("verdict") or "").lower()
+            if verdict != "yes":
+                _penalize(
+                    "build_integrity",
+                    30 if label == "build" else 15,
+                    f"{label} verifier did not pass ({verdict or 'missing'}).",
+                )
+
+        if reviewer_score is None:
+            _penalize("reviewer", 20, "No reviewer score was recorded.")
+        elif reviewer_score < threshold:
+            _penalize(
+                "reviewer",
+                min(30, threshold - reviewer_score),
+                f"Reviewer score {reviewer_score}/100 is below threshold {threshold}.",
+            )
+
+        if not manifest.get("injected_learnings"):
+            _penalize("learnings", 8, "No curated learnings were injected into the code stage.")
+        if int(manifest.get("lessons_count") or 0) <= 0 and not manifest.get("injected_lesson_ids"):
+            _penalize("lessons", 5, "No RAG lessons were injected into the run.")
+
+        serialized = json.dumps(manifest, default=str).lower()
+        if "deterministic-stub" in serialized or '"backend": "deterministic"' in serialized:
+            _penalize("llm_fallback", 25, "Deterministic fallback appeared in run metadata.")
+        if "truncated for llm context" in serialized or "context window" in serialized:
+            _penalize("context_pressure", 10, "Prompt/context truncation markers appeared.")
+
+        status = str(manifest.get("status") or "")
+        critical_buckets = {"build_integrity", "reviewer", "llm_fallback", "context_pressure"}
+        passed = status == "done" and not (critical_buckets & set(penalties))
+        raw_score = 100 - sum(penalties.values())
+        score = max(0, min(100, raw_score))
+        return {
+            "passed": passed,
+            "score": score,
+            "status": status,
+            "reviewer_score": reviewer_score,
+            "reviewer_threshold": threshold,
+            "penalties": penalties,
+            "reasons": reasons,
+            "signals": {
+                "build_verdict": (manifest.get("build_verification") or {}).get("verdict"),
+                "boot_verdict": (manifest.get("boot_verification") or {}).get("verdict"),
+                "integration_verdict": (manifest.get("integration_verification") or {}).get("verdict"),
+                "injected_skills_count": len(manifest.get("injected_skills") or []),
+                "injected_learnings_count": len(manifest.get("injected_learnings") or []),
+                "lessons_count": int(manifest.get("lessons_count") or 0),
+            },
+        }
+
     @staticmethod
     def _quality_source_priority(source: Any) -> int:
         normalized = str(source or "").strip().lower()
@@ -8109,6 +8237,8 @@ class StudioRunner:
         next_action: Optional[str] = None,
         question_count: Optional[int] = None,
         injected_lesson_ids: Optional[List[str]] = None,
+        injected_skills: Optional[List[str]] = None,
+        injected_learnings: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         stage_plan = self._build_stage_plan(stage)
         stage_name = str(stage_plan.get("name") or "")
@@ -8131,6 +8261,10 @@ class StudioRunner:
             record["task_id"] = task_id
         if injected_lesson_ids is not None:
             record["injected_lesson_ids"] = injected_lesson_ids
+        if injected_skills is not None:
+            record["injected_skills"] = injected_skills
+        if injected_learnings is not None:
+            record["injected_learnings"] = injected_learnings
 
         if summary is not None:
             record["summary"] = summary

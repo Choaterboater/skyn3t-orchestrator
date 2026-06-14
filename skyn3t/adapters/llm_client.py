@@ -406,6 +406,15 @@ class LLMClient:
         return False
 
     async def _resolve_auto_backend(self):
+        if os.environ.get("SKYN3T_NO_CLAUDE", "").strip().lower() in {
+            "1", "true", "yes", "on"
+        }:
+            if self._openrouter_key and await self._try_named_backend("openrouter"):
+                return self._impl
+            self._impl = _DeterministicBackend()
+            self._backend_name = "deterministic"
+            return self._impl
+
         # "Not claude at all for coding": code-generation callers resolve
         # to the OpenRouter API first — the Claude subscription is
         # reserved for reasoning stages (planner/architect/reviewer).

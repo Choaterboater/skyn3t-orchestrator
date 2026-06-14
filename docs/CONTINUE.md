@@ -63,6 +63,23 @@ Read docs/CONTINUE.md. Continue from domain-autonomy implementation on main. Ver
 Next: decide whether to commit generated candidate apps into an examples/projects repo, harden live connector credentials, and update default routing if Opus/strong-tier should be opt-in only.
 ```
 
+## LLM learnings playbook
+
+The curated LLM learnings corpus is stored on the NAS and should remain part of
+future Studio/LLM handoffs:
+
+| Item | Value |
+|------|-------|
+| Local mount | `/Volumes/Projects/skynetllm` |
+| JSON playbook | `/Volumes/Projects/skynetllm/playbook.json` |
+| Markdown playbook | `/Volumes/Projects/skynetllm/playbook.md` |
+| SMB source | `smb://ugnas/Projects/skynetllm/` |
+| Env var | `SKYN3T_LEARNINGS_DIR=/Volumes/Projects/skynetllm` |
+
+The playbook contains curated model winners, build-pattern shapes, and skill
+guidance. It should be retrieved into prompts through the unified `LLMClient`
+path; readiness should warn if the playbook is missing.
+
 ## Next priorities (ordered)
 
 > **RECONCILED 2026-06-11 (later session).** Most of the original list is DONE —

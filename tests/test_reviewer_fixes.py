@@ -41,7 +41,7 @@ async def test_try_fix_one_backfills_missing_local_hook_import(monkeypatch, tmp_
     )
 
     class FakeLLMClient:
-        def __init__(self, default_model=None, backend=None):  # noqa: D401, ARG002
+        def __init__(self, default_model=None, backend=None, **kwargs):  # noqa: D401, ARG002
             pass
 
         async def complete(self, prompt, system, max_tokens, temperature, timeout):  # noqa: ARG002
@@ -91,7 +91,7 @@ async def test_try_fix_one_llm_returns_empty(monkeypatch, tmp_path: Path) -> Non
     _write(scaffold, "src/App.jsx", "export default function App(){return null;}")
 
     class EmptyLLMClient:
-        def __init__(self, default_model=None, backend=None):
+        def __init__(self, default_model=None, backend=None, **kwargs):
             pass
 
         async def complete(self, prompt, system, max_tokens, temperature, timeout):
@@ -138,7 +138,7 @@ async def test_try_fix_one_no_issue_in_candidate(monkeypatch, tmp_path: Path) ->
     _write(scaffold, "src/App.jsx", "export default function App(){return null;}")
 
     class FakeLLMClient:
-        def __init__(self, default_model=None, backend=None):
+        def __init__(self, default_model=None, backend=None, **kwargs):
             pass
 
         async def complete(self, prompt, system, max_tokens, temperature, timeout):

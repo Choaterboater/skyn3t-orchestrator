@@ -298,7 +298,12 @@ async def _try_fix_one(
     for model in MODEL_LADDER:
         try:
             from skyn3t.adapters import LLMClient
-            client = LLMClient(default_model=model, backend="openrouter")
+            client = LLMClient(
+                default_model=model,
+                backend="openrouter",
+                caller_name="reviewer_fixes",
+                backend_is_policy=True,
+            )
             try:
                 body = await client.complete(
                     prompt,

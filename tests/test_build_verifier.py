@@ -163,6 +163,72 @@ async def test_node_project_fails_when_package_json_is_garbage(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_node_project_fails_fast_on_undeclared_import_dependency(tmp_path, monkeypatch):
+    monkeypatch.setenv("SKYN3T_VERIFY_NPM_INSTALL", "0")
+    scaffold = tmp_path / "scaffold"
+    (scaffold / "src").mkdir(parents=True)
+    (scaffold / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "demo",
+                "version": "0.0.0",
+                "type": "module",
+                "scripts": {"build": "vite build"},
+                "dependencies": {"@vitejs/plugin-react": "^4.0.0", "vite": "^5.0.0"},
+            }
+        )
+    )
+    (scaffold / "src" / "ComplianceScoreRing.jsx").write_text(
+        "import PropTypes from 'prop-types';\nexport default function Ring(){return null;}\n",
+        encoding="utf-8",
+    )
+
+    agent = BuildVerifierAgent()
+    await agent.initialize()
+    res = await agent.execute(TaskRequest(input_data={"scaffold_dir": str(scaffold)}))
+    out = res.output
+
+    assert out["verdict"] == "no", out
+    assert out["command"] == "dependency preflight"
+    assert "prop-types" in out["stderr"]
+    assert "ComplianceScoreRing.jsx" in out["stderr"]
+
+
+@pytest.mark.asyncio
+async def test_node_project_fails_fast_on_missing_test_runner_dependency(tmp_path, monkeypatch):
+    monkeypatch.setenv("SKYN3T_VERIFY_NPM_INSTALL", "0")
+    scaffold = tmp_path / "scaffold"
+    scaffold.mkdir()
+    (scaffold / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "demo",
+                "version": "0.0.0",
+                "scripts": {"build": "echo ok", "test": "vitest run"},
+                "dependencies": {},
+                "devDependencies": {},
+            }
+        )
+    )
+
+    agent = BuildVerifierAgent()
+    await agent.initialize()
+    res = await agent.execute(TaskRequest(input_data={"scaffold_dir": str(scaffold)}))
+    out = res.output
+
+    assert out["verdict"] == "no", out
+    assert out["command"] == "dependency preflight"
+    assert "vitest" in out["stderr"]
+    assert "scripts.test" in out["stderr"]
+
+
+def test_node_dependency_preflight_allows_builtin_subpath_imports():
+    assert BuildVerifierAgent._package_root("fs/promises") is None
+    assert BuildVerifierAgent._package_root("path/posix") is None
+    assert BuildVerifierAgent._package_root("stream/promises") is None
+
+
+@pytest.mark.asyncio
 async def test_static_render_gate_returns_skipped_when_playwright_unavailable(tmp_path, monkeypatch):
     """When Playwright isn't installed, the render gate gracefully reports
     skipped and the static check passes on parse alone — never penalizes a

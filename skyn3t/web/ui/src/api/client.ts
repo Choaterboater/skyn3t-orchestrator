@@ -438,6 +438,39 @@ export type OpenRouterCatalog = {
   };
 };
 
+export type BenchmarkCase = {
+  id: string;
+  title: string;
+  template: string;
+  stack: string;
+  brief: string;
+  expected_gates?: string[];
+  tags?: string[];
+};
+
+export type BenchmarkResults = {
+  runs: Array<{
+    slug?: string;
+    case_id?: string;
+    stack?: string;
+    status?: string;
+    reviewer_score?: number;
+    scorecard_score?: number;
+    scorecard_passed?: boolean;
+    penalties?: Record<string, number>;
+    build_verdict?: string;
+    updated_at?: number;
+  }>;
+  summary: Array<{
+    case_id?: string;
+    runs?: number;
+    passes?: number;
+    pass_rate?: number;
+    avg_score?: number;
+    latest?: Record<string, unknown>;
+  }>;
+};
+
 export type ImprovementStatus = {
   available?: boolean;
   enabled?: boolean;
@@ -524,6 +557,26 @@ export type MetaStatus = {
 };
 
 export type LlmBackends = { backends: string[] };
+
+export type LlmReadiness = {
+  status?: "ready" | "degraded" | "not_ready" | string;
+  real_project_ready?: boolean;
+  configured?: { backend?: string; model?: string | null };
+  policy?: Record<string, unknown>;
+  availability?: Record<string, Record<string, unknown>>;
+  real_available_backends?: string[];
+  blockers?: Array<Record<string, unknown>>;
+  warnings?: Array<Record<string, unknown>>;
+  learnings?: {
+    dir?: string;
+    json_path?: string;
+    md_path?: string;
+    json_exists?: boolean;
+    md_exists?: boolean;
+    entry_count?: number;
+    source_hint?: string | null;
+  };
+};
 
 export type AgentTypes = { types: string[] };
 
@@ -613,6 +666,10 @@ export const api = {
     fetchJson<OpenRouterCatalog>(
       `/api/models/openrouter${refresh ? "?refresh=1" : ""}`,
     ),
+  benchmarkCohort: () =>
+    fetchJson<{ cases: BenchmarkCase[] }>("/api/studio/benchmark-cohort"),
+  benchmarkResults: () =>
+    fetchJson<BenchmarkResults>("/api/studio/benchmark-results"),
   swarmSnapshot: () => fetchJson<any>("/api/swarm/snapshot"),
   usageTotals: () =>
     fetchJson<{
@@ -996,6 +1053,7 @@ export const api = {
     }),
   llmBackends: () =>
     fetchJson<LlmBackends>("/api/llm/backends").then((d) => d.backends ?? []),
+  llmReadiness: () => fetchJson<LlmReadiness>("/api/llm/readiness"),
   agentTypes: () =>
     fetchJson<AgentTypes>("/api/agents/types").then((d) => d.types ?? []),
   createAgent: (payload: {

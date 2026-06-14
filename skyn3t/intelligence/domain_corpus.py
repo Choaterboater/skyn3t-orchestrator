@@ -22,6 +22,14 @@ NETWORKING_DOMAINS = (
     "inventory_config",
     "automation_scripts",
 )
+PERMISSIVE_LICENSES = {
+    "mit",
+    "apache-2.0",
+    "bsd-2-clause",
+    "bsd-3-clause",
+    "isc",
+    "mpl-2.0",
+}
 
 _TAG_RE = re.compile(r"[^a-z0-9_+-]+")
 _GITHUB_RE = re.compile(
@@ -144,6 +152,30 @@ class GoldenProjectRecord:
         }
 
 
+@dataclass
+class GithubLearningSafety:
+    """Safety decision for learning from a GitHub source."""
+
+    allowed: bool
+    repo: str
+    read_only_original: bool = True
+    candidate_strategy: str = "local_candidate_copy"
+    license_status: str = "unknown"
+    redaction_required: bool = True
+    reasons: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "allowed": self.allowed,
+            "repo": self.repo,
+            "read_only_original": self.read_only_original,
+            "candidate_strategy": self.candidate_strategy,
+            "license_status": self.license_status,
+            "redaction_required": self.redaction_required,
+            "reasons": list(self.reasons),
+        }
+
+
 def normalize_tag(value: Any) -> str:
     text = _TAG_RE.sub("_", str(value or "").strip().lower()).strip("_")
     return text[:64]
@@ -223,6 +255,59 @@ def source_from_uri(uri: str, *, ref: str = "") -> CorpusSource:
         ref=ref,
         clone_strategy="local_copy",
         read_only_original=True,
+    )
+
+
+def assess_github_learning_source(
+    uri: str,
+    *,
+    approved: bool = False,
+    public: bool = True,
+    license_spdx: str = "",
+) -> GithubLearningSafety:
+    """Decide whether a GitHub repo may be ingested as learning material.
+
+    This is an ingestion guardrail, not a license engine: unknown licenses can
+    still be learned from only after explicit approval, and originals always
+    remain read-only with work done in local candidate copies.
+    """
+
+    parsed = parse_github_repo(uri)
+    repo = "/".join(parsed) if parsed else str(uri or "").strip()
+    reasons: List[str] = []
+    allowed = True
+    if not parsed:
+        allowed = False
+        reasons.append("source is not a recognized GitHub repository")
+    if not public and not approved:
+        allowed = False
+        reasons.append("private/non-public repositories require explicit approval")
+
+    license_id = normalize_tag(license_spdx).replace("_", "-")
+    if license_id:
+        if license_id in PERMISSIVE_LICENSES:
+            license_status = "permissive"
+        elif approved:
+            license_status = "approved_non_permissive"
+            reasons.append(f"license {license_spdx} requires pattern-only learning")
+        else:
+            license_status = "needs_review"
+            allowed = False
+            reasons.append(f"license {license_spdx} requires review before ingestion")
+    else:
+        license_status = "unknown"
+        if not approved:
+            allowed = False
+            reasons.append("license unknown; approval required before ingestion")
+
+    if allowed:
+        reasons.append("original repository remains read-only; learn into local candidate copies only")
+        reasons.append("redact secrets and environment-specific data before RAG/skill storage")
+    return GithubLearningSafety(
+        allowed=allowed,
+        repo=repo,
+        license_status=license_status,
+        reasons=reasons,
     )
 
 

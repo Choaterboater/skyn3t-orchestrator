@@ -859,11 +859,15 @@ class DesignerAgent(BaseAgent):
         )
         try:
             from skyn3t.adapters import LLMClient
+            from skyn3t.core.model_router import resolve_model
+
+            backend, model = resolve_model("designer")
             client = LLMClient(
-                default_model="openrouter/owl-alpha",
-                backend="openrouter",
+                default_model=model,
+                backend=backend,
                 event_bus=self.event_bus,
                 caller_name=self.name,
+                backend_is_policy=bool(backend),
             )
             try:
                 raw = await client.complete(
@@ -1252,11 +1256,15 @@ class DesignerAgent(BaseAgent):
 
         try:
             from skyn3t.adapters import LLMClient
+            from skyn3t.core.model_router import resolve_model
+
+            backend, model = resolve_model("designer")
             client = LLMClient(
-                default_model="openrouter/owl-alpha",
-                backend="openrouter",
+                default_model=model,
+                backend=backend,
                 event_bus=self.event_bus,
                 caller_name=self.name,
+                backend_is_policy=bool(backend),
             )
             try:
                 raw = await client.complete(

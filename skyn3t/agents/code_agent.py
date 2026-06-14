@@ -17,10 +17,38 @@ from skyn3t.prompt_compression import compress_prompt_context
 
 logger = logging.getLogger("skyn3t.agents.code_agent")
 
+_PROMPT_SKILL_MIN_SCORE = -0.5
+_UNSAFE_PROMPT_SKILL_TAGS = {
+    "malicious_skill",
+    "mcp_mismatched_skill",
+    "mcp_overprivileged_skill",
+    "mcp_poisoned_tool",
+    "mcp_underdeclared_skill",
+    "sdi1_mismatch",
+    "sdi2_inappropriate",
+    "sdi3_scope_creep",
+    "sdi4_divergence",
+    "sqp1_vague_triggers",
+    "sqp2_missing_warnings",
+    "sqp3_locale_forcing",
+    "ssd1_semantic_injection",
+    "ssd2_novel_phrasing",
+    "ssd3_nl_exfiltration",
+    "ssd4_narrative_deception",
+}
+
 _PLAN_TIMEOUT_SECONDS = 120.0
 _FILE_BUILD_TIMEOUT_SECONDS = 180.0
 _FILE_RETRY_TIMEOUT_SECONDS = 120.0
 _CLUSTER_BUILD_TIMEOUT_SECONDS = 240.0
+
+
+def _prompt_skill_allowed(skill: Any) -> bool:
+    try:
+        tags = {str(tag).strip().lower() for tag in getattr(skill, "tags", [])}
+    except Exception:
+        tags = set()
+    return not bool(tags & _UNSAFE_PROMPT_SKILL_TAGS)
 
 
 def _strip_fences(body: str) -> str:
@@ -1462,6 +1490,7 @@ class CodeAgent(BaseAgent):
         # by the time TaskResult is constructed, regardless of which
         # branches below execute.
         injected_skills: List[str] = []
+        injected_learnings: List[str] = []
 
         # Read prior-stage artifacts so we build on what research,
         # architecture, design, and brainstorm produced — not just the
@@ -1855,6 +1884,17 @@ class CodeAgent(BaseAgent):
             try:
                 from skyn3t.intelligence.skill_library import get_default_library
                 lib = get_default_library()
+                try:
+                    from skyn3t.intelligence.learnings_store import (
+                        sync_playbook_skills_to_library,
+                    )
+
+                    sync_playbook_skills_to_library(
+                        library=lib,
+                        min_score=_PROMPT_SKILL_MIN_SCORE,
+                    )
+                except Exception:
+                    logger.debug("playbook skill sync failed", exc_info=True)
                 # Query multiple tags: stack-specific shape skills,
                 # role-specific skills (code_agent), and topic skills
                 # (polling, websocket, etc.). Dedupe by skill name.
@@ -1875,8 +1915,14 @@ class CodeAgent(BaseAgent):
                 for tag in topic_tags:
                     if not tag:
                         continue
-                    for skill in lib.find(tag=tag, min_score=0.0, limit=3):
+                    for skill in lib.find(
+                        tag=tag,
+                        min_score=_PROMPT_SKILL_MIN_SCORE,
+                        limit=6,
+                    ):
                         if skill.name in seen:
+                            continue
+                        if not _prompt_skill_allowed(skill):
                             continue
                         seen.add(skill.name)
                         snippet = (skill.body or "").strip()
@@ -1917,10 +1963,16 @@ class CodeAgent(BaseAgent):
                                 query_bits.append(str(_spec.get("path") or ""))
                                 query_bits.append(str(_spec.get("purpose") or ""))
                         query = " ".join(b for b in query_bits if b)[:2000]
-                        for skill in _search(query, limit=8):
+                        for skill in _search(
+                            query,
+                            limit=8,
+                            min_score=_PROMPT_SKILL_MIN_SCORE,
+                        ):
                             if len(skill_lines) >= 8:
                                 break
                             if skill.name in seen:
+                                continue
+                            if not _prompt_skill_allowed(skill):
                                 continue
                             seen.add(skill.name)
                             snippet = (skill.body or "").strip()
@@ -1943,6 +1995,45 @@ class CodeAgent(BaseAgent):
                 injected_skills = sorted(seen)
             except Exception:
                 logger.debug("skill injection failed", exc_info=True)
+
+            try:
+                from skyn3t.intelligence.learnings_store import (
+                    get_default_store,
+                    playbook_entry_safe_for_prompt,
+                )
+
+                items = get_default_store().guidance_for(
+                    brief or stack,
+                    stack=stack,
+                    tags=[stack, "code", "build_pattern", "routing"],
+                    limit=5,
+                )
+                learning_lines: List[str] = []
+                for entry in items:
+                    if not playbook_entry_safe_for_prompt(
+                        entry,
+                        min_score=_PROMPT_SKILL_MIN_SCORE,
+                    ):
+                        continue
+                    title = str(entry.get("title") or "").strip()
+                    content = str(entry.get("content") or "").strip()
+                    if not title or not content:
+                        continue
+                    if len(content) > 1200:
+                        content = content[:1200] + "\n…[truncated]"
+                    injected_learnings.append(title)
+                    learning_lines.append(f"### {title}\n{content}")
+                if learning_lines:
+                    build_system = (
+                        build_system
+                        + "\n\nCurated learnings playbook — apply when relevant:\n\n"
+                        + "\n\n".join(learning_lines)
+                    )
+                    await self.think(
+                        f"injected {len(learning_lines)} curated learning(s) into prompt"
+                    )
+            except Exception:
+                logger.debug("learnings playbook injection failed", exc_info=True)
 
             try:
                 from skyn3t.core.model_router import tier_for_stage
@@ -3523,6 +3614,7 @@ class CodeAgent(BaseAgent):
                 "written_count": written_count,
                 "missing_files": missing_files,
                 "injected_skills": injected_skills,
+                "injected_learnings": injected_learnings,
                 "planned_imports": planned_imports,
                 "stub_markers": stub_markers,
                 "entrypoint_files": entrypoint_files,

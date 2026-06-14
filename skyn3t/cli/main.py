@@ -409,6 +409,26 @@ def studio_reject(
     _success(f"Rejected [bold]{slug}[/bold] — re-running stage with your feedback.")
 
 
+@studio_app.command("benchmarks")
+def studio_benchmarks() -> None:
+    """List the fixed quality-recovery benchmark cohort."""
+    from skyn3t.studio.benchmark_cohort import list_benchmark_cases
+
+    table = Table(title="Studio benchmark cohort", box=box.ROUNDED)
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Stack", style="magenta")
+    table.add_column("Title", style="bold")
+    table.add_column("Expected gates", style="dim")
+    for case in list_benchmark_cases():
+        table.add_row(
+            str(case.get("id") or ""),
+            str(case.get("stack") or ""),
+            str(case.get("title") or ""),
+            ", ".join(str(g) for g in case.get("expected_gates") or []),
+        )
+    console.print(table)
+
+
 agent_app = typer.Typer(help="Agent management commands", no_args_is_help=True)
 task_app = typer.Typer(help="Task management commands", no_args_is_help=True)
 pipeline_app = typer.Typer(help="Pipeline management commands", no_args_is_help=True)
@@ -3550,6 +3570,28 @@ def skills_search(query: str) -> None:
         rel = s.relevance(query)
         tbl.add_row(s.name, f"{rel:.1f}", ", ".join(s.tags[:3]))
     console.print(tbl)
+
+
+@skills_app.command("sync-playbook")
+def skills_sync_playbook() -> None:
+    """Import safe skills from the configured learnings playbook."""
+    from skyn3t.intelligence.learnings_store import sync_playbook_skills_to_library
+    from skyn3t.intelligence.skill_library import get_default_library
+
+    result = sync_playbook_skills_to_library(library=get_default_library())
+    imported = result.get("imported") or []
+    skipped = result.get("skipped") or []
+    flagged = result.get("flagged") or []
+    _success(
+        "Playbook skills synced\n"
+        f"• Imported/updated: {len(imported)}\n"
+        f"• Skipped: {len(skipped)}\n"
+        f"• Flagged unsafe: {len(flagged)}"
+    )
+    if flagged:
+        console.print("[yellow]Flagged entries:[/yellow]")
+        for item in flagged[:20]:
+            console.print(f"  - {item}")
 
 
 @skills_app.command("candidates")

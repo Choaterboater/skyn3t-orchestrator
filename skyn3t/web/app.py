@@ -2262,6 +2262,14 @@ async def llm_backends():
     }
 
 
+@app.get("/api/llm/readiness")
+async def llm_readiness():
+    """Non-secret LLM readiness gate for real Project Studio builds."""
+    from skyn3t.core.llm_readiness import assess_llm_readiness
+
+    return assess_llm_readiness()
+
+
 @app.get("/api/llm/models")
 async def llm_models(backend: str = "auto"):
     from skyn3t.adapters.model_catalog import list_models
@@ -4388,6 +4396,21 @@ async def studio_templates():
         "templates": list_templates(),
         "mission_setup": mission_setup_options(),
     }
+
+
+@app.get("/api/studio/benchmark-cohort")
+async def studio_benchmark_cohort():
+    from skyn3t.studio.benchmark_cohort import list_benchmark_cases
+
+    return {"cases": list_benchmark_cases()}
+
+
+@app.get("/api/studio/benchmark-results")
+async def studio_benchmark_results():
+    from skyn3t.studio.benchmark_results import collect_benchmark_results
+
+    runner = _get_studio_runner(app)
+    return collect_benchmark_results(Path(runner.projects_root))
 
 
 @app.get("/api/examples")

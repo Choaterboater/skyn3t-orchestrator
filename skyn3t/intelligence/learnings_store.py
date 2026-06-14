@@ -26,11 +26,38 @@ logger = logging.getLogger("skyn3t.intelligence.learnings_store")
 DEFAULT_DIR = "data/learnings"
 DEFAULT_OLLAMA_MODEL = "gemma3:4b"
 OLLAMA_URL = "http://localhost:11434/api/generate"
+PLAYBOOK_SKILL_MIN_SCORE = -0.5
+_UNSAFE_PLAYBOOK_TAGS = {
+    "malicious_skill",
+    "mcp_mismatched_skill",
+    "mcp_overprivileged_skill",
+    "mcp_poisoned_tool",
+    "mcp_underdeclared_skill",
+    "sdi1_mismatch",
+    "sdi2_inappropriate",
+    "sdi3_scope_creep",
+    "sdi4_divergence",
+    "sqp1_vague_triggers",
+    "sqp2_missing_warnings",
+    "sqp3_locale_forcing",
+    "ssd1_semantic_injection",
+    "ssd2_novel_phrasing",
+    "ssd3_nl_exfiltration",
+    "ssd4_narrative_deception",
+}
 
 
 def learnings_dir() -> Path:
     """Where the compiled corpus lives. Point at a NAS via SKYN3T_LEARNINGS_DIR."""
-    return Path(os.environ.get("SKYN3T_LEARNINGS_DIR", DEFAULT_DIR))
+    raw = os.environ.get("SKYN3T_LEARNINGS_DIR", "").strip()
+    if raw:
+        return Path(raw)
+    try:
+        from skyn3t.config.settings import get_settings
+
+        return Path(getattr(get_settings(), "learnings_dir", DEFAULT_DIR))
+    except Exception:
+        return Path(DEFAULT_DIR)
 
 
 class LearningsStore:
@@ -257,6 +284,109 @@ def _ollama_generate(model: str, prompt: str, *, timeout: float = 30.0) -> Optio
     except Exception:
         logger.debug("ollama generate unavailable", exc_info=True)
         return None
+
+
+def _score_to_counts(score: float) -> tuple[int, int]:
+    score = max(-1.0, min(1.0, float(score)))
+    if abs(score) < 0.001:
+        return 0, 0
+    total = 6 if score < 0 else 10
+    success = round(((score + 1.0) / 2.0) * total)
+    success = max(0, min(total, success))
+    return success, total - success
+
+
+def _playbook_skill_safe(entry: Dict[str, Any], *, min_score: float) -> bool:
+    return playbook_entry_safe_for_prompt(entry, min_score=min_score)
+
+
+def playbook_entry_safe_for_prompt(entry: Dict[str, Any], *, min_score: float = -1.0) -> bool:
+    try:
+        score = float(entry.get("score") or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    if score < min_score:
+        return False
+    tags = {str(tag).strip().lower() for tag in (entry.get("tags") or []) if str(tag).strip()}
+    if tags & _UNSAFE_PLAYBOOK_TAGS:
+        return False
+    content = str(entry.get("content") or "").strip()
+    if not str(entry.get("title") or "").strip() or not content:
+        return False
+    try:
+        from skyn3t.intelligence.skill_library import scan_skill_markdown
+
+        if scan_skill_markdown(content):
+            return False
+    except Exception:
+        logger.debug("playbook safety scan failed", exc_info=True)
+        return False
+    return True
+
+
+def sync_playbook_skills_to_library(
+    *,
+    store: Optional[LearningsStore] = None,
+    library: Any = None,
+    min_score: float = PLAYBOOK_SKILL_MIN_SCORE,
+) -> Dict[str, Any]:
+    """Import safe playbook ``kind=skill`` entries into SkillLibrary.
+
+    The playbook is the curated NAS corpus. Some useful patterns have negative
+    historical scores because they were measured before the current prompt path;
+    keep mildly negative entries available while filtering known unsafe tags and
+    dangerous markdown.
+    """
+
+    if store is None:
+        store = get_default_store()
+    if library is None:
+        from skyn3t.intelligence.skill_library import get_default_library
+
+        library = get_default_library()
+    from skyn3t.intelligence.skill_library import Skill, scan_skill_markdown
+
+    imported: List[str] = []
+    skipped: List[str] = []
+    flagged: List[str] = []
+    for entry in store._load():
+        if not isinstance(entry, dict) or entry.get("kind") != "skill":
+            continue
+        title = str(entry.get("title") or "").strip()
+        if not _playbook_skill_safe(entry, min_score=min_score):
+            skipped.append(title or "(untitled)")
+            continue
+        content = str(entry.get("content") or "").strip()
+        findings = scan_skill_markdown(content)
+        if findings:
+            flagged.append(f"{title}: {', '.join(findings)}")
+            skipped.append(title)
+            continue
+        try:
+            score = float(entry.get("score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        success_count, failure_count = _score_to_counts(score)
+        tags = sorted(
+            {
+                "learnings-playbook",
+                "playbook",
+                *[str(tag).strip() for tag in (entry.get("tags") or []) if str(tag).strip()],
+            }
+        )
+        skill = Skill(
+            name=title,
+            body=content,
+            description=content.splitlines()[0][:240] if content else "",
+            tags=tags,
+            triggers=tags,
+            success_count=success_count,
+            failure_count=failure_count,
+            source="learnings_playbook",
+        )
+        path = library.upsert(skill, count_mode="set")
+        imported.append(Path(path).stem)
+    return {"imported": imported, "skipped": skipped, "flagged": flagged}
 
 
 _default_store: Optional[LearningsStore] = None

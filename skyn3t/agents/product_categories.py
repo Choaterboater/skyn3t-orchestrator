@@ -374,7 +374,15 @@ Do not include the verbatim brief. Do not add commentary. Do not wrap output in 
         from skyn3t.adapters import LLMClient
 
         async def _run() -> str:
-            client = LLMClient(default_model="openrouter/owl-alpha", backend="openrouter")
+            from skyn3t.core.model_router import resolve_model
+
+            backend, model = resolve_model("planner")
+            client = LLMClient(
+                default_model=model,
+                backend=backend,
+                caller_name="product_categories",
+                backend_is_policy=bool(backend),
+            )
             try:
                 out = await client.complete(
                     prompt,

@@ -1052,7 +1052,13 @@ class CodeImproverAgent(BaseAgent):
 
             try:
                 from skyn3t.adapters import LLMClient
-                client = LLMClient(default_model=model, backend=backend)
+                client = LLMClient(
+                    default_model=model,
+                    backend=backend,
+                    event_bus=self.event_bus,
+                    caller_name=self.name,
+                    backend_is_policy=bool(backend),
+                )
             except Exception as e:
                 attempts_log.append({
                     "backend": str(backend), "model": str(model),

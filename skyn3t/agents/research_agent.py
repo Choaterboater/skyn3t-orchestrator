@@ -170,7 +170,9 @@ class ResearchAgent(BaseAgent):
             if client is None:
                 from skyn3t.adapters import LLMClient
                 client = LLMClient(default_model=self.config.get("model"),
-                                    backend=self.config.get("backend"))
+                                    backend=self.config.get("backend"),
+                                    event_bus=self.event_bus,
+                                    caller_name=self.name)
             # Detect integration-heavy briefs. When the user names third-
             # party products/APIs the program should talk to, the research
             # we need is the actual API surface — endpoints, auth, response
@@ -273,6 +275,8 @@ class ResearchAgent(BaseAgent):
                             retry_client = _LLMClient(
                                 default_model=None, backend=None,
                                 skip_backends=[primary] if primary else [],
+                                event_bus=self.event_bus,
+                                caller_name=self.name,
                             )
                             s_out = await retry_client.complete(
                                 one_prompt, max_tokens=1200, temperature=0.2,
