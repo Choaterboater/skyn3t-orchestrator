@@ -346,6 +346,9 @@ def test_apply_targeted_fix_preserves_existing_file_for_build_invalid_output(tmp
 
     assert "src/App.jsx" not in result.files_created
     assert "src/App.jsx" not in result.files_changed
+    assert "src/App.jsx" in result.files_preserved
+    assert result.ok is False
+    assert result.fix_label == "noop"
     assert any("Build-invalid regenerated content for src/App.jsx" in e for e in result.errors)
     assert target.read_text(encoding="utf-8") == "export default function App() { return <div>ok</div>; }\n"
 
@@ -397,6 +400,132 @@ def test_missing_export_fix_is_grounded_in_real_exports(tmp_path: Path):
     assert "useConfig" in prompt              # the real existing export surface
 
 
+def test_fix_hints_are_threaded_into_regen_prompt(tmp_path: Path):
+    """PATTERN 2 (Hermes loop): experience-index recall passed as
+    fix_hints must appear in the per-file regen prompt so the fix LLM
+    prefers known-good strategies and avoids known anti-patterns."""
+    scaffold = tmp_path / "scaffold"
+    (scaffold / "src").mkdir(parents=True)
+    target = scaffold / "src" / "App.jsx"
+    target.write_text("export default function App() { return null; }\n")
+
+    captured: dict = {}
+
+    class CaptureLLM:
+        async def complete(self, prompt: str, max_tokens: int, temperature: float) -> str:  # noqa: ARG002
+            captured["prompt"] = prompt
+            return "export default function App() { return <div/>; }\n"
+
+    issues = [
+        FileIssue(
+            path="src/App.jsx",
+            error_message="Line 1, col 1: Unexpected token",
+            suggested_action="regenerate",
+        )
+    ]
+    hints = (
+        "  - WORKED: `regenerate:App.jsx` (3/3, 100%)\n"
+        "  - did NOT work: `mixed:2` (2/2 failed)"
+    )
+    asyncio.run(
+        apply_targeted_fix(
+            scaffold_dir=scaffold,
+            issues=issues,
+            llm_client=CaptureLLM(),
+            stack="react_vite",
+            fix_hints=hints,
+        )
+    )
+    prompt = captured["prompt"]
+    assert "LEARNED FROM PRIOR ATTEMPTS" in prompt
+    assert "regenerate:App.jsx" in prompt        # known-good winner shown
+    assert "did NOT work" in prompt              # anti-pattern shown
+    assert "do NOT repeat" in prompt             # explicit avoid instruction
+
+
+def test_no_fix_hints_omits_learned_block(tmp_path: Path):
+    """Empty fix_hints (cold index) must not inject a misleading header."""
+    scaffold = tmp_path / "scaffold"
+    (scaffold / "src").mkdir(parents=True)
+    (scaffold / "src" / "App.jsx").write_text(
+        "export default function App() { return null; }\n"
+    )
+    captured: dict = {}
+
+    class CaptureLLM:
+        async def complete(self, prompt: str, max_tokens: int, temperature: float) -> str:  # noqa: ARG002
+            captured["prompt"] = prompt
+            return "export default function App() { return <div/>; }\n"
+
+    issues = [
+        FileIssue(
+            path="src/App.jsx",
+            error_message="Line 1, col 1: Unexpected token",
+            suggested_action="regenerate",
+        )
+    ]
+    asyncio.run(
+        apply_targeted_fix(
+            scaffold_dir=scaffold,
+            issues=issues,
+            llm_client=CaptureLLM(),
+            stack="react_vite",
+        )
+    )
+    assert "LEARNED FROM PRIOR ATTEMPTS" not in captured["prompt"]
+
+
+def test_preserve_only_round_is_noop_and_not_attributable(tmp_path: Path):
+    """PATTERN 4: a preserve-only round changed nothing — it must report
+    the file in files_preserved, stay ok=False, and carry a 'noop'
+    fix_label so runner never attributes it as a 'worked' fix."""
+    scaffold = tmp_path / "scaffold"
+    (scaffold / "src").mkdir(parents=True)
+    target = scaffold / "src" / "App.jsx"
+    original = "export default function App() { return <div>ok</div>; }\n"
+    target.write_text(original)
+
+    class BrokenLLM:
+        async def complete(self, prompt: str, max_tokens: int, temperature: float) -> str:  # noqa: ARG002
+            # build-invalid: 'export default const' is not valid JS
+            return "export default const App = () => <div>broken</div>;"
+
+    issues = [
+        FileIssue(path="src/App.jsx", error_message="boom", suggested_action="regenerate")
+    ]
+    result = asyncio.run(
+        apply_targeted_fix(scaffold_dir=scaffold, issues=issues, llm_client=BrokenLLM())
+    )
+    assert result.files_changed == []
+    assert result.files_created == []
+    assert result.files_preserved == ["src/App.jsx"]
+    assert result.ok is False
+    assert result.fix_label == "noop"          # must NOT be 'regenerate:App.jsx'
+    assert target.read_text(encoding="utf-8") == original
+
+
+def test_successful_regenerate_keeps_real_label(tmp_path: Path):
+    """Guard the happy path didn't regress to 'noop'."""
+    scaffold = tmp_path / "scaffold"
+    (scaffold / "src").mkdir(parents=True)
+    (scaffold / "src" / "App.jsx").write_text(
+        "export default function App(){return null;}\n"
+    )
+
+    class GoodLLM:
+        async def complete(self, prompt: str, max_tokens: int, temperature: float) -> str:  # noqa: ARG002
+            return "export default function App() { return null; }\n"
+
+    issues = [FileIssue(path="src/App.jsx", error_message="x", suggested_action="regenerate")]
+    result = asyncio.run(
+        apply_targeted_fix(scaffold_dir=scaffold, issues=issues, llm_client=GoodLLM())
+    )
+    assert result.files_changed == ["src/App.jsx"]
+    assert result.files_preserved == []
+    assert result.fix_label == "regenerate:App.jsx"
+    assert result.ok is True
+
+
 def test_apply_targeted_fix_timeout_preserves_existing_file(
     tmp_path: Path,
     monkeypatch,
@@ -428,6 +557,9 @@ def test_apply_targeted_fix_timeout_preserves_existing_file(
 
     assert "src/App.jsx" not in result.files_created
     assert "src/App.jsx" not in result.files_changed
+    assert "src/App.jsx" in result.files_preserved
+    assert result.ok is False
+    assert result.fix_label == "noop"
     assert any("Timed out regenerating src/App.jsx" in e for e in result.errors)
     assert "preserved existing file instead" in result.errors[0]
     assert target.read_text(encoding="utf-8") == "export default function App() { return <div>ok</div>; }\n"
@@ -458,5 +590,8 @@ def test_apply_targeted_fix_preserves_existing_file_for_syntax_invalid_output(tm
 
     assert "src/App.jsx" not in result.files_created
     assert "src/App.jsx" not in result.files_changed
+    assert "src/App.jsx" in result.files_preserved
+    assert result.ok is False
+    assert result.fix_label == "noop"
     assert any("Invalid regenerated content for src/App.jsx" in e for e in result.errors)
     assert target.read_text(encoding="utf-8") == original

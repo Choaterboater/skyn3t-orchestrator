@@ -2237,7 +2237,11 @@ class StudioRunner:
                                     # verifier pass can resolve the
                                     # experience_index row's fix_worked
                                     # state (mark_latest_unresolved_*).
-                                    if contract_signature and fix_result.fix_label:
+                                    if (
+                                        contract_signature
+                                        and fix_result.fix_label
+                                        and fix_result.fix_label != "noop"
+                                    ):
                                         manifest["_pending_fix"] = {
                                             "error_signature": contract_signature,
                                             "fix_applied": fix_result.fix_label,
@@ -2394,7 +2398,11 @@ class StudioRunner:
                                         llm_client=client,
                                         brief=brief,
                                     )
-                                    if consistency_signature and fix_result.fix_label:
+                                    if (
+                                        consistency_signature
+                                        and fix_result.fix_label
+                                        and fix_result.fix_label != "noop"
+                                    ):
                                         manifest["_pending_fix"] = {
                                             "error_signature": consistency_signature,
                                             "fix_applied": fix_result.fix_label,
@@ -2883,6 +2891,14 @@ class StudioRunner:
                         attempt = 0
                         while verdict == "no" and attempt < FIX_ATTEMPTS:
                             attempt += 1
+                            # PATTERN 3: capture the failure signature of the
+                            # build we are about to fix, so we can tell after
+                            # re-verify whether the round actually changed the
+                            # failure class (vs. churning bytes on the same
+                            # break).
+                            prev_build_signature = self._build_error_signature(
+                                build_result
+                            )
                             try:
                                 fixed = await self._apply_build_fix_round(
                                     scaffold_dir, brief, build_result, attempt,
@@ -2952,6 +2968,41 @@ class StudioRunner:
                                     )
                                 except Exception:
                                     logger.exception("persist fix-as-skill failed")
+                                break
+                            # PATTERN 3 (StuckDetector): the round changed
+                            # something but the build still fails with the
+                            # SAME error class — the fix made no progress.
+                            # Stop now instead of burning the remaining
+                            # attempts (and then blind-retrying the whole
+                            # project).
+                            new_build_signature = self._build_error_signature(
+                                build_result
+                            )
+                            if (
+                                verdict == "no"
+                                and prev_build_signature is not None
+                                and new_build_signature == prev_build_signature
+                            ):
+                                manifest.setdefault("build_fix_attempts", [])[-1][
+                                    "stopped"
+                                ] = "no_progress"
+                                self._append_history(
+                                    manifest,
+                                    "BUILD_FIX_NO_PROGRESS",
+                                    status="running",
+                                    message=(
+                                        f"Fix round {attempt} did not change "
+                                        f"the build failure "
+                                        f"({prev_build_signature}); stopping "
+                                        f"the in-place fix loop."
+                                    ),
+                                )
+                                logger.info(
+                                    "build_fix StuckDetector: round %d no "
+                                    "progress on %s — breaking loop",
+                                    attempt,
+                                    prev_build_signature,
+                                )
                                 break
                     if verdict in ("yes", "skipped"):
                         try:
@@ -3979,6 +4030,73 @@ class StudioRunner:
                 return False
         return True
 
+    async def _build_fix_hints(self, build_signature: str) -> str:
+        """Format experience-index recall for ONE build signature into a
+        compact hints string for the targeted-fix regen prompt.
+
+        Reads MemoryStore.rank_fixes_for_signature (winners) and
+        anti_patterns_for_signature (losers); each is timeout-guarded so
+        a slow/locked store never stalls the build-fix loop. Returns ""
+        when the index has nothing graded for this signature.
+        """
+        sig = (build_signature or "").strip()
+        if not sig:
+            return ""
+        try:
+            from skyn3t.memory.store import MemoryStore
+            store = MemoryStore()
+        except Exception:
+            return ""
+        try:
+            ranked = await asyncio.wait_for(
+                store.rank_fixes_for_signature(sig, limit=3), timeout=2.0,
+            )
+            anti = await asyncio.wait_for(
+                store.anti_patterns_for_signature(sig, limit=3), timeout=2.0,
+            )
+        except Exception:
+            return ""
+        if not ranked and not anti:
+            return ""
+        lines: List[str] = []
+        for r in ranked:
+            lines.append(
+                f"  - WORKED: `{r['fix_applied']}` "
+                f"({r['wins']}/{r['attempts']}, {r['rate']:.0%})"
+            )
+        for r in anti:
+            lines.append(
+                f"  - did NOT work: `{r['fix_applied']}` "
+                f"({r['attempts'] - r['wins']}/{r['attempts']} failed)"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_error_signature(build_result: Dict[str, Any]) -> Optional[str]:
+        """Recompute the stable build-error signature from a build_result.
+
+        Mirrors what _apply_build_fix_round derives internally (parse the
+        log -> classify the first issue) so the build-fix loop can detect a
+        no-progress round: if the signature after a re-verify matches the
+        signature that fed the round, the fix changed bytes but not the
+        failure class. Returns None when the log isn't parseable into a
+        known category (so two *unclassifiable* failures never compare
+        equal and false-trigger the stop).
+        """
+        try:
+            from skyn3t.agents.targeted_fix import _parse_build_errors
+            from skyn3t.intelligence.error_signatures import (
+                signature_for_build_issues,
+            )
+            issues = _parse_build_errors(
+                build_result.get("stderr") or "",
+                build_result.get("stdout") or "",
+            )
+            return signature_for_build_issues(issues, source="build")
+        except Exception:
+            logger.debug("build signature recompute failed", exc_info=True)
+            return None
+
     async def _apply_build_fix_round(
         self,
         scaffold_dir: Path,
@@ -4044,6 +4162,22 @@ class StudioRunner:
                         "publish PROJECT_STAGE_FAILED for build failed",
                         exc_info=True,
                     )
+            # PATTERN 2 (Hermes learning loop): feed the experience
+            # index back INTO the repair prompt. Query known-good
+            # winners + known-bad anti-patterns for THIS signature and
+            # hand them to apply_targeted_fix so the fix LLM stops
+            # re-trying losing strategies (the live "build-invalid
+            # output -> preserve -> blind retry" cycle).
+            fix_hints = ""
+            if build_signature:
+                try:
+                    fix_hints = await self._build_fix_hints(build_signature)
+                except Exception:
+                    logger.debug(
+                        "fix-hints recall failed for %s",
+                        build_signature,
+                        exc_info=True,
+                    )
             client = LLMClient(event_bus=self.event_bus, caller_name="build_fix")
             try:
                 result = await apply_targeted_fix(
@@ -4052,6 +4186,7 @@ class StudioRunner:
                     llm_client=client,
                     brief=brief,
                     stack=stack,
+                    fix_hints=fix_hints,
                 )
             except Exception:
                 logger.exception("targeted fix engine failed on round %d", attempt)
@@ -4067,7 +4202,11 @@ class StudioRunner:
                 # Record this fix attempt against the build signature
                 # so the resolver (in the build-verifier retry path
                 # below) can mark it worked/didn't on the next pass.
-                if build_signature and result.fix_label:
+                if (
+                    build_signature
+                    and result.fix_label
+                    and result.fix_label != "noop"
+                ):
                     try:
                         self._pending_build_fix = {
                             "error_signature": build_signature,

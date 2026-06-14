@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
 
@@ -61,11 +61,17 @@ class FixResult:
     files_changed: List[str]
     files_created: List[str]
     errors: List[str]
+    # Files that apply_targeted_fix deliberately LEFT UNCHANGED because the
+    # regenerate attempt failed (timeout / syntax-invalid / build-invalid).
+    # A preserve is a NO-FIX: it must not count as progress and must not be
+    # attributed as a "worked" fix in the experience index (pattern 4).
+    files_preserved: List[str] = field(default_factory=list)
     # A short, stable label describing what the fix did. Used by the
     # experience-index ranker (memory.store.rank_fixes_for_signature)
     # to attribute outcomes to a specific fix strategy. Empty when
     # nothing was applied. Format: "<action>:<path>" for single-issue
-    # fixes, "<action>:N" when N issues shared an action.
+    # fixes, "<action>:N" when N issues shared an action, or "noop" when
+    # nothing was actually changed or created (only preserves/errors).
     fix_label: str = ""
 
 
@@ -522,6 +528,7 @@ async def apply_targeted_fix(
     llm_client=None,
     brief: str = "",
     stack: str = "",
+    fix_hints: str = "",
 ) -> FixResult:
     """Apply targeted fixes for a list of FileIssues.
 
@@ -532,12 +539,18 @@ async def apply_targeted_fix(
             only placeholder creation and simple patches are attempted.
         brief: The original project brief for context.
         stack: The detected stack key (react_vite, next, etc.).
+        fix_hints: Optional prose from the experience index (Hermes
+            learning loop) describing fixes that DID and did NOT work
+            for this build-error signature. Appended verbatim to each
+            per-file regen prompt so the LLM prefers known-good
+            strategies and avoids known anti-patterns. Empty disables.
 
     Returns:
         FixResult with changed/created file lists.
     """
     changed: List[str] = []
     created: List[str] = []
+    preserved: List[str] = []
     errors: List[str] = []
 
     # Resolve once so containment checks below have a stable parent.
@@ -690,10 +703,20 @@ async def apply_targeted_fix(
                     f"existing export above verbatim. Never invent a placeholder symbol, "
                     f"never stub it, never rename the existing exports.\n\n"
                 )
+            hints_block = ""
+            if fix_hints and fix_hints.strip():
+                hints_block = (
+                    "LEARNED FROM PRIOR ATTEMPTS ON THIS ERROR:\n"
+                    f"{fix_hints.strip()}\n"
+                    "Prefer a strategy like the ones that WORKED above; "
+                    "do NOT repeat any strategy listed as one that did NOT "
+                    "work.\n\n"
+                )
             prompt = (
                 f"Fix the following error in this {stack or 'project'} file:\n\n"
                 f"ERROR: {issue.error_message}\n\n"
                 f"{export_grounding}"
+                f"{hints_block}"
                 f"CURRENT FILE ({issue.path}):\n"
                 f"```\n{old_content}\n```\n\n"
                 f"Rewrite the ENTIRE file so the error is fixed. "
@@ -716,6 +739,7 @@ async def apply_targeted_fix(
                     issue,
                     f"timeout after {regen_timeout:.0f}s",
                 )
+                preserved.append(issue.path)
                 errors.append(
                     f"Timed out regenerating {issue.path} after "
                     f"{regen_timeout:.0f}s; preserved existing file instead."
@@ -740,6 +764,7 @@ async def apply_targeted_fix(
                     issue,
                     f"invalid syntax: {validation_error}",
                 )
+                preserved.append(issue.path)
                 errors.append(
                     f"Invalid regenerated content for {issue.path}: "
                     f"{validation_error}; preserved existing file instead."
@@ -753,6 +778,7 @@ async def apply_targeted_fix(
                     issue,
                     "build-invalid output",
                 )
+                preserved.append(issue.path)
                 errors.append(
                     f"Build-invalid regenerated content for {issue.path}; "
                     "preserved existing file instead."
@@ -795,6 +821,7 @@ async def apply_targeted_fix(
         ok=len(errors) == 0 and (len(changed) > 0 or len(created) > 0),
         files_changed=changed,
         files_created=created,
+        files_preserved=preserved,
         errors=errors,
         fix_label=_derive_fix_label(issues, changed, created),
     )
@@ -819,6 +846,11 @@ def _derive_fix_label(
     """
     if not issues:
         return ""
+    # A preserve-only / error-only round changed nothing — do NOT hand the
+    # experience index a real fix label, or runner will stash a _pending_fix
+    # that a later unrelated pass can falsely mark "worked" (pattern 4).
+    if not changed and not created:
+        return "noop"
     actions = {(i.suggested_action or "").strip() or "unknown" for i in issues}
     total = len(issues)
     if len(actions) == 1:
