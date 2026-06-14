@@ -15,12 +15,24 @@ logger = logging.getLogger(__name__)
 
 _SECRET_KEY_PLACEHOLDER = "change-me-in-production"
 
+# Repo root (the directory that holds .env and the canonical data/ dir).
+# settings.py is at <repo>/skyn3t/config/settings.py, so parents[2] == <repo>.
+# Anchoring relative-path defaults and the env_file here makes path resolution
+# DETERMINISTIC regardless of the process CWD. Without this, a server tick
+# launched from a CWD other than the repo (e.g. .../Skyn3t/data) resolves the
+# default "./data" against os.getcwd() and the skills dir collapses to an empty
+# .../data/data/skills, burying the curated skill corpus.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        # Absolute env_file so .env loads no matter the CWD (a bare ".env" is
+        # resolved against os.getcwd() by pydantic-settings and silently skipped
+        # off-repo).
+        env_file=str(_REPO_ROOT / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -399,7 +411,15 @@ class Settings(BaseSettings):
     def parse_paths(cls, v: Any) -> Any:
         if v is None:
             return None
-        return Path(v).expanduser().absolute()
+        p = Path(v).expanduser()
+        # Anchor RELATIVE values (the cwd-independent defaults like "./data")
+        # against the repo root, not os.getcwd(). An explicitly-set ABSOLUTE
+        # path (env DATA_DIR, tests' tmp dir) is honored verbatim, preserving
+        # test isolation. This makes the skills dir resolve to the canonical
+        # repo/data/skills in every process context (server tick included).
+        if not p.is_absolute():
+            p = _REPO_ROOT / p
+        return p.resolve()
 
     def ensure_directories(self) -> None:
         """Create necessary data directories."""
