@@ -298,3 +298,180 @@ def test_sample_body_is_generic_and_serializable():
     encoded = _json.loads(_json.dumps(body))
     assert isinstance(encoded, dict)
     assert "name" in encoded
+
+
+# ─── DEFECT 2: SPA catch-all "/" must not mask a dead backend ───────────
+#
+# _health_check returns the FIRST 2xx/3xx among ("/api/health", "/health",
+# "/healthz", "/"). Because "/" (the SPA index.html) is served by a
+# catch-all even when every /api route 502s, a green "/" used to promote a
+# hollow app to verdict="yes". The fix: liveness via "/" ALONE (no backend
+# health route, no functional "yes") is not enough to pass.
+
+
+def _drive_execute_to_health(
+    agent: BootVerifierAgent,
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    health: tuple,
+    smoke: dict,
+):
+    """Stub out the heavy subprocess phases (detect/install/boot/kill) so
+    execute() runs end-to-end against an in-memory health-check + smoke
+    result, exercising the real liveness-success branch under test.
+    """
+    from skyn3t.agents.boot_verifier import BootProbe
+
+    probe = BootProbe(
+        kind="node-express",
+        entry="server/index.js",
+        install_cmd=None,
+        boot_cmd=["node", "server/index.js"],
+        cwd=".",
+        port=3100,
+        env_file=None,
+        notes=[],
+    )
+    monkeypatch.setattr(agent, "_detect_boot", lambda scaffold_dir: probe)
+    monkeypatch.setattr(agent, "_ensure_runnable_env", lambda scaffold_dir, probe: None)
+    monkeypatch.setattr(agent, "_free_port", lambda preferred: preferred)
+    monkeypatch.setattr(agent, "_build_boot_env", lambda *a, **k: {})
+
+    async def _fake_boot(cmd, cwd, env, port):
+        return True, None, "listening on 3100", ""
+
+    monkeypatch.setattr(agent, "_boot_and_wait", _fake_boot)
+
+    async def _fake_health(port):
+        return health
+
+    monkeypatch.setattr(agent, "_health_check", _fake_health)
+
+    async def _fake_kill(proc):
+        return None
+
+    monkeypatch.setattr(agent, "_kill_proc", _fake_kill)
+
+    async def _fake_api(port, routes, deadline=None):
+        return smoke
+
+    async def _fake_spa(port):
+        return smoke
+
+    monkeypatch.setattr(agent, "_functional_smoke_api", _fake_api)
+    monkeypatch.setattr(agent, "_functional_smoke_spa", _fake_spa)
+
+    from skyn3t.core.agent import TaskRequest
+
+    task = TaskRequest(title="boot", input_data={"scaffold_dir": str(tmp_path)})
+    return asyncio.run(agent.execute(task))
+
+
+def test_health_check_returns_path_when_only_root_answers(monkeypatch):
+    """(1) _health_check returns path "/" when ONLY "/" responds 200."""
+    agent = _make_agent()
+
+    import urllib.error
+
+    class _FakeResp:
+        def getcode(self):
+            return 200
+
+    def _fake_urlopen(req, timeout=None):
+        # Every backend health route 502s; only "/" (the SPA index) is 200.
+        url = req.full_url if hasattr(req, "full_url") else req.get_full_url()
+        if url.endswith("/"):
+            return _FakeResp()
+        raise urllib.error.HTTPError(url, 502, "Bad Gateway", {}, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    status, url, path = asyncio.run(agent._health_check(3100))
+    assert status == 200
+    assert path == "/"
+    assert url.endswith("/")
+
+
+def test_health_check_returns_backend_path_when_api_health_answers(monkeypatch):
+    """A real /api/health 200 yields path "/api/health" (the backend route)."""
+    agent = _make_agent()
+
+    class _FakeResp:
+        def getcode(self):
+            return 200
+
+    def _fake_urlopen(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else req.get_full_url()
+        if url.endswith("/api/health"):
+            return _FakeResp()
+        raise AssertionError(f"unexpected probe before /api/health: {url}")
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+    status, url, path = asyncio.run(agent._health_check(3100))
+    assert status == 200
+    assert path == "/api/health"
+
+
+def test_execute_spa_catch_all_only_fails_hollow(monkeypatch, tmp_path: Path):
+    """(2) Catch-all "/" only + no derivable routes + Playwright absent →
+    verdict "no" with SPA/hollow language in the summary."""
+    agent = _make_agent()
+    # No routes derivable (forces the SPA path), and the SPA DOM check
+    # behaves as if Playwright is absent → smoke verdict "skipped".
+    monkeypatch.setattr(agent, "_derive_primary_routes", staticmethod(lambda d: []))
+    skipped = {"ran": False, "verdict": "skipped", "checks": [], "spa_dom_mutated": None}
+
+    result = _drive_execute_to_health(
+        agent, monkeypatch, tmp_path,
+        # liveness proven ONLY by the catch-all "/"
+        health=(200, "http://127.0.0.1:3100/", "/"),
+        smoke=skipped,
+    )
+    assert result.success is True
+    assert result.output["verdict"] == "no"
+    summary = result.output["summary"].lower()
+    assert "spa" in summary or "hollow" in summary
+    assert result.output["failure_hint"]
+
+
+def test_execute_real_backend_health_passes(monkeypatch, tmp_path: Path):
+    """(3) Regression: a real /api/health 200 → verdict "yes" (backend lives),
+    even when the functional smoke is skipped."""
+    agent = _make_agent()
+    monkeypatch.setattr(agent, "_derive_primary_routes", staticmethod(lambda d: []))
+    skipped = {"ran": False, "verdict": "skipped", "checks": [], "spa_dom_mutated": None}
+
+    result = _drive_execute_to_health(
+        agent, monkeypatch, tmp_path,
+        health=(200, "http://127.0.0.1:3100/api/health", "/api/health"),
+        smoke=skipped,
+    )
+    assert result.success is True
+    assert result.output["verdict"] == "yes"
+
+
+def test_execute_catch_all_but_functional_yes_passes(monkeypatch, tmp_path: Path):
+    """(4) Regression: liveness only via "/" BUT the functional smoke proved
+    a working app (verdict "yes") → still passes verdict "yes"."""
+    agent = _make_agent()
+    routes = [
+        {"method": "GET", "path": "/api/todos", "entity": "todos"},
+        {"method": "POST", "path": "/api/todos", "entity": "todos"},
+    ]
+    monkeypatch.setattr(agent, "_derive_primary_routes", staticmethod(lambda d: routes))
+    smoke_yes = {
+        "ran": True,
+        "verdict": "yes",
+        "checks": [{"route": "/api/todos", "method": "GET", "ok": True, "detail": "200"}],
+        "spa_dom_mutated": None,
+    }
+
+    result = _drive_execute_to_health(
+        agent, monkeypatch, tmp_path,
+        health=(200, "http://127.0.0.1:3100/", "/"),
+        smoke=smoke_yes,
+    )
+    assert result.success is True
+    assert result.output["verdict"] == "yes"

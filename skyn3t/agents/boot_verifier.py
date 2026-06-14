@@ -68,6 +68,13 @@ DEFAULT_TOTAL_TIMEOUT = 360     # 6 min absolute ceiling for the whole flow
 # not testing every route.
 HEALTH_ENDPOINTS: Tuple[str, ...] = ("/api/health", "/health", "/healthz", "/")
 
+# Real backend health routes. A 2xx/3xx on one of these proves the
+# *backend* is alive. A 2xx on "/" alone does NOT — an SPA dev server
+# (or a catch-all that serves index.html for every unmatched path)
+# answers "/" with 200 even when every /api route 502s. So "/" is a
+# liveness signal but NOT proof of a working backend.
+_BACKEND_HEALTH_ENDPOINTS = frozenset({"/api/health", "/health", "/healthz"})
+
 _STUB_MARKER = "TODO[skyn3t]: code generation failed"
 
 # Functional smoke gate. Default-ON; flip off with SKYN3T_VERIFY_FUNCTIONAL=0
@@ -366,7 +373,7 @@ class BootVerifierAgent(BaseAgent):
             )
 
         # Step 4: health-check.
-        health_status, health_url = await self._health_check(actual_port)
+        health_status, health_url, health_path = await self._health_check(actual_port)
 
         # Step 4b: functional smoke (server still live). Guarded by
         # SKYN3T_VERIFY_FUNCTIONAL (default on). Degrades to a 'skipped'
@@ -413,10 +420,76 @@ class BootVerifierAgent(BaseAgent):
             pass
 
         if health_status and 200 <= health_status < 400:
+            # Liveness passed — but on WHICH endpoint? A 2xx/3xx on a real
+            # backend health route ("/api/health", "/health", "/healthz")
+            # proves the backend lives. A 2xx on "/" alone does NOT: an SPA
+            # dev server (or a catch-all that serves index.html for every
+            # unmatched path) answers "/" with 200 even when every /api
+            # route 502s. That "hollow app" used to pass verdict="yes".
+            backend_health_ok = (
+                health_path in _BACKEND_HEALTH_ENDPOINTS and 200 <= health_status < 400
+            )
+            smoke_verdict = functional_smoke.get("verdict")
+
+            # Catch-all hollow-app guard: liveness was proven ONLY by the
+            # SPA "/" index, and the functional smoke could not affirmatively
+            # confirm a working app (no API round-trip 'yes', e.g. no routes
+            # were derivable and/or Playwright was absent so the SPA DOM
+            # check was skipped). With no real backend health route AND no
+            # positive functional signal, "/" returning 200 tells us nothing
+            # about whether the backend works — fail rather than rubber-stamp.
+            if not backend_health_ok and smoke_verdict != "yes":
+                summary = (
+                    f"server booted and answered HTTP {health_status} on "
+                    f"{health_url}, but ONLY the SPA catch-all '/' responded — "
+                    f"no real backend health route ({', '.join(sorted(_BACKEND_HEALTH_ENDPOINTS))}) "
+                    f"answered and the functional smoke could not confirm a "
+                    f"working API (verdict={smoke_verdict!r}). This is the "
+                    f"'hollow app' / SPA-catch-all class: the index.html is "
+                    f"served for every path while the backend 502s on every "
+                    f"/api call, so a green '/' masks a dead backend "
+                    f"(stack: {probe.kind})."
+                )
+                failure_hint = (
+                    "Liveness passed only because '/' returned the SPA "
+                    "index.html (a catch-all serves it for every unmatched "
+                    "path), NOT because the backend is healthy. Add a GET "
+                    "/api/health route that returns JSON {ok: true} from the "
+                    "backend itself, and make sure the API routers are mounted "
+                    "BEFORE the SPA catch-all so /api/* isn't swallowed by "
+                    "index.html. If this really is a pure static SPA, expose a "
+                    "derivable /api route or install Playwright so the "
+                    "functional smoke can prove the UI works."
+                )
+                try:
+                    await self.share_learning(
+                        f"boot_verifier: {probe.kind} → no (SPA catch-all hollow app)",
+                        scope="build",
+                    )
+                except Exception:
+                    logger.debug("share_learning(boot_verifier) failed", exc_info=True)
+                return TaskResult(
+                    task_id=task.task_id, success=True,
+                    output={
+                        "verdict": "no",
+                        "kind": probe.kind,
+                        "command": " ".join(probe.boot_cmd),
+                        "port": actual_port,
+                        "health_url": health_url,
+                        "http_status": health_status,
+                        "stdout": boot_out[-4000:],
+                        "stderr": boot_err[-4000:],
+                        "summary": summary,
+                        "scaffold_dir": str(scaffold_dir),
+                        "failure_hint": failure_hint,
+                        "functional_smoke": functional_smoke,
+                    },
+                )
+
             # Liveness passed. Fold the functional smoke into the verdict:
             # a failed CRUD round-trip (functional verdict 'no') hardens
             # the top-level verdict to 'no'; 'skipped'/'yes' leave it 'yes'.
-            functional_failed = functional_smoke.get("verdict") == "no"
+            functional_failed = smoke_verdict == "no"
             top_verdict = "no" if functional_failed else "yes"
             failed_checks = [
                 c for c in functional_smoke.get("checks", []) if not c.get("ok")
@@ -867,15 +940,23 @@ class BootVerifierAgent(BaseAgent):
 
     # ── health check ──────────────────────────────────────────────
 
-    async def _health_check(self, port: int) -> Tuple[int, str]:
-        """Try each candidate endpoint; return first 2xx/3xx status."""
+    async def _health_check(self, port: int) -> Tuple[int, str, str]:
+        """Try each candidate endpoint; return first 2xx/3xx status.
+
+        Returns ``(status, url, path)`` — the ``path`` is the matched
+        HEALTH_ENDPOINTS entry (e.g. ``"/api/health"`` or ``"/"``) so the
+        caller can tell whether liveness was proven by a *real backend
+        health route* or only by the SPA catch-all ``"/"``.
+        """
         import urllib.error
         import urllib.request
         last_status = 0
         last_url = ""
+        last_path = ""
         for path in HEALTH_ENDPOINTS:
             url = f"http://127.0.0.1:{port}{path}"
             last_url = url
+            last_path = path
             try:
                 req = urllib.request.Request(url, headers={
                     "User-Agent": "skyn3t-boot-verifier",
@@ -893,7 +974,7 @@ class BootVerifierAgent(BaseAgent):
                 )
                 last_status = resp.getcode()
                 if 200 <= last_status < 400:
-                    return last_status, url
+                    return last_status, url, path
             except urllib.error.HTTPError as e:
                 # An HTTP error (e.g. 404) at least means the server
                 # is responding. Note it and try the next endpoint.
@@ -901,7 +982,7 @@ class BootVerifierAgent(BaseAgent):
             except Exception:
                 # Connection refused, timeout, etc. — try the next path.
                 continue
-        return last_status, last_url
+        return last_status, last_url, last_path
 
     # ── functional smoke ──────────────────────────────────────────
 
