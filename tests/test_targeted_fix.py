@@ -350,6 +350,53 @@ def test_apply_targeted_fix_preserves_existing_file_for_build_invalid_output(tmp
     assert target.read_text(encoding="utf-8") == "export default function App() { return <div>ok</div>; }\n"
 
 
+def test_missing_export_fix_is_grounded_in_real_exports(tmp_path: Path):
+    """The dominant unrepaired failure ("X is not exported by Y"): the regen
+    prompt must inject the file's REAL export surface + the exact missing symbol
+    so the fix LLM adds it instead of re-hallucinating (which produced the live
+    "build-invalid output" / preserved-existing no-fixes)."""
+    from skyn3t.agents.targeted_fix import _extract_export_surface
+
+    scaffold = tmp_path / "scaffold"
+    (scaffold / "src" / "hooks").mkdir(parents=True)
+    target = scaffold / "src" / "hooks" / "useConfig.js"
+    target.write_text(
+        "export const useConfig = () => ({});\n"
+        "export default function ConfigProvider() { return null; }\n"
+    )
+    assert "useConfig" in _extract_export_surface(target.read_text())
+
+    captured: dict = {}
+
+    class CaptureLLM:
+        async def complete(self, prompt: str, max_tokens: int, temperature: float) -> str:  # noqa: ARG002
+            captured["prompt"] = prompt
+            return (
+                "export const useConfig = () => ({});\n"
+                "export const fetchConfig = () => ({});\n"
+            )
+
+    issues = [
+        FileIssue(
+            path="src/hooks/useConfig.js",
+            error_message="Missing export: fetchConfig",
+            suggested_action="regenerate",
+        )
+    ]
+    asyncio.run(
+        apply_targeted_fix(
+            scaffold_dir=scaffold,
+            issues=issues,
+            llm_client=CaptureLLM(),
+            stack="react_vite",
+        )
+    )
+    prompt = captured["prompt"]
+    assert "GROUNDING" in prompt
+    assert "fetchConfig" in prompt            # the exact missing symbol
+    assert "useConfig" in prompt              # the real existing export surface
+
+
 def test_apply_targeted_fix_timeout_preserves_existing_file(
     tmp_path: Path,
     monkeypatch,

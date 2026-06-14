@@ -77,6 +77,41 @@ def _preserve_existing_on_regenerate_failure(issue: FileIssue, reason: str) -> N
     )
 
 
+def _extract_export_surface(content: str) -> List[str]:
+    """Best-effort list of the symbols a JS/TS module actually exports.
+
+    Used to GROUND an unresolved-export fix (Aider/Codebuff pattern): the regen
+    prompt shows the model what the file REALLY exports so it adds the missing
+    symbol instead of re-hallucinating it or renaming the existing exports —
+    the dominant cause of "build-invalid output" / preserved-existing no-fixes.
+    """
+    names: List[str] = []
+    for m in re.finditer(
+        r"export\s+default\s+(?:async\s+)?(?:function|class)\s+(\w+)", content
+    ):
+        names.append(f"default (={m.group(1)})")
+    if re.search(
+        r"export\s+default\b(?!\s+(?:async\s+)?(?:function|class))", content
+    ):
+        names.append("default")
+    for m in re.finditer(
+        r"export\s+(?:async\s+)?(?:const|let|var|function|class)\s+(\w+)", content
+    ):
+        names.append(m.group(1))
+    for m in re.finditer(r"export\s*\{([^}]*)\}", content):
+        for part in m.group(1).split(","):
+            part = part.strip()
+            if part:
+                names.append(part.split(" as ")[-1].strip())
+    seen: set = set()
+    out: List[str] = []
+    for n in names:
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
 def _parse_build_errors(stderr: str, stdout: str) -> List[FileIssue]:
     """Extract (file, line, message) tuples from Vite / webpack / tsc output.
 
@@ -636,9 +671,29 @@ async def apply_targeted_fix(
                 continue
 
             old_content = target_path.read_text(encoding="utf-8")
+            # GROUNDING (Aider/Codebuff pattern): for an unresolved-export error
+            # the fix LLM keeps re-hallucinating the symbol because the prompt
+            # never tells it what THIS file really exports. Inject the real
+            # export surface + the exact missing symbol so the fix is grounded
+            # in fact, not guessed.
+            export_grounding = ""
+            mexp = re.search(r"Missing export:\s*([^\s(]+)", issue.error_message)
+            if mexp:
+                missing = mexp.group(1).strip().strip("\"'")
+                real_exports = _extract_export_surface(old_content)
+                export_grounding = (
+                    f"GROUNDING — this file currently exports EXACTLY: "
+                    f"[{', '.join(real_exports) if real_exports else 'nothing'}]. "
+                    f"Another module imports '{missing}' from this file, but this file "
+                    f"does not export it. Add a correct, working named export for "
+                    f"'{missing}' (or a default export if it is 'default'), keeping every "
+                    f"existing export above verbatim. Never invent a placeholder symbol, "
+                    f"never stub it, never rename the existing exports.\n\n"
+                )
             prompt = (
                 f"Fix the following error in this {stack or 'project'} file:\n\n"
                 f"ERROR: {issue.error_message}\n\n"
+                f"{export_grounding}"
                 f"CURRENT FILE ({issue.path}):\n"
                 f"```\n{old_content}\n```\n\n"
                 f"Rewrite the ENTIRE file so the error is fixed. "
