@@ -51,8 +51,15 @@ def test_compile_and_guidance(tmp_path):
         _FakeSkill("good skill", "do X then Y", 8, 1),
         _FakeSkill("bad skill", "", 0, 5),  # score -1 -> filtered out
     ])
-    # data_dir -> tmp (no model_tournament/build_success files) to isolate the test
-    n = store.compile(library=lib, prefs_path=prefs, min_skill_score=0.2, data_dir=str(tmp_path))
+    # data_dir + projects_dir -> tmp (no tournament/build_success/project.json
+    # files) to isolate the test from real runtime state.
+    n = store.compile(
+        library=lib,
+        prefs_path=prefs,
+        min_skill_score=0.2,
+        data_dir=str(tmp_path),
+        projects_dir=tmp_path / "no_projects",
+    )
     assert n == 2
     assert store.json_path.exists() and store.md_path.exists()
 
@@ -61,6 +68,90 @@ def test_compile_and_guidance(tmp_path):
 
     ctx = store.ask("fastapi tests", use_model=False)
     assert "fastapi" in ctx.lower()
+
+
+def _make_build(projects_root, slug, *, score, stack, gaps, sub_scores=None):
+    d = projects_root / slug
+    d.mkdir(parents=True)
+    qs = {"source": "reviewer", "score": score, "verdict": "no-go",
+          "review_file": "review.md"}
+    if sub_scores is not None:
+        qs["sub_scores"] = sub_scores
+    (d / "project.json").write_text(
+        json.dumps({"slug": slug, "stack": stack, "quality_summary": qs}),
+        encoding="utf-8",
+    )
+    body = ["# Review", "", "## Strengths", "- Palette is coherent.", "",
+            "## Gaps & Inconsistencies"]
+    body += [f"- **{g}.** Some explanation of the gap." for g in gaps]
+    (d / "review.md").write_text("\n".join(body), encoding="utf-8")
+
+
+def test_review_deductions_become_avoid_learnings(tmp_path):
+    projects = tmp_path / "Projects"
+    shared = "Scaffold package.json missing every brief dependency"
+    # two sub-ship react_vite builds that share one recurring gap
+    _make_build(projects, "app-a", score=49, stack="react_vite",
+                gaps=[shared, "Typography self-contradicts"],
+                sub_scores={"completeness": 10, "correctness": 5,
+                            "consistency": 8, "packaging": 7})
+    _make_build(projects, "app-b", score=60, stack="react_vite",
+                gaps=[shared, "No mobile-responsive spec"],
+                sub_scores={"completeness": 12, "correctness": 6,
+                            "consistency": 9, "packaging": 9})
+    # a SHIPPED build whose gaps must NOT be learned
+    _make_build(projects, "app-ok", score=90, stack="react_vite",
+                gaps=["Shipped build trivial nit should be ignored"])
+
+    store = LearningsStore(root=tmp_path / "learn")
+    n = store.compile(
+        library=_FakeLib([]), prefs_path=tmp_path / "none.json",
+        data_dir=str(tmp_path), projects_dir=projects,
+    )
+    assert n == 1  # one aggregated negative entry for the one failing stack
+
+    entry = json.loads(store.json_path.read_text())[0]
+    assert entry["kind"] == "review_deduction"
+    assert "react_vite" in entry["title"]
+    content = entry["content"]
+    assert "AVOID" in content
+    assert "seen 2×" in content                 # shared gap clustered across builds
+    assert "correctness" in content              # weakest sub_score dimension surfaced
+    assert "should be ignored" not in content.lower()  # shipped build excluded
+    assert entry["score"] > 0                    # positive so it surfaces in guidance
+
+    # it must be retrievable and prompt-safe (rides the existing injection path)
+    top = store.guidance_for("react_vite app", stack="react_vite")
+    assert top and top[0]["kind"] == "review_deduction"
+    assert playbook_entry_safe_for_prompt(entry, min_score=-0.5) is True
+
+
+def test_review_deductions_filter_vendored_scanner_noise(tmp_path):
+    projects = tmp_path / "Projects"
+    _make_build(
+        projects, "noisy", score=55, stack="react_vite",
+        gaps=[
+            "scaffold/node_modules/@babel/traverse/lib/path.js.map: contains `TODO` marker",
+            "project.json: contains `TODO` marker",
+            "None detected",
+            "Docker packaging is broken",  # the one real, actionable gap
+        ],
+    )
+    store = LearningsStore(root=tmp_path / "learn")
+    store.compile(
+        library=_FakeLib([]), prefs_path=tmp_path / "none.json",
+        data_dir=str(tmp_path), projects_dir=projects,
+    )
+    content = json.loads(store.json_path.read_text())[0]["content"]
+    assert "Docker packaging is broken" in content
+    assert "node_modules" not in content
+    assert "TODO" not in content
+    assert "None detected" not in content
+
+
+def test_review_deductions_empty_when_no_projects_dir(tmp_path):
+    store = LearningsStore(root=tmp_path / "learn")
+    assert store._review_deduction_entries(tmp_path / "missing") == []
 
 
 def test_storage_dir_is_configurable_for_nas(monkeypatch, tmp_path):

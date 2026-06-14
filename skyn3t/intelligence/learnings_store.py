@@ -17,9 +17,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import urllib.request
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("skyn3t.intelligence.learnings_store")
 
@@ -27,6 +29,27 @@ DEFAULT_DIR = "data/learnings"
 DEFAULT_OLLAMA_MODEL = "gemma3:4b"
 OLLAMA_URL = "http://localhost:11434/api/generate"
 PLAYBOOK_SKILL_MIN_SCORE = -0.5
+
+# A build whose reviewer score is below this never shipped — its review.md
+# deductions are the signal for what to AVOID next time.
+SHIP_THRESHOLD = 85
+# review.md sections that hold the reviewer's deductions (vs. "Strengths").
+_GAP_SECTION_RE = re.compile(r"gap|inconsisten|issue|weak claim|risk|problem", re.I)
+_HEADING_RE = re.compile(r"^\s*#{1,6}\s+(.*\S)\s*$")
+_BULLET_RE = re.compile(r"^\s*[-*]\s+(.+)$")
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+# Drop consistency-scanner noise: vendored files, build artifacts, intentional
+# stub TODO sentinels, and "no gap" non-findings. Teaching the model to "avoid"
+# babel's source maps would be actively harmful — these aren't real deductions.
+_GAP_NOISE_RE = re.compile(
+    r"node_modules|\.js\.map\b|\.min\.js\b|/dist/|/vendor/|/build/"
+    r"|contains\s+`?todo`?\s+marker|^none(\s+detected)?$|^n/?a$",
+    re.I,
+)
+_GAP_STOPWORDS = {
+    "the", "a", "an", "is", "are", "to", "of", "and", "in", "on", "for",
+    "with", "no", "not", "its", "it", "as", "that", "this", "but", "has",
+}
 _UNSAFE_PLAYBOOK_TAGS = {
     "malicious_skill",
     "mcp_mismatched_skill",
@@ -60,6 +83,28 @@ def learnings_dir() -> Path:
         return Path(DEFAULT_DIR)
 
 
+def _resolve_projects_dir(explicit: Optional[Path]) -> Path:
+    """Root holding per-build ``<slug>/project.json`` outputs (PROJECTS_DIR)."""
+    if explicit is not None:
+        return Path(explicit)
+    raw = os.environ.get("PROJECTS_DIR", "").strip()
+    if raw:
+        return Path(raw)
+    try:
+        from skyn3t.config.settings import get_settings
+
+        return Path(get_settings().projects_dir)
+    except Exception:
+        return Path("projects")
+
+
+def _normalize_gap(text: str) -> str:
+    """Loose cluster key so near-identical gaps across builds count together."""
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    content = [w for w in words if w not in _GAP_STOPWORDS]
+    return " ".join(content[:6])
+
+
 class LearningsStore:
     def __init__(self, root: Optional[Path] = None):
         self.root = Path(root) if root else learnings_dir()
@@ -74,12 +119,15 @@ class LearningsStore:
         prefs_path: Optional[Path] = None,
         min_skill_score: float = -0.5,
         data_dir: str = "data",
+        projects_dir: Optional[Path] = None,
     ) -> int:
         """Gather curated learnings into the store. Returns the entry count.
 
         Pulls from EVERY signal the system already produces so the corpus grows
         as the system runs: skills, winning build shapes, model-tournament
-        winners per task, and per-stack build success rates.
+        winners per task, per-stack build success rates, and — the only
+        *negative* source — the reviewer's itemized deductions on sub-ship
+        builds (what repeatedly costs score, so the next build avoids it).
         """
         d = Path(data_dir)
         entries: List[Dict[str, Any]] = []
@@ -87,6 +135,7 @@ class LearningsStore:
         entries.extend(self._build_pattern_entries(prefs_path))
         entries.extend(self._model_tournament_entries(d / "model_tournament.json"))
         entries.extend(self._build_success_entries(d / "build_success_rate.json"))
+        entries.extend(self._review_deduction_entries(projects_dir))
         self._write(entries)
         return len(entries)
 
@@ -203,6 +252,143 @@ class LearningsStore:
                 "content": content,
                 "score": wsr,
                 "tags": [stack, "build_pattern"],
+            })
+        return out
+
+    def _parse_review_gaps(
+        self, review_path: Path, max_bytes: int
+    ) -> List[Tuple[str, str]]:
+        """``(headline, cluster_key)`` for each gap bullet in a review.md.
+
+        Only bullets under a deductions heading ("Gaps & Inconsistencies",
+        "Weak Claims / Risks", …) are mined — never "Strengths".
+        """
+        try:
+            text = review_path.read_text(encoding="utf-8", errors="ignore")[:max_bytes]
+        except Exception:
+            return []
+        out: List[Tuple[str, str]] = []
+        in_section = False
+        for raw in text.splitlines():
+            heading = _HEADING_RE.match(raw)
+            if heading:
+                in_section = bool(_GAP_SECTION_RE.search(heading.group(1)))
+                continue
+            if not in_section:
+                continue
+            bullet = _BULLET_RE.match(raw)
+            if not bullet:
+                continue
+            body = bullet.group(1).strip()
+            if not body:
+                continue
+            bold = _BOLD_RE.search(body)
+            headline = (bold.group(1) if bold else body).strip().strip(".`").strip()
+            if _GAP_NOISE_RE.search(headline):
+                continue
+            if len(headline) > 160:
+                headline = headline[:160].rsplit(" ", 1)[0] + "…"
+            key = _normalize_gap(headline)
+            if len(key) < 6:  # too generic to cluster meaningfully
+                continue
+            out.append((headline, key))
+        return out
+
+    def _review_deduction_entries(
+        self,
+        projects_dir: Optional[Path] = None,
+        *,
+        ship_threshold: int = SHIP_THRESHOLD,
+        max_gaps_per_stack: int = 8,
+        max_review_bytes: int = 200_000,
+    ) -> List[Dict[str, Any]]:
+        """Negative learnings mined from reviewer deductions on sub-ship builds.
+
+        Every other source teaches what *won*; this teaches what repeatedly
+        *costs* score. For each ``<slug>/project.json`` with
+        ``quality_summary.score < ship_threshold`` it reads the review.md
+        "Gaps & Inconsistencies" bullets and the weakest ``sub_scores``
+        dimension, then aggregates per stack into one compact "AVOID" entry.
+        Frequency across builds is the confidence — a gap that sinks many
+        builds outranks a one-off, and rides the same ``guidance_for()``
+        injection the positive learnings use.
+        """
+        root = _resolve_projects_dir(projects_dir)
+        if not root.exists():
+            return []
+        gaps: Dict[str, Counter] = defaultdict(Counter)
+        gap_example: Dict[str, Dict[str, str]] = defaultdict(dict)
+        dim_sum: Dict[str, Counter] = defaultdict(Counter)
+        dim_cnt: Dict[str, Counter] = defaultdict(Counter)
+        build_count: Counter = Counter()
+        score_sum: Counter = Counter()
+        for pj in sorted(root.glob("*/project.json")):
+            try:
+                d = json.loads(pj.read_text(encoding="utf-8", errors="ignore"))
+            except Exception:
+                continue
+            qs = d.get("quality_summary")
+            if not isinstance(qs, dict):
+                continue
+            score = qs.get("score")
+            if not isinstance(score, (int, float)) or score >= ship_threshold:
+                continue
+            stack = str(d.get("stack") or "general").strip() or "general"
+            build_count[stack] += 1
+            score_sum[stack] += float(score)
+            sub = qs.get("sub_scores")
+            if isinstance(sub, dict):
+                for dim, val in sub.items():
+                    try:
+                        v = float(val)
+                    except (TypeError, ValueError):
+                        continue
+                    dim_sum[stack][dim] += v
+                    dim_cnt[stack][dim] += 1
+            review_path = pj.parent / str(qs.get("review_file") or "review.md")
+            for headline, key in self._parse_review_gaps(review_path, max_review_bytes):
+                gaps[stack][key] += 1
+                gap_example[stack].setdefault(key, headline)
+
+        out: List[Dict[str, Any]] = []
+        for stack, n in build_count.items():
+            top = gaps[stack].most_common(max_gaps_per_stack)
+            if not top:
+                continue
+            avg = score_sum[stack] / n if n else 0.0
+            weakest, worst_avg = "", None
+            for dim, total in dim_sum[stack].items():
+                a = total / (dim_cnt[stack][dim] or 1)
+                if worst_avg is None or a < worst_avg:
+                    weakest, worst_avg = dim, a
+            lines = [
+                f"AVOID these — they repeatedly cost score in past '{stack}' builds "
+                f"({n} sub-{ship_threshold} build{'s' if n != 1 else ''}, "
+                f"avg score {avg:.0f}/100)."
+            ]
+            if weakest:
+                lines.append(
+                    f"Weakest dimension: {weakest} (avg {worst_avg:.0f}) — "
+                    f"spend extra rigor there."
+                )
+            lines.append("Most common review gaps:")
+            for key, freq in top:
+                seen = f"  (seen {freq}×)" if freq > 1 else ""
+                lines.append(f"- {gap_example[stack].get(key, key)}{seen}")
+            # Confidence scales with how many builds confirm the pattern, capped
+            # so a recurring failure surfaces high but never outranks a
+            # near-perfect winning shape.
+            conf = round(min(0.9, 0.55 + 0.05 * n), 3)
+            tags = [stack, "deduction", "avoid", "review", "code"]
+            if weakest:
+                tags.append(weakest)
+            out.append({
+                "kind": "review_deduction",
+                "key": f"avoid:{stack}",
+                "title": f"{stack}: recurring review gaps to avoid",
+                "content": "\n".join(lines),
+                "score": conf,
+                "tags": tags,
             })
         return out
 
